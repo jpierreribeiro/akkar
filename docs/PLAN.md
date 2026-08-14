@@ -275,25 +275,22 @@ in the other direction.
 - **Core** — router, `req`, response-by-return, and the invariants above.
 - **Adapter boundary** — Postgres adapter, injected `req.db`.
 - **Middleware and validation** — rungs 3 and 4.
-- **In-process test client** — the whole suite runs in about 0.11 s.
+- **In-process test client.**
+- **Request body limit** — 1 MB by default, rejected before buffering, for
+  both a declared `Content-Length` and a chunked body.
+- **Request deadline** — 30 s by default, with immutable-winner arbitration.
 
 The sketch overshot the original milestones: validation, middleware, mounting
 and the test client all landed earlier than planned. What remains is less
 glamorous and more important.
 
-### Next, in order
+### Next
 
-1. **Request body size limit.** Two lines, and it closes a denial-of-service
-   vector: a 5 MB body was accepted and written straight to Postgres.
-2. **HTTP conformance**, all in the router: `405` with `Allow` instead of
-   `404`, `HEAD` over `GET` routes, `OPTIONS` and CORS, trailing slashes,
-   percent-decoding route params. Normalizing `req.headers` belongs here too,
-   since it touches how `req` is assembled.
-3. **Pool, timeout, graceful shutdown.** The trio that separates "it runs" from
-   "it runs in production".
-4. **Redis and non-JSON bodies.** What is missing before a real service can be
-   ported over.
-5. **Prefix-tree routing**, whenever the linear scan starts to hurt.
+The ordered, actionable list lives in `docs/BACKLOG.md`, which also records
+what is deliberately *not* being built. This section only states the shape:
 
-Also open: prepared statements over the extended protocol, structured logging,
-and deciding where CPU-bound work runs.
+1. Three design decisions that are cheap now and expensive later, chiefly the
+   boundary between request data and request capabilities on `req`.
+2. HTTP conformance, all inside the router.
+3. Connection pooling and graceful shutdown.
+4. OpenAPI generated from the schemas already declared.

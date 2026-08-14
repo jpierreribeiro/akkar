@@ -206,6 +206,7 @@ PORT=8099 lua5.4 examples/crud.lua
 |---|---|
 | `docs/PLAN.md` | objective, the verified ladder, invariants, risks, milestones |
 | `docs/DECISIONS.md` | seven design decisions, with alternatives side by side |
+| `docs/BACKLOG.md` | ordered next steps, and what is deliberately not built |
 | `docs/substrate/RESULT.md` | substrate proof: TLS, driver concurrency, CRUD |
 | `examples/crud.lua` | ten scenarios against a real Postgres |
 
