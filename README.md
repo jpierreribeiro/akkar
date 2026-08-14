@@ -15,8 +15,8 @@ app:run()
 ## Status
 
 **Under construction, for my own use.** The substrate is proven and the
-ergonomics are settled — see `docs/substrate/RESULT.md`. What is missing is the
-production layer: connection pooling, timeouts, graceful shutdown.
+ergonomics are settled — see `docs/substrate/RESULT.md`. Body limits and
+request deadlines are in; connection pooling and graceful shutdown are not.
 
 There is no compatibility policy. The API will change.
 
@@ -176,7 +176,8 @@ assert.equal(422, res.status)
 assert.equal("required", res.body.fields["body.name"])
 ```
 
-The whole suite runs in 0.11 s.
+The whole suite runs in about two seconds, most of which is deliberate
+sleeping in the deadline tests.
 
 ---
 
@@ -208,14 +209,35 @@ PORT=8099 lua5.4 examples/crud.lua
 | `docs/substrate/RESULT.md` | substrate proof: TLS, driver concurrency, CRUD |
 | `examples/crud.lua` | ten scenarios against a real Postgres |
 
+## Safe defaults
+
+`app:run()` with no arguments is already production-shaped. Configuration
+appears only when you disagree with the default.
+
+| Default | Value | Override |
+|---|---|---|
+| Request body limit | 1 MB | `app:run { body_limit = 5 * 1024 * 1024 }` |
+| Request deadline | 30 s | `app:run { timeout = 5 }` |
+
+An oversized body is rejected with `413` before it is buffered — both when
+`Content-Length` declares it and when a chunked body simply keeps arriving. A
+request that overruns its deadline answers `503`.
+
+The deadline is cooperative: it fires while the handler is yielding on I/O. A
+handler burning CPU in a tight loop is not interrupted by it — that is what the
+watchdog reports instead. The two cover different failures on purpose.
+
+Timeout arbitration follows one rule: **the winner is decided by the first
+arbitrating event and a late event never overturns it.** A handler that
+finishes at 4.99 s against a 5 s deadline has completed, and is never reported
+as a timeout.
+
 ## Known gaps
 
 Audited by probing a running server, not written from memory.
 
 | | |
 |---|---|
-| **No request body size limit** | a 5 MB body was accepted and written straight to Postgres — a denial-of-service vector |
-| **No request timeout** | nothing stops a handler from hanging forever |
 | `405` answers `404` | a `POST` to a `GET`-only route should answer `405` with `Allow` |
 | `HEAD` and `OPTIONS` answer `404` | no CORS preflight is possible |
 | Trailing slash | `/users/` does not match `/users` |
@@ -227,6 +249,7 @@ Audited by probing a running server, not written from memory.
 | No Redis adapter | |
 | Non-JSON bodies answer 400 | no form-urlencoded, no multipart uploads |
 | Linear scan for dynamic routes | a prefix tree is the fix, but this is not urgent |
+| Pinned to Lua 5.4 | the blocker is `cqueues`, which pins `lua == 5.4` and has had no release since 2020 — not `lua-http`, which accepts `>= 5.1` |
 
 ## License
 

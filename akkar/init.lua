@@ -41,6 +41,16 @@ akkar.unauthorized= function(m)    return response(401, { error = m or "unauthor
 akkar.forbidden   = function(m)    return response(403, { error = m or "forbidden" }) end
 akkar.not_found   = function(m)    return response(404, { error = m or "not found" }) end
 akkar.conflict    = function(m)    return response(409, { error = m or "conflict" }) end
+akkar.too_large   = function(m)    return response(413, { error = m or "payload too large" }) end
+akkar.unavailable = function(m)    return response(503, { error = m or "service unavailable" }) end
+
+-- Safe defaults, applied unless app:run{} overrides them.  The point is that
+-- `app:run()` with no arguments is already production-shaped: a body limit and
+-- a deadline exist whether or not anyone remembered to ask for them.
+akkar.defaults = {
+  body_limit = 1024 * 1024,   -- 1 MB
+  timeout    = 30,            -- seconds of wall clock per request
+}
 
 -- ================================================================ validation
 -- Two spellings of the same thing.  The short one expands into the long one:
@@ -163,6 +173,51 @@ local function install_watchdog(where)
   end, "", WATCHDOG_INSTRUCTIONS)
 end
 local function remove_watchdog() debug.sethook() end
+
+-- ================================================================== deadline
+-- Wall-clock budget for one request.
+--
+-- Arbitration follows one rule, learned the expensive way on an earlier
+-- project: THE WINNER IS DECIDED BY THE FIRST ARBITRATING EVENT AND A LATE
+-- EVENT NEVER OVERTURNS IT.  A handler that finishes at 4.99 s against a 5 s
+-- deadline has completed; reporting that as a timeout would discard work that
+-- actually happened, which is how this goes wrong silently.
+--
+-- A nested controller is stepped through `cqueues.poll`, never `loop`, because
+-- calling loop() from inside the server's controller would block every other
+-- request -- exactly the failure this is meant to prevent.
+--
+-- HONEST LIMIT: this is cooperative.  It can only fire while the handler is
+-- yielding on I/O.  A handler burning CPU in a tight loop is not interrupted
+-- by the deadline; that is what the watchdog below reports instead.
+local function with_deadline(seconds, fn)
+  if not seconds or seconds <= 0 or not cqueues.running() then
+    return "COMPLETION", fn()          -- no budget, or no controller to yield to
+  end
+
+  local cq = cqueues.new()
+  local winner, result
+
+  cq:wrap(function()
+    local ok, res = pcall(fn)
+    if winner == nil then              -- first arbitrating event wins
+      winner = ok and "COMPLETION" or "ERROR"
+      result = res
+    end
+  end)
+
+  local deadline = cqueues.monotime() + seconds
+  while winner == nil do
+    local remaining = deadline - cqueues.monotime()
+    if remaining <= 0 then break end
+    cqueues.poll(cq, remaining)        -- yields to the outer controller
+    cq:step(0)
+  end
+
+  if winner == nil then winner = "TIMEOUT" end
+  if winner == "ERROR" then error(result, 0) end
+  return winner, result
+end
 
 -- ==================================================================== guards
 -- Invariant: reading something that was never configured gives a useful
@@ -387,7 +442,18 @@ local function handle(app, input)
   local chain = input.short and short or normal
   if input.short then req.__short = input.short end
 
-  local ok, res = pcall(function() return normalize(chain(app, req)) end)
+  local ok, res = pcall(function()
+    local winner, value = with_deadline(input.timeout, function()
+      return normalize(chain(app, req))
+    end)
+    if winner == "TIMEOUT" then
+      io.stderr:write(string.format("[akkar] deadline: %s %s exceeded %.1fs\n",
+                                    req.method, req.path, input.timeout))
+      return response(503, { error = "request deadline exceeded" })
+    end
+    return value
+  end)
+
   if not ok then
     if is_response(res) then return res end
     io.stderr:write("[akkar] middleware error: " .. tostring(res) .. "\n")
@@ -397,11 +463,39 @@ local function handle(app, input)
 end
 
 -- ==================================================================== server
+-- Reads the body without ever buffering more than the limit.
+--
+-- Two checks, because either alone is insufficient: a declared Content-Length
+-- is rejected before a single byte is read, and the running total is capped as
+-- well, since a chunked body declares no length at all.  `get_body_as_string`
+-- has no limit of its own, so calling it on an untrusted request is how a
+-- client turns a 5 MB upload into whatever the process can allocate.
+local function read_body(stream, request_headers, limit)
+  -- `:get` returns NO values when the header is absent, not nil, so it cannot
+  -- be passed straight into tonumber() -- that call would receive zero
+  -- arguments and raise.  Bind it first.
+  local length = request_headers:get "content-length"
+  local declared = length and tonumber(length)
+  if declared and declared > limit then
+    return nil, "declared"
+  end
+
+  local parts, total = {}, 0
+  for chunk in stream:each_chunk() do
+    total = total + #chunk
+    if total > limit then return nil, "streamed" end
+    parts[#parts + 1] = chunk
+  end
+  return table.concat(parts)
+end
+
 function App:run(config)
   config = config or {}
   local port = config.port or 8080
   local host = config.host or "127.0.0.1"
   local db_factory = config.db
+  local body_limit = config.body_limit or akkar.defaults.body_limit
+  local timeout    = config.timeout    or akkar.defaults.timeout
   chains(self)
 
   local s = assert(server.listen {
@@ -412,18 +506,22 @@ function App:run(config)
         local target = h:get ":path" or "/"
         local path, qs = target:match "^([^?]*)%??(.*)$"
 
-        local raw = stream:get_body_as_string()
-        local body, parse_error
-        if raw and #raw > 0 then
+        local raw, oversize = read_body(stream, h, body_limit)
+        local body, short
+        if oversize then
+          short = response(413, { error = "request body exceeds " ..
+                                          body_limit .. " bytes" })
+        elseif raw and #raw > 0 then
           local decoded, value = pcall(cjson.decode, raw)
-          if decoded then body = value else parse_error = "invalid JSON body" end
+          if decoded then body = value
+          else short = response(400, { error = "invalid JSON body" }) end
         end
 
         local res = handle(self, {
           method = h:get ":method", path = path, query = parse_query(qs),
-          body = body, headers = h,
+          body = body, headers = h, timeout = timeout,
           db = db_factory and db_factory() or nil,
-          short = parse_error and response(400, { error = parse_error }) or nil,
+          short = short,
         })
 
         local rh = headers.new()
@@ -466,6 +564,7 @@ function App:test(config)
         query = parse_query(qs),
         body = options.body,
         headers = options.headers or {},
+        timeout = options.timeout or config.timeout,
         db = config.db and config.db() or nil,
       })
       return { status = res.status, body = res.body }

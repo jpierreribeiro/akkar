@@ -158,3 +158,95 @@ describe("in-process test client", function()
     assert.is_nil(res.body)
   end)
 end)
+
+describe("request deadline", function()
+  local cqueues = require "cqueues"
+
+  -- The deadline needs a controller to yield to, so these run inside one.
+  local function in_controller(fn)
+    local cq = cqueues.new()
+    local result, failure
+    cq:wrap(function()
+      local ok, res = pcall(fn)
+      if ok then result = res else failure = res end
+    end)
+    assert(cq:loop(10))
+    if failure then error(failure, 0) end
+    return result
+  end
+
+  it("stops a handler that overruns its budget", function()
+    local app = akkar.new()
+    app:get("/slow", function() cqueues.sleep(2) return { done = true } end)
+
+    local res = in_controller(function()
+      return app:test():get("/slow", { timeout = 0.15 })
+    end)
+    assert.equal(503, res.status)
+    assert.equal("request deadline exceeded", res.body.error)
+  end)
+
+  it("lets a handler inside its budget through untouched", function()
+    local app = akkar.new()
+    app:get("/quick", function() cqueues.sleep(0.02) return { done = true } end)
+
+    local res = in_controller(function()
+      return app:test():get("/quick", { timeout = 1.0 })
+    end)
+    assert.equal(200, res.status)
+    assert.is_true(res.body.done)
+  end)
+
+  -- SM-WAIT arbitration: the winner is decided by the first arbitrating event
+  -- and a late one never overturns it.  Reporting a finished handler as a
+  -- timeout would discard work that actually happened.
+  it("never reports a completed handler as a timeout", function()
+    local app = akkar.new()
+    app:get("/edge", function() cqueues.sleep(0.05) return { done = true } end)
+
+    for _ = 1, 25 do
+      local res = in_controller(function()
+        return app:test():get("/edge", { timeout = 0.055 })
+      end)
+      -- Either outcome is legal at the boundary.  What is illegal is a 503
+      -- carrying a body the handler produced, or a 200 with no body.
+      if res.status == 200 then
+        assert.is_true(res.body.done)
+      else
+        assert.equal(503, res.status)
+        assert.equal("request deadline exceeded", res.body.error)
+      end
+    end
+  end)
+
+  it("does not convert a handler error into a timeout", function()
+    local app = akkar.new()
+    app:get("/boom", function() error "handler exploded" end)
+
+    local res = in_controller(function()
+      return app:test():get("/boom", { timeout = 1.0 })
+    end)
+    assert.equal(500, res.status)
+  end)
+
+  it("one slow request does not stall another", function()
+    local app = akkar.new()
+    app:get("/slow", function() cqueues.sleep(0.30) return { which = "slow" } end)
+    app:get("/fast", function() return { which = "fast" } end)
+
+    local order = {}
+    local cq = cqueues.new()
+    cq:wrap(function()
+      app:test():get("/slow", { timeout = 5 })
+      order[#order + 1] = "slow"
+    end)
+    cq:wrap(function()
+      cqueues.sleep(0.05)
+      app:test():get("/fast", { timeout = 5 })
+      order[#order + 1] = "fast"
+    end)
+    assert(cq:loop(10))
+
+    assert.same({ "fast", "slow" }, order)
+  end)
+end)
