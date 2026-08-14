@@ -179,7 +179,7 @@ req.db:many("select ...", ...)
 req.db:transaction(function(tx) ... end)
 ```
 
-Three methods and plain SQL. The minimal surface is exactly what lets the fake
+Four methods and plain SQL. The minimal surface is exactly what lets the fake
 database in `spec/` be a table of four functions rather than a library mock.
 
 ### B — a query builder
@@ -232,7 +232,101 @@ what lets the duplicate-route error say *where* both of them are.
 
 ---
 
-## 7. Smaller decisions still open
+## 7. The boundary between request data and capabilities ✅ **settled**
+
+`req` carries two different kinds of thing:
+
+```lua
+method, path, params, query, body, headers   -- request data, from HTTP
+db, cache, log, clock                        -- capabilities, from app:run{}
+```
+
+The hazard is well known: `req` decays into a service locator, accumulating
+`req.queue`, `req.mail`, `req.storage`, `req.metrics`, `req.recommendations`,
+until it is a global by another name.
+
+### Why this could not be deferred
+
+Every entry is permanent. Moving `req.db` to `ctx.db` later would force an edit
+to every handler ever written — precisely what the complexity ladder forbids.
+It was the one open question with no cheap second chance.
+
+### A — separate the two, `function(req, ctx)`
+
+Clean in theory. But it breaks the ladder the moment it is adopted, and reads
+worse: two bags instead of one.
+
+### B — keep `req` flat, close the set by rule ✅ **implemented**
+
+`req` stays flat. What prevents the sprawl is not syntax, it is an **admission
+criterion enforced in code**:
+
+> A capability is infrastructure the framework knows how to inject, guard and
+> fake. Anything belonging to the application does not qualify.
+
+The set is `db`, `cache`, `log`, `clock`, and it is closed. A mailer, a payment
+gateway or a recommendation service does not qualify: handlers close over those
+instead.
+
+`clock` and `log` are on the list because deterministic tests need both
+injectable, not because the framework ships either one.
+
+### How it is enforced
+
+`app:run{}` and `app:test{}` validate their keys and reject anything unknown,
+naming the nearest match:
+
+```
+unknown app:run{} option 'timout'; did you mean 'timeout'?
+unknown app:test{} option 'mailer'
+```
+
+This closes the capability set and fixes a separate foolproofing gap at the
+same time: unknown options used to be **silently ignored**, so
+`app:run { timout = 5 }` left a server running with a 30 s deadline its author
+believed was 5 s.
+
+A capability given as a function is a factory called once per request — that is
+how `db` hands out a connection. Anything else is passed through as-is.
+
+---
+
+## 8. Adapters: own the contract, not the implementation ✅ **settled**
+
+The README used to say "all I/O goes through adapters the framework owns".
+Owning implementations for Postgres, Redis, S3, SMTP and queues would make
+akkar the ecosystem's bottleneck, and there is no version of that this project
+can staff.
+
+The rule is narrower and more useful:
+
+> **akkar owns the contract. Libraries implement it.**
+
+akkar defines what a capability must offer, how it is acquired and released,
+and how it fails. `akkar.db` is the reference implementation for Postgres, not
+the only permitted one.
+
+### The database contract
+
+```lua
+db:one(sql, ...)               -- first row, or nil
+db:many(sql, ...)              -- array of rows, possibly empty
+db:exec(sql, ...)              -- no rows expected
+db:transaction(function(tx) end)  -- commit at the end, rollback on any error
+```
+
+Four methods. That small surface is exactly what lets the fake database in
+`spec/` be a table of four functions rather than a library mock — which is the
+real test of whether a contract is the right size.
+
+Not yet decided: whether akkar should verify at startup that a configured
+capability satisfies its contract. It would catch the mistake at boot rather
+than on the first request, matching how duplicate routes already behave. See
+`docs/BACKLOG.md`.
+
+---
+
+## 9. Smaller decisions still open
 
 - **422 or 400** for validation. Currently 422.
 - **Error shape**: currently

@@ -4,6 +4,14 @@ A microframework for JSON APIs in Lua 5.4, on `cqueues` and `lua-http`.
 
 No nginx, no C, no build step. One coroutine per request.
 
+**akkar turns common server mistakes into impossible states or explicit
+errors.** Handlers return, so a double response cannot happen. I/O goes through
+adapters, so untestable I/O cannot happen. `transaction(fn)` is closure-scoped,
+so an abandoned `BEGIN` cannot happen. Validation runs first, so invalid input
+never reaches a handler. Bodies and deadlines are bounded by default, so an
+unbounded request cannot happen. And when something blocks the event loop —
+the one failure Lua servers hide best — it says so, with a file and a line.
+
 ```lua
 local app = require("akkar").new()
 app:get("/", function() return { hello = "world" } end)
@@ -50,16 +58,30 @@ Writing the response twice becomes **structurally impossible** — there is no
 `c.JSON()` to call again. And there is no `Abort()` + `return` pair where
 forgetting the `return` keeps the handler running.
 
-### 2. All I/O goes through adapters the framework owns
+### 2. All I/O goes through adapters, and akkar owns the contract
 
 A handler never calls `require "pgmoon"`. It receives `req.db`. That is what
 makes in-process testing possible, and what keeps the substrate replaceable.
 
-Reading something that was never configured gives a useful message rather than
-`attempt to index a nil value`:
+akkar defines the contract — for a database, four methods — and ships a
+Postgres adapter as the reference, not as the only permitted one. Owning every
+driver would make akkar the bottleneck.
+
+`req` stays deliberately small. Capabilities come from a **closed set** — `db`,
+`cache`, `log`, `clock` — because `req` accumulating `req.mailer`,
+`req.payments` and `req.storage` is how a request object becomes a global by
+another name. Unknown options are rejected at startup rather than ignored:
+
+```
+unknown app:run{} option 'timout'; did you mean 'timeout'?
+```
+
+And reading something that was never configured gives a useful message rather
+than `attempt to index a nil value`:
 
 ```
 req.user is not set; this route is missing the authentication middleware
+req.db is not configured; pass db = ... to app:run{}
 ```
 
 ### 3. A blocking watchdog
@@ -205,7 +227,7 @@ PORT=8099 lua5.4 examples/crud.lua
 | | |
 |---|---|
 | `docs/PLAN.md` | objective, the verified ladder, invariants, risks, milestones |
-| `docs/DECISIONS.md` | seven design decisions, with alternatives side by side |
+| `docs/DECISIONS.md` | nine design decisions, with alternatives side by side |
 | `docs/BACKLOG.md` | ordered next steps, and what is deliberately not built |
 | `docs/substrate/RESULT.md` | substrate proof: TLS, driver concurrency, CRUD |
 | `examples/crud.lua` | ten scenarios against a real Postgres |

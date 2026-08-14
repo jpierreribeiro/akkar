@@ -159,6 +159,64 @@ describe("in-process test client", function()
   end)
 end)
 
+describe("the capability boundary", function()
+
+  it("guards every unconfigured capability, not just db", function()
+    local app = akkar.new()
+    app:get("/db",    function(req) return { x = req.db.anything } end)
+    app:get("/cache", function(req) return { x = req.cache.anything } end)
+    app:get("/log",   function(req) return { x = req.log.anything } end)
+    app:get("/clock", function(req) return { x = req.clock.anything } end)
+
+    local c = app:test()
+    for _, path in ipairs { "/db", "/cache", "/log", "/clock" } do
+      assert.equal(500, c:get(path).status)
+    end
+  end)
+
+  it("injects a capability given as a plain value", function()
+    local app = akkar.new()
+    app:get("/now", function(req) return { now = req.clock.now() } end)
+
+    local res = app:test({ clock = { now = function() return 1755000000 end } }):get "/now"
+    assert.equal(200, res.status)
+    assert.equal(1755000000, res.body.now)
+  end)
+
+  it("calls a capability given as a function once per request", function()
+    local app = akkar.new()
+    app:get("/n", function(req) return { n = req.db.n } end)
+
+    local calls = 0
+    local factory = function() calls = calls + 1 return { n = calls } end
+    local c = app:test { db = factory }
+
+    assert.equal(1, c:get("/n").body.n)
+    assert.equal(2, c:get("/n").body.n)
+    assert.equal(2, calls)          -- one acquisition per request, not shared
+  end)
+
+  -- The closed set is what stops `req` from decaying into a service locator.
+  it("rejects an unknown option and suggests the nearest one", function()
+    local app = akkar.new()
+
+    local ok, err = pcall(function() app:test { timout = 5 } end)
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):match "unknown app:test{} option 'timout'")
+    assert.is_truthy(tostring(err):match "did you mean 'timeout'")
+  end)
+
+  it("refuses an application concern as a capability", function()
+    local app = akkar.new()
+
+    -- A mailer is the application's business, not infrastructure the framework
+    -- knows how to guard and fake.  Handlers close over it instead.
+    local ok, err = pcall(function() app:test { mailer = {} } end)
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):match "unknown app:test{} option 'mailer'")
+  end)
+end)
+
 describe("request deadline", function()
   local cqueues = require "cqueues"
 

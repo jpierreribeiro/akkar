@@ -52,6 +52,87 @@ akkar.defaults = {
   timeout    = 30,            -- seconds of wall clock per request
 }
 
+-- ================================================== capabilities and settings
+-- THE CLOSED SET.  This is the boundary that keeps `req` from decaying into a
+-- service locator.
+--
+-- `req` carries two different kinds of thing, and only one of them is open to
+-- extension:
+--
+--   request data   method, path, params, query, body, headers
+--                  derived from the HTTP request itself
+--
+--   capabilities   db, cache, log, clock
+--                  infrastructure injected from app:run{}
+--
+-- A capability is infrastructure the framework knows how to inject, guard and
+-- fake.  Anything belonging to the application -- a mailer, a payment gateway,
+-- a recommendation service -- does not qualify and must be closed over by the
+-- handler instead.  Without an admission rule this table grows forever, and
+-- every entry becomes permanent: moving `req.db` to `ctx.db` later would force
+-- an edit to every handler ever written, which is exactly what the complexity
+-- ladder forbids.
+local CAPABILITIES = { db = true, cache = true, log = true, clock = true }
+
+-- Everything else app:run{} accepts.  Listed so that a typo is an error rather
+-- than silence: `app:run { timout = 5 }` used to be ignored, leaving a server
+-- running with a 30 s deadline the author believed was 5 s.
+local SETTINGS = {
+  host = true, port = true, tls = true, ctx = true,
+  body_limit = true, timeout = true,
+}
+
+local function nearest(word, candidates)
+  -- Levenshtein, small enough to be worth it: a suggestion turns "unknown
+  -- option" into a one-second fix.
+  local best, best_distance = nil, math.huge
+  for candidate in pairs(candidates) do
+    local previous = {}
+    for j = 0, #candidate do previous[j] = j end
+    for i = 1, #word do
+      local current = { [0] = i }
+      for j = 1, #candidate do
+        local cost = word:sub(i, i) == candidate:sub(j, j) and 0 or 1
+        current[j] = math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+      end
+      previous = current
+    end
+    if previous[#candidate] < best_distance then
+      best, best_distance = candidate, previous[#candidate]
+    end
+  end
+  if best_distance <= math.max(2, #word // 3) then return best end
+end
+
+local function check_config(config, allowed, what)
+  for key in pairs(config) do
+    if not allowed[key] then
+      local suggestion = nearest(key, allowed)
+      error(string.format("unknown %s option '%s'%s", what, key,
+                          suggestion and ("; did you mean '" .. suggestion .. "'?")
+                                      or ""), 3)
+    end
+  end
+end
+
+-- Resolves the configured capabilities for one request.  A capability given as
+-- a function is a factory called once per request -- that is how `db` hands out
+-- a connection.  Anything else is passed through as-is.
+local function acquire(configured, guard_for)
+  local out = {}
+  for name in pairs(CAPABILITIES) do
+    local provided = configured and configured[name]
+    if provided == nil then
+      out[name] = guard_for(name)
+    elseif type(provided) == "function" then
+      out[name] = provided()
+    else
+      out[name] = provided
+    end
+  end
+  return out
+end
+
 -- ================================================================ validation
 -- Two spellings of the same thing.  The short one expands into the long one:
 --   "string?"                    ==  v.string { optional = true }
@@ -426,15 +507,25 @@ akkar.parse_query = parse_query
 local function handle(app, input)
   local normal, short = chains(app)
 
+  -- Request data.
   local req = {
     method  = input.method,
     path    = input.path,
     query   = input.query or {},
     body    = input.body,
     headers = input.headers or {},
-    db      = input.db or guard("req.db", "req.db is not configured; pass db = ... to app:run{}"),
     user    = guard("req.user", "req.user is not set; this route is missing the authentication middleware"),
   }
+
+  -- Capabilities, from the closed set.  Each one that was not configured is a
+  -- guard, so reading it says what is missing instead of indexing a nil.
+  for name, value in pairs(acquire(input.capabilities, function(missing)
+    return guard("req." .. missing,
+                 "req." .. missing .. " is not configured; pass " ..
+                 missing .. " = ... to app:run{}")
+  end)) do
+    req[name] = value
+  end
 
   -- A request that failed to parse still traverses the chain, so logging
   -- middleware sees the 400.  Middleware returning garbage cannot escape
@@ -491,9 +582,16 @@ end
 
 function App:run(config)
   config = config or {}
+
+  -- Startup check: an unknown option is a mistake, and a mistake found here
+  -- costs a second.  Found in production it costs an incident.
+  local allowed = {}
+  for k in pairs(SETTINGS) do allowed[k] = true end
+  for k in pairs(CAPABILITIES) do allowed[k] = true end
+  check_config(config, allowed, "app:run{}")
+
   local port = config.port or 8080
   local host = config.host or "127.0.0.1"
-  local db_factory = config.db
   local body_limit = config.body_limit or akkar.defaults.body_limit
   local timeout    = config.timeout    or akkar.defaults.timeout
   chains(self)
@@ -520,7 +618,7 @@ function App:run(config)
         local res = handle(self, {
           method = h:get ":method", path = path, query = parse_query(qs),
           body = body, headers = h, timeout = timeout,
-          db = db_factory and db_factory() or nil,
+          capabilities = config,
           short = short,
         })
 
@@ -553,6 +651,11 @@ end
 -- request does, because `handle` is shared.
 function App:test(config)
   config = config or {}
+
+  local allowed = { timeout = true }
+  for k in pairs(CAPABILITIES) do allowed[k] = true end
+  check_config(config, allowed, "app:test{}")
+
   chains(self)
   local client = {}
   local function call(method)
@@ -565,7 +668,7 @@ function App:test(config)
         body = options.body,
         headers = options.headers or {},
         timeout = options.timeout or config.timeout,
-        db = config.db and config.db() or nil,
+        capabilities = config,
       })
       return { status = res.status, body = res.body }
     end

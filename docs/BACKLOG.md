@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 17 tests, no database needed, ~2 s
+busted                      # 22 tests, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -44,54 +44,24 @@ every `GET`. `lua-http` behaviour is only exercised by a real request.
 
 ---
 
-## 1. Decisions to settle before writing more
+## 1. Decisions settled ✅
 
-These are cheap now and expensive later. None of them needs a study; they need
-a choice, recorded in `docs/DECISIONS.md`.
+Recorded in `docs/DECISIONS.md` sections 7 and 8, and enforced in code.
 
-### 1.1 The boundary between request data and request capabilities
+- **The capability boundary.** `req` stays flat, and the capability set is
+  **closed** to `db`, `cache`, `log`, `clock`. `app:run{}` and `app:test{}`
+  reject unknown options instead of ignoring them, which closes the set and
+  also fixes a separate hazard: `app:run { timout = 5 }` used to run silently
+  with the 30 s default.
+- **Adapters own the contract, not the implementation.** akkar defines what a
+  database must offer — `one`, `many`, `exec`, `transaction` — and ships the
+  Postgres adapter as the reference, not the only permitted one.
+- **The thesis**, now at the top of the README: akkar turns common server
+  mistakes into impossible states or explicit errors.
 
-`req` carries two different kinds of thing today:
-
-```lua
-method, path, query, body, headers    -- request data, derived from HTTP
-db, user                              -- capabilities, injected from app:run{}
-```
-
-The risk is that `req` grows into a service locator: `req.cache`, `req.queue`,
-`req.mail`, `req.storage`, `req.metrics`, and on.
-
-This is urgent for one specific reason: **if `req.db` ever becomes `ctx.db`, it
-breaks the ladder rule**, because every handler already written would have to
-be edited. It is the one open question that cannot be deferred.
-
-Recommendation: keep `req.db` flat, but close the set by rule — only
-infrastructure capabilities declared in `app:run{}` appear on `req`, never
-anything belonging to the application domain. `req.mailer` does not qualify. It
-is the admission criterion that prevents the sprawl, not the syntax.
-
-### 1.2 Adapters: own the contract, not the implementation
-
-The README currently says "all I/O goes through adapters the framework owns".
-Owning implementations for Postgres, Redis, S3, SMTP and queues makes akkar the
-ecosystem's bottleneck.
-
-Better: **akkar owns the contract; libraries implement it.** akkar defines
-lifecycle, testability and error semantics for a capability, and ships a
-Postgres adapter as the reference — not as the only permitted one.
-
-### 1.3 The thesis in the README
-
-Today: *"A microframework for JSON APIs in Lua 5.4."* True, but it says what it
-is rather than why it should exist. What the code actually does is closer to:
-
-> akkar turns common server mistakes into impossible states or explicit errors.
-
-Handlers return, so double responses cannot happen. Adapters exist, so
-untestable I/O cannot happen. `transaction(fn)` exists, so an abandoned `BEGIN`
-cannot happen. Validation exists, so invalid input never reaches a handler. The
-watchdog exists, so silent blocking gets reported. Body limits and deadlines
-exist, so an unbounded request cannot happen.
+Left open deliberately: whether akkar should verify at startup that a
+configured capability satisfies its contract, so a bad adapter fails at boot
+rather than on the first request — the way duplicate routes already behave.
 
 ---
 
@@ -183,7 +153,8 @@ This probably needs a `response` schema alongside `body`, `params` and `query`.
   interpolates `$1` through `escape_literal` — safe against injection, but not
   the right mechanism.
 - **Non-JSON bodies**: form-urlencoded and multipart both answer `400` today.
-- **Redis adapter**, once 1.2 has settled the contract.
+- **Redis adapter**. The contract question is settled (`DECISIONS.md` §8);
+  what remains is choosing a library and writing the adapter.
 - **Structured logging.**
 - **Prefix-tree routing.** Dynamic routes are a linear scan. Not urgent — say
   so honestly rather than optimizing early.
