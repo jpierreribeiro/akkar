@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 50 tests, no database needed, ~2 s
+busted                      # 54 tests, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -184,25 +184,52 @@ that accepts anything while looking validated.
 
 ---
 
-## 6. Smaller, unordered
+## 6. Smaller
+
+### Done
+
+- **Non-JSON bodies.** `application/x-www-form-urlencoded` is accepted,
+  because an HTML form cannot send JSON and answering 400 to one was the
+  framework calling a normal web request malformed. A `charset` parameter on
+  the content type is tolerated. An unrecognised type gets **415**, not 400:
+  the body may be perfectly well formed and simply not something this server
+  reads, and 400 would blame the client for the wrong thing.
+- **CORS**, as `akkar.cors{}` middleware rather than core, because trusted
+  origins are policy only the application knows. What akkar contributes is
+  that the preflight advertises the router's **real** `Allow` list instead of
+  a hardcoded guess.
+- **Signals.** `app:handle_signals()` installs `SIGTERM` and `SIGINT` handlers
+  that call `app:stop`. Not automatic — a library that installs signal
+  handlers behind an application's back fights whatever else the process is
+  doing — but one line rather than an exercise. Verified: a `SIGTERM` with a
+  request in flight let it finish with 200 before the process exited.
+
+### Still open
 
 - **Prepared statements** over the extended protocol. `akkar/db.lua`
   interpolates `$1` through `escape_literal` — safe against injection, but not
   the right mechanism.
-- **Non-JSON bodies**: form-urlencoded and multipart both answer `400` today.
-- **Redis adapter**. The contract question is settled (`DECISIONS.md` §8);
-  what remains is choosing a library and writing the adapter.
-- **Structured logging.**
+- **Validating handler output against `response`.** Today it is documentation
+  only. FastAPI's `response_model` also filters and validates. Whether akkar
+  should is a real decision: it catches a handler leaking a field, and it also
+  means a handler can fail on the way out.
+- **Multipart uploads.** Streaming them properly interacts with the body
+  limit, so this is not just another content type.
+- **Redis adapter.** The contract question is settled (`DECISIONS.md` §8);
+  what remains is choosing a library and writing it.
+- **Structured logging**, and `log` as a real capability rather than a slot.
+- **Startup contract checks** — verifying a configured capability satisfies
+  its contract at boot rather than on the first request, the way duplicate
+  routes already fail.
 - **Prefix-tree routing.** Dynamic routes are a linear scan. Not urgent — say
   so honestly rather than optimizing early.
 - **Where CPU-bound work runs.** `bcrypt` at cost 12 takes ~250 ms *by design*
   and will stall the process. The watchdog reports it; it does not solve it.
   The answers are an external queue or a separate process. Undecided.
 - **Lua 5.5.** The blocker is `cqueues`, which pins `lua == 5.4` and has had no
-  release since 2020 — **not** `lua-http`, which accepts `>= 5.1`. Being a
-  version behind is awkward for something calling itself modern stock Lua, and
-  this is not in our hands. It is an argument for the adapter boundary, and
-  eventually for owning the substrate.
+  release since 2020 — **not** `lua-http`, which accepts `>= 5.1`. Not in our
+  hands. An argument for the adapter boundary, and eventually for owning the
+  substrate.
 
 ---
 

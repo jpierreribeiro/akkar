@@ -674,3 +674,55 @@ describe("OpenAPI generation", function()
     assert.is_truthy(res.body.paths["/users/{id}"])
   end)
 end)
+
+describe("request bodies beyond JSON", function()
+  it("accepts form-urlencoded, because an HTML form cannot send JSON", function()
+    local app = akkar.new()
+    app:post("/f", { body = { name = "string" } }, function(req)
+      return { name = req.body.name }
+    end)
+
+    local res = app:test():post("/f", {
+      body = { name = "ada" },
+      headers = { ["content-type"] = "application/x-www-form-urlencoded" },
+    })
+    assert.equal(200, res.status)
+  end)
+
+  it("tolerates a charset parameter on the content type", function()
+    local app = akkar.new()
+    app:post("/j", { body = { name = "string" } }, function(req)
+      return { name = req.body.name }
+    end)
+    local res = app:test():post("/j", {
+      body = { name = "ada" },
+      headers = { ["content-type"] = "application/json; charset=utf-8" },
+    })
+    assert.equal(200, res.status)
+  end)
+end)
+
+describe("CORS", function()
+  it("advertises the router's real Allow list on a preflight", function()
+    local app = akkar.new()
+    app:use(akkar.cors { origin = "https://example.com" })
+    app:get("/users",  function() return {} end)
+    app:post("/users", function() return {} end)
+
+    local res = app:test():options "/users"
+    -- The browser is told what the router accepts, not a hardcoded guess.
+    assert.equal(res.headers.allow, res.headers["access-control-allow-methods"])
+    assert.equal("https://example.com", res.headers["access-control-allow-origin"])
+    assert.is_truthy(res.headers["access-control-max-age"])
+  end)
+
+  it("adds the origin header to ordinary responses too", function()
+    local app = akkar.new()
+    app:use(akkar.cors())
+    app:get("/x", function() return { ok = true } end)
+
+    local res = app:test():get "/x"
+    assert.equal(200, res.status)
+    assert.equal("*", res.headers["access-control-allow-origin"])
+  end)
+end)

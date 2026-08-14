@@ -683,6 +683,37 @@ local function handle(app, input)
 end
 
 -- ==================================================================== server
+-- Decodes a request body by content type.
+--
+-- Form-encoded bodies are handled because an HTML form cannot send JSON, and
+-- answering 400 to one was the framework declaring a normal web request
+-- malformed.  An unrecognised type gets 415, not 400: the body may be
+-- perfectly well formed and simply not something this server reads, and 400
+-- would blame the client for the wrong thing.
+--
+-- Returns (true, value) or (false, { status, message }).
+local function decode_body(raw, content_type)
+  local kind = (content_type or "application/json"):match "^[^;]*"
+  kind = kind:gsub("%s", ""):lower()
+
+  if kind == "" or kind == "application/json" or kind:match "%+json$" then
+    local ok, value = pcall(cjson.decode, raw)
+    if ok then return true, value end
+    return false, { status = 400, message = "invalid JSON body" }
+  end
+
+  if kind == "application/x-www-form-urlencoded" then
+    return true, parse_query(raw)
+  end
+
+  return false, {
+    status = 415,
+    message = "unsupported content type '" .. kind ..
+              "'; this endpoint reads application/json or " ..
+              "application/x-www-form-urlencoded",
+  }
+end
+
 -- Reads the body without ever buffering more than the limit.
 --
 -- Two checks, because either alone is insufficient: a declared Content-Length
@@ -796,9 +827,9 @@ function App:run(config)
           short = response(413, { error = "request body exceeds " ..
                                           body_limit .. " bytes" })
         elseif raw and #raw > 0 then
-          local decoded, value = pcall(cjson.decode, raw)
+          local decoded, value = decode_body(raw, h:get "content-type")
           if decoded then body = value
-          else short = response(400, { error = "invalid JSON body" }) end
+          else short = response(value.status or 400, { error = value.message }) end
         end
 
         local res = handle(self, {
@@ -836,6 +867,15 @@ function App:run(config)
   io.stderr:write(string.format("[akkar] listening on %s://%s:%s\n",
                   config.tls and "https" or "http", bh or host, tostring(bp or port)))
   self.server = s
+
+  -- The signal task, if one was installed, runs alongside the server rather
+  -- than instead of it.
+  if self.signal_task then
+    local cq = cqueues.new()
+    cq:wrap(function() s:loop() end)
+    cq:wrap(self.signal_task)
+    return assert(cq:loop())
+  end
   return assert(s:loop())
 end
 
@@ -870,6 +910,58 @@ function App:test(config)
     client[m] = call(m:upper())
   end
   return client
+end
+
+-- ================================================================ middleware
+-- CORS is middleware rather than core, because it is policy: only the
+-- application knows which origins it trusts.  What akkar contributes is that
+-- the preflight already knows the real Allow list, so the browser is told
+-- what the router actually accepts instead of a hardcoded guess.
+function akkar.cors(options)
+  options = options or {}
+  local origin  = options.origin or "*"
+  local headers_allowed = options.headers or "content-type, authorization"
+  local max_age = tostring(options.max_age or 600)
+  local credentials = options.credentials and "true" or nil
+
+  return function(req, next)
+    local res = next(req)
+    res.headers = res.headers or {}
+    res.headers["access-control-allow-origin"] = origin
+    if credentials then res.headers["access-control-allow-credentials"] = credentials end
+    if req.method == "OPTIONS" then
+      res.headers["access-control-allow-methods"] =
+        res.headers["allow"] or "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+      res.headers["access-control-allow-headers"] = headers_allowed
+      res.headers["access-control-max-age"] = max_age
+    end
+    return res
+  end
+end
+
+-- Installs SIGTERM and SIGINT handlers that call app:stop.
+--
+-- Not automatic: a library that installs signal handlers behind an
+-- application's back is a library that fights with whatever else the process
+-- is doing.  But without this a container stop kills requests mid-flight, so
+-- it should be one line rather than an exercise.
+function App:handle_signals(signals)
+  local ok, signal = pcall(require, "cqueues.signal")
+  if not ok then
+    io.stderr:write("[akkar] cqueues.signal unavailable; signals not handled\n")
+    return self
+  end
+  signals = signals or { signal.SIGTERM, signal.SIGINT }
+  for _, sig in ipairs(signals) do signal.block(sig) end
+
+  local listener = signal.listen(table.unpack(signals))
+  local app = self
+  self.signal_task = function()
+    listener:wait()
+    io.stderr:write("[akkar] signal received\n")
+    app:stop()
+  end
+  return self
 end
 
 akkar.Response = Response

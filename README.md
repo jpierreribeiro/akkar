@@ -258,6 +258,14 @@ appears only when you disagree with the default.
 | Connection pool size | 10 | `db.connect { pool_size = 25 }` |
 | Shutdown grace | 10 s | `app:run { shutdown_grace = 30 }` |
 
+Signals are opt-in, because a library that installs handlers behind an
+application's back fights whatever else the process is doing:
+
+```lua
+app:handle_signals()      -- SIGTERM and SIGINT call app:stop()
+app:run()
+```
+
 An oversized body is rejected with `413` before it is buffered — both when
 `Content-Length` declares it and when a chunked body simply keeps arriving. A
 request that overruns its deadline answers `503`.
@@ -273,16 +281,15 @@ as a timeout.
 
 ## Known gaps
 
-Audited by probing a running server, not written from memory.
-
 | | |
 |---|---|
-| No `SIGTERM` handler | `app:stop()` drains correctly but nothing calls it, so a container stop does not yet drain |
 | Interpolated literals, not prepared statements | safe against injection, but the extended protocol is the right answer |
-| No Redis adapter | |
-| Non-JSON bodies answer 400 | no form-urlencoded, no multipart uploads |
-| No CORS middleware | `OPTIONS` answers `Allow`, but the CORS headers are not written |
+| `response` is documentation only | it feeds OpenAPI; handler output is not validated or filtered against it |
+| No multipart uploads | streaming them interacts with the body limit, so it is not just another content type |
+| No Redis adapter | the contract is settled; the adapter is not written |
+| `log` and `cache` are slots, not implementations | injectable and guarded, but akkar ships neither |
 | Linear scan for dynamic routes | a prefix tree is the fix, but this is not urgent |
+| CPU-bound handlers still stall the process | the watchdog reports it; an external queue or separate process is the answer, undecided |
 | Pinned to Lua 5.4 | the blocker is `cqueues`, which pins `lua == 5.4` and has had no release since 2020 — not `lua-http`, which accepts `>= 5.1` |
 
 ## License
