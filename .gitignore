@@ -1,0 +1,22 @@
+# rocks instalados localmente
+.luarocks/
+lua_modules/
+*.rock
+*.src.rock
+
+# artefatos de build
+*.so
+*.o
+
+# cobertura
+luacov.stats.out
+luacov.report.out
+
+# certificados de teste
+*.pem
+
+# editor / sistema
+.vscode/
+.idea/
+*.swp
+.DS_Store
