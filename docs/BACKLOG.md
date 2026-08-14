@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 41 tests, no database needed, ~2 s
+busted                      # 50 tests, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -144,26 +144,43 @@ container stop does not yet drain.
 
 ---
 
-## 5. OpenAPI from the schemas
+## 5. OpenAPI from the schemas ✅
 
-The highest-return item on this list, and the one that changes who akkar is
-compared against.
-
-The schema is already declared for validation:
+`akkar.openapi` generates an OpenAPI 3.1 document from the schemas already
+declared for validation. Nothing is described twice.
 
 ```lua
-app:post("/users", {
-  body = { name = "string", email = "string?" },
-}, handler)
+local openapi = require "akkar.openapi"
+openapi.serve(app, "/openapi.json", { title = "My API", version = "1.0.0" })
 ```
 
-The principle worth stealing from FastAPI is not `Depends`. It is that **one
-declaration by the programmer should be reused by the framework as many times
-as possible**. Today that declaration feeds validation and nothing else. It
-should also produce the OpenAPI document, and it must never require declaring
-the same information twice.
+What carries across, because it reads the same tables `akkar.validate` reads:
 
-This probably needs a `response` schema alongside `body`, `params` and `query`.
+| Declared | Appears as |
+|---|---|
+| `v.string { min = 1, max = 100 }` | `minLength`, `maxLength` |
+| `v.integer { min = 1, max = 100 }` | `minimum`, `maximum` |
+| `v.string { one_of = {...} }` | `enum` |
+| `v.string { match = "..." }` | `pattern` |
+| `"string?"` | absent from `required` |
+| `default = 20` | `default` |
+| `/users/:id` | `/users/{id}` |
+
+Statuses akkar produces on its own — `422` where a schema exists, `500`
+everywhere — are documented without anyone declaring them.
+
+A route with no schema still appears, with its path parameters typed as
+strings: an undocumented endpoint is worse than a thinly documented one. A
+mounted sub-app is documented at the prefix it answers on.
+
+`response` is a new route option describing the success body. It is
+**documentation only** — akkar does not yet validate or filter what a handler
+returns against it, unlike FastAPI's `response_model`. Doing so is a real
+decision, not an oversight, and it is not made yet.
+
+Route options are now checked the same way `app:run{}` options are, so
+`app:post("/x", { bdy = ... })` fails at startup instead of leaving a route
+that accepts anything while looking validated.
 
 ---
 

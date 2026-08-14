@@ -13,6 +13,7 @@ package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local akkar = require "akkar"
 local db    = require "akkar.db"
+local openapi = require "akkar.openapi"
 local v     = akkar.v
 
 local app = akkar.new()
@@ -186,6 +187,13 @@ health:get("/ready", function(req)
 end)
 
 app:mount("/health", health)
+
+-- ============================================================================
+-- 7. OpenAPI, generated from the schemas already declared above.  No route
+--    describes itself twice.
+-- ============================================================================
+
+openapi.serve(app, "/openapi.json", { title = "akkar CRUD example", version = "0.1.0" })
 
 -- Rung 0 still works.
 app:get("/", function() return { hello = "world" } end)

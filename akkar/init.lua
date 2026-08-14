@@ -91,6 +91,13 @@ local SETTINGS = {
   body_limit = true, timeout = true, shutdown_grace = true,
 }
 
+-- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
+-- silently declaring no schema at all is worse than an error, because the
+-- route then accepts anything while looking validated.
+local ROUTE_OPTIONS = {
+  params = true, query = true, body = true, response = true, before = true,
+}
+
 local function nearest(word, candidates)
   -- Levenshtein, small enough to be worth it: a suggestion turns "unknown
   -- option" into a one-second fix.
@@ -368,6 +375,7 @@ for _, method in ipairs { "get", "post", "put", "patch", "delete" } do
     local verb = method:upper()
     local info = debug.getinfo(2, "Sl")
     local where = info.short_src .. ":" .. info.currentline
+    if opts then check_config(opts, ROUTE_OPTIONS, verb .. " " .. path) end
 
     -- Invariant: a duplicate route fails at startup, naming both sites.
     for _, r in ipairs(self.routes) do

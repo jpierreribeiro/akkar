@@ -24,7 +24,8 @@ app:run()
 
 **Under construction, for my own use.** The substrate is proven and the
 ergonomics are settled — see `docs/substrate/RESULT.md`. Body limits, request
-deadlines, connection pooling and graceful shutdown are in. OpenAPI is not.
+deadlines, connection pooling, graceful shutdown and OpenAPI generation are in.
+See "Known gaps" for what is not.
 
 There is no compatibility policy. The API will change.
 
@@ -189,6 +190,19 @@ health:test():get "/live"            -- standalone
 app:test():get "/health/live"        -- mounted
 ```
 
+**OpenAPI, generated from what you already wrote.** The schema declared for
+validation is the schema in the document — no route describes itself twice:
+
+```lua
+local openapi = require "akkar.openapi"
+openapi.serve(app, "/openapi.json", { title = "My API", version = "1.0.0" })
+```
+
+`v.string { min = 1, max = 100 }` becomes `minLength`/`maxLength`, `one_of`
+becomes `enum`, `match` becomes `pattern`, `/users/:id` becomes
+`/users/{id}`, and the `422` akkar itself produces is documented without
+anyone declaring it.
+
 **In-process testing.** No socket, no port, no database — but through the same
 middleware, validation and dispatch chain a real request travels:
 
@@ -228,7 +242,7 @@ PORT=8099 lua5.4 examples/crud.lua
 |---|---|
 | `docs/PLAN.md` | objective, the verified ladder, invariants, risks, milestones |
 | `docs/DECISIONS.md` | nine design decisions, with alternatives side by side |
-| `docs/BACKLOG.md` | ordered next steps, and what is deliberately not built |
+| `docs/BACKLOG.md` | what is done, what is next, and what is deliberately not built |
 | `docs/substrate/RESULT.md` | substrate proof: TLS, driver concurrency, CRUD |
 | `examples/crud.lua` | ten scenarios against a real Postgres |
 

@@ -277,6 +277,18 @@ describe("the capability boundary", function()
     assert.is_truthy(tostring(err):match "did you mean 'timeout'")
   end)
 
+  it("rejects an unknown route option instead of ignoring it", function()
+    local app = akkar.new()
+    local ok, err = pcall(function()
+      app:post("/x", { bdy = { name = "string" } }, function() return {} end)
+    end)
+    assert.is_false(ok)
+    -- Ignoring this would leave a route accepting anything while looking
+    -- validated, which is worse than a loud failure at startup.
+    assert.is_truthy(tostring(err):match "unknown POST /x option 'bdy'")
+    assert.is_truthy(tostring(err):match "did you mean 'body'")
+  end)
+
   it("refuses an application concern as a capability", function()
     local app = akkar.new()
 
@@ -569,5 +581,96 @@ describe("request deadline", function()
     assert(cq:loop(10))
 
     assert.same({ "fast", "slow" }, order)
+  end)
+end)
+
+describe("OpenAPI generation", function()
+  local openapi = require "akkar.openapi"
+  local v = akkar.v
+
+  local function sample()
+    local app = akkar.new()
+    app:get("/users", {
+      query = { limit = v.integer { optional = true, min = 1, max = 100, default = 20 } },
+    }, function() return {} end)
+    app:post("/users", {
+      body = { name = v.string { min = 1, max = 100 }, email = "string?" },
+      response = { id = "integer", name = "string" },
+    }, function() return {} end)
+    app:get("/users/:id", { params = { id = v.integer { min = 1 } } }, function() return {} end)
+    app:delete("/raw/:key", function() return nil end)   -- no schema at all
+
+    local health = akkar.new()
+    health:get("/live", function() return {} end)
+    app:mount("/health", health)
+    return app
+  end
+
+  it("turns :id into an OpenAPI path template", function()
+    local doc = openapi.document(sample())
+    assert.is_truthy(doc.paths["/users/{id}"])
+    assert.is_nil(doc.paths["/users/:id"])
+  end)
+
+  it("reuses the validation schema rather than asking for it twice", function()
+    local doc = openapi.document(sample())
+    local body = doc.paths["/users"].post.requestBody
+      .content["application/json"].schema
+
+    assert.equal("object", body.type)
+    assert.equal("string", body.properties.name.type)
+    assert.equal(1,   body.properties.name.minLength)
+    assert.equal(100, body.properties.name.maxLength)
+    assert.same({ "name" }, body.required)          -- email was optional
+  end)
+
+  it("carries query constraints and defaults across", function()
+    local doc = openapi.document(sample())
+    local params = doc.paths["/users"].get.parameters
+    assert.equal("limit", params[1].name)
+    assert.equal("query", params[1]["in"])
+    assert.is_false(params[1].required)
+    assert.equal(1,   params[1].schema.minimum)
+    assert.equal(100, params[1].schema.maximum)
+    assert.equal(20,  params[1].schema.default)
+  end)
+
+  it("declares a path parameter even when the route has no schema", function()
+    local doc = openapi.document(sample())
+    local params = doc.paths["/raw/{key}"].delete.parameters
+    assert.equal("key", params[1].name)
+    assert.is_true(params[1].required)
+  end)
+
+  it("documents a mounted sub-app at the prefix it answers on", function()
+    local doc = openapi.document(sample())
+    assert.is_truthy(doc.paths["/health/live"])
+    assert.is_truthy(doc.paths["/health/live"].get)
+  end)
+
+  it("documents the statuses akkar produces on its own", function()
+    local doc = openapi.document(sample())
+    assert.is_truthy(doc.paths["/users"].post.responses["422"])   -- has a schema
+    assert.is_truthy(doc.paths["/users"].post.responses["500"])
+    assert.is_nil(doc.paths["/health/live"].get.responses["422"]) -- has none
+  end)
+
+  it("describes the response body when one is declared", function()
+    local doc = openapi.document(sample())
+    local schema = doc.paths["/users"].post.responses["200"]
+      .content["application/json"].schema
+    assert.equal("integer", schema.properties.id.type)
+  end)
+
+  it("serves the document over HTTP with no handler written", function()
+    local app = sample()
+    openapi.serve(app, "/openapi.json", { title = "Test API", version = "1.2.3" })
+
+    local res = app:test():get "/openapi.json"
+    assert.equal(200, res.status)
+    assert.equal("3.1.0", res.body.openapi)
+    assert.equal("Test API", res.body.info.title)
+    assert.equal("1.2.3", res.body.info.version)
+    assert.is_truthy(res.body.paths["/users/{id}"])
   end)
 end)
