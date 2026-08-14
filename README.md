@@ -23,8 +23,8 @@ app:run()
 ## Status
 
 **Under construction, for my own use.** The substrate is proven and the
-ergonomics are settled — see `docs/substrate/RESULT.md`. Body limits and
-request deadlines are in; connection pooling and graceful shutdown are not.
+ergonomics are settled — see `docs/substrate/RESULT.md`. Body limits, request
+deadlines, connection pooling and graceful shutdown are in. OpenAPI is not.
 
 There is no compatibility policy. The API will change.
 
@@ -241,6 +241,8 @@ appears only when you disagree with the default.
 |---|---|---|
 | Request body limit | 1 MB | `app:run { body_limit = 5 * 1024 * 1024 }` |
 | Request deadline | 30 s | `app:run { timeout = 5 }` |
+| Connection pool size | 10 | `db.connect { pool_size = 25 }` |
+| Shutdown grace | 10 s | `app:run { shutdown_grace = 30 }` |
 
 An oversized body is rejected with `413` before it is buffered — both when
 `Content-Length` declares it and when a chunked body simply keeps arriving. A
@@ -261,8 +263,7 @@ Audited by probing a running server, not written from memory.
 
 | | |
 |---|---|
-| No connection pool | one connection per request, ~4 ms of handshake every time |
-| No graceful shutdown | |
+| No `SIGTERM` handler | `app:stop()` drains correctly but nothing calls it, so a container stop does not yet drain |
 | Interpolated literals, not prepared statements | safe against injection, but the extended protocol is the right answer |
 | No Redis adapter | |
 | Non-JSON bodies answer 400 | no form-urlencoded, no multipart uploads |

@@ -56,8 +56,9 @@ end
 -- `app:run()` with no arguments is already production-shaped: a body limit and
 -- a deadline exist whether or not anyone remembered to ask for them.
 akkar.defaults = {
-  body_limit = 1024 * 1024,   -- 1 MB
-  timeout    = 30,            -- seconds of wall clock per request
+  body_limit     = 1024 * 1024,   -- 1 MB
+  timeout        = 30,            -- seconds of wall clock per request
+  shutdown_grace = 10,            -- seconds to drain before saying so
 }
 
 -- ================================================== capabilities and settings
@@ -87,7 +88,7 @@ local CAPABILITIES = { db = true, cache = true, log = true, clock = true }
 -- running with a 30 s deadline the author believed was 5 s.
 local SETTINGS = {
   host = true, port = true, tls = true, ctx = true,
-  body_limit = true, timeout = true,
+  body_limit = true, timeout = true, shutdown_grace = true,
 }
 
 local function nearest(word, candidates)
@@ -123,22 +124,35 @@ local function check_config(config, allowed, what)
   end
 end
 
--- Resolves the configured capabilities for one request.  A capability given as
--- a function is a factory called once per request -- that is how `db` hands out
--- a connection.  Anything else is passed through as-is.
+local function callable(x)
+  if type(x) == "function" then return true end
+  local mt = type(x) == "table" and getmetatable(x)
+  return mt and mt.__call ~= nil or false
+end
+
+-- Resolves the configured capabilities for one request.  A capability that is
+-- callable is a factory invoked once per request -- that is how `db` hands out
+-- a pooled connection.  Anything else is passed through as-is, which is how a
+-- clock or a logger can be a plain table.
+--
+-- Returns the capabilities and the subset that must be released afterwards.
 local function acquire(configured, guard_for)
-  local out = {}
+  local out, to_release = {}, {}
   for name in pairs(CAPABILITIES) do
     local provided = configured and configured[name]
     if provided == nil then
       out[name] = guard_for(name)
-    elseif type(provided) == "function" then
-      out[name] = provided()
+    elseif callable(provided) then
+      local value = provided()
+      out[name] = value
+      if type(value) == "table" and type(value.release) == "function" then
+        to_release[#to_release + 1] = value
+      end
     else
       out[name] = provided
     end
   end
-  return out
+  return out, to_release
 end
 
 -- ================================================================ validation
@@ -618,12 +632,19 @@ local function handle(app, input)
 
   -- Capabilities, from the closed set.  Each one that was not configured is a
   -- guard, so reading it says what is missing instead of indexing a nil.
-  for name, value in pairs(acquire(input.capabilities, function(missing)
+  local capabilities, to_release = acquire(input.capabilities, function(missing)
     return guard("req." .. missing,
                  "req." .. missing .. " is not configured; pass " ..
                  missing .. " = ... to app:run{}")
-  end)) do
-    req[name] = value
+  end)
+  for name, value in pairs(capabilities) do req[name] = value end
+
+  -- Releasing is the framework's job, not the handler's.  It happens on every
+  -- exit -- normal return, thrown response, handler error, deadline -- because
+  -- a connection that leaks on the error path leaks exactly when load is
+  -- highest.
+  local function release_all()
+    for _, resource in ipairs(to_release) do pcall(function() resource:release() end) end
   end
 
   -- A request that failed to parse still traverses the chain, so logging
@@ -643,6 +664,7 @@ local function handle(app, input)
     end
     return value
   end)
+  release_all()
 
   if not ok then
     if is_response(res) then return res end
@@ -679,6 +701,49 @@ local function read_body(stream, request_headers, limit)
   return table.concat(parts)
 end
 
+-- ================================================================== shutdown
+-- The sequence, and one rule that matters more than the diagram:
+--
+--   RUNNING -> STOP_ACCEPTING -> DRAINING -> CLOSING -> STOPPED
+--
+--   A STALLED DRAIN PUBLISHES A DIAGNOSTIC AND CHANGES NO OWNERSHIP.
+--
+-- When the drain overruns its grace period akkar says so and keeps waiting;
+-- it does not force connections closed.  Forcing is what truncates a response
+-- mid-write and corrupts what the client already received.  This was learned
+-- on an earlier project, where the drain that never finished was one of two
+-- defects that killed it.
+function App:stop(grace)
+  if self.state ~= "RUNNING" then return self.state end
+  grace = grace or self.shutdown_grace or 10
+
+  self.state = "STOP_ACCEPTING"
+  io.stderr:write("[akkar] shutdown: no longer accepting connections\n")
+  pcall(function() self.server:pause() end)
+
+  self.state = "DRAINING"
+  local deadline = cqueues.monotime() + grace
+  local warned = false
+  while self.in_flight > 0 do
+    if cqueues.monotime() > deadline and not warned then
+      warned = true
+      io.stderr:write(string.format(
+        "[akkar] shutdown STALLED: %d request(s) still in flight after %gs;" ..
+        " still waiting, nothing is being forced\n", self.in_flight, grace))
+    end
+    cqueues.poll(0.02)
+  end
+  if warned then io.stderr:write("[akkar] shutdown: drain completed\n") end
+
+  self.state = "CLOSING"
+  for _, closer in ipairs(self.closers) do pcall(closer) end
+  pcall(function() self.server:close() end)
+
+  self.state = "STOPPED"
+  io.stderr:write("[akkar] shutdown: stopped cleanly\n")
+  return self.state
+end
+
 function App:run(config)
   config = config or {}
 
@@ -693,11 +758,25 @@ function App:run(config)
   local host = config.host or "127.0.0.1"
   local body_limit = config.body_limit or akkar.defaults.body_limit
   local timeout    = config.timeout    or akkar.defaults.timeout
+  self.shutdown_grace = config.shutdown_grace or akkar.defaults.shutdown_grace
+  self.state, self.in_flight, self.closers = "RUNNING", 0, {}
+
+  -- Pools and anything else holding a socket are closed during CLOSING, after
+  -- the drain, never before it.
+  for name in pairs(CAPABILITIES) do
+    local provided = config[name]
+    local pool = type(provided) == "table" and provided.pool
+    if pool and type(pool.close) == "function" then
+      self.closers[#self.closers + 1] = function() pool:close() end
+    end
+  end
+
   chains(self)
 
   local s = assert(server.listen {
     host = host, port = port, tls = config.tls or false, ctx = config.ctx,
     onstream = function(_, stream)
+      self.in_flight = self.in_flight + 1
       local ok, err = pcall(function()
         local h = assert(stream:get_headers())
         local target = h:get ":path" or "/"
@@ -739,6 +818,7 @@ function App:run(config)
       end)
       if not ok then io.stderr:write("[akkar] stream: " .. tostring(err) .. "\n") end
       stream:shutdown()
+      self.in_flight = self.in_flight - 1
     end,
     onerror = function(_, _, op, e) io.stderr:write(("[akkar] %s: %s\n"):format(op, tostring(e))) end,
   })

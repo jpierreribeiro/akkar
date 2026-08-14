@@ -288,6 +288,198 @@ describe("the capability boundary", function()
   end)
 end)
 
+describe("connection pool", function()
+  local cqueues = require "cqueues"
+  local db_adapter = require "akkar.db"
+
+  -- A pool over fake connections: the pool logic is what is under test, not
+  -- Postgres.  `docs/substrate/RESULT.md` covers the real driver.
+  local function fake_pool(size, on_open)
+    local opened = 0
+    local function open()
+      opened = opened + 1
+      if on_open then on_open(opened) end
+      local conn = { id = opened, pg = true }
+      function conn:close() self.pg = nil end
+      function conn:release() if self.pool then self.pool:put(self) else self:close() end end
+      return conn
+    end
+    local pool = db_adapter.Pool.new(open, size)
+    return pool, function() return opened end
+  end
+
+  it("reuses a connection instead of opening a second one", function()
+    local pool, opened = fake_pool(4)
+    local a = pool:get()
+    a:release()
+    local b = pool:get()
+    b:release()
+    assert.equal(1, opened())
+    assert.equal(a, b)
+  end)
+
+  it("opens up to the cap and no further", function()
+    local pool, opened = fake_pool(3)
+    local held = {}
+    for i = 1, 3 do held[i] = pool:get() end
+    assert.equal(3, opened())
+    assert.equal(3, pool:stats().live)
+    for _, c in ipairs(held) do c:release() end
+    assert.equal(3, pool:stats().idle)
+  end)
+
+  -- This is where pool code is usually wrong.
+  it("yields rather than blocking when exhausted, and resumes on release", function()
+    local pool = fake_pool(1)
+    local order = {}
+
+    local cq = cqueues.new()
+    cq:wrap(function()
+      local conn = pool:get()
+      order[#order + 1] = "first acquired"
+      cqueues.sleep(0.10)              -- holds the only connection
+      order[#order + 1] = "first releasing"
+      conn:release()
+    end)
+    cq:wrap(function()
+      cqueues.sleep(0.02)              -- arrives while the pool is empty
+      order[#order + 1] = "second waiting"
+      local conn = pool:get()
+      order[#order + 1] = "second acquired"
+      conn:release()
+    end)
+    -- Proof the wait did not block the loop: an unrelated coroutine runs
+    -- while the second one is parked.
+    cq:wrap(function()
+      cqueues.sleep(0.05)
+      order[#order + 1] = "unrelated ran"
+    end)
+
+    assert(cq:loop(5))
+    assert.same({
+      "first acquired", "second waiting", "unrelated ran",
+      "first releasing", "second acquired",
+    }, order)
+  end)
+
+  it("does not leak a slot when opening fails", function()
+    local attempts = 0
+    local pool = db_adapter.Pool.new(function()
+      attempts = attempts + 1
+      error("connection refused", 0)
+    end, 2)
+
+    for _ = 1, 5 do
+      local ok = pcall(function() return pool:get() end)
+      assert.is_false(ok)
+    end
+    assert.equal(5, attempts)               -- kept trying, never wedged
+    assert.equal(0, pool:stats().live)      -- and never leaked a slot
+  end)
+
+  it("discards a connection left inside a transaction", function()
+    local pool, opened = fake_pool(2)
+    local conn = pool:get()
+    conn.in_transaction = true              -- rollback failed
+    conn:release()
+
+    assert.equal(0, pool:stats().idle)      -- not put back
+    assert.equal(0, pool:stats().live)      -- slot returned
+    pool:get()
+    assert.equal(2, opened())               -- a fresh one was opened
+  end)
+
+  it("releases the connection even when the handler raises", function()
+    local pool = fake_pool(1)
+    local app = akkar.new()
+    app:get("/boom", function() error "handler exploded" end)
+    app:get("/ok", function() return { ok = true } end)
+
+    local factory = setmetatable({}, { __call = function() return pool:get() end })
+    local c = app:test { db = factory }
+
+    assert.equal(500, c:get("/boom").status)
+    assert.equal(0, pool:stats().live - #pool.idle)   -- nothing still checked out
+    assert.equal(200, c:get("/ok").status)            -- pool of 1 still usable
+  end)
+
+  it("pool_size = 0 opts out and opens per request", function()
+    local factory = db_adapter.connect { pool_size = 0, database = "x" }
+    assert.equal("function", type(factory))           -- no pool attached
+  end)
+end)
+
+describe("graceful shutdown", function()
+  local cqueues = require "cqueues"
+
+  -- App:stop drives a state machine; these exercise it without a socket by
+  -- standing in a fake server.  The socket path is covered by hand against a
+  -- real server, since that is where lua-http behaviour actually lives.
+  local function stoppable(in_flight)
+    local app = akkar.new()
+    app.state, app.in_flight, app.closers = "RUNNING", in_flight or 0, {}
+    app.server = { pause = function() end, close = function() end }
+    return app
+  end
+
+  it("runs the sequence to STOPPED when nothing is in flight", function()
+    local app = stoppable(0)
+    assert.equal("STOPPED", app:stop(1))
+  end)
+
+  it("is idempotent -- a second stop is not a second teardown", function()
+    local app = stoppable(0)
+    local closed = 0
+    app.closers = { function() closed = closed + 1 end }
+    app:stop(1)
+    app:stop(1)
+    assert.equal(1, closed)
+  end)
+
+  it("closes pools during CLOSING, after the drain, never before", function()
+    local app = stoppable(1)
+    local order = {}
+    app.closers = { function() order[#order + 1] = "pool closed" end }
+
+    local cq = cqueues.new()
+    cq:wrap(function()
+      cqueues.sleep(0.10)
+      order[#order + 1] = "request finished"
+      app.in_flight = 0
+    end)
+    cq:wrap(function() app:stop(1) end)
+    assert(cq:loop(5))
+
+    assert.same({ "request finished", "pool closed" }, order)
+    assert.equal("STOPPED", app.state)
+  end)
+
+  -- The rule that matters more than the diagram.
+  it("waits past the grace period rather than forcing a request to end", function()
+    local app = stoppable(1)
+    local finished = false
+
+    local cq = cqueues.new()
+    cq:wrap(function()
+      cqueues.sleep(0.40)          -- far longer than the grace below
+      finished = true
+      app.in_flight = 0
+    end)
+
+    local took
+    cq:wrap(function()
+      local t = cqueues.monotime()
+      app:stop(0.05)               -- grace expires almost immediately
+      took = cqueues.monotime() - t
+    end)
+    assert(cq:loop(5))
+
+    assert.is_true(finished)       -- the request was never truncated
+    assert.is_true(took > 0.3)     -- stop kept waiting, it did not force
+    assert.equal("STOPPED", app.state)
+  end)
+end)
+
 describe("request deadline", function()
   local cqueues = require "cqueues"
 

@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 30 tests, no database needed, ~2 s
+busted                      # 41 tests, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -87,41 +87,60 @@ dance, which was the framework leaking lua-http into user code.
 
 ---
 
-## 3. Connection pooling
+## 3. Connection pooling ✅
 
-`akkar/db.lua` opens a connection per request — roughly 4 ms of handshake on
-every call, and under load it will exhaust the Postgres `max_connections`.
+`akkar.db.connect` pools by default, `pool_size = 10`. `pool_size = 0` opts
+out and opens per request.
 
-What it has to get right:
+The two things that decide whether pool code is right:
 
-- a cap plus a waiting queue, **yielding the coroutine when full**, never
-  blocking;
-- returning the connection to the pool at the end of the request **including
-  when the handler raised** — the same discipline `transaction` already has, so
-  a connection cannot leak;
-- discarding a connection left inside an open transaction or otherwise
-  unhealthy;
-- a test that covers exhaustion, which is where this kind of code is usually
-  wrong.
+- **Exhaustion yields, it does not block.** A waiter parks on a
+  `cqueues.condition`, so other requests keep running while it waits. There is
+  a test asserting an unrelated coroutine runs while a waiter is parked.
+- **The release happens on every exit** — normal return, thrown response,
+  handler error, deadline — because a connection that leaks on the error path
+  leaks exactly when load is highest. It is the framework's job, not the
+  handler's.
+
+A connection left inside a transaction, or whose rollback failed, is discarded
+rather than returned, so the next request cannot inherit an open `BEGIN`. A
+failed open returns its slot instead of wedging the pool.
+
+Verified against a real Postgres: 12 queries of 0.2 s through a pool of 3 took
+0.84 s, against 0.80 s predicted by four waves of three, and the backend never
+saw more than the cap.
 
 ---
 
-## 4. Graceful shutdown
-
-The state machine was worked out on an earlier project and is worth reusing:
+## 4. Graceful shutdown ✅
 
 ```
-RUNNING → STOP_ACCEPTING → CANCELLING → DRAINING → CLOSING_BACKEND → STOPPED
+RUNNING → STOP_ACCEPTING → DRAINING → CLOSING → STOPPED
 ```
 
-with stalled variants of `DRAINING` and `CLOSING_BACKEND`, and one rule that
-matters more than the diagram:
+`app:stop(grace)` stops accepting, drains what is in flight, then closes pools
+and the listener. Idempotent.
 
-> A stalled state publishes a diagnostic and **changes no ownership**. It never
-> releases the backend, a VM, a task or a buffer.
+The rule that matters more than the diagram:
 
-In other words: when the drain hangs, warn and keep waiting. Forcing the close
-is what corrupts things.
+> **A stalled drain publishes a diagnostic and changes no ownership.**
+
+When the grace period expires akkar says so and keeps waiting. It does not
+force connections closed, because forcing truncates a response mid-write and
+corrupts what the client already received.
+
+Verified against a real server: a 1.2 s request under a 0.3 s grace produced
+
+```
+[akkar] shutdown STALLED: 1 request(s) still in flight after 0.3s;
+        still waiting, nothing is being forced
+```
+
+and the request still completed with 200.
+
+Still missing: nothing installs a `SIGTERM` handler. `app:stop` has to be
+called by the embedding program, which is correct for a library but means a
+container stop does not yet drain.
 
 ---
 
