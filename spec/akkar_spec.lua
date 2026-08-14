@@ -159,6 +159,77 @@ describe("in-process test client", function()
   end)
 end)
 
+describe("HTTP conformance", function()
+  local function app_with_routes()
+    local app = akkar.new()
+    app:get("/users",      function() return { list = true } end)
+    app:post("/users",     function() return akkar.created { made = true } end)
+    app:get("/users/:id",  function(req) return { id = req.params.id } end)
+    return app
+  end
+
+  it("answers 405 with Allow when the path exists but the method does not", function()
+    local res = app_with_routes():test():delete "/users"
+    assert.equal(405, res.status)
+    assert.equal("GET, POST", res.headers.allow)
+    assert.same({ "GET", "POST" }, res.body.allowed)
+  end)
+
+  it("still answers 404 when the path itself is unknown", function()
+    local res = app_with_routes():test():get "/nothing"
+    assert.equal(404, res.status)
+  end)
+
+  it("serves HEAD from the GET handler", function()
+    local res = app_with_routes():test():head "/users"
+    assert.equal(200, res.status)
+    -- No HEAD route was ever declared; the GET handler answered it.
+  end)
+
+  it("answers OPTIONS from the routing table, with no handler written", function()
+    local res = app_with_routes():test():options "/users"
+    assert.equal(204, res.status)
+    assert.equal("GET, HEAD, OPTIONS, POST", res.headers.allow)
+  end)
+
+  it("treats a trailing slash as the same resource", function()
+    local c = app_with_routes():test()
+    assert.equal(200, c:get("/users").status)
+    assert.equal(200, c:get("/users/").status)
+    assert.equal(200, c:get("/users/2/").status)
+  end)
+
+  it("keeps the root path as /", function()
+    local app = akkar.new()
+    app:get("/", function() return { root = true } end)
+    assert.equal(200, app:test():get("/").status)
+  end)
+
+  it("percent-decodes route parameters, as query strings already were", function()
+    local app = akkar.new()
+    app:get("/echo/:value", function(req) return { value = req.params.value } end)
+
+    local c = app:test()
+    assert.equal("a b",  c:get("/echo/a%20b").body.value)
+    assert.equal("1",    c:get("/echo/%31").body.value)
+    assert.equal("ç",    c:get("/echo/%C3%A7").body.value)
+  end)
+
+  it("hands handlers a plain lowercase header table from either path", function()
+    local app = akkar.new()
+    app:get("/h", function(req)
+      return { auth = req.headers.authorization, ct = req.headers["content-type"] }
+    end)
+
+    -- Mixed case in, lowercase out -- no req.headers:get fallback needed.
+    local res = app:test():get("/h", {
+      headers = { Authorization = "Bearer x", ["Content-Type"] = "application/json" },
+    })
+    assert.equal("Bearer x", res.body.auth)
+    assert.equal("application/json", res.body.ct)
+  end)
+end)
+
 describe("the capability boundary", function()
 
   it("guards every unconfigured capability, not just db", function()

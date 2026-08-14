@@ -38,9 +38,9 @@ end)
 -- ============================================================================
 
 local function authenticate(req, next)
-  local token = req.headers.authorization or
-                (req.headers.get and req.headers:get "authorization")
-  if token ~= "Bearer secret" then
+  -- req.headers is a plain lowercase table whether this request came off a
+  -- socket or from the in-process test client.
+  if req.headers.authorization ~= "Bearer secret" then
     return akkar.unauthorized "missing or invalid token"
   end
   req.user = { id = 1, name = "ada", role = "admin" }

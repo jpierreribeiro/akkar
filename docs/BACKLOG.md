@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 22 tests, no database needed, ~2 s
+busted                      # 30 tests, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -65,24 +65,25 @@ rather than on the first request — the way duplicate routes already behave.
 
 ---
 
-## 2. HTTP conformance
+## 2. HTTP conformance ✅
 
-All of it lives in the router, so it is one sitting. Confirmed by probing a
-running server:
+All of it landed in the router, verified against a running server:
 
-| Today | Should be |
+| | |
 |---|---|
-| `POST` to a `GET`-only route → `404` | `405` with an `Allow` header |
-| `HEAD /users` → `404` | the `GET` handler, headers only, no body |
-| `OPTIONS /users` → `404` | a preflight answer; CORS is impossible without it |
-| `/users/` → `404` | matches `/users` |
-| `/users/%31` → param is `"%31"` | param is `"1"`; query strings already decode |
+| `405` with `Allow` | `DELETE /users` → `405`, `allow: GET, POST` |
+| `HEAD` | served by the `GET` handler, same headers, zero body bytes |
+| `OPTIONS` | answered from the routing table, no handler written: `allow: GET, HEAD, OPTIONS, POST` |
+| Trailing slash | `/users/` and `/users/1/` match |
+| Percent-decoded params | `/users/%31` resolves to id `1` |
+| `req.headers` | a plain lowercase table from both the socket and the test client |
 
-Normalize `req.headers` in the same pass: it is a `lua-http` object on the
-server and a plain table in the test client, which is why `examples/crud.lua`
-has to write `req.headers.authorization or (req.headers.get and
-req.headers:get "authorization")`. That is ugly and it is the framework's
-fault.
+Decoding happens per parameter rather than over the whole path, so `%2F`
+cannot smuggle a segment separator into a parameter.
+
+`examples/crud.lua` lost its
+`req.headers.authorization or (req.headers.get and req.headers:get "...")`
+dance, which was the framework leaking lua-http into user code.
 
 ---
 

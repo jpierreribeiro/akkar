@@ -261,16 +261,12 @@ Audited by probing a running server, not written from memory.
 
 | | |
 |---|---|
-| `405` answers `404` | a `POST` to a `GET`-only route should answer `405` with `Allow` |
-| `HEAD` and `OPTIONS` answer `404` | no CORS preflight is possible |
-| Trailing slash | `/users/` does not match `/users` |
-| Route params are not percent-decoded | query strings are; paths are not |
 | No connection pool | one connection per request, ~4 ms of handshake every time |
 | No graceful shutdown | |
 | Interpolated literals, not prepared statements | safe against injection, but the extended protocol is the right answer |
-| `req.headers` is inconsistent | a lua-http object on the server, a plain table in the test client |
 | No Redis adapter | |
 | Non-JSON bodies answer 400 | no form-urlencoded, no multipart uploads |
+| No CORS middleware | `OPTIONS` answers `Allow`, but the CORS headers are not written |
 | Linear scan for dynamic routes | a prefix tree is the fix, but this is not urgent |
 | Pinned to Lua 5.4 | the blocker is `cqueues`, which pins `lua == 5.4` and has had no release since 2020 — not `lua-http`, which accepts `>= 5.1` |
 

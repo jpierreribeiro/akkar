@@ -24,8 +24,9 @@ local akkar = {}
 local Response = {}
 Response.__index = Response
 
-local function response(status, body)
-  return setmetatable({ status = status, body = body, __response = true }, Response)
+local function response(status, body, extra_headers)
+  return setmetatable({ status = status, body = body, headers = extra_headers,
+                        __response = true }, Response)
 end
 akkar.response = response
 
@@ -43,6 +44,13 @@ akkar.not_found   = function(m)    return response(404, { error = m or "not foun
 akkar.conflict    = function(m)    return response(409, { error = m or "conflict" }) end
 akkar.too_large   = function(m)    return response(413, { error = m or "payload too large" }) end
 akkar.unavailable = function(m)    return response(503, { error = m or "service unavailable" }) end
+
+-- 405 carries Allow.  A 405 without it tells the client it guessed wrong but
+-- not what would have been right, which is the whole value of the status.
+akkar.method_not_allowed = function(allowed)
+  return response(405, { error = "method not allowed", allowed = allowed },
+                  { ["allow"] = table.concat(allowed, ", ") })
+end
 
 -- Safe defaults, applied unless app:run{} overrides them.  The point is that
 -- `app:run()` with no arguments is already production-shaped: a body limit and
@@ -309,6 +317,10 @@ local function guard(name, hint)
                             __tostring = function() return "<" .. name .. " missing>" end })
 end
 
+local function unescape(s)
+  return (s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+end
+
 -- ==================================================================== router
 local App = {}
 App.__index = App
@@ -372,17 +384,21 @@ function App:mount(prefix, sub)
   return self
 end
 
+-- Percent-decoding happens here rather than on the whole path, because
+-- decoding first would let %2F smuggle a segment separator into a parameter.
+local function decode_params(names, captured)
+  local params = {}
+  for i, name in ipairs(names) do params[name] = unescape(captured[i]) end
+  return params
+end
+
 function App:match(method, path)
   local hit = self.exact[method .. " " .. path]
   if hit then return hit, {} end
   for _, r in ipairs(self.routes) do
     if r.method == method and #r.names > 0 then
       local captured = { path:match(r.pattern) }
-      if captured[1] ~= nil then
-        local params = {}
-        for i, name in ipairs(r.names) do params[name] = captured[i] end
-        return r, params
-      end
+      if captured[1] ~= nil then return r, decode_params(r.names, captured) end
     end
   end
   for _, m in ipairs(self.mounts) do
@@ -394,6 +410,32 @@ function App:match(method, path)
     end
   end
   return nil
+end
+
+-- Which methods this path would accept.  Empty means the path itself is
+-- unknown, which is a 404; non-empty with the requested method absent is a
+-- 405, and the difference matters to whoever is holding the client.
+function App:methods_for(path)
+  local seen, list = {}, {}
+  local function add(verb)
+    if not seen[verb] then seen[verb] = true list[#list + 1] = verb end
+  end
+  for _, r in ipairs(self.routes) do
+    if #r.names == 0 then
+      if r.path == path then add(r.method) end
+    elseif path:match(r.pattern) then
+      add(r.method)
+    end
+  end
+  for _, m in ipairs(self.mounts) do
+    if path:sub(1, #m.prefix) == m.prefix then
+      local rest = path:sub(#m.prefix + 1)
+      if rest == "" then rest = "/" end
+      for _, verb in ipairs(m.app:methods_for(rest)) do add(verb) end
+    end
+  end
+  table.sort(list)
+  return list
 end
 
 -- ================================================================== dispatch
@@ -409,9 +451,38 @@ end
 
 local function dispatch(app, req)
   local route, params = app:match(req.method, req.path)
+
   if not route then
-    return response(404, { error = "no route for " .. req.method .. " " .. req.path })
+    -- HEAD is served by the GET handler.  RFC 9110 requires HEAD wherever GET
+    -- exists, and answering 404 to a HEAD on a live resource is a lie.
+    if req.method == "HEAD" then
+      route, params = app:match("GET", req.path)
+    end
+
+    if not route then
+      local allowed = app:methods_for(req.path)
+
+      if #allowed > 0 then
+        -- OPTIONS is answered from the routing table itself: no handler has
+        -- to be written for a client to discover what a path accepts.
+        if req.method == "OPTIONS" then
+          local list = { "OPTIONS" }
+          for _, verb in ipairs(allowed) do
+            list[#list + 1] = verb
+            if verb == "GET" then list[#list + 1] = "HEAD" end
+          end
+          table.sort(list)
+          return response(204, nil, { ["allow"] = table.concat(list, ", ") })
+        end
+        -- The path exists, the method does not.  That is a 405, and it says
+        -- what would have worked.
+        return akkar.method_not_allowed(allowed)
+      end
+
+      return response(404, { error = "no route for " .. req.method .. " " .. req.path })
+    end
   end
+
   req.params = params
   req.route = route.path
 
@@ -487,8 +558,36 @@ local function chains(app)
   return app._chain, app._chain_short
 end
 
-local function unescape(s)
-  return (s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+-- `/users/` and `/users` are the same resource.  Answering 404 to one of them
+-- is a distinction no client asked for.  The root stays "/".
+local function normalize_path(path)
+  if path == "" then return "/" end
+  if #path > 1 and path:sub(-1) == "/" then
+    path = path:gsub("/+$", "")
+    if path == "" then return "/" end
+  end
+  return path
+end
+
+-- Headers reach a handler as a plain table with lowercase keys, whether the
+-- request came off a socket or from the in-process test client.  Before this,
+-- a handler had to write
+--   req.headers.authorization or (req.headers.get and req.headers:get "...")
+-- which is the framework leaking lua-http into user code.
+local function normalize_headers(source)
+  local out = {}
+  if not source then return out end
+  if type(source.get) == "function" then          -- a lua-http headers object
+    for name, value in source:each() do
+      if name:sub(1, 1) ~= ":" then               -- drop :method, :path, ...
+        local existing = out[name]
+        out[name] = existing and (existing .. ", " .. value) or value
+      end
+    end
+  else
+    for name, value in pairs(source) do out[name:lower()] = value end
+  end
+  return out
 end
 
 local function parse_query(qs)
@@ -510,10 +609,10 @@ local function handle(app, input)
   -- Request data.
   local req = {
     method  = input.method,
-    path    = input.path,
+    path    = normalize_path(input.path),
     query   = input.query or {},
     body    = input.body,
-    headers = input.headers or {},
+    headers = normalize_headers(input.headers),
     user    = guard("req.user", "req.user is not set; this route is missing the authentication middleware"),
   }
 
@@ -624,13 +723,19 @@ function App:run(config)
 
         local rh = headers.new()
         rh:append(":status", tostring(res.status))
+        if res.headers then
+          for name, value in pairs(res.headers) do rh:append(name, value) end
+        end
         local payload = res.body and cjson.encode(res.body) or nil
         if payload then
           rh:append("content-type", "application/json")
           rh:append("content-length", tostring(#payload))
         end
-        stream:write_headers(rh, payload == nil)
-        if payload then stream:write_chunk(payload, true) end
+        -- HEAD carries the headers a GET would, including content-length, and
+        -- no body.  That is the point of HEAD.
+        local send_body = payload ~= nil and h:get ":method" ~= "HEAD"
+        stream:write_headers(rh, not send_body)
+        if send_body then stream:write_chunk(payload, true) end
       end)
       if not ok then io.stderr:write("[akkar] stream: " .. tostring(err) .. "\n") end
       stream:shutdown()
@@ -670,10 +775,10 @@ function App:test(config)
         timeout = options.timeout or config.timeout,
         capabilities = config,
       })
-      return { status = res.status, body = res.body }
+      return { status = res.status, body = res.body, headers = res.headers or {} }
     end
   end
-  for _, m in ipairs { "get", "post", "put", "patch", "delete" } do
+  for _, m in ipairs { "get", "post", "put", "patch", "delete", "head", "options" } do
     client[m] = call(m:upper())
   end
   return client
