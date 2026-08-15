@@ -122,4 +122,28 @@ describe("the concurrency ceiling", function()
     assert.is_true(akkar.defaults.max_concurrent == nil,
       "the ceiling is computed, not a fixed default")
   end)
+
+  it("publishes the ceiling on the app, so other code can read it", function()
+    -- It was a local handed to lua-http and nothing else, which meant
+    -- `akkar.limit.shed` -- the one piece of the framework that needs to know
+    -- how loaded the server is -- read nil and could never fire. A ceiling
+    -- only the listener can see is half a ceiling.
+    local PORT = 8393
+    local app = akkar.new()
+    app:get("/ping", function() return { ok = true } end)
+
+    local cq = cqueues.new()
+    cq:wrap(function()
+      pcall(function()
+        app:run { port = PORT, check_capabilities = false, max_concurrent = 8,
+                  log = akkar.log.new { level = "error" } }
+      end)
+    end)
+    cq:wrap(function()
+      cqueues.sleep(0.2)
+      assert.equal(8, app.max_concurrent)
+      app:stop(1)
+    end)
+    assert(cq:loop(20))
+  end)
 end)

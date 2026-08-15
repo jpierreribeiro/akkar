@@ -320,12 +320,41 @@ function M.shed(options)
   local ceiling  = options.ceiling or 0.8   -- fraction of max_concurrent
   local critical = options.critical or function() return false end
 
+  -- REFUSED AT CONSTRUCTION rather than degraded into a no-op. Given neither
+  -- an app to read nor an explicit capacity, this middleware cannot ever shed,
+  -- and an installed shedder that never sheds is the exact failure it exists
+  -- to prevent -- discovered under the load it was supposed to survive. The
+  -- framework's habit is to make the misconfiguration loud at boot, the way a
+  -- duplicate route and an unknown `run{}` option already are.
+  if not options.capacity and not options.app then
+    error("akkar.limit.shed needs `app = app`, so it can read the in-flight " ..
+          "count and the concurrency ceiling, or an explicit `capacity`. " ..
+          "With neither it can never shed.", 2)
+  end
+
+  local warned = false
+
   return function(req, next)
     local app = options.app
     local in_flight = app and app.in_flight or 0
     local capacity  = options.capacity or (app and app.max_concurrent)
 
-    if capacity and in_flight > capacity * ceiling and not critical(req) then
+    -- An app whose ceiling could not be derived -- `max_concurrent` unset and
+    -- `/proc/self/limits` unreadable, which is every platform that is not
+    -- Linux -- reaches here with no capacity. Say so once. Saying it per
+    -- request would bury the log under the load being shed.
+    if not capacity then
+      if not warned then
+        warned = true
+        req.log:warn("shed is installed but has no capacity to measure against", {
+          hint = "pass capacity = N, or run on a platform where the descriptor "
+              .. "ceiling can be read, or set app:run { max_concurrent = N }",
+        })
+      end
+      return next(req)
+    end
+
+    if in_flight > capacity * ceiling and not critical(req) then
       return too_many(options.retry_after_ms or 1000)
     end
     return next(req)

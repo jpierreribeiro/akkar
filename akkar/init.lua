@@ -1699,6 +1699,14 @@ function App:run(config)
   local max_concurrent = config.max_concurrent
   if max_concurrent == nil then max_concurrent = descriptor_ceiling() end
 
+  -- PUBLISHED ON THE APP, not merely handed to lua-http. `akkar.limit.shed`
+  -- sheds low-priority work at a fraction of this number and reads it from
+  -- here; while it was a local, that read returned nil and the shedder could
+  -- never fire in any app that did not pass `capacity` by hand -- which is to
+  -- say it was dead code in the shape most likely to be deployed. A ceiling
+  -- the server enforces and nothing else can read is half a ceiling.
+  self.max_concurrent = max_concurrent
+
   local s = assert(server.listen {
     host = host, port = port, tls = config.tls or false, ctx = config.ctx,
     reuseport = config.reuseport,
