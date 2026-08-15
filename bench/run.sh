@@ -75,7 +75,24 @@ start_processes() {
     lua5.4 bench/serve.lua "$PORT" "$POOL" >/dev/null 2>&1 &
   done
   sleep 2
-  # A configuration that cannot answer at all must not be measured.
+
+  # Rule 1 applied to the CONFIGURATION, not just the responses.
+  #
+  # Verifying every response is not enough.  The first scaling run on a
+  # c5.2xlarge started 8 processes, 7 died instantly with EADDRINUSE because
+  # SO_REUSEPORT was not set, and the one survivor answered every request
+  # perfectly -- so the run passed its own checks and reported a flat line
+  # labelled "8 processes".  A configuration that is not the configuration
+  # produces numbers that look exactly like real ones.
+  local alive
+  alive=$(pgrep -fc "bench/serve.lua $PORT" || echo 0)
+  if [ "$alive" -ne "$1" ]; then
+    echo "REFUSING TO RUN: asked for $1 processes, $alive are alive."
+    echo "The rest most likely failed to bind.  Is reuseport = true set?"
+    exit 1
+  fi
+
+  # And it must actually answer before being measured.
   curl -sf --max-time 5 "http://127.0.0.1:$PORT$TARGET" >/dev/null || {
     echo "REFUSING TO RUN: the server did not answer $TARGET with 2xx before the run."
     exit 1

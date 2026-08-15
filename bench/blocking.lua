@@ -43,4 +43,4 @@ app:get("/expensive-yielding", function()
 end)
 
 app:handle_signals()
-app:run { port = port, log = akkar.log.new { level = "warn" } }
+app:run { port = port, reuseport = true, log = akkar.log.new { level = "warn" } }

@@ -113,7 +113,7 @@ local internal = log.new { level = "info", format = "text" }
 local SETTINGS = {
   host = true, port = true, tls = true, ctx = true,
   body_limit = true, timeout = true, shutdown_grace = true,
-  check_capabilities = true,
+  check_capabilities = true, reuseport = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -992,8 +992,17 @@ function App:run(config)
 
   chains(self)
 
+  -- SO_REUSEPORT is how several processes share one port, which is how akkar
+  -- uses a machine: one Lua VM is one core, so capacity is processes.  The
+  -- kernel load-balances accepted connections between them, and no proxy is
+  -- needed in front.
+  --
+  -- Without it the second process dies with EADDRINUSE, and a benchmark that
+  -- starts N processes silently measures one.  That is not hypothetical: it
+  -- is what the first scaling run on a c5.2xlarge actually did.
   local s = assert(server.listen {
     host = host, port = port, tls = config.tls or false, ctx = config.ctx,
+    reuseport = config.reuseport,
     onstream = function(_, stream)
       self.in_flight = self.in_flight + 1
       local ok, err = pcall(function()

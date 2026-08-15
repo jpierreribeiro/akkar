@@ -53,6 +53,7 @@ registry:serve(app, "/metrics", {
 app:handle_signals()
 app:run {
   port = port,
+  reuseport = true,      -- several of these share the port; see bench/run.sh
   db = factory,
   log = akkar.log.new { level = "warn" },   -- warnings only; info would be noise
 }

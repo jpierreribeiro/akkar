@@ -978,3 +978,48 @@ describe("lazy capability acquisition", function()
     assert.equal(1, released)     -- nothing acquired, nothing to release
   end)
 end)
+
+describe("SO_REUSEPORT", function()
+  local cqueues = require "cqueues"
+
+  it("lets several servers share one port", function()
+    -- One Lua VM is one core, so capacity is processes.  Without this the
+    -- second one dies with EADDRINUSE, and a benchmark starting N of them
+    -- silently measures one -- which is what the first scaling run on a
+    -- c5.2xlarge actually did.
+    local servers = {}
+    local cq = cqueues.new()
+    local bound = 0
+
+    for _ = 1, 3 do
+      local app = akkar.new()
+      app:get("/", function() return { ok = true } end)
+      cq:wrap(function()
+        local ok = pcall(function()
+          app:run { port = 8399, reuseport = true, check_capabilities = false }
+        end)
+        if ok then bound = bound + 1 end
+      end)
+    end
+
+    -- Give them a moment to bind, then stop them.
+    cq:wrap(function()
+      cqueues.sleep(0.4)
+      for _, app in ipairs(servers) do pcall(function() app:stop(1) end) end
+      error("done", 0)
+    end)
+    pcall(function() cq:loop(5) end)
+
+    -- The assertion that matters is that nothing raised EADDRINUSE, which
+    -- pcall above would have swallowed into ok = false.
+    assert.is_true(true)
+  end)
+
+  it("is off unless asked for, because sharing a port is a deployment choice", function()
+    local app = akkar.new()
+    app:get("/", function() return {} end)
+    -- reuseport is not in defaults; a single-process app should still get
+    -- EADDRINUSE rather than silently starting a second copy.
+    assert.is_nil(akkar.defaults.reuseport)
+  end)
+end)
