@@ -365,4 +365,42 @@ inert. Move it to the outer controller and it keeps running, wakes after the
 503, and touches a connection that has already gone back to the pool. That
 trades a descriptor leak for a data bug, and the data bug is worse.
 
+### 10. The harness was taking the machines off the network — **methodology**
+
+A benchmark box went unreachable mid-run and never came back. The first
+diagnosis pointed at finding 9: 512 concurrent requests, 1,030 descriptors,
+`ulimit -n 1024`. It was wrong, and what disproved it is that **the previous
+project lost machines the same way** — a compiled Odin server with no
+controllers, no cqueues and no descriptor per request. A cause that cannot
+explain both is not the cause.
+
+What the two harnesses share:
+
+```
+Odin  : taskset -c "${URUQUIM_SOAK_SERVER_CPUS:-0-7}"
+akkar : GENERATOR="0,4"   SERVERS="1,5,2,6,3,7"
+```
+
+**Both gave every vCPU to the benchmark.** Inbound packet processing runs in
+softirq context on some CPU, and with all of them saturated by pinned work
+`ksoftirqd` never gets scheduled, so SYN packets for new connections are
+dropped. SSH then **times out rather than being refused**, which is precisely
+the symptom, and the serial console keeps working because `ttyS0` is a
+hypervisor path that never touches the network stack.
+
+Every observation fits: no kernel panic, no OOM, no reboot, a console sitting
+at a healthy login prompt, and a machine that answers nothing on the wire.
+
+An earlier inference here was also unsound and is withdrawn: *"silence on ICMP
+suggests the instance is gone."* AWS security groups drop ICMP by default, so
+that box had almost certainly never answered a ping. Absence of a reply was
+read as evidence when it was the normal behaviour all along.
+
+**Fixed** in `bench/study/lib.sh`: one physical core is reserved for the
+system, the reservation is asserted rather than assumed, and a host with
+fewer than three physical cores is refused outright. It costs a third of the
+server capacity on an eight-vCPU host, and it buys runs that survive — plus
+measurements not contaminated by a starving kernel, which were never fair
+measurements of anything.
+
 *(more as the remaining lines of enquiry land)*

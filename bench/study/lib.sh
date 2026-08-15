@@ -25,6 +25,26 @@ eval "$(luarocks path --bin)" 2>/dev/null
 # c5.2xlarge is 4 physical cores x 2 threads.  Two hyperthreads of one core are
 # not two cores, and pinning to 0-5 rather than to whole cores measures the
 # siblings fighting each other.
+#
+# ONE PHYSICAL CORE IS RESERVED FOR THE SYSTEM, and this is the most expensive
+# line in the file by its absence.
+#
+# The previous version of this harness gave every vCPU to the benchmark:
+# generator on one core, servers on the other three. So did the previous
+# project's, which defaulted to `taskset -c 0-7`. Machines died mid-run in
+# both -- a compiled Odin server and an interpreted Lua one, which rules out
+# anything about the framework.
+#
+# The mechanism: inbound packet processing runs in softirq context on some
+# CPU. With every CPU saturated by pinned work, `ksoftirqd` never gets
+# scheduled and SYN packets for new connections are dropped. SSH then TIMES
+# OUT rather than being refused, which is exactly the symptom, and the serial
+# console keeps working because ttyS0 is a hypervisor path that never touches
+# the network stack. The box is alive and deaf.
+#
+# The cost is a third of the server capacity on an eight-vCPU host. It buys a
+# run that survives, and measurements that are not contaminated by a starving
+# kernel -- which was never a fair measurement of anything anyway.
 detect_topology() {
   declare -gA SIBLINGS
   for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
@@ -33,25 +53,53 @@ detect_topology() {
     SIBLINGS[$core]="${SIBLINGS[$core]:+${SIBLINGS[$core]},}${cpu##*/cpu}"
   done
   mapfile -t PHYSICAL < <(printf '%s\n' "${!SIBLINGS[@]}" | sort -n)
-  GENERATOR="${SIBLINGS[${PHYSICAL[0]}]}"
+
+  local total=${#PHYSICAL[@]}
+  if [ "$total" -lt 3 ]; then
+    echo "REFUSING: $total physical cores. This harness needs one for the" >&2
+    echo "  system, one for the generator and at least one for the servers." >&2
+    return 1
+  fi
+
+  # Core 0 to the system.  Core 1 to the generator.  The rest to the servers.
+  RESERVED="${SIBLINGS[${PHYSICAL[0]}]}"
+  GENERATOR="${SIBLINGS[${PHYSICAL[1]}]}"
   SERVERS=""
   for i in "${!PHYSICAL[@]}"; do
-    [ "$i" -eq 0 ] && continue
+    [ "$i" -le 1 ] && continue
     SERVERS="${SERVERS:+$SERVERS,}${SIBLINGS[${PHYSICAL[$i]}]}"
   done
-  SERVER_CORES=$(( ${#PHYSICAL[@]} - 1 ))
-  export GENERATOR SERVERS SERVER_CORES
+  SERVER_CORES=$(( total - 2 ))
+  export RESERVED GENERATOR SERVERS SERVER_CORES
 }
 
 # Cores for exactly N physical cores, so a scaling run gives each process one.
+# Starts at index 2: index 0 is the system's and index 1 is the generator's.
 cores_for() {
-  local want=$1 list=""
+  local want=$1 list="" taken=0
   for i in "${!PHYSICAL[@]}"; do
-    [ "$i" -eq 0 ] && continue
-    [ "$((i))" -le "$want" ] || break
+    [ "$i" -le 1 ] && continue
+    [ "$taken" -lt "$want" ] || break
     list="${list:+$list,}${SIBLINGS[${PHYSICAL[$i]}]}"
+    taken=$((taken + 1))
   done
   echo "$list"
+}
+
+# A run that saturates every core is a run that can take the machine off the
+# network, so the reservation is asserted rather than assumed.
+verify_reservation() {
+  local busy
+  busy=$(taskset -c "$RESERVED" true 2>&1) || {
+    echo "REFUSING: cannot pin to the reserved cores $RESERVED" >&2
+    return 1
+  }
+  case ",$SERVERS,$GENERATOR," in
+    *",${RESERVED%%,*},"*)
+      echo "REFUSING: core ${RESERVED%%,*} is both reserved and in use" >&2
+      return 1 ;;
+  esac
+  return 0
 }
 
 # --------------------------------------------------------------------- gates

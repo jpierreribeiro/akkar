@@ -9,7 +9,8 @@
 #
 # usage: run.sh <part> [part ...]
 source "$(dirname "$0")/lib.sh"
-detect_topology
+detect_topology || exit 1
+verify_reservation || exit 1
 
 PORT=${PORT:-8500}
 DURATION=${DURATION:-10s}
@@ -135,6 +136,7 @@ header() {
   echo "machine   : $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
   echo "topology  : ${#PHYSICAL[@]} physical cores x 2 threads"
   echo "affinity  : servers $SERVERS, generator $GENERATOR"
+  echo "reserved  : $RESERVED left to the kernel -- see lib.sh for why"
   echo "load      : wrk -t$THREADS -c$CONNS -d$DURATION, $REPS reps, median"
   echo "date      : $(date -u '+%Y-%m-%d %H:%M UTC')"
 }
