@@ -27,6 +27,14 @@ app:get("/users/:id", {
   return user or akkar.not_found "user not found"
 end)
 
+-- Variable payload, to find where serialisation starts to dominate.
+app:get("/rows/:n", {
+  params = { n = akkar.v.integer { min = 1, max = 5000 } },
+}, function(req)
+  return { users = req.db:many(
+    "select id, name, email from users order by id limit $1", req.params.n) }
+end)
+
 app:run {
   port = port,
   reuseport = true,

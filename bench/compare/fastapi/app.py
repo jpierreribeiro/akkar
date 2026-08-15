@@ -53,3 +53,12 @@ async def get_user(id: int = Path(ge=1)) -> JSONResponse:
         return JSONResponse(status_code=404, content={"error": "user not found"})
     return JSONResponse(
         content={"id": row["id"], "name": row["name"], "email": row["email"]})
+
+
+@app.get("/rows/{n}")
+async def rows(n: int = Path(ge=1, le=5000)) -> JSONResponse:
+    """Variable payload, to find where serialisation starts to dominate."""
+    result = await pool.fetch(
+        "select id, name, email from users order by id limit $1", n)
+    return JSONResponse(content={"users": [
+        {"id": r["id"], "name": r["name"], "email": r["email"]} for r in result]})

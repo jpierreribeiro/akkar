@@ -81,6 +81,32 @@ func main() {
 		c.JSON(http.StatusOK, u)
 	})
 
+	// Variable payload, to find where serialisation starts to dominate.
+	r.GET("/rows/:n", func(c *gin.Context) {
+		n, err := strconv.Atoi(c.Param("n"))
+		if err != nil || n < 1 || n > 5000 {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error": "validation failed", "fields": gin.H{"params.n": "min is 1"}})
+			return
+		}
+		rows, err := pool.Query(c.Request.Context(),
+			"select id, name, email from users order by id limit $1", n)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "query failed"})
+			return
+		}
+		defer rows.Close()
+		out := make([]user, 0, n)
+		for rows.Next() {
+			var u user
+			if err := rows.Scan(&u.ID, &u.Name, &u.Email); err != nil {
+				break
+			}
+			out = append(out, u)
+		}
+		c.JSON(http.StatusOK, gin.H{"users": out})
+	})
+
 	srv := &http.Server{Addr: "127.0.0.1:" + port, Handler: r}
 	if err := srv.ListenAndServe(); err != nil {
 		panic(err)
