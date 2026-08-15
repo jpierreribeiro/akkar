@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 137 tests with Postgres and Redis up, no database needed, ~2 s
+busted                      # 139 tests with Postgres and Redis up, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -334,10 +334,44 @@ that accepts anything while looking validated.
   Also added `akkar.raw(body, content_type)`, since `/metrics` is text rather
   than JSON — useful for a CSV export or an SVG too.
 
+- **Benchmarks**, `bench/`, run on a c5.2xlarge — see `bench/RESULTS.md`.
+  Methodology borrowed from `uruquim-odin`'s `planning/benchmark-methodology.md`:
+  verify every response, alternate the order, discard a warm-up, derive the
+  noise floor from the machine, pin whole physical cores.
+
+  Results: **linear scaling across physical cores** (1.00x, 1.00x, 1.00x),
+  with hyperthreads worth about 18% more. `/ping` reaches 31.8k req/s against
+  `/users/:id` at 2.7k, so the database dominates a real request twelve to
+  one. One blocking handler multiplies neighbour p99 by ten and
+  `work.yielding` takes it back to baseline.
+
+  Two runs were wrong first, both instructively: seven of eight processes had
+  died with `EADDRINUSE` while the survivor answered correctly, which found
+  the missing `SO_REUSEPORT`; and an affinity mask that split sibling threads
+  read as poor scaling when it was contention. Both are written up.
+
 ### Still open
 
-- **Redis adapter.** The contract question is settled (`DECISIONS.md` §8);
-  what remains is choosing a library and writing it.
+Nothing here blocks using akkar. Two items are closed by measurement rather
+than by work, and the third is the milestone everything else was clearing the
+way for.
+
+- **Port a real service off Gin.** `docs/PLAN.md` names this as the milestone
+  never reached, and it is the only honest test of completeness — it will
+  surface ten to twenty gaps no planning predicts. Everything since has been
+  closing the gaps already known to block it, and none remain.
+
+- **Soak test.** Every benchmark so far is twelve to fifteen seconds, which
+  says nothing about connection churn, memory growth or GC behaviour over
+  hours. Cheap to run now that a machine exists: start it, leave it, come
+  back. For a framework meant for production this is the largest unmeasured
+  thing left.
+
+  One specific question to answer with it: `/users/:id` p99 was 191 ms at one
+  process with 100 concurrent connections against `pool_size = 10`, so ninety
+  requests were queuing for a connection. Pool sizing against concurrency is
+  currently undocumented, and a soak run is where the guidance comes from.
+
 - **Prefix-tree routing — measured, and the answer is no.** Worst-case dynamic
   match is 33 µs at 50 routes and 95 µs at 200, against roughly 4000 µs for one
   Postgres query. A prefix tree would buy 0.8% of a request. Revisit past ~500
@@ -348,23 +382,6 @@ that accepts anything while looking validated.
   repeating for `luaossl`. That is taking on maintenance of a C library, not a
   backlog item. It is the strongest argument yet for the adapter boundary, and
   eventually for owning the substrate.
-
-- **Benchmarks**, `bench/`, run on a c5.2xlarge. Results in
-  `bench/RESULTS.md`. The methodology is borrowed from `uruquim-odin`'s
-  `planning/benchmark-methodology.md`: verify every response, alternate the
-  order, discard a warm-up, and derive the noise floor from the machine
-  (2.6% here).
-
-  What came out: the framework scales 3.57x to four processes; `/ping` does
-  36k req/s against `/users/:id` at 2.6k, so the database dominates a real
-  request by thirteen to one; one blocking handler multiplies neighbour p99
-  by ten, and `work.yielding` takes it back to baseline.
-
-  The first run was wrong in an instructive way — seven of eight processes
-  had died with `EADDRINUSE` and the survivor answered everything correctly,
-  so the run passed its own gate. That found the missing `SO_REUSEPORT`
-  support and added a rule the borrowed methodology did not have: verify the
-  configuration, not only the responses.
 
 ---
 
