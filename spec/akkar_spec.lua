@@ -1024,3 +1024,89 @@ describe("SO_REUSEPORT", function()
     assert.is_nil(akkar.defaults.reuseport)
   end)
 end)
+
+describe("the deadline controller pool", function()
+  local cqueues = require "cqueues"
+
+  local function in_controller(fn)
+    local cq = cqueues.new()
+    local result, failure
+    cq:wrap(function()
+      local ok, res = pcall(fn)
+      if ok then result = res else failure = res end
+    end)
+    assert(cq:loop(20))
+    if failure then error(failure, 0) end
+    return result
+  end
+
+  it("does not leak an abandoned handler into the next request", function()
+    -- The risk the pool introduces, and the reason a timed-out controller is
+    -- discarded rather than reused: a handler abandoned by the deadline is
+    -- still running inside its controller.
+    local app = akkar.new()
+    local leaked = false
+    app:get("/slow", function()
+      cqueues.sleep(1.5)
+      leaked = true               -- runs after its request was abandoned
+      return { late = true }
+    end)
+    app:get("/fast", function() return { ok = true } end)
+
+    local slow = in_controller(function()
+      return app:test():get("/slow", { timeout = 0.15 })
+    end)
+    assert.equal(503, slow.status)
+
+    -- Whatever the abandoned handler does later, the next request must be
+    -- clean and must not inherit it.
+    for _ = 1, 5 do
+      local res = in_controller(function()
+        return app:test():get("/fast", { timeout = 1 })
+      end)
+      assert.equal(200, res.status)
+      assert.is_true(res.body.ok)
+    end
+  end)
+
+  it("still arbitrates correctly when controllers are reused", function()
+    local app = akkar.new()
+    app:get("/quick", function() cqueues.sleep(0.01) return { n = 1 } end)
+    app:get("/slow",  function() cqueues.sleep(2) return { n = 2 } end)
+    app:get("/boom",  function() error "exploded" end)
+
+    -- Run the three kinds repeatedly so pooled controllers are exercised.
+    for _ = 1, 4 do
+      assert.equal(200, in_controller(function()
+        return app:test():get("/quick", { timeout = 1 })
+      end).status)
+      assert.equal(500, in_controller(function()
+        return app:test():get("/boom", { timeout = 1 })
+      end).status)
+      assert.equal(503, in_controller(function()
+        return app:test():get("/slow", { timeout = 0.1 })
+      end).status)
+    end
+  end)
+
+  it("keeps concurrent requests independent", function()
+    local app = akkar.new()
+    app:get("/a", function() cqueues.sleep(0.05) return { which = "a" } end)
+    app:get("/b", function() cqueues.sleep(0.02) return { which = "b" } end)
+
+    local seen = {}
+    local cq = cqueues.new()
+    for i = 1, 8 do
+      cq:wrap(function()
+        local path = (i % 2 == 0) and "/a" or "/b"
+        local res = app:test():get(path, { timeout = 2 })
+        -- A pooled controller must never return another request's answer.
+        seen[#seen + 1] = (path == "/a" and res.body.which == "a")
+                       or (path == "/b" and res.body.which == "b")
+      end)
+    end
+    assert(cq:loop(20))
+    assert.equal(8, #seen)
+    for _, correct in ipairs(seen) do assert.is_true(correct) end
+  end)
+end)

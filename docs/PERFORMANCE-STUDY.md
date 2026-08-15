@@ -152,4 +152,48 @@ message and Postgres sends one DataRow message per row, so a thousand rows cost
 **2,006 socket reads averaging 22 bytes each**. The other half is building one
 Lua table per row.
 
+### 4. A controller per request tied a hard OS limit to the collector
+
+`with_deadline` created a fresh `cqueues` controller for every request. Three
+separate investigations landed on that one object:
+
+- it cost **25 µs of akkar's 34.7 µs** total per-request overhead;
+- it contributed to the **2,814 bytes** of garbage a trivial request produced;
+- and each controller holds **exactly 2.00 file descriptors**.
+
+The last one is the finding no profile would have surfaced. Confirmed at three
+different limits:
+
+```
+ulimit -n 256   ->  126 controllers   (2.03 each)
+ulimit -n 1024  ->  510 controllers   (2.01 each)
+ulimit -n 4096  -> 2046 controllers   (2.00 each)
+```
+
+Those descriptors came back **only when the collector ran**. The framework had
+quietly coupled a hard operating-system limit to the pace of the garbage
+collector, and nothing declared it.
+
+Fixed by pooling controllers, and by stepping before polling — `wrap` only
+queues the coroutine, so polling first made every synchronous request wait on
+a descriptor for work already ready to run.
+
+**Deterministic evidence**, which needs no quiet machine and has no noise floor
+to hide in:
+
+```
+controllers created per 500 requests    before: 500      after: 1
+file descriptors per request            before: 2.000    after: 0.000
+```
+
+The risk a pool introduces is handing the next request an abandoned handler's
+controller. Only an empty controller goes back — the same discipline the
+connection pool already uses for a transaction left open. Three tests pin it,
+including one that abandons a handler by deadline and then asserts five
+subsequent requests are clean.
+
+**Timing not yet certified.** The A/B measured +33% but the machine's noise
+floor was 71.2% at the time, against 0.7% when it is alone. Inside the noise
+is not a result, and it is not being reported as one.
+
 *(more as the remaining lines of enquiry land)*

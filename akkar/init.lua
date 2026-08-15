@@ -368,12 +368,30 @@ local function remove_watchdog() debug.sethook() end
 -- HONEST LIMIT: this is cooperative.  It can only fire while the handler is
 -- yielding on I/O.  A handler burning CPU in a tight loop is not interrupted
 -- by the deadline; that is what the watchdog below reports instead.
+local controller_pool = {}
+local POOL_LIMIT = 64
+
 local function with_deadline(seconds, fn)
   if not seconds or seconds <= 0 or not cqueues.running() then
     return "COMPLETION", fn()          -- no budget, or no controller to yield to
   end
 
-  local cq = cqueues.new()
+  -- Controllers are pooled, and speed is only one of three reasons.
+  --
+  -- Three separate investigations landed on this object.  A fresh
+  -- `cqueues.new()` per request cost 25 us of akkar's 34.7 us total overhead;
+  -- it contributed to the 2,814 bytes of garbage a trivial request produced;
+  -- and each controller holds **exactly 2.00 file descriptors**, confirmed at
+  -- three different limits:
+  --
+  --     ulimit -n 256   ->  126 controllers   (2.03 each)
+  --     ulimit -n 1024  ->  510 controllers   (2.01 each)
+  --     ulimit -n 4096  -> 2046 controllers   (2.00 each)
+  --
+  -- Those descriptors came back only when the collector ran, which quietly
+  -- tied a hard operating-system limit to the pace of the garbage collector.
+  -- Nothing declared that, and no profile would have shown it.
+  local cq = table.remove(controller_pool) or cqueues.new()
   local winner, result
 
   cq:wrap(function()
@@ -384,12 +402,25 @@ local function with_deadline(seconds, fn)
     end
   end)
 
+  -- Step before polling.  `wrap` only queues the coroutine, so the handler has
+  -- not started yet; polling first made every synchronous request wait on a
+  -- descriptor for work that was already ready to run.
+  cq:step(0)
+
   local deadline = cqueues.monotime() + seconds
   while winner == nil do
     local remaining = deadline - cqueues.monotime()
     if remaining <= 0 then break end
     cqueues.poll(cq, remaining)        -- yields to the outer controller
     cq:step(0)
+  end
+
+  -- Only an empty controller goes back.  A handler abandoned by the deadline
+  -- is still running inside its controller, and reusing that would hand the
+  -- next request someone else's unfinished work -- the same class of bug as a
+  -- pooled database connection with a transaction still open.
+  if cq:empty() and #controller_pool < POOL_LIMIT then
+    controller_pool[#controller_pool + 1] = cq
   end
 
   if winner == nil then winner = "TIMEOUT" end
