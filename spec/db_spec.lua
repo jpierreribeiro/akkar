@@ -163,3 +163,56 @@ describe("akkar.db parameter typing", function()
     assert.is_nil(row.label)
   end)
 end)
+
+describe("akkar.db buffered reads", function()
+  -- akkar serves pgmoon's two-calls-per-row socket reads out of one large
+  -- read.  It is the only place akkar reaches into a dependency's internals,
+  -- so what it produces has to be proven identical rather than assumed.
+  local function rows_from(config, n)
+    local conn = db.connect(config)()
+    conn:exec "drop table if exists akkar_buffer_spec"
+    conn:exec [[create table akkar_buffer_spec (
+      id int, name text, note text, ratio float8, flag boolean)]]
+    -- `mod()` rather than `%`, which string.format would have eaten.
+    conn:exec("insert into akkar_buffer_spec select g, 'user ' || g, " ..
+              "repeat('x', mod(g, 97)), g / 7.0, mod(g, 2) = 0 " ..
+              "from generate_series(1, " .. n .. ") g")
+    local rows = conn:many "select * from akkar_buffer_spec order by id"
+    conn:close()
+    return rows
+  end
+
+  local function config_with(buffered)
+    local c = {}
+    for k, val in pairs(CONFIG) do c[k] = val end
+    c.buffered_reads = buffered
+    return c
+  end
+
+  it("returns exactly what the unbuffered driver returns", function()
+    -- Row counts chosen to straddle the 64 KB read: a small result fits in one
+    -- read, a large one does not, and the message that spans the boundary is
+    -- where a buffered reader goes wrong.
+    for _, n in ipairs { 1, 100, 2000 } do
+      local off = rows_from(config_with(false), n)
+      local on  = rows_from(config_with(true), n)
+      assert.equal(n, #on, "row count changed at n = " .. n)
+      assert.same(off, on, "buffered reads changed the result at n = " .. n)
+    end
+  end)
+
+  it("handles a single value larger than the read chunk", function()
+    -- One field bigger than 64 KB forces the reader to keep asking, which is
+    -- the loop that would hang or truncate if the refill were wrong.
+    local conn = db.connect(config_with(true))()
+    local big = conn:one "select repeat('y', 200000) as blob"
+    assert.equal(200000, #big.blob)
+    conn:close()
+  end)
+
+  it("can be turned off without a fork", function()
+    local conn = db.connect(config_with(false))()
+    assert.equal(1, conn:one("select 1 as n").n)
+    conn:close()
+  end)
+end)

@@ -43,14 +43,15 @@ describe("allocation per request", function()
 
   it("stays under the ceiling for a trivial route", function()
     -- History, so a future reader knows which way this has moved:
-    --   2,814  before the guards, the request id and the watchdog were fixed
-    --   2,166  after
-    -- The ceiling is set above the current figure with room for an honest
-    -- change, and low enough that re-introducing any one of those three
-    -- allocations breaks it.
+    --   2,814  before the guards and the request id were fixed
+    --   2,423  after
+    --   2,166  with the watchdog closure pooled as well -- reverted, because
+    --          that last 257 bytes measured +2.1% against a 3.4% noise floor
+    -- The ceiling sits above the current figure with room for an honest
+    -- change, and low enough that re-introducing either allocation breaks it.
     local bytes = bytes_per_request(client, "/ping", 2000)
-    assert.is_true(bytes < 2400,
-      string.format("allocation regressed: %.0f bytes/request, ceiling 2400", bytes))
+    assert.is_true(bytes < 2600,
+      string.format("allocation regressed: %.0f bytes/request, ceiling 2600", bytes))
   end)
 
   it("is flat in the number of requests, so nothing accumulates", function()

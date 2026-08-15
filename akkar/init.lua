@@ -346,47 +346,35 @@ akkar.validate = validate
 local WATCHDOG_INSTRUCTIONS = 200000
 local WATCHDOG_LIMIT        = 0.100   -- seconds of uninterrupted CPU
 
--- The hook closure and its state are pooled, for the same reason the deadline
--- controllers are: this is per request, on every request, and it is the same
--- object every time.  The state lives in a table the closure captures once
--- rather than in fresh upvalues, so a reused watchdog is reset rather than
--- rebuilt.
-local watchdog_pool = {}
-local WATCHDOG_POOL_LIMIT = 64
-
-local function new_watchdog()
-  local state = { cpu = 0, last = 0, warned = false, where = nil }
-  local hook = function()
+-- The hook closure is built per request.  It was pooled for a while, on the
+-- reasoning that had made the deadline controllers worth pooling: same object,
+-- every request, measurable allocation.  It cut 257 bytes per request and
+-- measured **+2.1% against a 3.4% noise floor** -- nothing -- so the pool was
+-- taken back out and the machinery with it.
+--
+-- Recorded rather than quietly reverted, because the reasoning was sound and
+-- someone will have it again.
+local function install_watchdog(where)
+  local cpu, last, warned = 0, cqueues.monotime(), false
+  debug.sethook(function()
     local now = cqueues.monotime()
-    local dt = now - state.last
-    state.last = now
-    if dt < 0.050 then state.cpu = state.cpu + dt else state.cpu = 0 end
-    if state.cpu > WATCHDOG_LIMIT and not state.warned then
-      state.warned = true
+    local dt = now - last
+    last = now
+    if dt < 0.050 then cpu = cpu + dt else cpu = 0 end
+    if cpu > WATCHDOG_LIMIT and not warned then
+      warned = true
       internal:warn("handler blocked the event loop without yielding", {
-        blocked_ms = math.floor(state.cpu * 1000),
-        at = state.where,
+        blocked_ms = math.floor(cpu * 1000),
+        at = where,
         traceback = debug.traceback("", 2),
         hint = "this stalls every request in this process",
       })
     end
-  end
-  return { state = state, hook = hook }
+  end, "", WATCHDOG_INSTRUCTIONS)
 end
 
-local function install_watchdog(where)
-  local w = table.remove(watchdog_pool) or new_watchdog()
-  local state = w.state
-  state.cpu, state.last, state.warned, state.where = 0, cqueues.monotime(), false, where
-  debug.sethook(w.hook, "", WATCHDOG_INSTRUCTIONS)
-  return w
-end
-
-local function remove_watchdog(w)
+local function remove_watchdog()
   debug.sethook()
-  if w and #watchdog_pool < WATCHDOG_POOL_LIMIT then
-    watchdog_pool[#watchdog_pool + 1] = w
-  end
 end
 
 -- ================================================================== deadline
@@ -728,11 +716,11 @@ local function dispatch(app, req)
     end
   end
 
-  local watchdog = install_watchdog(route.where)
+  install_watchdog(route.where)
   -- `normalize` runs INSIDE the pcall: a handler returning an invalid value
   -- must become a 500 with a clear log, not escape as an unhandled error.
   local ok, result = pcall(function() return normalize(run()) end)
-  remove_watchdog(watchdog)
+  remove_watchdog()
 
   if not ok then
     -- Response-as-error: a deep layer can signal HTTP without threading a

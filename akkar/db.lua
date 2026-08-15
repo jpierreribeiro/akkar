@@ -55,6 +55,56 @@ local function serialize_number(_, v)
   return FLOAT8, tostring(v)
 end
 
+-- ============================================================ buffered reads
+--
+-- pgmoon asks the socket for five bytes, then for a body, once per protocol
+-- message -- and Postgres sends one message per row.  A thousand rows is 2,006
+-- socket calls for about 54 KB, averaging 22 bytes each.
+--
+-- The obvious diagnosis was wrong, and it is worth writing down because it
+-- looked so convincing.  pgmoon opens the connection with `setmode("bn", "bn")`
+-- -- unbuffered -- which reads as a syscall per call.  Counted with strace, a
+-- thousand-row query costs about a hundred read syscalls in the whole process,
+-- not two thousand: cqueues buffers internally regardless of the mode.  Asking
+-- cqueues for full buffering measured *slower*.
+--
+-- So the cost is not I/O.  It is 2,006 Lua-level calls and the strings they
+-- allocate, measured at 30% of a thousand-row query.  This serves them from one
+-- large read instead, which is the only part of that 30% that can be recovered
+-- without a driver written in C.
+--
+-- Installed after `connect()` has returned, never before: the SSL negotiation
+-- reads a single byte off the raw socket, and a buffer that swallowed bytes
+-- ahead of the handshake would break TLS.
+local READ_CHUNK = 65536
+
+local function buffered_receive(sock)
+  local buf, pos = "", 1
+  return function(_, n)
+    -- All three of pgmoon's call sites ask for a fixed count.  Anything else
+    -- falls back to the socket rather than guessing, so a future pgmoon that
+    -- asks for a line or for everything still works.
+    if type(n) ~= "number" or n < 0 then
+      if pos <= #buf then
+        return nil, "akkar.db: unbuffered read requested with buffered bytes pending"
+      end
+      return sock:read(n)
+    end
+
+    while #buf - pos + 1 < n do
+      if pos > 1 then buf, pos = buf:sub(pos), 1 end   -- drop what was consumed
+      local chunk, err = sock:read(-READ_CHUNK)        -- up to CHUNK, not exactly
+      if not chunk then return nil, err end
+      buf = buf .. chunk
+    end
+
+    local out = buf:sub(pos, pos + n - 1)
+    pos = pos + n
+    if pos > #buf then buf, pos = "", 1 end            -- keep it from growing
+    return out
+  end
+end
+
 -- A query may arrive as text with parameters, or as an `akkar.sql` builder.
 -- The builder is the safe path, so it must be the convenient one too: a path
 -- that is safe but awkward loses to concatenation every time.
@@ -150,6 +200,13 @@ function M.connect(config)
     -- no fork of the driver.
     pg.type_serializers = setmetatable({ number = serialize_number },
                                        { __index = pg.type_serializers })
+
+    -- Reading in one gulp instead of two calls per row.  `buffered_reads =
+    -- false` opts out, because this is the one place akkar reaches into a
+    -- dependency's internals and a way back out should not require a fork.
+    if config.buffered_reads ~= false and pg.sock and pg.sock.sock then
+      pg.sock.receive = buffered_receive(pg.sock.sock)
+    end
 
     -- `null` was read from `pgmoon.null`, which does not exist -- the module
     -- exports only VERSION, Postgres and new.  So the row-cleaning pass that
