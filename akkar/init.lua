@@ -47,6 +47,15 @@ akkar.conflict    = function(m)    return response(409, { error = m or "conflict
 akkar.too_large   = function(m)    return response(413, { error = m or "payload too large" }) end
 akkar.unavailable = function(m)    return response(503, { error = m or "service unavailable" }) end
 
+--- A response that is not JSON: Prometheus text, a CSV export, an SVG.
+--- The body is written exactly as given, with the content type stated.
+function akkar.raw(body, content_type, status)
+  local res = response(status or 200, nil)
+  res.raw = tostring(body)
+  res.content_type = content_type or "text/plain; charset=utf-8"
+  return res
+end
+
 -- 405 carries Allow.  A 405 without it tells the client it guessed wrong but
 -- not what would have been right, which is the whole value of the status.
 akkar.method_not_allowed = function(allowed)
@@ -545,6 +554,7 @@ end
 -- shape and has nothing to do with the route's schema.
 local function apply_response_schema(res, schema, where)
   if res.status < 200 or res.status >= 300 then return res end
+  if res.raw then return res end
   if type(res.body) ~= "table" then return res end
   -- An array body is out of scope: `response` describes an object, and a list
   -- schema is a separate decision rather than an oversight.
@@ -1014,9 +1024,9 @@ function App:run(config)
         if res.headers then
           for name, value in pairs(res.headers) do rh:append(name, value) end
         end
-        local payload = res.body and cjson.encode(res.body) or nil
+        local payload = res.raw or (res.body and cjson.encode(res.body)) or nil
         if payload then
-          rh:append("content-type", "application/json")
+          rh:append("content-type", res.content_type or "application/json")
           rh:append("content-length", tostring(#payload))
         end
         -- HEAD carries the headers a GET would, including content-length, and
@@ -1075,7 +1085,8 @@ function App:test(config)
         timeout = options.timeout or config.timeout,
         capabilities = config,
       })
-      return { status = res.status, body = res.body, headers = res.headers or {} }
+      return { status = res.status, body = res.body, raw = res.raw,
+               headers = res.headers or {} }
     end
   end
   for _, m in ipairs { "get", "post", "put", "patch", "delete", "head", "options" } do
@@ -1143,6 +1154,7 @@ akkar.null = cjson.null
 akkar.check_capabilities = check_capability_contracts
 akkar.log = log
 akkar.work = require "akkar.work"
+akkar.metrics = require "akkar.metrics"
 
 akkar.Response = Response
 akkar.guard = guard

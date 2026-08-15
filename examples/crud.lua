@@ -15,6 +15,7 @@ local akkar = require "akkar"
 local db    = require "akkar.db"
 local redis = require "akkar.redis"
 local logging = require "akkar.log"
+local metrics = require "akkar.metrics"
 local openapi = require "akkar.openapi"
 local v     = akkar.v
 
@@ -23,6 +24,9 @@ local app = akkar.new()
 -- ============================================================================
 -- Global middleware.  `next` returns the response, so post-processing works.
 -- ============================================================================
+
+local registry = metrics.new()
+app:use(registry:middleware())
 
 app:use(function(req, next)
   local t0 = require("cqueues").monotime()
@@ -230,7 +234,19 @@ app:post("/uploads", {
 end)
 
 -- ============================================================================
--- 9. OpenAPI, generated from the schemas already declared above.  No route
+-- 9. Metrics.  Labelled by route pattern, so a million distinct paths still
+--    produce one series per route.
+-- ============================================================================
+
+local pg_factory = db.connect { port = 55432, database = "akkar",
+                                user = "postgres", password = "akkar" }
+registry:serve(app, "/metrics", {
+  akkar_db_pool_idle = function() return pg_factory.pool:stats().idle end,
+  akkar_db_pool_live = function() return pg_factory.pool:stats().live end,
+})
+
+-- ============================================================================
+-- 10. OpenAPI, generated from the schemas already declared above.  No route
 --    describes itself twice.
 -- ============================================================================
 
@@ -244,8 +260,7 @@ app:get("/", function() return { hello = "world" } end)
 if ... == nil then      -- only start a server when run directly, not required
   app:run {
     port = tonumber(os.getenv "PORT") or 8080,
-    db    = db.connect { port = 55432, database = "akkar",
-                         user = "postgres", password = "akkar" },
+    db    = pg_factory,
     cache = redis.connect { port = 6379 },
     log   = logging.new { format = os.getenv "AKKAR_LOG_JSON" and "json" or "text" },
   }

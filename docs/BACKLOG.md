@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 128 tests with Postgres and Redis up, no database needed, ~2 s
+busted                      # 137 tests with Postgres and Redis up, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -320,6 +320,19 @@ that accepts anything while looking validated.
   real answers are N processes, a lower cost factor chosen knowingly, or
   moving authentication behind the queue and changing what the endpoint
   promises.
+
+- **Prometheus metrics**, `akkar/metrics.lua`, text format with no
+  dependency. Counters by method/route/status, a latency histogram, and gauges
+  read at scrape time so pool occupancy costs nothing until asked for.
+
+  **Labelled by route pattern, never by request path.** `/users/:id` is one
+  series; `/users/1`, `/users/2`, … would be one per user. Unbounded label
+  cardinality is the standard way to take down a metrics backend, and a
+  framework that offers `req.path` as a label is handing that over. Verified:
+  six distinct paths including a probe for `/wp-admin/…` produce four series.
+
+  Also added `akkar.raw(body, content_type)`, since `/metrics` is text rather
+  than JSON — useful for a CSV export or an SVG too.
 
 ### Still open
 

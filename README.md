@@ -320,7 +320,7 @@ as a timeout.
 | | |
 |---|---|
 | Uploads are buffered, not streamed | a multipart body is held in memory under `body_limit`; streaming parts to disk is a separate feature |
-| Linear scan for dynamic routes | a prefix tree is the fix, but this is not urgent |
+| Linear scan for dynamic routes | measured: 33 µs worst case at 50 routes, against ~4000 µs for one query. A prefix tree would buy 0.8% of a request; revisit past ~500 dynamic routes |
 | `bcrypt` and other C calls still stall the process | `work.yielding` only helps loops written in Lua; a C function that does not return cannot be yielded. Run N processes or move it behind the queue |
 | Pinned to Lua 5.4 | the blocker is `cqueues`, which pins `lua == 5.4` and has had no release since 2020 — not `lua-http`, which accepts `>= 5.1` |
 
