@@ -1945,4 +1945,9 @@ akkar.strict = require "akkar.strict"
 
 akkar.Response = Response
 akkar.guard = guard
+
+-- Exposed because middleware has to tell a thrown response from a raised
+-- error, and the alternative was comparing metatables -- the framework's
+-- internals leaking into code written against it.
+akkar.is_response = is_response
 return akkar

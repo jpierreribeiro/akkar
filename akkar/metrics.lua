@@ -172,11 +172,34 @@ end
 --- probe.
 function Registry:middleware()
   local cqueues = require "cqueues"
+  local akkar = require "akkar"
   return function(req, next)
     local started = cqueues.monotime()
-    local res = next(req)
-    self:observe(req.method, req.route or "<unmatched>", res.status,
-                 cqueues.monotime() - started)
+
+    -- OBSERVED ON BOTH OUTCOMES. Raising is how akkar expresses a deliberate
+    -- 404 and how a handler error becomes a 500, so measuring only the value
+    -- that came back left the histogram blind to every error the server ever
+    -- produced -- while reporting a clean latency distribution over the
+    -- requests that happened to succeed.
+    --
+    -- That is worse than a missing metric. An operator reads this during an
+    -- incident, and during an incident the errors ARE the traffic. A scrape
+    -- that omits them says the server is healthy in the exact minute it is
+    -- not.
+    local ok, res = pcall(next, req)
+    local elapsed = cqueues.monotime() - started
+
+    local status
+    if ok then
+      status = res.status
+    elseif akkar.is_response(res) then
+      status = res.status         -- a thrown response: 404, 412, 429
+    else
+      status = 500                -- a raised error, which dispatch turns into one
+    end
+    self:observe(req.method, req.route or "<unmatched>", status, elapsed)
+
+    if not ok then error(res, 0) end
     return res
   end
 end

@@ -165,3 +165,71 @@ describe("the sandbox's string bound", function()
     assert.is_false(refused, "one tenant's generous ceiling raised another's")
   end)
 end)
+
+describe("the sandbox's run state", function()
+  local vm = require "akkar.vm"
+
+  -- A chunk is COMPILED ONCE AND RUN MANY TIMES -- that is the whole reason
+  -- `compile` and `run` are separate calls -- so anything a run mutates on a
+  -- per-chunk table is shared with every other run of that chunk. Two tenants
+  -- executing the same published spec are the ordinary case, not the exotic
+  -- one.
+  --
+  -- Both runs below use ONE compiled chunk. `pause` is the only exposed host
+  -- function and it yields, which is what lets the two runs interleave -- the
+  -- same way a real sandbox interleaves when it touches anything doing I/O.
+  local SOURCE = [[
+    local rounds, nap = ...
+    pause(nap)
+    local ok = pcall(function()
+      local n = 0
+      for _ = 1, rounds do n = n + 1 end
+      return n
+    end)
+    return ok
+  ]]
+
+  it("does not let one run's overrun raise inside another", function()
+    -- `exceeded` and `reason` lived on the table `compile` created, so a
+    -- tenant that exhausted its budget set a flag the sandbox's own `pcall`
+    -- reads -- and the NEXT tenant's `pcall`, on the same chunk, then refused
+    -- to return normally and died with a stranger's message.
+    local chunk = assert(vm.compile(SOURCE, {
+      expose = { pause = function(s) cqueues.sleep(s) end },
+    }))
+
+    local greedy_ok, thrifty_ok, thrifty_report
+    local cq = cqueues.new()
+    cq:wrap(function()
+      -- Exhausts its budget shortly after waking.
+      greedy_ok = vm.run(chunk, { instructions = 2000, check_every = 200 },
+                         5000000, 0.02)
+    end)
+    cq:wrap(function()
+      -- Wakes later, does almost nothing, and must be unaffected.
+      local ok, _, report = vm.run(chunk, { instructions = 10e6 }, 10, 0.12)
+      thrifty_ok, thrifty_report = ok, report
+    end)
+    assert(cq:loop(10))
+
+    assert.is_false(greedy_ok, "the greedy run should have hit its budget")
+    assert.is_true(thrifty_ok,
+      "a neighbour's overrun reached into this run's pcall and raised")
+    assert.is_nil(thrifty_report.exceeded,
+      "this run reported a budget it never exceeded")
+  end)
+
+  -- THE OTHER HALF IS NOT PINNED, AND THIS IS WHY.
+  --
+  -- `run` also used to clear `exceeded` on entry, which reads like the mirror
+  -- defect: a tenant starting a run wipes the flag of a sibling already over
+  -- its budget, and that sibling's `pcall` goes back to swallowing the
+  -- overrun. Fresh state per run closes it by construction.
+  --
+  -- No probe demonstrates it, and it was not written down as fixed without
+  -- one. Between the hook raising and the sandbox's `pcall` reading the flag
+  -- there is no yield, so no sibling can be scheduled inside that window: a
+  -- run that has set the flag either raises straight out of the chunk or is
+  -- already inside the check. The clearing was wrong to write and appears not
+  -- to have been reachable. Both statements are worth keeping.
+end)
