@@ -203,6 +203,23 @@ app:get("/users/:id", {
 end)
 ```
 
+**Accidental globals are an error, not a surprise.** On a server a global
+written inside a handler outlives the request and is visible to the next one:
+
+```lua
+app:run { port = 8080, strict = true }
+```
+
+```
+assignment to undeclared global 'total' at handlers/cart.lua:14
+  a global written in a handler outlives the request and is visible to the next one
+  did you mean `local total`?
+```
+
+akkar itself measures clean — zero global writes across every module, checked
+in the bytecode — and the whole test suite runs under strict mode so that stays
+true.
+
 **Several processes, one port.** One Lua VM is one core, so capacity is
 processes. `SO_REUSEPORT` lets them share a port with no proxy in front:
 

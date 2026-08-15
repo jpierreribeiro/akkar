@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 139 tests with Postgres and Redis up, no database needed, ~2 s
+busted                      # 147 tests with Postgres and Redis up, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -349,6 +349,25 @@ that accepts anything while looking validated.
   died with `EADDRINUSE` while the survivor answered correctly, which found
   the missing `SO_REUSEPORT`; and an affinity mask that split sibling threads
   read as poor scaling when it was contention. Both are written up.
+
+- **Strict mode**, `akkar/strict.lua`, and the whole suite runs under it.
+
+  Global-by-default is the most common criticism of Lua at scale, and on a
+  server it is worse than a typo: a global written inside a handler outlives
+  the request and is visible to the next one, in the same process, for another
+  user.
+
+  `PLAN.md` invariant 9 has said "nothing global" since the beginning and
+  nothing enforced it. akkar measures clean — **zero global writes across every
+  module, checked in the bytecode** — but that was discipline, and discipline
+  does not extend to handlers someone else writes.
+
+  Now `app:run { strict = true }` turns an undeclared global into an error
+  where it happens, with a message that says why it matters rather than only
+  that it happened. Opt-in, because a false positive taking down a live server
+  is worse than the bug it was hunting. `spec/000_strict_first_spec.lua`
+  installs it before every other spec, so the invariant is checked against
+  akkar's own code on every run.
 
 ### Still open
 

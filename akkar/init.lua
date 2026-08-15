@@ -113,7 +113,7 @@ local internal = log.new { level = "info", format = "text" }
 local SETTINGS = {
   host = true, port = true, tls = true, ctx = true,
   body_limit = true, timeout = true, shutdown_grace = true,
-  check_capabilities = true, reuseport = true,
+  check_capabilities = true, reuseport = true, strict = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -970,6 +970,16 @@ function App:run(config)
     check_capability_contracts(config)
   end
 
+  -- Global-by-default is Lua's sharpest edge on a server: a global written
+  -- inside a handler outlives the request and is visible to the next one, in
+  -- the same process, for another user.  Strict mode turns that into an error
+  -- at the moment it happens.
+  --
+  -- Opt-in rather than default, because a false positive that takes down a
+  -- live server is worse than the bug it was looking for.  Development and
+  -- the test suite should turn it on; see `akkar.strict`.
+  if config.strict then require("akkar.strict").on() end
+
   local port = config.port or 8080
   local host = config.host or "127.0.0.1"
   local body_limit = config.body_limit or akkar.defaults.body_limit
@@ -1164,6 +1174,7 @@ akkar.check_capabilities = check_capability_contracts
 akkar.log = log
 akkar.work = require "akkar.work"
 akkar.metrics = require "akkar.metrics"
+akkar.strict = require "akkar.strict"
 
 akkar.Response = Response
 akkar.guard = guard
