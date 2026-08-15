@@ -1223,6 +1223,10 @@ akkar.parse_query = parse_query
 -- policy is application knowledge, the same argument as `akkar.cors`.
 akkar.limit = require "akkar.limit"
 
+-- The same request twice, charged once. Middleware for the same reason:
+-- which requests are idempotent, and for how long, is application knowledge.
+akkar.idempotency = require("akkar.idempotency").new
+
 -- Builds `req` and runs the chain.  Shared by the server and the test client,
 -- so both travel exactly the same path.
 local function handle(app, input)

@@ -572,6 +572,39 @@ forever. A limiter that leaks slots is worse than no limiter.
 six times the configured limit. That is a development default, not rate
 limiting. `akkar.limit.scriptable(cache)` says which one you have.
 
+## The same request twice, charged once
+
+A client cannot tell "the request never arrived" from "the response never came
+back", so it retries — and the card is charged twice. Only the server can tell
+the difference, and only if it remembers.
+
+```lua
+app:use(akkar.idempotency { ttl = 86400 })
+```
+
+```
+POST /charges
+Idempotency-Key: 8f14e45f-ea6e-4b3f-9c2a-1d2f3e4b5a60
+```
+
+Three of the four cases are the interesting ones. A repeat **after
+completion** replays the stored status and body, with `idempotent-replay:
+true` so the client knows its retry did nothing new. A repeat **while the
+first is still running** gets **409** — returning nothing is wrong and running
+it twice is worse. The **same key with a different body** gets **422**, because
+the key is a promise about *which* request this is, and silently replaying
+would hide a client bug exactly where it matters.
+
+**A failed handler releases the key** rather than storing the failure. Caching
+a 500 would mean the retry — the entire point — can never succeed. Only 2xx is
+remembered.
+
+**What it is not:** deduplication at the door, not an idempotent handler. If
+the handler charges a card and then crashes before returning, the charge
+happened and nothing here knows. That needs the payment processor's own key
+underneath this one. And the guarantee is only as strong as the store: with
+`akkar.cache.memory` it is per process, which is not deduplication at all.
+
 ## Known gaps
 
 | | |
