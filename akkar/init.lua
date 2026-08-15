@@ -627,6 +627,23 @@ function App:use(fn)
   return self
 end
 
+--- Registers what to do when akkar is about to answer 500.
+---
+---     app:on_error(function(err, req)
+---       sentry:capture(err, { request_id = req.id, route = req.path })
+---       return akkar.response(500, { instance = req.id })
+---     end)
+---
+--- `err` is whatever was raised, untouched. `req` is the request, and it may
+--- be absent for a failure that happened before one existed.
+function App:on_error(fn)
+  if type(fn) ~= "function" then
+    error("app:on_error needs a function(err, req); got " .. type(fn), 2)
+  end
+  self._on_error = fn
+  return self
+end
+
 -- A sub-application is an ordinary app mounted under a prefix.  One concept
 -- instead of two, and the sub-app stays testable on its own.
 function App:mount(prefix, sub)
@@ -910,7 +927,64 @@ end
 --
 -- Only success bodies are touched.  An error response is the framework's own
 -- shape and has nothing to do with the route's schema.
-local function apply_response_schema(res, schema, where)
+--- Turns an internal failure into a response, through the application's own
+--- handler when it registered one.
+---
+--- Three places produce a 500 -- a handler that raised, middleware that
+--- raised, and a response that did not match its own schema -- and until now
+--- each assembled the body itself and dropped the cause on the floor.
+--- Middleware saw the 500 come back through the chain, which is correct, but
+--- nothing could see WHY. Sentry, an internal error code and RFC 7807 output
+--- all had nowhere to attach.
+---
+--- Two rules keep the invariants intact:
+---
+--- The handler's return value goes through `normalize` like any other
+--- response, so a handler that returns a string or a number becomes the
+--- default 500 rather than escaping as something the server cannot send.
+---
+--- If the error handler itself raises, the default 500 takes over. A bug in
+--- the error handler must not crash the server through the exact path that
+--- exists to stop that happening.
+---
+--- The default is unchanged and stays deliberately bare: `{"error":
+--- "internal server error"}`. A Lua error carries file paths, line numbers
+--- and sometimes SQL. The detail belongs in the log beside the request id,
+--- which is already how it works and is why the response carries that id.
+local function internal_error(app, err, req)
+  local fallback = response(500, { error = "internal server error" })
+
+  local handler = app and app._on_error
+  if not handler then return fallback end
+
+  local ok, result = pcall(handler, err, req)
+
+  -- `normalize` turns nil into 204, which is the right reading of "the
+  -- handler had nothing to add" everywhere except here: answering an empty
+  -- SUCCESS to a request that failed would be the worst outcome of the three.
+  -- Returning nothing from an error handler means it declined.
+  if ok and result == nil then return fallback end
+
+  if not ok then
+    internal:error("the error handler itself raised", {
+      request_id = req and req.id,
+      detail = tostring(result),
+      hint = "the built-in 500 was sent instead",
+    })
+    return fallback
+  end
+
+  local valid, response_or_why = pcall(normalize, result)
+  if not valid then
+    internal:error("the error handler returned something that is not a response", {
+      request_id = req and req.id, detail = tostring(response_or_why),
+    })
+    return fallback
+  end
+  return response_or_why
+end
+
+local function apply_response_schema(res, schema, where, app, req)
   if res.status < 200 or res.status >= 300 then return res end
   if res.raw then return res end
   if type(res.body) ~= "table" then return res end
@@ -926,7 +1000,9 @@ local function apply_response_schema(res, schema, where)
     internal:error("response does not match its schema", {
       at = where, fields = table.concat(detail, "; "),
     })
-    return response(500, { error = "internal server error" })
+    return internal_error(app,
+      "response does not match its schema at " .. tostring(where) ..
+      ": " .. table.concat(detail, "; "), req)
   end
   return response(res.status, cleaned, res.headers)
 end
@@ -1014,11 +1090,11 @@ local function dispatch(app, req)
     internal:error("handler raised", {
       request_id = req.id, at = route.where, detail = tostring(result),
     })
-    return response(500, { error = "internal server error" })
+    return internal_error(app, result, req)
   end
 
   if opts and opts.response then
-    result = apply_response_schema(result, opts.response, route.where)
+    result = apply_response_schema(result, opts.response, route.where, app, req)
   end
   return result
 end
@@ -1079,6 +1155,42 @@ local function request_id(headers)
   id_counter = id_counter + 1
   return ID_PREFIX .. string.format("%06x", id_counter & 0xffffff)
 end
+
+-- W3C Trace Context, which is the same idea as `x-request-id` with a format
+-- everything else already speaks:
+--
+--     traceparent: 00-<32 hex trace id>-<16 hex span id>-<2 hex flags>
+--
+-- akkar accepts one, exposes it, and passes it on. It does NOT create spans
+-- or export them: that is an OpenTelemetry dependency and an adapter, and it
+-- belongs behind the same boundary as everything else here.
+--
+-- Validated rather than trusted. A malformed header is dropped instead of
+-- propagated, because forwarding a broken trace id corrupts somebody else's
+-- trace as well as this one, and it arrives from the network.
+local function trace_context(headers)
+  local given = headers and headers["traceparent"]
+  if type(given) ~= "string" then return nil end
+
+  local version, trace_id, span_id, flags =
+    given:match "^(%x%x)%-(%x+)%-(%x+)%-(%x%x)$"
+  if not version then return nil end
+  if #trace_id ~= 32 or #span_id ~= 16 then return nil end
+  -- All-zero ids are explicitly invalid in the specification.
+  if trace_id:match "^0+$" or span_id:match "^0+$" then return nil end
+  -- Version ff is forbidden; a version akkar does not know is still
+  -- forwarded, which is what the specification asks for.
+  if version == "ff" then return nil end
+
+  return {
+    traceparent = given,
+    trace_id = trace_id,
+    span_id = span_id,
+    sampled = tonumber(flags, 16) & 0x01 == 1,
+    tracestate = headers["tracestate"],
+  }
+end
+akkar.trace_context = trace_context
 
 local function normalize_headers(source)
   local out = {}
@@ -1164,6 +1276,20 @@ local function handle(app, input)
   local to_release = {}
   setmetatable(req, {
     __index = function(self, key)
+      -- Parsed on first read, like a capability, and for the same kind of
+      -- reason: putting it in the constructor added a ninth field to `req`,
+      -- which grew the table's hash part and cost 191 bytes on EVERY request
+      -- including the overwhelming majority that carry no trace at all. The
+      -- allocation ceiling test caught it.
+      --
+      -- Only cached when there is something to cache: a nil result leaves the
+      -- table exactly as it was, so a request without the header stays free.
+      if key == "trace" then
+        local parsed = trace_context(rawget(self, "headers"))
+        if parsed then rawset(self, "trace", parsed) end
+        return parsed
+      end
+
       if not CAPABILITIES[key] then return nil end
       local provided = input.capabilities and input.capabilities[key]
       local value
@@ -1211,6 +1337,8 @@ local function handle(app, input)
     if is_response(value) then
       value.headers = value.headers or {}
       value.headers["x-request-id"] = req.id
+      -- Echoed back so a client can tie the response to the trace it started.
+      if req.trace then value.headers["traceparent"] = req.trace.traceparent end
     end
     if winner == "TIMEOUT" then
       internal:warn("request deadline exceeded", {
@@ -1234,7 +1362,7 @@ local function handle(app, input)
   if not ok then
     if is_response(res) then return res end
     internal:error("middleware raised", { request_id = req.id, detail = tostring(res) })
-    return response(500, { error = "internal server error" })
+    return internal_error(app, res, req)
   end
   return res
 end

@@ -1,5 +1,23 @@
 # Next — deadline correctness and five borrowed ideas
 
+> **Status.** Items 0, 1, 2 and 5 are **done**. Items 3 and 4 remain.
+>
+> Item 0 was confirmed against real servers, and the consequence written here
+> was wrong in a way worth keeping: there is **no cross-request data leak on
+> Postgres**, because pgmoon refuses a busy connection with an error. What
+> happens instead is that the pool slot is poisoned **permanently** — a pool
+> of ten dies after ten timed-out queries.
+>
+> On **Redis** it is a real leak, and that was not in this plan at all: RESP
+> matches replies to commands by order and nothing else, so a request received
+> the abandoned `BLPOP`'s reply as its own answer, and then the stream
+> realigned and everything looked normal again.
+>
+> A third failure came out of the same investigation and is not in this plan
+> either: every in-flight request holds a controller costing **exactly two
+> file descriptors**, which puts a hard wall at ~500 concurrent requests per
+> process against `ulimit -n 1024`. See finding 9 in `PERFORMANCE-STUDY.md`.
+
 Written 2026-08-15. Meant to fold into `docs/BACKLOG.md` once the items land;
 kept separate so it does not conflict with work already in flight.
 
