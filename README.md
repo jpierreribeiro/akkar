@@ -605,6 +605,41 @@ happened and nothing here knows. That needs the payment processor's own key
 underneath this one. And the guarantee is only as strong as the store: with
 `akkar.cache.memory` it is per process, which is not deduplication at all.
 
+## The write that vanishes
+
+Two clients read the same record. Both edit it. Both save. The second
+overwrites the first and **nothing anywhere reports an error** — both saw 200,
+and one person's work is gone, found weeks later if ever.
+
+HTTP has had the answer since 1997 and almost nobody switches it on.
+
+```lua
+app:use(akkar.etag { require_on = { "PUT", "PATCH" }, current = load_document })
+```
+
+```
+GET /documents/7            ->  200, ETag: "a3f1c9..."
+PUT /documents/7            ->  428   no If-Match, and this route demands one
+PUT + If-Match: "stale"     ->  412   the resource moved since you read it
+PUT + If-Match: "a3f1c9..." ->  200
+```
+
+**428 is the line between a feature and an invariant.** Without it a client
+that simply forgets the header races silently, and the mechanism is optional in
+practice. The precondition is checked *before* the handler runs, so a refused
+write never reaches the database — checking afterwards would mean the write
+happened and then the client was told it did not.
+
+`If-None-Match` gets the cheap half: a client that already holds the current
+version gets **304** and no body.
+
+**The limit:** a body-derived ETag is not a row version. Two edits producing
+the same body are indistinguishable, so A-then-B-then-A can let a stale write
+through. The strong form is a version column compared inside the write's own
+transaction, and only the application knows which column that is. This is the
+transport half — correct, free, and a great deal better than what almost every
+JSON API has today, which is nothing.
+
 ## Known gaps
 
 | | |

@@ -1,7 +1,6 @@
 # Next — deadline correctness and five borrowed ideas
 
-> **Status.** Items 0, 1, 2, 3 and 5 are **done**. Item 4 (`If-Match` → 412)
-> remains. Rate and concurrency limiting, which was not on this list, was
+> **Status.** All six items are **done**. Rate and concurrency limiting, which was not on this list, was
 > added as `akkar.limit` after the study measured the need for it.
 >
 > Item 0 was confirmed against real servers, and the consequence written here

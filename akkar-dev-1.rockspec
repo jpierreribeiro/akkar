@@ -70,6 +70,7 @@ build = {
     ["akkar.doctor"] = "akkar/doctor.lua",
     ["akkar.limit"] = "akkar/limit.lua",
     ["akkar.idempotency"] = "akkar/idempotency.lua",
+    ["akkar.etag"] = "akkar/etag.lua",
     ["akkar.strict"] = "akkar/strict.lua",
     ["akkar.work"] = "akkar/work.lua",
     ["akkar.openapi"] = "akkar/openapi.lua",

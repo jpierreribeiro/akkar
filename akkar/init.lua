@@ -1227,6 +1227,11 @@ akkar.limit = require "akkar.limit"
 -- which requests are idempotent, and for how long, is application knowledge.
 akkar.idempotency = require("akkar.idempotency").new
 
+-- The write that vanishes: two clients read, both write, one write is gone
+-- with no error anywhere. HTTP has had the answer since 1997.
+akkar.etag = require("akkar.etag").new
+akkar.etag_of = require("akkar.etag").of
+
 -- Builds `req` and runs the chain.  Shared by the server and the test client,
 -- so both travel exactly the same path.
 local function handle(app, input)
