@@ -34,8 +34,31 @@ local function check(path)
 end
 
 describe("Teal declarations", function()
-  it("the declaration file itself type-checks", function()
-    assert.is_truthy(check("types/akkar.d.tl"):match "0 errors detected")
+  it("every declaration file type-checks", function()
+    -- All of them, discovered rather than listed, so a new one added without
+    -- a test still gets checked.
+    local listing = assert(io.popen "ls types/*.d.tl")
+    local found = 0
+    for path in listing:lines() do
+      found = found + 1
+      assert.is_truthy(check(path):match "0 errors detected",
+                       path .. " does not type-check")
+    end
+    listing:close()
+    assert.is_true(found >= 4)
+  end)
+
+  it("declares the modules akkar actually ships", function()
+    -- A declaration file that has drifted asserts guarantees that no longer
+    -- hold, so the set is checked against the rockspec rather than trusted.
+    local rockspec = assert(io.open "akkar-dev-1.rockspec"):read "a"
+    for _, module in ipairs { "akkar.jobs", "akkar.db.memory", "akkar.cache.memory" } do
+      assert.is_truthy(rockspec:find(module, 1, true), module .. " missing from rockspec")
+      local path = "types/" .. module .. ".d.tl"
+      local file = io.open(path)
+      assert.is_truthy(file, "no declarations for " .. module)
+      if file then file:close() end
+    end
   end)
 
   it("a correct handler passes", function()

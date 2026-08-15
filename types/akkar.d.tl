@@ -158,6 +158,36 @@ local record akkar
       with: function(Logger, {string: any}): Logger
    end
 
+   -- =================================================================== jobs
+   -- Semantics live in `akkar.jobs`; a store only persists.  Three methods is
+   -- the whole store contract, so a new backend is small.
+   record JobStore
+      enqueue: function(JobStore, string, string): integer
+      dequeue: function(JobStore, string, ?number): string
+      depth: function(JobStore, string): integer
+   end
+
+   record Job
+      kind: string
+      payload: any
+      queued_at: integer
+   end
+
+   record ConsumeOptions
+      timeout: number
+      log: Logger
+      should_stop: function(): boolean
+   end
+
+   record Queue
+      push: function(Queue, string, any): integer
+      pop: function(Queue, ?number): Job, string
+      depth: function(Queue): integer
+      -- A failing job is logged and dropped.  A retry policy nobody chose
+      -- hides the failure and repeats the side effects already committed.
+      consume: function(Queue, {string: function(any, ?Job)}, ?ConsumeOptions): {string: integer}
+   end
+
    -- ================================================================== server
    record RunOptions
       host: string
