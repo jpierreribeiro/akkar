@@ -203,6 +203,16 @@ app:get("/users/:id", {
 end)
 ```
 
+**Several processes, one port.** One Lua VM is one core, so capacity is
+processes. `SO_REUSEPORT` lets them share a port with no proxy in front:
+
+```lua
+app:run { port = 8080, reuseport = true }
+```
+
+Measured on a c5.2xlarge: 2.02x from one process to two, 3.57x to four, with
+per-process throughput holding at 1.01x and 0.89x. See `bench/RESULTS.md`.
+
 **Logs that correlate without being asked to.** A request id is taken from
 `x-request-id` or generated, echoed on the response, and bound into `req.log`:
 
@@ -273,6 +283,7 @@ PORT=8099 lua5.4 examples/crud.lua
 | `docs/BACKLOG.md` | what is done, what is next, and what is deliberately not built |
 | `docs/substrate/RESULT.md` | substrate proof: TLS, driver concurrency, CRUD |
 | `bench/README.md` | throughput, multicore scaling, and what a blocking handler costs |
+| `bench/RESULTS.md` | measured on a c5.2xlarge, including the run that was wrong |
 | `examples/crud.lua` | ten scenarios against a real Postgres |
 
 ## Safe defaults

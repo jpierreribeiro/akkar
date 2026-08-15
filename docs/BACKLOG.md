@@ -349,11 +349,22 @@ that accepts anything while looking validated.
   backlog item. It is the strongest argument yet for the adapter boundary, and
   eventually for owning the substrate.
 
-- **Benchmarks**, `bench/`, written for a machine with real cores. Three
-  targets: throughput, N-process scaling under `SO_REUSEPORT`, and what one
-  blocking handler costs at N=1 versus N=8. Results go in `bench/RESULTS.md`
-  with the instance type, because a number without its machine is not a
-  result.
+- **Benchmarks**, `bench/`, run on a c5.2xlarge. Results in
+  `bench/RESULTS.md`. The methodology is borrowed from `uruquim-odin`'s
+  `planning/benchmark-methodology.md`: verify every response, alternate the
+  order, discard a warm-up, and derive the noise floor from the machine
+  (2.6% here).
+
+  What came out: the framework scales 3.57x to four processes; `/ping` does
+  36k req/s against `/users/:id` at 2.6k, so the database dominates a real
+  request by thirteen to one; one blocking handler multiplies neighbour p99
+  by ten, and `work.yielding` takes it back to baseline.
+
+  The first run was wrong in an instructive way — seven of eight processes
+  had died with `EADDRINUSE` and the survivor answered everything correctly,
+  so the run passed its own gate. That found the missing `SO_REUSEPORT`
+  support and added a rule the borrowed methodology did not have: verify the
+  configuration, not only the responses.
 
 ---
 
