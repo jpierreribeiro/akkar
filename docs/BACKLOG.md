@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 147 tests with Postgres and Redis up, no database needed, ~2 s
+busted                      # 152 tests with Postgres, Redis and tl available, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -368,6 +368,36 @@ that accepts anything while looking validated.
   is worse than the bug it was hunting. `spec/000_strict_first_spec.lua`
   installs it before every other spec, so the invariant is checked against
   akkar's own code on every run.
+
+- **Teal type declarations**, `types/akkar.d.tl`.
+
+  The strongest criticism of Lua for anything carrying real responsibility is
+  that nothing checks your intent before the program runs. Writing akkar
+  carefully does not answer that. Teal — a typed dialect compiling to plain Lua
+  — does, and the ecosystem already has the pattern: a `-tl-type` package
+  carrying declarations for a library written in ordinary Lua. akkar is not
+  rewritten; a handler written in Teal simply gets checked.
+
+  Verified against a handler written to fail in three specific ways:
+
+  ```
+  invalid key 'parms' in record 'req' of type akkar.Request
+  in local declaration: n: got string, expected integer
+  unknown field timout
+  ```
+
+  That last one is now caught in **three layers**: Teal at compile time,
+  config validation at startup, strict mode at runtime.
+
+  `spec/teal_spec.lua` runs the compiler against the declarations and both
+  example handlers, so they cannot drift. A declaration file that has drifted
+  is worse than none — it asserts guarantees that no longer hold. Skipped when
+  `tl` is absent, so nobody needs Teal to work on akkar.
+
+  **What it still cannot catch**, said so nobody assumes otherwise: whether a
+  schema matches the table a handler actually returns. Schemas are values built
+  at runtime; validation is what checks them. Types narrow the gap, they do not
+  close it.
 
 ### Still open
 

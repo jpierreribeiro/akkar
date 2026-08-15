@@ -203,6 +203,20 @@ app:get("/users/:id", {
 end)
 ```
 
+**Types, if you want them.** Lua checks nothing before the program runs, and
+writing akkar carefully does not change that. `types/akkar.d.tl` means a
+handler written in [Teal](https://github.com/teal-language/tl) — a typed
+dialect compiling to plain Lua — is checked without akkar being rewritten:
+
+```
+invalid key 'parms' in record 'req' of type akkar.Request
+in local declaration: n: got string, expected integer
+unknown field timout
+```
+
+It does not check whether a schema matches what a handler returns; schemas are
+runtime values, and validation is what checks those.
+
 **Accidental globals are an error, not a surprise.** On a server a global
 written inside a handler outlives the request and is visible to the next one:
 
