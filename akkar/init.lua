@@ -14,6 +14,7 @@ in a framework that exists:
 ]]
 
 local cqueues = require "cqueues"
+local time    = require "akkar.time"
 local server  = require "http.server"
 local headers = require "http.headers"
 local cjson   = require "cjson"
@@ -442,9 +443,9 @@ local WATCHDOG_LIMIT        = 0.100   -- seconds of uninterrupted CPU
 -- Recorded rather than quietly reverted, because the reasoning was sound and
 -- someone will have it again.
 local function install_watchdog(where)
-  local cpu, last, warned = 0, cqueues.monotime(), false
+  local cpu, last, warned = 0, time.monotime(), false
   debug.sethook(function()
-    local now = cqueues.monotime()
+    local now = time.monotime()
     local dt = now - last
     last = now
     if dt < 0.050 then cpu = cpu + dt else cpu = 0 end
@@ -519,9 +520,9 @@ local function with_deadline(seconds, fn)
   -- descriptor for work that was already ready to run.
   cq:step(0)
 
-  local deadline = cqueues.monotime() + seconds
+  local deadline = time.monotime() + seconds
   while winner == nil do
-    local remaining = deadline - cqueues.monotime()
+    local remaining = deadline - time.monotime()
     if remaining <= 0 then break end
     cqueues.poll(cq, remaining)        -- yields to the outer controller
     cq:step(0)
@@ -1592,10 +1593,10 @@ function App:stop(grace)
   pcall(function() self.server:pause() end)
 
   self.state = "DRAINING"
-  local deadline = cqueues.monotime() + grace
+  local deadline = time.monotime() + grace
   local warned = false
   while self.in_flight > 0 do
-    if cqueues.monotime() > deadline and not warned then
+    if time.monotime() > deadline and not warned then
       warned = true
       internal:warn("shutdown stalled; still waiting, nothing is being forced", {
         in_flight = self.in_flight, grace_s = grace,

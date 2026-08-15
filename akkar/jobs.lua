@@ -72,6 +72,8 @@ local cjson = require "cjson"
 local Queue = {}
 Queue.__index = Queue
 
+local time = require "akkar.time"
+
 local M = {}
 
 -- Exponential backoff with full jitter.  The jitter is not decoration: a
@@ -150,11 +152,11 @@ function Queue:push(kind, payload, options)
     id = options.id,
     kind = kind,
     payload = payload,
-    queued_at = os.time(),
+    queued_at = time.now(),
     attempts = 0,
   }
 
-  local run_at = delayed and (os.time() + options.delay) or 0
+  local run_at = delayed and (time.now() + options.delay) or 0
 
   -- CLAIMING AND PUSHING ARE ONE STEP where the store can do it.
   --
@@ -188,7 +190,7 @@ end
 function Queue:pop(timeout)
   -- Anything whose time has come joins the queue before we look at it.
   if supports(self.store, "promote") then
-    self.store:promote(self.key, os.time())
+    self.store:promote(self.key, time.now())
   end
 
   local encoded = self.store:dequeue(self.key, timeout or 5)
@@ -229,17 +231,17 @@ end
 function Queue:fail(job, err)
   job.attempts = (job.attempts or 0) + 1
   job.last_error = tostring(err)
-  job.first_failed_at = job.first_failed_at or os.time()
+  job.first_failed_at = job.first_failed_at or time.now()
 
   if job.attempts <= self.retries then
     local delay = delay_for(job.attempts, self.backoff)
-    self.store:schedule(self.key, cjson.encode(job), os.time() + delay)
+    self.store:schedule(self.key, cjson.encode(job), time.now() + delay)
     return "retried", delay
   end
 
   if not self.dead_letter then return "dropped" end
 
-  job.died_at = os.time()
+  job.died_at = time.now()
   self.store:enqueue(self:dead_key(), cjson.encode(job))
 
   -- An unbounded dead-letter queue is a memory leak with a respectable name.

@@ -15,6 +15,7 @@ Output goes to stderr by default, so nothing needs configuring to work.
 ]]
 
 local cjson = require "cjson"
+local time  = require "akkar.time"
 
 local LEVELS = { debug = 10, info = 20, warn = 30, error = 40 }
 
@@ -60,7 +61,7 @@ end
 function Logger:log(level, message, fields)
   if LEVELS[level] < LEVELS[self.level] then return end
 
-  local entry = { level = level, message = message, time = os.time() }
+  local entry = { level = level, message = message, time = time.now() }
   merge(entry, self.bound)
   merge(entry, fields)
 

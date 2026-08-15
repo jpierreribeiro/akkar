@@ -12,6 +12,8 @@ with quantiles, because those cannot be aggregated across processes, and this
 framework's answer to more CPU is more processes.
 ]]
 
+local time = require "akkar.time"
+
 local M = {}
 
 -- Buckets in seconds, chosen for an API talking to a database: sub-millisecond
@@ -28,7 +30,7 @@ function M.new(options)
     requests = {},        -- [method|route|status] = count
     duration = {},        -- [method|route] = { counts = {}, sum, total }
     gauges   = {},        -- [name|labels] = value
-    started  = os.time(),
+    started  = time.now(),
   }, Registry)
 end
 
@@ -134,7 +136,7 @@ function Registry:render()
 
   line ""
   line "# TYPE akkar_uptime_seconds gauge"
-  line("akkar_uptime_seconds " .. (os.time() - self.started))
+  line("akkar_uptime_seconds " .. (time.now() - self.started))
 
   return table.concat(out, "\n") .. "\n"
 end
@@ -174,7 +176,7 @@ function Registry:middleware()
   local cqueues = require "cqueues"
   local akkar = require "akkar"
   return function(req, next)
-    local started = cqueues.monotime()
+    local started = time.monotime()
 
     -- OBSERVED ON BOTH OUTCOMES. Raising is how akkar expresses a deliberate
     -- 404 and how a handler error becomes a 500, so measuring only the value
@@ -187,7 +189,7 @@ function Registry:middleware()
     -- that omits them says the server is healthy in the exact minute it is
     -- not.
     local ok, res = pcall(next, req)
-    local elapsed = cqueues.monotime() - started
+    local elapsed = time.monotime() - started
 
     local status
     if ok then

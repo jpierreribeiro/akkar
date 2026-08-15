@@ -20,6 +20,8 @@ local jobs = require "akkar.jobs"
 local Store = {}
 Store.__index = Store
 
+local time = require "akkar.time"
+
 local M = {}
 
 function Store:enqueue(key, encoded)
@@ -76,7 +78,7 @@ function Store:claim(key, id, ttl)
   local seen = self.claims[key]
   if not seen then seen = {} self.claims[key] = seen end
 
-  local now = os.time()
+  local now = time.now()
   local held = seen[id]
   if held and held > now then return false end
   seen[id] = now + (ttl or 3600)
