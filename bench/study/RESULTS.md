@@ -1,0 +1,190 @@
+# The positioning study
+
+What the previous benchmark page could not say, measured properly and on a
+machine that survived the run.
+
+```
+machine   : AWS c5.2xlarge, Xeon Platinum 8124M @ 3.00GHz
+topology  : 4 physical cores x 2 threads
+affinity  : servers on 2 whole physical cores, generator on 1
+reserved  : 1 whole physical core left to the kernel -- see below
+processes : 2 per framework, one per physical core, VERIFIED after every start
+pool      : 10 connections per process, all three
+load      : wrk, 5 repetitions, alternating order, nearest-rank median
+date      : 2026-08-15
+```
+
+Semantic equivalence proved before any timing: all four variants return
+byte-identical JSON on every route, compared canonically, and a run whose body
+contains `"error"` is refused rather than measured.
+
+---
+
+## 1. What the performance work bought
+
+akkar at `62a40ca`, before any fix, against HEAD. Same harness, same machine,
+alternating, zero retries on both rows.
+
+| route | baseline | HEAD | change | floor |
+|---|---|---|---|---|
+| `/ping` @100 | 18,575 req/s · p50 5.30ms · p99 7.67ms | 21,732 · 4.70ms · **5.59ms** | **+17.0%** | 2.8% |
+| `/users/42` @16 | 2,724 · 5.64ms · 11.77ms | 7,758 · **2.04ms** · **2.96ms** | **+184.7%** | 1.7% |
+
+Reproduced on three independent machines across two CPU generations: `/ping`
+came out +19.2%, +17.1% and +17.0%; `/users/42` came out 2.85x twice.
+
+The database route improves on **all three** columns — throughput 2.85x, p50
+down 64%, p99 down 75%. An earlier run showed the tail getting *worse*, and
+that was an artefact of measuring at a concurrency the pool could not serve.
+See part 3.
+
+---
+
+## 2. akkar against Gin and FastAPI
+
+This **supersedes** `bench/compare/RESULTS.md`, whose magnitudes were retracted
+after an audit found four asymmetries running simultaneously.
+
+### Framework alone — `/ping`, 100 connections
+
+```
+framework          req/s        p50        p99   spread   relative
+gin            117316.51   631.00us     8.90ms     1.6%      1.00x
+fastapi         22009.46     3.60ms     7.42ms     1.2%      0.19x
+akkar           20648.03     4.85ms     6.08ms     4.3%      0.18x
+akkar-lean      22916.64     4.24ms     6.70ms     0.9%      0.20x
+```
+
+### One indexed query — `/users/42`, 16 connections
+
+```
+gin             26358.92   562.00us     1.53ms     1.2%      1.00x
+akkar            7321.95     2.16ms     3.22ms     1.4%      0.28x
+fastapi          5687.87     2.80ms     3.64ms     5.5%      0.22x
+akkar-lean       8016.22     1.64ms     3.87ms     0.9%      0.30x
+```
+
+### Two hundred rows — `/rows/200`, 16 connections
+
+```
+gin              7194.09     1.98ms     7.09ms     1.1%      1.00x
+akkar            1450.45    10.92ms    15.93ms     2.2%      0.20x
+fastapi           879.68    18.02ms    22.52ms     0.9%      0.12x
+```
+
+**akkar is at parity with FastAPI on the framework path and ahead of it on
+every route that touches the database** — 29% ahead on one row, 65% ahead on
+two hundred. Every earlier conclusion on this subject is reversed: the
+retracted page had FastAPI 1.4x ahead on `/ping` and 3.4x ahead on the query.
+
+Gin remains 3x to 5x ahead, and the honest framing is per core: one Gin
+process spreads goroutines across every core while one Lua VM is one core.
+Per process it is **10,267 against ~58,600 — 5.7x**, and that is the number
+that means something.
+
+---
+
+## 3. Does capacity follow cores?
+
+```
+framework procs         req/s        p50        p99   per-proc
+akkar    1          10024.38     9.72ms    12.80ms      10024
+akkar    2          20534.50     4.84ms     5.81ms      10267
+```
+
+**Linear.** akkar's central claim — one VM is one core, so buy capacity with
+processes — is measured and true. Slightly superlinear here, as the second
+process picks up hyperthread siblings that were idle.
+
+---
+
+## 4. The tail, and where it comes from
+
+`/users/42`, holding the pool fixed and varying only the offered concurrency:
+
+```
+configuration                 req/s        p50        p99   spread
+pool 10  conns 50          7338.34     5.52ms    22.57ms     2.7%
+pool 10  conns 100         7044.75     5.33ms      4.88s     1.1%
+pool 30  conns 100         7715.17    11.90ms    23.94ms     4.9%
+pool 30  conns 200         7050.82    25.93ms    80.93ms     3.3%
+```
+
+**Throughput is flat.** Every configuration serves about seven thousand a
+second, and offered concurrency beyond the pool buys nothing but queue — which
+the tail pays for, two hundred fold.
+
+The tail was never something the performance work introduced. It is pool-wait,
+and it disappears when the connections fit. This is the measurement that
+`akkar.limit.concurrent` exists for.
+
+---
+
+## 5. What the per-request deadline costs — **and a suspicion refuted**
+
+An earlier comparison showed akkar at p99 647ms and akkar-lean at 86ms on the
+same route, which suggested the deadline was multiplying the tail sevenfold.
+That was two separate runs, and it was recorded as a suspicion rather than a
+result. The controlled version, same process, alternating, five repetitions:
+
+```
+variant               req/s        p50          p99   spread
+shipped             7539.71    12.19ms      27.40ms     3.2%
+lean                8596.92    10.48ms      27.55ms     1.1%
+```
+
+**The deadline costs 12.3% of throughput and nothing at all in the tail** —
+27.40ms against 27.55ms, indistinguishable. The suspicion was wrong, and the
+discipline that recorded it as a suspicion is what allowed it to be checked.
+
+Twelve percent for a per-request wall-clock budget that neither Gin nor
+uvicorn offers is the trade akkar makes, stated rather than hidden. It is one
+line to turn off.
+
+---
+
+## 6. How each one degrades as the body grows
+
+```
+rows      akkar        gin     fastapi   akkar/gin   akkar/fastapi     bytes
+1       7214.06   22362.21     5366.85       0.32x           1.34x        66
+10      6070.25   20640.23     4299.32       0.29x           1.41x       618
+100     2416.92   10565.29     1520.95       0.23x           1.59x      9846
+500      641.84    3561.76      375.53       0.18x           1.71x     51486
+1000     332.66    1973.68      191.78       0.17x           1.74x    104799
+2000     167.16    1004.03       96.91       0.17x           1.72x    213009
+```
+
+**akkar beats FastAPI at every size, and the margin widens with the payload** —
+1.34x at one row, 1.74x at a thousand. Against Gin the ratio degrades from
+0.32x to 0.17x, and that curve is pgmoon decoding rows in the interpreter:
+55% of a thousand-row query, measured by stage.
+
+The retracted page said akkar's degradation was worse than everyone's. It is
+worse than Gin's and **better than FastAPI's**.
+
+---
+
+## What this study is not
+
+- **Not a claim about developer velocity, ecosystem or maintenance**, which
+  decide framework choice far more often than throughput does.
+- **Not tuned Postgres, other query shapes, or a realistic mixed workload.**
+  Three routes, one box, stock settings.
+- **Not sustained load.** Every figure is ten seconds. A soak is still owed.
+
+## What it cost to get
+
+Four machines. Three of them went unreachable mid-run and were replaced before
+the cause was understood; three separate technical hypotheses — descriptor
+exhaustion, softirq starvation, spot reclaim — were argued from symptoms and
+all three were wrong. The evidence that mattered was that SSH **timed out**
+rather than being refused, which is a packet being dropped, which on AWS is a
+security group: a `/32` rule pinned to a residential IP that changes every
+half hour or so. Nothing was ever wrong with the machines.
+
+The harness carries the scars, and they are the reason these numbers can be
+trusted: the process count is verified after every start, each server proves
+which tree it loaded, a run whose body says `"error"` is refused, the
+concurrency for database routes is derived from the pool rather than chosen,
+and one physical core is reserved so the kernel is never starved.

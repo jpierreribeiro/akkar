@@ -1,5 +1,20 @@
 # akkar against Gin and FastAPI
 
+> ## ⚠ SUPERSEDED — see `bench/study/RESULTS.md`
+>
+> This page was retracted, and the re-run it promised has since happened on a
+> harness built to refuse exactly the defects listed below. **Read
+> `bench/study/RESULTS.md` instead.**
+>
+> What the re-run found, so nobody has to hunt for it: akkar is at **parity
+> with FastAPI** on the framework path and **ahead of it on every route that
+> touches the database** — the opposite of what this page reported. Gin stays
+> 3x to 5x ahead. And the conclusion below that the gap *widens* with a
+> database is wrong: it **narrows**, from 0.18x to 0.28x.
+>
+> The original retraction follows, kept because the four defects it names are
+> the reason the new harness exists.
+>
 > ## ⚠ THE MAGNITUDES BELOW ARE NOT DEFENSIBLE
 >
 > An audit of this harness found four asymmetries running **simultaneously**
