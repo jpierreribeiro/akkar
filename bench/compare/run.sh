@@ -125,12 +125,21 @@ done
 [ "$FAILED" -eq 1 ] && { echo; echo "RUN INVALID -- see above."; exit 1; }
 
 echo "# results on $TARGET (median of $REPS, alternating order)"
-printf "  %-10s %14s %12s %12s %12s\n" "framework" "req/s" "p50" "p99" "relative"
+printf "  %-10s %13s %10s %10s %10s %9s\n" \
+       "framework" "req/s" "p50" "p99" "relative" "spread"
 BASE=""
 for fw in "${FRAMEWORKS[@]}"; do
-  read -r rps p50 p99 <<<"$(echo "${SAMPLES[$fw]}" | grep -v '^$' | sort -n \
-    | awk '{r[NR]=$1;a[NR]=$2;b[NR]=$3} END {m=int((NR+1)/2); print r[m], a[m], b[m]}')"
+  # Median, and the spread across this framework's own repetitions.  The
+  # spread IS its noise floor for this run: a difference smaller than it is
+  # not a result.
+  read -r rps p50 p99 spread <<<"$(echo "${SAMPLES[$fw]}" | grep -v '^$' | sort -n \
+    | awk '{r[NR]=$1;a[NR]=$2;b[NR]=$3}
+           END {m=int((NR+1)/2)
+                printf "%s %s %s %.1f", r[m], a[m], b[m], (r[NR]-r[1])/r[m]*100}')"
   [ -z "$BASE" ] && BASE="$rps"
   rel=$(awk -v x="$rps" -v b="$BASE" 'BEGIN{printf "%.2fx", x/b}')
-  printf "  %-10s %14s %12s %12s %12s\n" "$fw" "$rps" "$p50" "$p99" "$rel"
+  printf "  %-10s %13s %10s %10s %10s %8s%%\n" "$fw" "$rps" "$p50" "$p99" "$rel" "$spread"
 done
+echo
+echo "  spread is this framework's own noise on this run; a difference"
+echo "  smaller than the larger of two spreads is not a result"

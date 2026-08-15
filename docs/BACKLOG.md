@@ -446,6 +446,35 @@ that accepts anything while looking validated.
 
   `work.queue(cache, name)` still works and forwards, so nothing breaks.
 
+- **Comparison against Gin and FastAPI**, `bench/compare/RESULTS.md`.
+
+  | `/ping` | | `/users/:id` | |
+  |---|---:|---|---:|
+  | gin | 163,014 | gin | 26,212 |
+  | fastapi | 40,245 | fastapi | 9,316 |
+  | akkar | 28,850 | akkar | 2,744 |
+
+  **The headline is a correction.** This project had concluded from akkar alone
+  that "the framework is not the limit; Postgres is". Gin gets 26k from that
+  same Postgres, so it never was. The same query costs 32 µs through pgx,
+  82 µs through asyncpg and **330 µs through pgmoon**, which parses the wire
+  protocol in pure Lua. Pool size was ruled out first: akkar is flat at 2,740
+  whether the pool is 10 or 25, while Gin climbs from 26k to 32.6k.
+
+  akkar's own overhead is 34.7 µs against FastAPI's 24.8 µs — the same order.
+  **The gap is the driver, not the language**, and it sits squarely inside the
+  adapter boundary, which is the first time that boundary has been justified by
+  a number rather than by principle.
+
+  Three of the four predictions recorded in advance were wrong, and they are
+  scored in the results rather than quietly dropped.
+
+  One near-miss worth keeping: the first run had FastAPI at 2,433 req/s,
+  because it was installed without `uvloop` and `httptools`. That would have
+  published akkar as 11.8x faster than FastAPI when it is in fact 1.4x slower.
+  The equivalence gate does not catch a competitor being accidentally
+  handicapped — that check is human, and it nearly did not happen.
+
 ### Still open
 
 Nothing here blocks using akkar. Two items are closed by measurement rather

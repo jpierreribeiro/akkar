@@ -80,14 +80,18 @@ processes        req/s        p50        p99   req/s/process   scaling
 Throughput gains 12% from one process to two — above the 0.7% floor, so real —
 then flattens at about 2,700 req/s. p99 nearly halves, 191 ms to 100 ms.
 
-**The framework is not the limit; Postgres is.** `/ping` reaches 31,802 req/s
-where `/users/:id` reaches 2,705: the framework is **twelve times faster** than
-the path that touches the database — and Postgres here is unpinned, in Docker,
-on stock settings, competing for the same box.
+> **This section drew the wrong conclusion, and `bench/compare/RESULTS.md`
+> corrects it.** It read the gap between `/ping` at 31.8k and `/users/:id` at
+> 2.7k as "Postgres is the limit". Gin later reached 26,212 req/s and FastAPI
+> 9,316 against that same Postgres, on this same box, with the same pool and
+> the same query — so Postgres was never the limit at 2.7k. The limit is
+> **pgmoon**, which parses the wire protocol in pure Lua. Left here rather than
+> rewritten, because the reasoning is instructive: measuring one system alone
+> cannot tell you which of its parts is saturated.
 
-This confirms over HTTP and under load what every earlier measurement in this
-project predicted: in a real request the database dominates and the framework is
-noise. Optimising the router would be optimising the 8%.
+`/ping` reaches 31,802 req/s where `/users/:id` reaches 2,705. Within akkar the
+database path is twelve times more expensive than the framework path — but that
+cost is the driver's, not the database's.
 
 ### 3. What one blocking handler costs the neighbours
 
