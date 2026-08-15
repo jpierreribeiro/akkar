@@ -225,6 +225,12 @@ that accepts anything while looking validated.
   none is reachable, because binding done by the server cannot be tested
   against a fake.
 
+- **The pool lives in `akkar/pool.lua`**, not inside the Postgres adapter.
+  Whether a returned resource is fit for reuse is passed in as a predicate,
+  because "still inside a transaction" means something to Postgres and nothing
+  to Redis. The existing pool tests passed unchanged, which is the only real
+  evidence that a refactor was a refactor.
+
 ### Still open
 
 - **Validating handler output against `response`.** Today it is documentation

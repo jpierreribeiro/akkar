@@ -54,6 +54,7 @@ build = {
   modules = {
     ["akkar"]    = "akkar/init.lua",
     ["akkar.db"] = "akkar/db.lua",
+    ["akkar.pool"] = "akkar/pool.lua",
     ["akkar.openapi"] = "akkar/openapi.lua",
   },
   copy_directories = { "docs", "examples" },

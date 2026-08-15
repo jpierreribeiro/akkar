@@ -302,7 +302,7 @@ end)
 
 describe("connection pool", function()
   local cqueues = require "cqueues"
-  local db_adapter = require "akkar.db"
+  local Pool = require "akkar.pool"
 
   -- A pool over fake connections: the pool logic is what is under test, not
   -- Postgres.  `docs/substrate/RESULT.md` covers the real driver.
@@ -316,7 +316,7 @@ describe("connection pool", function()
       function conn:release() if self.pool then self.pool:put(self) else self:close() end end
       return conn
     end
-    local pool = db_adapter.Pool.new(open, size)
+    local pool = Pool.new(open, size, function(c) return not c.in_transaction and c.pg ~= nil end)
     return pool, function() return opened end
   end
 
@@ -376,7 +376,7 @@ describe("connection pool", function()
 
   it("does not leak a slot when opening fails", function()
     local attempts = 0
-    local pool = db_adapter.Pool.new(function()
+    local pool = Pool.new(function()
       attempts = attempts + 1
       error("connection refused", 0)
     end, 2)
@@ -416,7 +416,7 @@ describe("connection pool", function()
   end)
 
   it("pool_size = 0 opts out and opens per request", function()
-    local factory = db_adapter.connect { pool_size = 0, database = "x" }
+    local factory = require("akkar.db").connect { pool_size = 0, database = "x" }
     assert.equal("function", type(factory))           -- no pool attached
   end)
 end)

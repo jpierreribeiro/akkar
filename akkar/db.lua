@@ -19,9 +19,8 @@ no server-side plan caching between calls.  That is correct, safe binding; it
 is not the same thing as a named prepared statement.
 ]]
 
-local cqueues = require "cqueues"
-local condition = require "cqueues.condition"
-local pgmoon  = require "pgmoon"
+local pgmoon = require "pgmoon"
+local Pool   = require "akkar.pool"
 
 local Db = {}
 Db.__index = Db
@@ -90,73 +89,6 @@ end
 
 local M = {}
 
--- ====================================================================== pool
--- A bounded pool.  Two things it has to get right, because this is where
--- pool code is usually wrong:
---
---   1. When the pool is exhausted it YIELDS the coroutine instead of
---      blocking.  Blocking here would stall every other request in the
---      process, which is the exact failure the whole async design avoids.
---   2. A connection is returned even when the handler raised.  Same
---      discipline as `transaction`: the release is not the caller's to
---      remember.
-local Pool = {}
-Pool.__index = Pool
-
-function Pool.new(open, size)
-  return setmetatable({
-    open = open, size = size,
-    idle = {}, live = 0,
-    waiters = condition.new(),
-  }, Pool)
-end
-
-function Pool:get()
-  while true do
-    local conn = table.remove(self.idle)
-    if conn then
-      conn.pool = self
-      return conn
-    end
-    if self.live < self.size then
-      self.live = self.live + 1
-      local ok, conn_or_err = pcall(self.open)
-      if not ok then
-        self.live = self.live - 1
-        self.waiters:signal(1)         -- the slot is free again
-        error(conn_or_err, 0)
-      end
-      conn_or_err.pool = self
-      return conn_or_err
-    end
-    -- Exhausted: wait for a release.  `condition:wait` yields; it does not
-    -- spin and it does not block the loop.
-    self.waiters:wait()
-  end
-end
-
-function Pool:put(conn)
-  conn.pool = nil
-  -- A connection left inside a transaction, or one whose rollback failed, is
-  -- discarded.  Reusing it would hand an open BEGIN to the next request.
-  if conn.in_transaction or conn.broken or not conn.pg then
-    pcall(function() conn:close() end)
-    self.live = self.live - 1
-  else
-    self.idle[#self.idle + 1] = conn
-  end
-  self.waiters:signal(1)
-end
-
-function Pool:close()
-  for _, conn in ipairs(self.idle) do pcall(function() conn:close() end) end
-  self.idle, self.live = {}, 0
-end
-
-function Pool:stats()
-  return { size = self.size, live = self.live, idle = #self.idle }
-end
-
 -- ==================================================================== connect
 -- Returns a factory: akkar calls it once per request.  `pool_size = 0` opts
 -- out and opens a connection per request, which is what the substrate proof
@@ -179,7 +111,12 @@ function M.connect(config)
   local size = config.pool_size == nil and 10 or config.pool_size
   if size <= 0 then return open end
 
-  local pool = Pool.new(open, size)
+  -- What "fit for reuse" means here, and only here: a connection still inside
+  -- a transaction, or one whose rollback failed, would hand an open BEGIN to
+  -- the next request.
+  local pool = Pool.new(open, size, function(conn)
+    return not conn.in_transaction and not conn.broken and conn.pg ~= nil
+  end)
   -- A callable table rather than a plain function, so the pool can be reached
   -- for shutdown and diagnostics.  Lua functions cannot carry fields.
   return setmetatable({ pool = pool }, {
