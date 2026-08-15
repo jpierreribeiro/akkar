@@ -306,7 +306,7 @@ stats() { echo "$1" | grep -v '^$' | sort -n | awk '
        spread = r[m] > 0 ? (r[NR]-r[1])/r[m]*10000 : 0
        print r[m], p[m], spread}'; }
 
-report() {   # label samples_base samples_patch connections
+report() {   # label samples_base samples_patch connections [ceiling_rps]
   local label="$1" conns="$4"
   read -r brps bp50 bspread <<<"$(stats "$2")"
   read -r prps pp50 pspread <<<"$(stats "$3")"
@@ -320,16 +320,29 @@ report() {   # label samples_base samples_patch connections
   printf "  %-10s %13s %11s %13.1f%%\n" "baseline" "$brps" "$bp50" "$(awk -v x="$bspread" 'BEGIN{print x/100}')"
   printf "  %-10s %13s %11s %13.1f%%\n" "patch"    "$prps" "$pp50" "$(awk -v x="$pspread" 'BEGIN{print x/100}')"
 
-  # Rule 5: under closed-loop load, latency is connections / throughput.  If
-  # the measured p50 matches that, the number is queue depth and says nothing
-  # about how long the server took.
-  local implied measured ratio
-  implied=$(awk -v c="$conns" -v r="$prps" 'BEGIN{printf "%.3f", (r>0)? c/r*1000 : 0}')
-  measured=$(to_ms "$pp50")
-  ratio=$(awk -v i="$implied" -v m="$measured" 'BEGIN{printf "%.2f", (m>0)? i/m : 0}')
-  if awk -v r="$ratio" 'BEGIN{exit !(r > 0.85 && r < 1.15)}'; then
-    echo "  note: p50 ${measured}ms matches connections/throughput (${implied}ms)."
-    echo "        This run is saturated, so p50 is QUEUE DEPTH, not service time."
+  # Rule 5, stated correctly.
+  #
+  # An earlier version of this check compared p50 against connections divided
+  # by throughput and warned whenever they matched.  They ALWAYS match: in a
+  # closed-loop test that identity is Little's law, not a symptom.  It was
+  # detecting arithmetic.
+  #
+  # What actually distinguishes service time from queue depth is whether the
+  # SERVER had headroom: if adding connections raises throughput a lot, the
+  # low-concurrency run was not saturating anything and its latency is service
+  # time.  If throughput barely moves, the low run was already at the ceiling
+  # and its latency is queue depth.
+  if [ -n "${5:-}" ]; then
+    local headroom
+    headroom=$(awk -v low="$prps" -v ceil="$5" 'BEGIN{printf "%.2f", (low>0)? ceil/low : 0}')
+    if awk -v h="$headroom" 'BEGIN{exit !(h < 1.2)}'; then
+      echo "  note: throughput at c=$conns is within 20% of the ceiling"
+      echo "        (${headroom}x).  This run is saturated, so its latency is"
+      echo "        QUEUE DEPTH, not service time.  Lower the concurrency."
+    else
+      echo "  headroom: the ceiling is ${headroom}x this run's throughput, so"
+      echo "            latency here is service time rather than queue depth."
+    fi
   fi
 
   echo
@@ -348,7 +361,12 @@ report() {   # label samples_base samples_patch connections
 }
 
 report "throughput ceiling" "${CEIL[base]}" "${CEIL[patch]}" "$CONNECTIONS"
-report "service time"       "${LOW[base]}"  "${LOW[patch]}"  "$LOW_CONNECTIONS"
+
+# The service-time section is handed the ceiling, so it can say whether it had
+# headroom rather than restating Little's law.
+CEIL_RPS=$(echo "${CEIL[patch]}" | grep -v '^$' | sort -n \
+  | awk '{r[NR]=$1} END {print r[int((NR+1)/2)]}')
+report "service time" "${LOW[base]}" "${LOW[patch]}" "$LOW_CONNECTIONS" "$CEIL_RPS"
 
 echo "# reading it"
 echo "  The ceiling section answers 'how much work fits'.  The service-time"
