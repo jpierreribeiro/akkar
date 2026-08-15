@@ -1,0 +1,159 @@
+
+==============================================================
+1. What the performance work actually bought
+==============================================================
+machine   : Intel(R) Xeon(R) Platinum 8124M CPU @ 3.00GHz
+topology  : 4 physical cores x 2 threads
+affinity  : servers 2,6,3,7, generator 1,5
+reserved  : 0,4 left to the kernel -- see lib.sh for why
+load      : wrk -t4 -c100 -d10s, 5 reps, median
+date      : 2026-08-15 18:51 UTC
+
+akkar against akkar: the tree at 62a40ca, before any fix, against HEAD.
+Same harness, same machine, same processes, alternating order.
+
+/ping at 100 connections  (identical responses from both trees)  [0 retried]
+  variant          req/s        p50        p99   spread
+  baseline      17682.49     5.48ms     8.57ms     1.0%
+  HEAD          20775.05     4.82ms     5.77ms     6.7%
+  change +17.5% (1.17x), floor 6.7% -- certified
+
+/users/42 at 16 connections  (identical responses from both trees)  [0 retried]
+  variant          req/s        p50        p99   spread
+  baseline       2561.78     5.93ms    12.75ms     1.6%
+  HEAD           7304.40     2.10ms     3.10ms    23.9%
+  change +185.1% (2.85x), floor 23.9% -- certified
+
+/rows/200 at 16 connections  (identical responses from both trees)  [0 retried]
+  variant          req/s        p50        p99   spread
+  baseline       1314.21    10.24ms    24.75ms     2.7%
+  HEAD           1447.63    10.06ms    20.97ms     1.1%
+  change +10.2% (1.10x), floor 2.7% -- certified
+
+
+==============================================================
+2. akkar against Gin and FastAPI
+==============================================================
+machine   : Intel(R) Xeon(R) Platinum 8124M CPU @ 3.00GHz
+topology  : 4 physical cores x 2 threads
+affinity  : servers 2,6,3,7, generator 1,5
+reserved  : 0,4 left to the kernel -- see lib.sh for why
+load      : wrk -t4 -c100 -d10s, 5 reps, median
+date      : 2026-08-15 19:00 UTC
+processes : 2 each, one per physical core, VERIFIED after start
+pool      : 10 connections per process, all three
+
+/ping at 100 connections  (all four return byte-identical JSON)
+  framework           req/s        p50        p99   spread  relative
+  gin             117316.51   631.00us     8.90ms     1.6%     1.00x
+  fastapi          22009.46     3.60ms     7.42ms     1.2%     0.19x
+  akkar            20648.03     4.85ms     6.08ms     4.3%     0.18x
+  akkar-lean       22916.64     4.24ms     6.70ms     0.9%     0.20x
+
+/users/42 at 16 connections  (all four return byte-identical JSON)
+  framework           req/s        p50        p99   spread  relative
+  gin              26358.92   562.00us     1.53ms     1.2%     1.00x
+  fastapi           5687.87     2.80ms     3.64ms     5.5%     0.22x
+  akkar             7321.95     2.16ms     3.22ms     1.4%     0.28x
+  akkar-lean        8016.22     1.64ms     3.87ms     0.9%     0.30x
+
+/rows/200 at 16 connections  (all four return byte-identical JSON)
+  framework           req/s        p50        p99   spread  relative
+  gin               7194.09     1.98ms     7.09ms     1.1%     1.00x
+  fastapi            879.68    18.02ms    22.52ms     0.9%     0.12x
+  akkar             1450.45    10.92ms    15.93ms     2.2%     0.20x
+  akkar-lean        1469.75    10.60ms    17.57ms     1.6%     0.20x
+
+
+==============================================================
+3. Does capacity follow cores?
+==============================================================
+machine   : Intel(R) Xeon(R) Platinum 8124M CPU @ 3.00GHz
+topology  : 4 physical cores x 2 threads
+affinity  : servers 2,6,3,7, generator 1,5
+reserved  : 0,4 left to the kernel -- see lib.sh for why
+load      : wrk -t4 -c100 -d10s, 5 reps, median
+date      : 2026-08-15 19:17 UTC
+One Lua VM is one core, so akkar's answer to more CPU is more
+processes. This is where that claim is either true or it is not.
+
+  framework procs         req/s        p50        p99  per-proc
+  akkar    1          10024.38     9.72ms    12.80ms     10024
+  akkar    2          20534.50     4.84ms     5.81ms     10267
+
+  gin      1          60445.18     1.63ms     4.88ms     60445
+  gin      2         117602.72   640.00us     8.83ms     58801
+
+  fastapi  1          10686.85     7.53ms    31.94ms     10687
+  fastapi  2          21880.75     3.57ms     7.32ms     10940
+
+
+==============================================================
+6. The tail that appeared when the median got seven times better
+==============================================================
+machine   : Intel(R) Xeon(R) Platinum 8124M CPU @ 3.00GHz
+topology  : 4 physical cores x 2 threads
+affinity  : servers 2,6,3,7, generator 1,5
+reserved  : 0,4 left to the kernel -- see lib.sh for why
+load      : wrk -t4 -c100 -d10s, 5 reps, median
+date      : 2026-08-15 19:23 UTC
+
+On /users/42 HEAD serves 3.80x the throughput of the baseline and
+halves p50 seven times over -- while p99 goes from 99ms to 307ms and
+the spread from 0.9% to 12.2%.
+
+The hypothesis: HEAD is now fast enough that the CONNECTION POOL is
+the queue. 2 processes x pool 10 is 60 database connections
+against 100 client connections, so 40 requests are always waiting for
+a slot. The baseline was slow enough per request that the client never
+piled up like that.
+
+If that is right, the tail collapses when the connections fit -- and
+does not when the pool is merely bigger than the demand.
+
+  configuration                 req/s        p50        p99   spread
+  pool 10  conns 50          7338.34     5.52ms    22.57ms     2.7%
+  pool 10  conns 100         7044.75     5.33ms      4.88s     1.1%
+  pool 30  conns 100         7715.17    11.90ms    23.94ms     4.9%
+  pool 30  conns 200         7050.82    25.93ms    80.93ms     3.3%
+
+  (pool x 2 processes is the real connection count: 10 -> 60, 30 -> 180)
+
+==============================================================
+7. What the per-request deadline costs in the tail
+==============================================================
+machine   : Intel(R) Xeon(R) Platinum 8124M CPU @ 3.00GHz
+topology  : 4 physical cores x 2 threads
+affinity  : servers 2,6,3,7, generator 1,5
+reserved  : 0,4 left to the kernel -- see lib.sh for why
+load      : wrk -t4 -c100 -d10s, 5 reps, median
+date      : 2026-08-15 19:27 UTC
+
+In part 2, akkar showed p99 647ms on /users/42 and akkar-lean showed
+86ms on the same route and the same load. The only difference between
+them is timeout = 0, which bypasses the deadline controller.
+
+Those were two separate runs, so that is a suspicion and not a result.
+This is the controlled version: same process, alternating, five
+repetitions, at the concurrency where part 6 showed the pool queues.
+
+  variant               req/s        p50          p99   spread
+  shipped             7539.71    12.19ms      27.40ms     3.2%
+  lean                8596.92    10.48ms      27.55ms     1.1%
+
+  shipped = the deadline as akkar ships it; lean = timeout 0, no controller
+
+==============================================================
+5. How each one degrades as the body grows
+==============================================================
+machine   : Intel(R) Xeon(R) Platinum 8124M CPU @ 3.00GHz
+topology  : 4 physical cores x 2 threads
+affinity  : servers 2,6,3,7, generator 1,5
+reserved  : 0,4 left to the kernel -- see lib.sh for why
+load      : wrk -t4 -c100 -d10s, 5 reps, median
+date      : 2026-08-15 19:29 UTC
+
+  framework rows           req/s        p50        p99       bytes
+  akkar    1            7214.06     2.14ms     2.94ms          66
+  akkar    10           6070.25     2.58ms     4.13ms         618
+  akkar    100          2416.92     6.57ms     9.82ms        9846

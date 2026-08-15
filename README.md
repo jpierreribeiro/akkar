@@ -532,6 +532,46 @@ Duplicate routes are not checked: they already fail at startup naming both
 sites. What is checked is the case no invariant catches — `/users/:id` and
 `/users/:name` compile to the same pattern, and the second can never match.
 
+## Refusing fast instead of accepting slowly
+
+The study measured `/users/42` at four configurations, changing only how much
+concurrency was offered against a fixed pool:
+
+```
+60 pool conns,  50 clients   10,933 req/s   p99    6.79ms
+60 pool conns, 100 clients   10,302 req/s   p99  396.09ms
+180 pool conns, 100 clients  10,923 req/s   p99   13.58ms
+```
+
+Throughput is **flat**. Past capacity, accepting more work does not produce
+more answers — it produces a queue, and the tail pays for it sixtyfold.
+
+```lua
+app:use(akkar.limit.concurrent { limit = 5 })          -- at once, per caller
+app:use(akkar.limit.rate { per_second = 10, burst = 20 })
+```
+
+The concurrency limiter is the one those numbers argue for, and the one most
+frameworks leave out. A caller making ten requests a second is fine; the same
+caller holding fifty open against a pool of twenty is that 396 ms for
+everybody else.
+
+The decision runs **inside Redis**, as a Lua script sent with `EVAL`. Each
+limiter is read-then-write, and between the read and the write another process
+can decide the same thing — a limit that is not a limit. Redis runs a script
+atomically, so the decision happens where the state is. Timestamps come from
+Redis too, so a client with a wrong clock cannot move the window.
+
+The slot is released on **every** exit — normal return, thrown response,
+handler error — and entries older than a TTL are dropped on acquire, so a
+handler that dies without releasing costs one slot for one TTL rather than
+forever. A limiter that leaks slots is worse than no limiter.
+
+**The limit that must be stated:** these are only as strong as the store. With
+`akkar.cache.memory` the counters are per process, so a fleet of six enforces
+six times the configured limit. That is a development default, not rate
+limiting. `akkar.limit.scriptable(cache)` says which one you have.
+
 ## Known gaps
 
 | | |

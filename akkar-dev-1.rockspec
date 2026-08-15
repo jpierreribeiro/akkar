@@ -68,6 +68,7 @@ build = {
     ["akkar.scope"] = "akkar/scope.lua",
     ["akkar.vm"] = "akkar/vm.lua",
     ["akkar.doctor"] = "akkar/doctor.lua",
+    ["akkar.limit"] = "akkar/limit.lua",
     ["akkar.strict"] = "akkar/strict.lua",
     ["akkar.work"] = "akkar/work.lua",
     ["akkar.openapi"] = "akkar/openapi.lua",

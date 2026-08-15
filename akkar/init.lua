@@ -1219,6 +1219,10 @@ local function parse_query(qs)
 end
 akkar.parse_query = parse_query
 
+-- Rate and concurrency limiting, as middleware rather than core: a limit
+-- policy is application knowledge, the same argument as `akkar.cors`.
+akkar.limit = require "akkar.limit"
+
 -- Builds `req` and runs the chain.  Shared by the server and the test client,
 -- so both travel exactly the same path.
 local function handle(app, input)
