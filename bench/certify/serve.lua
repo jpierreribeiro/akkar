@@ -32,9 +32,25 @@ local db    = require "akkar.db"
 local port = tonumber(arg[1]) or 8500
 local pool = tonumber(arg[2]) or 10
 
+-- Best-effort pid, for the identity endpoint.
+local PID = tonumber((io.popen and (function()
+  local f = io.open("/proc/self/stat")
+  if not f then return nil end
+  local pid = f:read("n"); f:close(); return pid
+end)()) ) or 0
+
 local app = akkar.new()
 
 app:get("/ping", function() return { pong = true } end)
+
+-- Identity, so a harness can prove it is measuring the server it started
+-- rather than whatever else happened to be on the port.  That is not
+-- hypothetical: this target was once measured against a different agent's
+-- server that had claimed the port first, and every check passed because
+-- something answered.
+app:get("/__whoami", function()
+  return { target = "akkar-certify", dir = akkar_dir or "cwd", pid = PID }
+end)
 
 app:get("/users/:id", {
   params   = { id = akkar.v.integer { min = 1 } },

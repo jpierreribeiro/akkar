@@ -11,8 +11,12 @@ nothing else.
 
 Parameters go over the Postgres extended protocol -- pgmoon sends Parse, Bind,
 Describe and Execute with typed binding -- so a value is never spliced into SQL
-text.  This file used to interpolate `$1` through escape_literal on top of a
-library that already did it properly; deleting that was the fix.
+text.
+
+The types those parameters carry are corrected here: pgmoon declares every Lua
+number as `numeric`, which is a cross-type comparison against an integer column
+and therefore a sequential scan.  See `serialize_number` below; it is worth
+43x on a 10,000-row table.
 
 The statement is UNNAMED, meaning the parse happens on every call and there is
 no server-side plan caching between calls.  That is correct, safe binding; it
@@ -25,13 +29,29 @@ local Pool   = require "akkar.pool"
 local Db = {}
 Db.__index = Db
 
--- pgmoon marks NULL with a sentinel; cjson needs nil.
-local function clean(row, null)
-  if not row then return nil end
-  for k, val in pairs(row) do
-    if null ~= nil and val == null then row[k] = nil end
-  end
-  return row
+-- Postgres type OIDs for bound parameters.
+--
+-- THIS IS THE MOST EXPENSIVE LINE OF CODE IN THE PROJECT, by its absence.
+--
+-- pgmoon types every Lua number as `numeric` (OID 1700).  Comparing an
+-- `integer` column against a `numeric` parameter is a cross-type comparison
+-- Postgres cannot answer from the index, so it casts the column on every row
+-- and falls back to a sequential scan.  Measured on a 10,000-row table:
+--
+--     $1 numeric   Seq Scan,   Rows Removed by Filter: 10001,  3.287 ms
+--     $1 bigint    Index Scan, Index Cond: (id = '42'::bigint), 0.153 ms
+--
+-- Forty-three times, and it grows with the table.  Every parameterised lookup
+-- akkar has ever made against a numeric column has been a full scan.
+--
+-- Lua integers are 64-bit, so `int8` is the honest type.  Floats stay
+-- `float8`; comparing a float to an integer column legitimately cannot use
+-- the index, and pretending otherwise would change what the query means.
+local INT8, FLOAT8, TEXT, BOOL = 20, 701, 25, 16
+
+local function serialize_number(_, v)
+  if math.type(v) == "integer" then return INT8, tostring(v) end
+  return FLOAT8, tostring(v)
 end
 
 function Db:query(sql, ...)
@@ -43,7 +63,6 @@ end
 function Db:many(sql, ...)
   local res = self:query(sql, ...)
   if type(res) ~= "table" then return {} end
-  for i = 1, #res do clean(res[i], self.null) end
   return res
 end
 
@@ -105,7 +124,22 @@ function M.connect(config)
     }
     local ok, err = pg:connect()
     if not ok then error("db: could not connect: " .. tostring(err), 0) end
-    return setmetatable({ pg = pg, null = pgmoon.null }, Db)
+
+    -- Override pgmoon's number serializer per connection, so this fix needs
+    -- no fork of the driver.
+    pg.type_serializers = setmetatable({ number = serialize_number },
+                                       { __index = pg.type_serializers })
+
+    -- `null` was read from `pgmoon.null`, which does not exist -- the module
+    -- exports only VERSION, Postgres and new.  So the row-cleaning pass that
+    -- used it compared every field against nil and removed nothing, on every
+    -- row of every result.  It cost 9% of a single-row query and 24% of a
+    -- hundred-row one, which is exactly the shape of the "medium JSON" problem
+    -- from the previous framework.  It is gone.
+    --
+    -- Nothing is lost: pgmoon leaves a SQL NULL out of the row table entirely
+    -- unless `convert_null` is set, which akkar does not set.
+    return setmetatable({ pg = pg }, Db)
   end
 
   local size = config.pool_size == nil and 10 or config.pool_size

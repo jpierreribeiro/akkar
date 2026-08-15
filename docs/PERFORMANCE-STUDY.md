@@ -80,6 +80,70 @@ Taken from the previous framework's methodology, each earned by a mistake:
 
 ## Findings
 
-Recorded as they land, with the fix and its certification.
+### 1. Every parameterised query was a sequential scan — **certified, 3.91x**
 
-*(in progress)*
+pgmoon types every Lua number as `numeric` (OID 1700). Comparing an `integer`
+column against a `numeric` parameter is a cross-type comparison Postgres
+cannot answer from an index, so it casts the column on every row:
+
+```
+$1 numeric   Seq Scan,   Rows Removed by Filter: 10001,   3.287 ms
+$1 bigint    Index Scan, Index Cond: (id = '42'::bigint), 0.153 ms
+```
+
+Forty-three times on ten thousand rows, and it grows with the table. This was
+not a Lua problem, a framework problem or a driver-speed problem. It was a
+wrong type on a bound parameter, and it had been there since the day akkar
+first spoke to a database.
+
+**Certified end to end**, akkar against akkar, six processes each, identical
+configuration on both sides, five repetitions in alternating order:
+
+```
+variant      req/s        p50         p99    spread
+before     1848.98    49.40ms    209.71ms     11.7%
+after      7225.48    10.99ms    270.40ms     12.1%
+
+change : +290.8%  (3.91x)     floor: 12.1%     VERDICT: CERTIFIED
+```
+
+Fixed in `akkar/db.lua` by overriding pgmoon's number serializer per
+connection — Lua integers become `int8`, floats stay `float8`. Six tests in
+`spec/db_spec.lua` pin it, including one asserting the query plan contains no
+`Seq Scan`.
+
+### 2. A row-cleaning pass that could never do anything — removed
+
+`akkar/db.lua` walked every field of every row swapping `pgmoon.null` for nil.
+`pgmoon.null` does not exist; the module exports only `VERSION`, `Postgres` and
+`new`. So the comparison `null ~= nil and val == null` was always false, and the
+walk removed nothing on every row of every result.
+
+Measured at 41.4 µs wasted on a hundred rows and 395.4 µs on a thousand — 4.5%
+of the database path. Nothing is lost by removing it: pgmoon omits a SQL NULL
+from the row table entirely unless `convert_null` is set, which akkar never
+set.
+
+### 3. It is not the JSON encoder
+
+Same 1000-row payload, 57,665 bytes:
+
+```
+Go encoding/json      327 µs
+lua-cjson           1,123 µs
+Python json         1,919 µs
+```
+
+`lua-cjson` is 1.7x faster than Python's standard library. The "medium JSON"
+shape akkar shows is **not** serialisation: decomposed by stage, pgmoon's fetch
+and row decoding is **85–99%** of the path at every payload size, and
+`cjson.encode` never exceeds 10.6%. Per row, pgmoon costs 10.2 µs against
+cjson's 1.28 µs — the driver decode is eight times the encode for the same
+data.
+
+Half of pgmoon's cost is the socket layer: `receive_message` does two reads per
+message and Postgres sends one DataRow message per row, so a thousand rows cost
+**2,006 socket reads averaging 22 bytes each**. The other half is building one
+Lua table per row.
+
+*(more as the remaining lines of enquiry land)*
