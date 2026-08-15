@@ -1453,8 +1453,27 @@ local function handle(app, input)
   -- released here.  Releasing a database connection at this point would hand
   -- a live cursor to the next request.  The writer calls this instead, once
   -- the last byte is out.
+  --
+  -- On a COPY, never on the table the handler returned. Writing `release` onto
+  -- the handler's own value meant a handler returning a hoisted or memoised
+  -- response had request A's closure overwritten by request B: A's connection
+  -- was then never released and B's was released twice -- and the second
+  -- release found `pool` already cleared and CLOSED a connection sitting in
+  -- the pool's idle set. One leaked slot, one poisoned entry, one 500 to an
+  -- innocent request, per occurrence.
   if ok and is_response(res) and res.stream then
-    res.release = release_all
+    local streamed = response(res.status, res.body, res.headers)
+    streamed.stream = res.stream
+    streamed.content_type = res.content_type
+    streamed.raw = res.raw
+    -- Composed, not overwritten: middleware may already have deferred work of
+    -- its own onto the response, and the concurrency limiter does exactly that.
+    local deferred = res.release
+    streamed.release = function()
+      if deferred then pcall(deferred) end
+      release_all()
+    end
+    res = streamed
   else
     release_all()
   end

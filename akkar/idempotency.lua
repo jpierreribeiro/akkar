@@ -232,6 +232,19 @@ function M.new(options)
       error(result, 0)
     end
 
+    -- A streamed response has no body yet: the bytes are produced after this
+    -- middleware returns. Storing it recorded `status 200, body ""`, so a
+    -- retry replayed an EMPTY 200 for the whole TTL -- including for an export
+    -- whose producer died mid-body and left the client a truncated file. The
+    -- retry is the entire point of this module, and that made it useless
+    -- exactly when it was needed.
+    --
+    -- Not storable, so the claim goes back and a repeat re-runs the export.
+    if result and result.stream then
+      pcall(function() release(cache, { record }, {}) end)
+      return result
+    end
+
     local status = result and result.status or 200
     if status < 200 or status >= 300 then
       pcall(function() release(cache, { record }, {}) end)

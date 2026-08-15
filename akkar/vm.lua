@@ -161,11 +161,34 @@ local chunk_state = setmetatable({}, { __mode = "k" })
 -- never touches the sandbox's copy.
 local MAX_STRING = 1024 * 1024
 
--- Zero outside a run.  Lua runs one coroutine at a time and a sandboxed chunk
--- has no `coroutine` to yield with, so a plain counter is enough.
-local sandbox_depth = 0
-local sandbox_limit = MAX_STRING
+-- Per COROUTINE, not per process.
+--
+-- This was a pair of process globals: a depth counter incremented by `run`
+-- and decremented after, plus a single limit that the last `compile` won.
+-- Two defects came out of that, and both are cross-tenant:
+--
+-- A sandbox abandoned by a request deadline never runs the decrement, because
+-- an abandoned coroutine never resumes. The bound then applied to the WHOLE
+-- process, host code included, for the life of that process. Measured: one
+-- timed-out request made a plain `("x"):rep(4 MiB)` in framework code fail
+-- with one tenant's 64-byte ceiling.
+--
+-- And the single limit was last-writer-wins, so a tenant compiling with a
+-- generous ceiling raised it for a tenant who had asked for nothing, and a
+-- tenant compiling with a tiny one broke everybody else's strings.
+--
+-- Keyed on the running coroutine, both problems disappear by construction: an
+-- abandoned coroutine's entry is simply garbage that nothing ever reads
+-- again, and no two sandboxes can see each other's ceiling. The table holds
+-- weak keys so a collected coroutine takes its entry with it.
+local MAX_STRING = 1024 * 1024
+local active = setmetatable({}, { __mode = "k" })
 local bounds_installed = false
+
+local function current_limit()
+  local co = coroutine.running()
+  return co and active[co] or nil
+end
 
 local function install_string_bounds()
   if bounds_installed then return end
@@ -174,11 +197,12 @@ local function install_string_bounds()
   local rep = string.rep
 
   string.rep = function(s, n, sep)
-    if sandbox_depth > 0 then
+    local limit = current_limit()
+    if limit then
       local size = (#tostring(s) + #tostring(sep or "")) * (tonumber(n) or 0)
-      if size > sandbox_limit then
+      if size > limit then
         error(("string.rep would build %d bytes; the limit is %d")
-              :format(size, sandbox_limit), 2)
+              :format(size, limit), 2)
       end
     end
     return rep(s, n, sep)
@@ -215,13 +239,12 @@ function M.compile(source, options)
 
   local env = options.env or base_environment()
   install_string_bounds()
-  if options.max_string then sandbox_limit = options.max_string end
 
   -- The sandbox's copy points at the bounded one, so both spellings agree.
   env.string = env.string or {}
   env.string.rep = string.rep
 
-  local state = {}
+  local state = { max_string = options.max_string or MAX_STRING }
   install_pcall(env, state)
 
   for name, value in pairs(options.expose or {}) do env[name] = value end
@@ -289,9 +312,15 @@ function M.run(chunk, limits, ...)
   -- the diagnostic for every request that ran a sandbox.
   local previous, previous_mask, previous_count = debug.gethook()
   debug.sethook(hook, "", step)
-  sandbox_depth = sandbox_depth + 1
+  -- Marked on THIS coroutine only, so an abandoned run cannot bound anybody
+  -- else and two tenants cannot see each other's ceiling.
+  local co = coroutine.running()
+  local restore = co and active[co]
+  if co then active[co] = state.max_string or MAX_STRING end
+
   local results = table.pack(pcall(chunk, ...))
-  sandbox_depth = sandbox_depth - 1
+
+  if co then active[co] = restore end
   debug.sethook(previous, previous_mask or "", previous_count or 0)
 
   local report = { instructions = used, peak_kb = peak, exceeded = state.exceeded }

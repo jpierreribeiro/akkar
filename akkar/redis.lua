@@ -52,7 +52,13 @@ local function read_reply(sock)
   local tag, rest = line:sub(1, 1), line:sub(2)
 
   if tag == "+" then return rest end
-  if tag == "-" then return nil, rest end
+  -- The third value says WHICH KIND of failure this is. An error reply is the
+  -- server answering normally with bad news -- WRONGTYPE, NOSCRIPT -- and the
+  -- stream is perfectly in step afterwards. A read failure is not. Returning
+  -- `nil, err` for both made every application-level error destroy the
+  -- connection: measured, two WRONGTYPE replies took the pool from
+  -- `live=1 idle=1` to `live=0 idle=0`, reconnecting each time.
+  if tag == "-" then return nil, rest, "reply" end
   if tag == ":" then return tonumber(rest) end
 
   if tag == "$" then
@@ -101,20 +107,29 @@ Redis._read_reply = read_reply
 -- that clears it, which is exactly what makes the state visible to the pool.
 function Redis:command(...)
   if not self.sock then error("redis: connection is closed", 0) end
+  -- Marked BEFORE the write, not after.
+  --
+  -- `sock:write` yields whenever the send buffer fills, so a deadline landing
+  -- there abandons the coroutine with the command half on the wire -- and the
+  -- old placement left every reuse predicate satisfied. The next request's
+  -- command was then swallowed as payload of the unfinished one. Measured
+  -- with a 300 MiB value and a 20 ms deadline: the following request got no
+  -- reply and burned its own deadline.
+  self.in_flight = true
+
   local ok, err = self.sock:write(encode(...))
   if not ok then
     self.broken = true
     error("redis: write failed: " .. tostring(err), 0)
   end
 
-  self.in_flight = true
-  local value, reply_err = read_reply(self.sock)
+  local value, reply_err, kind = read_reply(self.sock)
   self.in_flight = false
 
   if reply_err then
-    -- A protocol-level failure leaves the stream out of step, so the
-    -- connection cannot be handed to the next request.
-    if not value then self.broken = true end
+    -- Only a PROTOCOL failure leaves the stream out of step. An error reply
+    -- is the server answering, and the connection is still perfectly usable.
+    if kind ~= "reply" then self.broken = true end
     error("redis: " .. tostring(reply_err), 0)
   end
   return value

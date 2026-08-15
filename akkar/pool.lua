@@ -42,6 +42,7 @@ function Pool:get()
     local resource = table.remove(self.idle)
     if resource then
       resource.pool = self
+      resource.pooled = nil
       return resource
     end
 
@@ -56,6 +57,7 @@ function Pool:get()
         error(resource_or_err, 0)
       end
       resource_or_err.pool = self
+      resource_or_err.pooled = nil
       return resource_or_err
     end
 
@@ -66,6 +68,16 @@ function Pool:get()
 end
 
 function Pool:put(resource)
+  -- Returning the same resource twice used to put it in `idle` twice, and
+  -- then two callers of `get()` received THE SAME OBJECT -- two requests
+  -- sharing one connection, which is the worst outcome this file can produce.
+  -- Verified: `put` twice gave `live=1 idle=2`, and two `get()` calls returned
+  -- the same table.
+  --
+  -- It is reachable whenever a release runs on two paths, and one such path
+  -- shipped in the streaming code.
+  if resource.pooled then return end
+
   resource.pool = nil
   local keep = true
   if self.reusable then
@@ -74,16 +86,31 @@ function Pool:put(resource)
   end
 
   if keep then
+    resource.pooled = true
     self.idle[#self.idle + 1] = resource
   else
     pcall(function() resource:close() end)
     self.live = self.live - 1
   end
-  self.waiters:signal(1)
+
+  -- Wake EVERY waiter, not one.
+  --
+  -- A request whose deadline fires while it is parked in `get()` is never
+  -- resumed, but it stays registered on the condition -- so `signal(1)` can
+  -- hand the wakeup to a coroutine that will never take it, and the live
+  -- waiter sleeps on beside an idle connection. Measured: a request waited
+  -- its full ten-second budget and returned 503 with `idle=1` in the pool.
+  --
+  -- One wakeup is lost per abandoned waiter, so timeouts under saturation
+  -- produce more timeouts -- exactly when a pool matters most. Waking all of
+  -- them costs a few needless loop iterations, which the loop already handles
+  -- because it re-checks and re-waits.
+  self.waiters:signal()
 end
 
 function Pool:close()
   for _, resource in ipairs(self.idle) do
+    resource.pooled = nil
     pcall(function() resource:close() end)
   end
   self.idle, self.live = {}, 0
