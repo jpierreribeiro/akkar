@@ -539,10 +539,23 @@ Written down because the list keeps trying to grow.
 
 ## Ideas parked, not rejected
 
-- **`akkar doctor`** — one command reporting runtime versions, route count,
-  duplicate routes, unconfigured dependencies, database reachability and which
-  production defaults are active. Attractive specifically for Lua, where "which
-  combination of libraries and versions actually works" is a real and recurring
-  pain: `pgmoon` needs `mime` without declaring it, `luaossl` compiles with
-  deprecation warnings against OpenSSL 3, `cqueues` pins an exact Lua version.
+- ~~**`akkar doctor`**~~ — **built**, `akkar/doctor.lua` and `bin/akkar`.
+
+  What it turned into, beyond the sketch: three levels rather than a list,
+  because a doctor that cries wolf gets ignored. `FAIL` exits 1 so a deploy
+  step can gate on it; a missing optional library is a warning, since
+  "luaossl is not installed" must not block a service speaking plain HTTP;
+  an unreachable declared database is a failure, since the server refuses to
+  boot in that state anyway.
+
+  Duplicate routes were dropped from the sketch — they already fail at
+  startup naming both sites, so there was nothing to add. What replaced them
+  is the case no invariant catches: `/users/:id` and `/users/:name` compile
+  to the same pattern and the second can never match.
+
+  Two defects it found in itself on the first run. The shadow check compared
+  routes by pattern, which excluded exactly the case above, since those two
+  patterns are identical. And the OpenSSL version printed as `805306576` —
+  a true fact nobody can use — because luaossl returns the packed
+  `OPENSSL_VERSION_NUMBER`.
 - **Generated clients and generated test data**, downstream of OpenAPI.

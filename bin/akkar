@@ -1,0 +1,87 @@
+#!/usr/bin/env lua5.4
+--[[
+akkar — the command line.
+
+One subcommand so far, and it is the one that answers the question a Lua
+project actually gets stuck on: **is this machine's combination of libraries
+one that works?**
+
+    akkar doctor                    what is installed, and what will bite
+    akkar doctor app.lua            and this application's configuration
+    akkar doctor app.lua --json     the same, for something that parses
+    akkar doctor app.lua --no-probe without touching the database
+
+`app.lua` is any file that returns the app, optionally with the config
+`app:run{}` would receive:
+
+    local app = require("akkar").new()
+    app:get("/health", function() return { ok = true } end)
+    return app, { db = db.connect { ... }, reuseport = true }
+
+Exit code is 0 when nothing is broken and 1 when something is, so a deploy
+step can gate on it. A warning is not a failure: "luaossl is not installed"
+must not block a service that speaks plain HTTP.
+]]
+
+local USAGE = [[
+akkar — a microframework for JSON APIs on cqueues and lua-http
+
+usage:
+  akkar doctor [app.lua] [--json] [--no-probe]
+
+    Reports the runtime, the installed libraries, this application's routes
+    and settings, and whether its capabilities answer. Exits 1 if anything is
+    broken.
+
+    app.lua      a file returning `app` or `app, config`
+    --json       machine-readable output
+    --no-probe   skip anything that touches the network
+
+  akkar version
+  akkar help
+]]
+
+local function fail(message)
+  io.stderr:write("akkar: " .. message .. "\n")
+  os.exit(2)
+end
+
+local function load_app(path)
+  local chunk, err = loadfile(path)
+  if not chunk then fail("could not load " .. path .. ": " .. tostring(err)) end
+
+  local ok, app, config = pcall(chunk)
+  if not ok then fail("loading " .. path .. " raised: " .. tostring(app)) end
+  if type(app) ~= "table" or type(app.routes) ~= "table" then
+    fail(path .. " must return the value akkar.new() returned; got " ..
+         type(app) .. ".\n  Add `return app` at the end, or `return app, config`.")
+  end
+  return app, config
+end
+
+local function doctor(args)
+  local path, options = nil, { exit = true }
+  for _, arg in ipairs(args) do
+    if arg == "--json" then options.json = true
+    elseif arg == "--no-probe" then options.probe = false
+    elseif arg:sub(1, 2) == "--" then fail("unknown option " .. arg)
+    else path = arg end
+  end
+
+  if path then options.app, options.config = load_app(path) end
+  require("akkar.doctor").cli(options)
+end
+
+local command = arg[1]
+local rest = { table.unpack(arg, 2) }
+
+if command == "doctor" then
+  doctor(rest)
+elseif command == "version" then
+  print("akkar dev-1 on " .. _VERSION)
+elseif command == nil or command == "help" or command == "--help" or command == "-h" then
+  print(USAGE)
+else
+  io.stderr:write("akkar: unknown command '" .. tostring(command) .. "'\n\n" .. USAGE)
+  os.exit(2)
+end

@@ -465,6 +465,53 @@ trimming are optional. Asking for a retry policy, a delay or an idempotency
 key that the store cannot honour is **an error at the call**, never a feature
 that quietly does nothing.
 
+## `akkar doctor`
+
+The question a Lua project actually gets stuck on is not "is my code right",
+it is **"is this machine's combination of libraries one that works?"** This
+project paid that cost three times before writing any framework code, and
+each one was an afternoon:
+
+- `pgmoon` requires `mime`, from luasocket, **without declaring it**. A clean
+  install dies with a `require` traceback naming a module nobody asked for.
+- `cqueues` pins `lua == 5.4` exactly and has had no release since 2020.
+- `luaossl` builds against OpenSSL 3 with deprecation warnings that look like
+  failures and are not.
+
+```sh
+akkar doctor                     # what is installed, and what will bite
+akkar doctor app.lua             # and this application's configuration
+akkar doctor app.lua --json      # for something that parses
+akkar doctor app.lua --no-probe  # without touching the database
+```
+
+`app.lua` is any file returning `app`, or `app, config` — the same table
+`app:run{}` takes.
+
+It reports the runtime and every library with the version **the library
+itself declares** (never guessed from a directory name), the route count
+across mounts and hosts, routes that can never match, the limits actually in
+force as numbers, and whether each configured capability answers its contract.
+
+**A doctor that cries wolf gets ignored**, so a finding is one of three things
+and they are not interchangeable:
+
+| | |
+|---|---|
+| `FAIL` | broken now. **Exit code 1**, so a deploy step can gate on it |
+| `warn` | works today, will bite. Exit code 0 |
+| `ok` | checked and fine — shown, so a missing check is visible |
+
+A missing optional library is a warning; "luaossl is not installed" must not
+block a service that speaks plain HTTP. An unreachable database the app
+declares is a failure, because the server refuses to boot in that state
+anyway — reporting it as a warning would be the doctor disagreeing with the
+framework.
+
+Duplicate routes are not checked: they already fail at startup naming both
+sites. What is checked is the case no invariant catches — `/users/:id` and
+`/users/:name` compile to the same pattern, and the second can never match.
+
 ## Known gaps
 
 | | |
