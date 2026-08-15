@@ -144,12 +144,20 @@ describe("memory metrics", function()
   end)
 
   it("tracks the heap growing", function()
+    -- Collect first, or this measures the wrong thing.  `memory()` reports
+    -- LIVE bytes, so with a suite's worth of garbage still uncollected, a
+    -- collection landing inside the loop below can free more than the ballast
+    -- adds and the heap ends up smaller than it started.  This test passed
+    -- alone and failed in the full suite for exactly that reason.
+    collectgarbage(); collectgarbage()
+
     local registry = metrics.new()
     local before = registry:memory()
     local ballast = {}
     for i = 1, 200000 do ballast[i] = { i } end
     local after = registry:memory()
-    assert.is_true(after > before)
+    assert.is_true(after > before,
+      string.format("heap did not grow: %.0f -> %.0f bytes", before, after))
     ballast = nil
   end)
 end)
