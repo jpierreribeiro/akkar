@@ -82,6 +82,23 @@ Redis._encode = encode          -- exposed for tests; not part of the contract
 Redis._read_reply = read_reply
 
 -- =================================================================== commands
+-- The window between the write and the read is the dangerous one, and it is
+-- marked rather than hoped about.
+--
+-- RESP has no request ids: replies are matched to commands purely by order.
+-- So a connection abandoned after the write and before the read carries a
+-- reply that belongs to somebody else, and the next request to use it reads
+-- that reply as its own answer. Demonstrated with a `BLPOP` and a deadline
+-- below it: the following request asked for a key it had just set and
+-- received `nil` -- the abandoned `BLPOP` timing out.
+--
+-- That is worse than the equivalent on Postgres, where pgmoon refuses with
+-- "connection is busy". Here nothing refuses, the stream realigns after one
+-- request, and what is left is a single wrong answer with no error anywhere:
+-- silent, transient, and unreproducible from a bug report.
+--
+-- `in_flight` stays set because the coroutine is abandoned before the line
+-- that clears it, which is exactly what makes the state visible to the pool.
 function Redis:command(...)
   if not self.sock then error("redis: connection is closed", 0) end
   local ok, err = self.sock:write(encode(...))
@@ -89,7 +106,11 @@ function Redis:command(...)
     self.broken = true
     error("redis: write failed: " .. tostring(err), 0)
   end
+
+  self.in_flight = true
   local value, reply_err = read_reply(self.sock)
+  self.in_flight = false
+
   if reply_err then
     -- A protocol-level failure leaves the stream out of step, so the
     -- connection cannot be handed to the next request.
@@ -168,8 +189,11 @@ function M.connect(config)
 
   -- Fit for reuse means the stream is still in step: a connection whose reply
   -- was truncated would give the next request someone else's answer.
+  -- A command whose reply was never read leaves the connection holding
+  -- somebody else's answer, and RESP has no way for the next request to
+  -- notice. Rejected here means closed and the slot freed.
   local pool = Pool.new(open, size, function(conn)
-    return not conn.broken and conn.sock ~= nil
+    return not conn.broken and not conn.in_flight and conn.sock ~= nil
   end)
   return setmetatable({ pool = pool }, {
     __call = function() return pool:get() end,

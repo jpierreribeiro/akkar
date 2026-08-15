@@ -113,8 +113,37 @@ local function statement(sql, ...)
   return sql, ...
 end
 
+-- `in_flight` is what makes an abandoned query detectable, and the placement
+-- of the two assignments is the entire mechanism.
+--
+-- When a request's deadline fires, `with_deadline` abandons the handler where
+-- it stands. If it stands inside `pg:query`, the coroutine is suspended
+-- waiting for rows and **never resumes** -- so the line clearing the flag
+-- never runs, and the connection carries the mark for the rest of its life.
+--
+-- Without it the pool saw nothing wrong: an unread result set sets neither
+-- `in_transaction` nor `broken`. The connection went back, and pgmoon refused
+-- every subsequent query on it with "connection is busy" -- forever, since
+-- nothing ever marked it broken either. Measured: one timed-out query
+-- permanently destroyed one pool slot, and a pool of ten died after ten.
+--
+-- The framework already understood this class of bug. `with_deadline` refuses
+-- to pool a controller whose handler was abandoned, and its comment calls it
+-- "the same class of bug as a pooled database connection with a transaction
+-- still open". The defence was built for the controller and not for the
+-- connection it holds.
 function Db:query(sql, ...)
-  local res, err = self.pg:query(statement(sql, ...))
+  self.in_flight = true
+  local ok, res, err = pcall(self.pg.query, self.pg, statement(sql, ...))
+  self.in_flight = false
+
+  -- A raised error leaves the protocol at an unknown offset, so the
+  -- connection is finished. Only `res == nil` was handled before, and pgmoon
+  -- raises rather than returns for a protocol fault.
+  if not ok then
+    self.broken = true
+    error("db: " .. tostring(res), 0)
+  end
   if not res then error("db: " .. tostring(err), 0) end
   return res
 end
@@ -224,10 +253,16 @@ function M.connect(config)
   if size <= 0 then return open end
 
   -- What "fit for reuse" means here, and only here: a connection still inside
-  -- a transaction, or one whose rollback failed, would hand an open BEGIN to
-  -- the next request.
+  -- a transaction would hand an open BEGIN to the next request, one whose
+  -- rollback failed is in an unknown state, and one with a query still in
+  -- flight has a result set nobody read sitting in its socket.
+  --
+  -- A rejected connection is closed and its slot freed, so the next request
+  -- opens a fresh one. That costs a reconnect on every timed-out query, which
+  -- is the right price: the alternative was a pool slot dead until restart.
   local pool = Pool.new(open, size, function(conn)
-    return not conn.in_transaction and not conn.broken and conn.pg ~= nil
+    return not conn.in_transaction and not conn.broken
+       and not conn.in_flight and conn.pg ~= nil
   end)
   -- A callable table rather than a plain function, so the pool can be reached
   -- for shutdown and diagnostics.  Lua functions cannot carry fields.
