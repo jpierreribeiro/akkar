@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 85 tests with Postgres and Redis up, no database needed, ~2 s
+busted                      # 95 tests with Postgres and Redis up, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -246,6 +246,22 @@ that accepts anything while looking validated.
   `password_hash` column in the table, so the filtering is demonstrated rather
   than asserted.
 
+- **Startup contract checks.** Each configured capability is acquired once at
+  boot, checked against its contract (`db` needs `one`/`many`/`exec`/
+  `transaction`, `cache` needs `get`/`set`/`del`), and released. A
+  misconfigured adapter now fails at startup the way a duplicate route does.
+
+  A real consequence, stated plainly: **the server refuses to start when the
+  database is unreachable.** That is right for a service whose every route
+  needs it and wrong for one that should come up degraded, so
+  `app:run { check_capabilities = false }` opts out.
+
+- **Capabilities are acquired lazily**, on first read of `req.db` rather than
+  on every request. Found while testing the opt-out above: with the database
+  down, *every* route failed — including `/health/live`, which never touches
+  it — so the opt-out did not actually let anything come up degraded. Eager
+  acquisition was also taking a pool slot for requests that never queried.
+
 ### Still open
 
 - **Multipart uploads.** Streaming them properly interacts with the body
@@ -253,9 +269,6 @@ that accepts anything while looking validated.
 - **Redis adapter.** The contract question is settled (`DECISIONS.md` §8);
   what remains is choosing a library and writing it.
 - **Structured logging**, and `log` as a real capability rather than a slot.
-- **Startup contract checks** — verifying a configured capability satisfies
-  its contract at boot rather than on the first request, the way duplicate
-  routes already fail.
 - **Prefix-tree routing.** Dynamic routes are a linear scan. Not urgent — say
   so honestly rather than optimizing early.
 - **Where CPU-bound work runs.** `bcrypt` at cost 12 takes ~250 ms *by design*

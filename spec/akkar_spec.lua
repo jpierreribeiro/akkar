@@ -844,3 +844,127 @@ describe("response schema", function()
     assert.equal(500, app:test():get("/u").status)
   end)
 end)
+
+describe("startup capability checks", function()
+  -- Driving the check directly rather than through app:run, which would bind
+  -- a socket and then loop forever on the cases that are meant to succeed.
+  local check = akkar.check_capabilities
+
+  it("rejects a db missing part of the contract", function()
+    local ok, err = pcall(check, { db = function()
+      return { one = function() end, many = function() end }   -- no exec, no transaction
+    end })
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):match "does not satisfy the db contract")
+    assert.is_truthy(tostring(err):match ":exec")
+    assert.is_truthy(tostring(err):match ":transaction")
+  end)
+
+  it("reports a capability that cannot be acquired at all", function()
+    local ok, err = pcall(check, { db = function() error("connection refused", 0) end })
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):match "db could not be acquired")
+    assert.is_truthy(tostring(err):match "connection refused")
+  end)
+
+  it("checks the cache contract too", function()
+    local ok, err = pcall(check, { cache = function() return { get = function() end } end })
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):match "does not satisfy the cache contract")
+    assert.is_truthy(tostring(err):match ":set")
+  end)
+
+  it("accepts an adapter that answers the whole contract", function()
+    local ok = pcall(check, { db = function()
+      return { one = function() end, many = function() end,
+               exec = function() end, transaction = function() end }
+    end })
+    assert.is_true(ok)
+  end)
+
+  it("releases the instance it acquired for the check", function()
+    local released = false
+    pcall(check, { db = function()
+      return {
+        one = function() end, many = function() end,
+        exec = function() end, transaction = function() end,
+        release = function() released = true end,
+      }
+    end })
+    -- A check that leaks the connection it opened is a check that costs a
+    -- connection every restart.
+    assert.is_true(released)
+  end)
+
+  it("ignores a capability that was never configured", function()
+    assert.is_true(pcall(check, {}))
+  end)
+end)
+
+describe("lazy capability acquisition", function()
+  it("does not acquire a capability the handler never reads", function()
+    local acquisitions = 0
+    local app = akkar.new()
+    app:get("/health", function() return { status = "live" } end)
+    app:get("/users",  function(req) return { n = req.db:many() } end)
+
+    local factory = function()
+      acquisitions = acquisitions + 1
+      return { many = function() return {} end }
+    end
+    local c = app:test { db = factory }
+
+    c:get "/health"
+    -- A health check taking a connection out of the pool means health checks
+    -- compete with real work for slots.
+    assert.equal(0, acquisitions)
+
+    c:get "/users"
+    assert.equal(1, acquisitions)
+  end)
+
+  it("acquires once per request, not once per read", function()
+    local acquisitions = 0
+    local app = akkar.new()
+    app:get("/x", function(req)
+      req.db:many() req.db:many() req.db:many()
+      return { ok = true }
+    end)
+
+    local c = app:test { db = function()
+      acquisitions = acquisitions + 1
+      return { many = function() return {} end }
+    end }
+    c:get "/x"
+    assert.equal(1, acquisitions)
+  end)
+
+  it("keeps serving routes that do not need a broken capability", function()
+    local app = akkar.new()
+    app:get("/health", function() return { status = "live" } end)
+    app:get("/users",  function(req) return { n = req.db:many() } end)
+
+    -- This is the whole reason `check_capabilities = false` exists: come up
+    -- degraded and still answer the health endpoint.
+    local c = app:test { db = function() error("connection refused", 0) end }
+
+    assert.equal(200, c:get("/health").status)
+    assert.equal(500, c:get("/users").status)
+  end)
+
+  it("still releases what it did acquire", function()
+    local released = 0
+    local app = akkar.new()
+    app:get("/x", function(req) req.db:many() return { ok = true } end)
+    app:get("/y", function() return { ok = true } end)
+
+    local c = app:test { db = function()
+      return { many = function() return {} end, release = function() released = released + 1 end }
+    end }
+
+    c:get "/x"
+    assert.equal(1, released)
+    c:get "/y"
+    assert.equal(1, released)     -- nothing acquired, nothing to release
+  end)
+end)

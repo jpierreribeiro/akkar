@@ -83,12 +83,21 @@ akkar.defaults = {
 -- ladder forbids.
 local CAPABILITIES = { db = true, cache = true, log = true, clock = true }
 
+-- What each capability must be able to do.  Checked once at startup, so a
+-- misconfigured adapter fails at boot the way a duplicate route already does,
+-- rather than on whichever request first happens to touch it.
+local CONTRACTS = {
+  db    = { "one", "many", "exec", "transaction" },
+  cache = { "get", "set", "del" },
+}
+
 -- Everything else app:run{} accepts.  Listed so that a typo is an error rather
 -- than silence: `app:run { timout = 5 }` used to be ignored, leaving a server
 -- running with a 30 s deadline the author believed was 5 s.
 local SETTINGS = {
   host = true, port = true, tls = true, ctx = true,
   body_limit = true, timeout = true, shutdown_grace = true,
+  check_capabilities = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -131,35 +140,55 @@ local function check_config(config, allowed, what)
   end
 end
 
+-- Acquires each configured capability once, checks it answers its contract,
+-- and lets it go again.
+--
+-- This deliberately makes the server refuse to start when the database is
+-- unreachable.  That is right for a service whose every route needs it, and
+-- wrong for one that should come up degraded and serve a health endpoint --
+-- hence `check_capabilities = false`.
+local function check_capability_contracts(config)
+  for name, methods in pairs(CONTRACTS) do
+    local provided = config[name]
+    if provided ~= nil then
+      local instance = provided
+      if type(provided) == "function" or
+         (type(provided) == "table" and getmetatable(provided)
+          and getmetatable(provided).__call) then
+        local ok, result = pcall(provided)
+        if not ok then
+          error(string.format("akkar: %s could not be acquired: %s",
+                              name, tostring(result)), 0)
+        end
+        instance = result
+      end
+
+      local missing = {}
+      for _, method in ipairs(methods) do
+        if type(instance) ~= "table" or type(instance[method]) ~= "function" then
+          missing[#missing + 1] = ":" .. method
+        end
+      end
+
+      -- Release before raising, so a failed check does not also leak the
+      -- connection it just opened.
+      if type(instance) == "table" and type(instance.release) == "function" then
+        pcall(function() instance:release() end)
+      end
+
+      if #missing > 0 then
+        error(string.format(
+          "akkar: %s does not satisfy the %s contract; missing %s",
+          name, name, table.concat(missing, ", ")), 0)
+      end
+    end
+  end
+end
+
 local function callable(x)
   if type(x) == "function" then return true end
   local mt = type(x) == "table" and getmetatable(x)
   return mt and mt.__call ~= nil or false
-end
-
--- Resolves the configured capabilities for one request.  A capability that is
--- callable is a factory invoked once per request -- that is how `db` hands out
--- a pooled connection.  Anything else is passed through as-is, which is how a
--- clock or a logger can be a plain table.
---
--- Returns the capabilities and the subset that must be released afterwards.
-local function acquire(configured, guard_for)
-  local out, to_release = {}, {}
-  for name in pairs(CAPABILITIES) do
-    local provided = configured and configured[name]
-    if provided == nil then
-      out[name] = guard_for(name)
-    elseif callable(provided) then
-      local value = provided()
-      out[name] = value
-      if type(value) == "table" and type(value.release) == "function" then
-        to_release[#to_release + 1] = value
-      end
-    else
-      out[name] = provided
-    end
-  end
-  return out, to_release
 end
 
 -- cjson represents JSON null with a sentinel userdata rather than nil, because
@@ -706,14 +735,39 @@ local function handle(app, input)
     user    = guard("req.user", "req.user is not set; this route is missing the authentication middleware"),
   }
 
-  -- Capabilities, from the closed set.  Each one that was not configured is a
-  -- guard, so reading it says what is missing instead of indexing a nil.
-  local capabilities, to_release = acquire(input.capabilities, function(missing)
-    return guard("req." .. missing,
-                 "req." .. missing .. " is not configured; pass " ..
-                 missing .. " = ... to app:run{}")
-  end)
-  for name, value in pairs(capabilities) do req[name] = value end
+  -- Capabilities, from the closed set, acquired ON FIRST READ.
+  --
+  -- Eager acquisition was wrong twice over.  A route that never queries still
+  -- took a connection out of the pool, so health checks competed with real
+  -- work for slots.  Worse, with the database down every route failed --
+  -- including the ones that do not touch it -- which defeated the whole point
+  -- of `check_capabilities = false`, whose reason to exist is coming up
+  -- degraded and still answering `/health/live`.
+  --
+  -- A capability that was never configured reads as a guard, so the error
+  -- says what is missing instead of indexing a nil.
+  local to_release = {}
+  setmetatable(req, {
+    __index = function(self, key)
+      if not CAPABILITIES[key] then return nil end
+      local provided = input.capabilities and input.capabilities[key]
+      local value
+      if provided == nil then
+        value = guard("req." .. key,
+                      "req." .. key .. " is not configured; pass " ..
+                      key .. " = ... to app:run{}")
+      elseif callable(provided) then
+        value = provided()
+        if type(value) == "table" and type(value.release) == "function" then
+          to_release[#to_release + 1] = value
+        end
+      else
+        value = provided
+      end
+      rawset(self, key, value)      -- acquired once per request, not per read
+      return value
+    end,
+  })
 
   -- Releasing is the framework's job, not the handler's.  It happens on every
   -- exit -- normal return, thrown response, handler error, deadline -- because
@@ -860,6 +914,10 @@ function App:run(config)
   for k in pairs(SETTINGS) do allowed[k] = true end
   for k in pairs(CAPABILITIES) do allowed[k] = true end
   check_config(config, allowed, "app:run{}")
+
+  if config.check_capabilities ~= false then
+    check_capability_contracts(config)
+  end
 
   local port = config.port or 8080
   local host = config.host or "127.0.0.1"
@@ -1034,6 +1092,9 @@ end
 
 -- Exposed so tests can express a JSON null without going through the wire.
 akkar.null = cjson.null
+
+-- Exposed so the startup checks can be tested without binding a socket.
+akkar.check_capabilities = check_capability_contracts
 
 akkar.Response = Response
 akkar.guard = guard

@@ -272,6 +272,14 @@ appears only when you disagree with the default.
 | Connection pool size | 10 | `db.connect { pool_size = 25 }` |
 | Shutdown grace | 10 s | `app:run { shutdown_grace = 30 }` |
 
+Configured capabilities are checked against their contracts at startup, so a
+misconfigured adapter fails at boot rather than on the first request that
+touches it. This means **the server refuses to start when the database is
+unreachable** — right for a service whose every route needs it, wrong for one
+that should come up degraded, so `app:run { check_capabilities = false }` opts
+out. Capabilities are acquired on first use, so a route that never queries
+takes no connection and keeps answering while the database is down.
+
 Signals are opt-in, because a library that installs handlers behind an
 application's back fights whatever else the process is doing:
 
