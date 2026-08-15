@@ -29,12 +29,12 @@ platform:swap_host("acme.example.com", new_app)    -- atomic, no request dropped
 
 | # | Item | Useful without the platform? |
 |---|---|---|
-| 1 | **Host-based routing.** `acme.example.com` selects the tenant. Only paths exist today. | Yes — multi-tenant is ordinary |
-| 2 | **App as a value, and hot swap.** Build routes and validation from a table; replace a mounted sub-app atomically. | Yes |
+| 1 | ~~**Host-based routing.**~~ **Done** — `App:host`, `App:for_host` | Yes — multi-tenant is ordinary |
+| 2 | ~~**App as a value, and hot swap.**~~ **Done** — `akkar.from_spec`, `App:swap_host` | Yes |
 | 3 | ~~**Safe SQL composition.**~~ **Done** — `akkar/sql.lua` | **Yes, most of all** |
 | 4 | ~~**Tenant-scoped `db`.**~~ **Done** — `akkar/scope.lua` | Yes |
-| 5 | **Real jobs.** Retry with backoff, delay, scheduling, dead-letter, idempotency. Today a failing job is logged and dropped, by choice. | Yes |
-| 6 | **Streaming responses.** A 200 MB export does not fit inside "the handler returns the response". | Yes |
+| 5 | ~~**Real jobs.**~~ **Done** — retries, jitter, delay, dead letters, idempotency | Yes |
+| 6 | ~~**Streaming responses.**~~ **Done** — `akkar.stream` | Yes |
 | 7 | **An isolated VM per execution.** Customer-authored logic: memory ceiling, instruction budget, no ambient I/O. | No — only the platform asks for this |
 
 ## Why 3 and 4 are the ones to start with
@@ -150,10 +150,41 @@ differs from the real one is how a test proves the wrong thing.
 
 | # | Item | State |
 |---|---|---|
-| 1 | Host-based routing | parked |
-| 2 | App as a value + hot swap | parked |
-| 3 | Safe SQL composition | **done** |
-| 4 | Tenant-scoped `db` | **done** |
-| 5 | Real jobs | parked |
-| 6 | Streaming responses | parked |
-| 7 | Isolated VM per execution | parked |
+| 1 | Host-based routing | **done** — `App:host`, `App:for_host`, 14 tests |
+| 2 | App as a value + hot swap | **done** — `akkar.from_spec`, `App:swap_host`, 12 tests |
+| 3 | Safe SQL composition | **done** — `akkar/sql.lua` |
+| 4 | Tenant-scoped `db` | **done** — `akkar/scope.lua` |
+| 5 | Real jobs | **done** — 23 tests, 7 against a live Redis |
+| 6 | Streaming responses | **done** — `akkar.stream`, 10 tests |
+| 7 | Isolated VM per execution | **the one left**, and the only one the list itself said akkar does not need without the platform |
+
+## What landed for 1 and 2
+
+**Host routing selects the whole application**, not just its routes — its
+middleware, its error handling, its OpenAPI document. Selecting only the
+routes would run the wrong app's authentication against the right app's
+handler, which is a worse bug than having no host routing at all.
+
+The tests that carry the weight are the ones about what must *not* match. A
+`*.example.com` treated as "ends with example.com" hands `evil-example.com` to
+the tenant application; treated as a Lua pattern without escaping, it matches
+`x.exampleXcom`. Both are covered, along with the bare domain and the
+two-label case. This is the same failure the tenant-scoped database prevents,
+one layer up.
+
+**A spec cannot introduce code.** Handlers are named and resolved against a
+table the caller supplies. A spec that carried executable code would mean
+anyone who can publish a spec can run anything in the process — and the specs
+that most want this shape are exactly the ones arriving from outside. That is
+item 7's problem, and answering it here by accident would answer it wrong.
+
+Schemas needed no translation: `"string?"` and `{ kind = "integer", min = 1 }`
+were already the data form. A test round-trips a whole spec through
+`cjson.encode` and back, because a spec that does not survive encoding is not
+data — it is Lua that looks like it.
+
+**The swap is atomic**, and the reason is worth stating rather than asserting:
+one Lua VM runs one coroutine at a time and switches only at a yield, and
+assigning a field yields nowhere. A request already in flight finishes against
+the app it was routed to, which a test proves by swapping while a handler
+sleeps.

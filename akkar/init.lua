@@ -596,6 +596,204 @@ function App:mount(prefix, sub)
   return self
 end
 
+-- =========================================================== apps from data
+--
+-- Routes, validation and mounts described by a table rather than by calls, so
+-- an application can be built from a spec a customer publishes instead of from
+-- source someone deploys.
+--
+--     akkar.from_spec({
+--       middleware = { "auth" },
+--       routes = {
+--         { method = "GET", path = "/users/:id",
+--           params = { id = "integer" },
+--           response = { id = "integer", name = "string" },
+--           handler = "users.show" },
+--       },
+--     }, { handlers = handlers, middleware = middleware })
+--
+-- **Handlers are named, never carried.** The spec says `"users.show"` and the
+-- caller supplies the table those names resolve against. A spec that carried
+-- executable code would mean anyone who can publish a spec can run anything in
+-- the process, and the specs that most want this shape are exactly the ones
+-- arriving from outside. Running customer-authored logic safely is a different
+-- problem with a different answer (an isolated VM), and conflating the two
+-- would quietly answer it wrong.
+--
+-- Schemas need no translation: `"string?"` and `{ kind = "integer", min = 1 }`
+-- are already the data form, so a spec round-trips through JSON as it stands.
+--
+-- Everything is checked while building. A spec is data, which means it is
+-- probably generated, which means the error has to name the route it came
+-- from -- "route 3 (GET /users/:id)" -- rather than failing on the first
+-- request that touches it.
+local VERBS_FROM_SPEC = { GET = true, POST = true, PUT = true, PATCH = true,
+                          DELETE = true, HEAD = true, OPTIONS = true }
+
+local function spec_error(index, route, message)
+  error(("akkar.from_spec: route %d (%s %s): %s"):format(
+        index, tostring(route and route.method or "?"),
+        tostring(route and route.path or "?"), message), 0)
+end
+
+local function resolve(name, table_of, what, index, route)
+  if type(name) == "function" then return name end
+  if type(name) ~= "string" then
+    spec_error(index, route, what .. " must be a name; got " .. type(name))
+  end
+  local found = table_of and table_of[name]
+  if not found then
+    spec_error(index, route, ("no %s named '%s' was provided"):format(what, name))
+  end
+  return found
+end
+
+function akkar.from_spec(spec, options)
+  if type(spec) ~= "table" then
+    error("akkar.from_spec needs a table; got " .. type(spec), 2)
+  end
+  options = options or {}
+  local app = akkar.new()
+
+  for i, name in ipairs(spec.middleware or {}) do
+    app:use(resolve(name, options.middleware, "middleware", i, nil))
+  end
+
+  for i, route in ipairs(spec.routes or {}) do
+    if type(route) ~= "table" then
+      error(("akkar.from_spec: route %d is a %s, not a table"):format(i, type(route)), 0)
+    end
+    local verb = tostring(route.method or "GET"):upper()
+    if not VERBS_FROM_SPEC[verb] then
+      spec_error(i, route, "unknown method")
+    end
+    if type(route.path) ~= "string" or route.path:sub(1, 1) ~= "/" then
+      spec_error(i, route, "path must be a string beginning with /")
+    end
+
+    local handler = resolve(route.handler, options.handlers, "handler", i, route)
+
+    -- Only the declarative keys travel.  A spec that could set arbitrary route
+    -- options would be a second, undocumented API surface.
+    local opts = {}
+    for _, key in ipairs { "params", "query", "body", "response" } do
+      if route[key] ~= nil then opts[key] = route[key] end
+    end
+    for _, name in ipairs(route.before or {}) do
+      opts.before = opts.before or {}
+      opts.before[#opts.before + 1] =
+        resolve(name, options.middleware, "middleware", i, route)
+    end
+
+    local ok, err = pcall(function()
+      app[verb:lower()](app, route.path, next(opts) and opts or nil, handler)
+    end)
+    if not ok then spec_error(i, route, tostring(err)) end
+  end
+
+  for prefix, sub in pairs(spec.mounts or {}) do
+    app:mount(prefix, type(sub) == "table" and sub.routes
+                      and akkar.from_spec(sub, options) or sub)
+  end
+
+  return app
+end
+
+-- ============================================================= host routing
+--
+-- `acme.example.com` and `globex.example.com` reaching different applications
+-- in one process. Only paths could distinguish them before, which forces every
+-- multi-tenant service into `/t/:tenant/...` and leaks the tenant into every
+-- URL a customer ever sees.
+--
+--     app:host("acme.example.com", acme)
+--     app:host("*.example.com", tenant_app)     -- one label, not a suffix match
+--
+-- The host selects the **whole application**, not just its routes: its
+-- middleware, its error handling, its OpenAPI document. Selecting only the
+-- routes would run the wrong app's authentication against the right app's
+-- handler, which is a worse bug than having no host routing at all.
+--
+-- Exact beats wildcard, and a host matching nothing falls through to this
+-- app's own routes -- so adding a host never takes away an answer that already
+-- worked.
+local function normalize_host(host)
+  if not host then return nil end
+  host = tostring(host):lower()
+  host = host:gsub("%.$", "")           -- the fully-qualified trailing dot
+  -- Strip the port, but not the colons of an IPv6 literal: `[::1]:8080` keeps
+  -- its brackets and loses its port, `[::1]` keeps everything.
+  if host:sub(1, 1) == "[" then
+    return (host:gsub("%]:%d+$", "]"))
+  end
+  return (host:gsub(":%d+$", ""))
+end
+akkar.normalize_host = normalize_host
+
+function App:host(pattern, sub)
+  self.hosts = self.hosts or {}
+  pattern = normalize_host(pattern)
+
+  local wildcard = pattern:match "^%*%.(.+)$"
+  for _, existing in ipairs(self.hosts) do
+    if existing.pattern == pattern then
+      error("akkar: host '" .. pattern .. "' is already routed; the second " ..
+            "registration would silently never match", 2)
+    end
+  end
+
+  self.hosts[#self.hosts + 1] = { pattern = pattern, suffix = wildcard, app = sub }
+  return self
+end
+
+--- Replaces the app answering for a host, atomically, without dropping a
+--- request.
+---
+--- "Atomically" is a real claim and it is worth saying why it holds. One Lua
+--- VM runs one coroutine at a time and switches only at a yield; assigning a
+--- field yields nowhere. So no request can observe the moment between the old
+--- app and the new one.
+---
+--- A request already in flight keeps the app it was routed to and finishes
+--- against it. That is the intended semantics, not a limitation: swapping an
+--- application out from under a handler halfway through would be worse than
+--- letting the last few requests finish on the old one.
+function App:swap_host(pattern, sub)
+  self.hosts = self.hosts or {}
+  pattern = normalize_host(pattern)
+  for _, entry in ipairs(self.hosts) do
+    if entry.pattern == pattern then
+      local previous = entry.app
+      entry.app = sub
+      return previous
+    end
+  end
+  -- Adding through swap is allowed; it is what the first publish of a tenant
+  -- looks like, and refusing it would force callers to track which is which.
+  return self:host(pattern, sub) and nil
+end
+
+--- The app that answers for this host, or nil to use this one.
+function App:for_host(host)
+  if not self.hosts then return nil end
+  host = normalize_host(host)
+  if not host then return nil end
+
+  for _, entry in ipairs(self.hosts) do        -- exact first, always
+    if not entry.suffix and entry.pattern == host then return entry.app end
+  end
+  for _, entry in ipairs(self.hosts) do
+    if entry.suffix then
+      -- `*.example.com` matches `a.example.com` and not `a.b.example.com`,
+      -- and never the bare `example.com`.  A suffix match would hand
+      -- `evil-example.com` to the tenant app.
+      local label = host:match("^([^.]+)%." .. entry.suffix:gsub("%p", "%%%0") .. "$")
+      if label then return entry.app end
+    end
+  end
+  return nil
+end
+
 -- Percent-decoding happens here rather than on the whole path, because
 -- decoding first would let %2F smuggle a segment separator into a parameter.
 local function decode_params(names, captured)
@@ -874,6 +1072,16 @@ akkar.parse_query = parse_query
 -- Builds `req` and runs the chain.  Shared by the server and the test client,
 -- so both travel exactly the same path.
 local function handle(app, input)
+  -- Before the chains are built, because the selected app has its own.
+  local requested_host = input.host
+  if requested_host == nil and input.headers then
+    requested_host = type(input.headers.get) == "function"
+                     and (input.headers:get ":authority" or input.headers:get "host")
+                     or input.headers.host or input.headers.Host
+  end
+  local host_app = app:for_host(requested_host)
+  if host_app then app = host_app end
+
   local normal, short = chains(app)
 
   -- Body shape is checked here rather than in the wire decoder, because the
@@ -899,6 +1107,7 @@ local function handle(app, input)
     query   = input.query or {},
     body    = body,
     headers = request_headers,
+    host    = normalize_host(requested_host),
     id      = request_id(request_headers),
     user    = guard("req.user", "req.user is not set; this route is missing the authentication middleware"),
   }
