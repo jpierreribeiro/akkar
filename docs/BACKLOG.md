@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 169 tests with Postgres, Redis and tl available, no database needed, ~2 s
+busted                      # 183 tests with Postgres, Redis and tl available, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -430,6 +430,21 @@ that accepts anything while looking validated.
   answer different questions: the Lua heap says whether the application is
   holding tables, RSS says what the OS thinks the process costs including the
   C side. A leak in one and not the other says which half to look at.
+
+- **The job queue split from its storage**, `akkar.jobs` with
+  `akkar.jobs.redis` and `akkar.jobs.memory`. The second half of the crystals
+  pattern: `jobs` holds the logic, a store holds only persistence.
+
+  `work.queue` had the two fused, which meant a Postgres-backed queue could
+  not exist without reimplementing the semantics beside it — and the two would
+  then be free to disagree. A store now answers three methods, `enqueue`,
+  `dequeue` and `depth`, and everything else is semantics.
+
+  The justification is visible in the tests: the same six semantic checks run
+  against **both** stores, memory and Redis, from one description. If the
+  semantics lived in the backend that would be impossible to write.
+
+  `work.queue(cache, name)` still works and forwards, so nothing breaks.
 
 ### Still open
 

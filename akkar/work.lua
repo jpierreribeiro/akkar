@@ -23,9 +23,9 @@ budget accordingly: coarse when the task matters more than the neighbours,
 fine when the opposite.  A claim that this is free would be wrong, and the
 first person to benchmark it would find out.
 
-`queue` handles work that should not be in the request at all: a report, a
-resized image, an email.  The handler enqueues and answers immediately; a
-separate process does the work on a separate core.
+For work that should not be in the request at all -- a report, a resized
+image, an email -- see `akkar.jobs`.  The handler enqueues and answers
+immediately; a separate process does the work on a separate core.
 
 **Neither fixes bcrypt.**  A C function that runs for 250 ms without returning
 to Lua cannot be yielded, because there is no point at which Lua regains
@@ -74,67 +74,15 @@ function M.chunked(every)
 end
 
 -- ====================================================================== queue
--- A Redis list used as a job queue.  `LPUSH` to enqueue, `BRPOP` to consume,
--- which blocks server-side rather than polling -- and blocking there is free
--- for us, because the Redis adapter yields while it waits.
+-- The queue moved to `akkar.jobs`, where the semantics are separated from the
+-- storage: `akkar.jobs.redis` and `akkar.jobs.memory` are stores, and the
+-- rules about what a job is and what happens when one fails live in one place
+-- that both share.
 --
--- Deliberately not a job framework.  No retries with backoff, no scheduled
--- jobs, no dead-letter queue, no dashboard.  Those are real needs and they
--- are a separate project; what is here is the smallest thing that gets work
--- off the request path.
-local Queue = {}
-Queue.__index = Queue
-
+-- `work.queue(cache, name)` still works and forwards, so nothing written
+-- against it breaks.
 function M.queue(cache, name)
-  return setmetatable({ cache = cache, key = "akkar:queue:" .. (name or "default") }, Queue)
+  return require("akkar.jobs.redis").new(cache, name)
 end
 
---- Enqueues a job.  Returns the queue depth after the push.
-function Queue:push(kind, payload)
-  return self.cache:command("LPUSH", self.key,
-                            cjson.encode { kind = kind, payload = payload,
-                                           queued_at = os.time() })
-end
-
---- Waits for one job, up to `timeout` seconds.  Returns nil on timeout.
---- The wait yields, so a worker parked here does not stall its own process.
-function Queue:pop(timeout)
-  local reply = self.cache:command("BRPOP", self.key, timeout or 5)
-  if not reply or type(reply) ~= "table" then return nil end
-  local ok, job = pcall(cjson.decode, reply[2])
-  if not ok then return nil, "queue: undecodable job discarded" end
-  return job
-end
-
-function Queue:depth()
-  return self.cache:command("LLEN", self.key)
-end
-
---- Consumes jobs until `should_stop()` returns true.
----
---- A failing job is logged and dropped rather than retried, because a retry
---- policy nobody chose is worse than no retry policy: it hides the failure
---- and repeats the side effects.
-function Queue:consume(handlers, options)
-  options = options or {}
-  local log = options.log
-  local should_stop = options.should_stop or function() return false end
-
-  while not should_stop() do
-    local job = self:pop(options.timeout or 1)
-    if job then
-      local handler = handlers[job.kind]
-      if not handler then
-        if log then log:warn("queue: no handler", { kind = job.kind }) end
-      else
-        local ok, err = pcall(handler, job.payload)
-        if not ok and log then
-          log:error("queue: job failed", { kind = job.kind, detail = tostring(err) })
-        end
-      end
-    end
-  end
-end
-
-M.Queue = Queue
 return M

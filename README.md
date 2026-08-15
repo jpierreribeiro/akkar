@@ -203,6 +203,24 @@ app:get("/users/:id", {
 end)
 ```
 
+**Adapters you can run without infrastructure.** Every capability ships an
+in-memory implementation next to the real one, so tests need nothing running
+and a small deployment can skip Redis entirely:
+
+```lua
+local app_client = app:test {
+  db    = require("akkar.db.memory").factory(function(fake)
+            fake:on("from users", { id = 1, name = "ada" })
+          end),
+  cache = require("akkar.cache.memory").factory(),
+}
+```
+
+The cache one is a real implementation with expiry, not a stand-in. The
+database one matches programmed queries and does not parse SQL, because a fake
+SQL engine would be a second database whose disagreements show up as tests
+that pass and production that does not.
+
 **Types, if you want them.** Lua checks nothing before the program runs, and
 writing akkar carefully does not change that. `types/akkar.d.tl` means a
 handler written in [Teal](https://github.com/teal-language/tl) — a typed

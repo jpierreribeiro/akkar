@@ -1,0 +1,128 @@
+--[[
+The jobs/store split.
+
+The property that justifies the split is that the SAME semantics run against
+different storage.  So the semantic tests run twice -- once over memory, once
+over Redis -- and the Redis half skips when none is reachable.
+]]
+
+package.path = "./?.lua;./?/init.lua;" .. package.path
+
+local akkar     = require "akkar"
+local jobs      = require "akkar.jobs"
+local memory    = require "akkar.jobs.memory"
+local jobs_redis= require "akkar.jobs.redis"
+local redis     = require "akkar.redis"
+
+describe("the store contract", function()
+  it("refuses a store that does not answer it", function()
+    local ok, err = pcall(function()
+      return jobs.new({ enqueue = function() end }, "x")
+    end)
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):match "missing :dequeue")
+  end)
+end)
+
+-- The semantics, run against every store.
+local function behaves_like_a_queue(label, make)
+  describe("queue semantics over " .. label, function()
+    local queue
+    before_each(function() queue = make() end)
+
+    it("round-trips a job with its kind and payload", function()
+      queue:push("send_email", { to = "ada@example.com" })
+      local job = queue:pop(1)
+      assert.equal("send_email", job.kind)
+      assert.equal("ada@example.com", job.payload.to)
+      assert.is_number(job.queued_at)
+    end)
+
+    it("is FIFO", function()
+      for i = 1, 3 do queue:push("n", { i = i }) end
+      local seen = {}
+      for _ = 1, 3 do seen[#seen + 1] = queue:pop(1).payload.i end
+      assert.same({ 1, 2, 3 }, seen)
+    end)
+
+    it("reports depth", function()
+      assert.equal(0, queue:depth())
+      queue:push("a", {})
+      queue:push("b", {})
+      assert.equal(2, queue:depth())
+    end)
+
+    it("returns nil when empty rather than hanging", function()
+      assert.is_nil(queue:pop(1))
+    end)
+
+    it("keeps working after a handler fails", function()
+      queue:push("boom", {})
+      queue:push("ok", { value = 7 })
+
+      local got, errors = nil, 0
+      local remaining = 3
+      local result = queue:consume({
+        boom = function() error "handler exploded" end,
+        ok   = function(payload) got = payload.value end,
+      }, {
+        timeout = 1,
+        log = { warn = function() end, error = function() errors = errors + 1 end },
+        should_stop = function() remaining = remaining - 1 return remaining < 0 end,
+      })
+
+      -- One failing job must not take the worker down with it.
+      assert.equal(7, got)
+      assert.equal(1, errors)
+      assert.equal(1, result.handled)
+      assert.equal(1, result.failed)
+    end)
+
+    it("warns about a job kind nobody handles", function()
+      queue:push("unknown_kind", {})
+      local warned = 0
+      local remaining = 2
+      queue:consume({}, {
+        timeout = 1,
+        log = { warn = function() warned = warned + 1 end, error = function() end },
+        should_stop = function() remaining = remaining - 1 return remaining < 0 end,
+      })
+      assert.equal(1, warned)
+    end)
+  end)
+end
+
+behaves_like_a_queue("memory", function() return memory.new("spec") end)
+
+local function redis_reachable()
+  local ok, conn = pcall(redis.connect { pool_size = 0 })
+  if ok then conn:close() end
+  return ok
+end
+
+if redis_reachable() then
+  behaves_like_a_queue("redis", function()
+    local cache = redis.connect { pool_size = 0 }()
+    cache:del "akkar:queue:spec-redis"
+    return jobs_redis.new(cache, "spec-redis")
+  end)
+else
+  describe("queue semantics over redis", function()
+    pending "Redis is not reachable; skipping"
+  end)
+end
+
+describe("offloading from a handler", function()
+  it("answers immediately and leaves the work queued", function()
+    local queue = memory.new "reports"
+    local app = akkar.new()
+    app:post("/reports", function()
+      queue:push("build_report", { user = 1 })
+      return akkar.response(202, { status = "queued" })
+    end)
+
+    local res = app:test():post("/reports", { body = {} })
+    assert.equal(202, res.status)
+    assert.equal(1, queue:depth())
+  end)
+end)
