@@ -2,16 +2,48 @@
 
 ## 1. Objective
 
-A microframework for **JSON APIs** in Lua 5.4, good enough to replace Go + Gin
-in the services I maintain.
+An **application runtime for backend services in Lua**, with safe and
+predictable defaults — good enough to replace Go + Gin in the services I
+maintain, and good enough for someone else to depend on.
+
+### The objective changed, and the old one is kept here
+
+This read "a microframework for JSON APIs in Lua 5.4" and the audience read
+"my own use — no public docs, no semantic versioning, no compatibility
+policy". Both were honest when written and both stopped describing the thing.
+
+What is in the tree is no longer a microframework. Routing, middleware,
+validation, database, pooling, Redis, jobs, metrics, OpenAPI, streaming,
+idempotency, rate limiting, structured logging, testing doubles, tenant scope
+and safe SQL is a runtime, whatever the README calls it. And "no public docs"
+sat beside a 26 KB public README for as long as both existed.
+
+Naming it a runtime is not ambition. It is what decides whether the next
+question — should this be one binary? should the substrate be swappable? — is
+in scope or out of it.
 
 Three decisions are settled:
 
 | Decision | Choice | Consequence |
 |---|---|---|
-| Audience | **My own use, in production** | No public docs, no semantic versioning, no compatibility policy. It can be aggressively opinionated. But it has to be genuinely reliable — this is not a toy. |
-| Substrate | **Lua 5.4 + cqueues / lua-http** | No nginx, no C, native coroutines. Accepts thinner drivers as the price. |
-| First milestone | **Handler ergonomics** | CRUD routes against a real Postgres, so the shape can be read and judged. |
+| Audience | **Public, and my own services first** | Semantic versioning, a compatibility policy, and docs that answer someone who did not write it. Still aggressively opinionated; opinions are now promises. |
+| Substrate | **Lua 5.4 + cqueues / lua-http, behind a contract** | No nginx, native coroutines. The substrate is a *detail*: what akkar promises is `app:get`, `req.db`, `akkar.stream` — never that cqueues is underneath. The contract in `spec/` is what makes that true rather than aspirational. |
+| Shape | **One artefact** | `akkar run app.lua`, and eventually a binary. Proved feasible in `docs/RUNTIME.md`; not yet designed. |
+
+### The rule that follows from calling it a runtime
+
+> **The public API must never depend on the implementation of the substrate.**
+
+`app:get`, `app:post`, `req.db`, `req.cache`, `req.log`, `akkar.stream`,
+`akkar.jobs`, `akkar.sql` are akkar. `cqueues`, `lua-http`, `pgmoon`,
+`lua-cjson` and `luaossl` are replaceable details.
+
+The boundary is not intact today, and the three breaches are named rather than
+assumed: `akkar.null` re-exports cjson's C sentinel as public API and compares
+it by identity; five modules require cjson directly, serialization being the
+one capability with no contract; and `ctx` hands a luaossl context and
+lua-http's expectations straight into application configuration. Closing those
+is part of the contract work, not separate from it.
 
 ### The requirement that governs the design
 

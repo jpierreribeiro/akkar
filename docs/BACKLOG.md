@@ -543,8 +543,8 @@ Written down because the list keeps trying to grow.
 |---|---|
 | ORM, migrations, templating, HTML, admin, scaffolding | Out of scope in `PLAN.md` §1, permanently. |
 | Adapters for payments, storage, mail | Past "JSON API framework". Own the contract, let libraries implement. |
-| `akkar build` producing a self-contained binary | Attractive, but Redbean is a *different substrate*, and `cqueues` is a C module. That is a substrate change, not a packaging step. |
-| CI, docs site, semantic versioning, compatibility policy, ADRs | The audience is my own use. Each costs before it pays. |
+| ~~`akkar build` producing a self-contained binary~~ | **Retracted — the reason was wrong.** It read "Redbean is a *different substrate*, and `cqueues` is a C module. That is a substrate change, not a packaging step." True of Redbean, and it does not follow for a C module: static linking changes no substrate. Measured since — cqueues runs an event loop inside a single 1.5 MB binary. See `docs/RUNTIME.md`. |
+| ~~CI, docs site, semantic versioning, compatibility policy, ADRs~~ | **Retracted with the audience.** These were excluded because "the audience is my own use". The audience changed; see `docs/PLAN.md` §1. |
 | A DX laboratory implementing the same API in eight frameworks | The cheap version captures most of the value: compare against Gin and FastAPI, which I already write daily and which need no toolchain. Read the docs for the rest. |
 
 ## Ideas parked, not rejected
