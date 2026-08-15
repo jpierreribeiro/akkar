@@ -457,6 +457,21 @@ way for.
   surface ten to twenty gaps no planning predicts. Everything since has been
   closing the gaps already known to block it, and none remain.
 
+- **Performance comparison against Gin and FastAPI**, `bench/compare/`.
+  `METHOD.md` was written before any service existed and before any number
+  did, because a threshold picked after seeing the result is a
+  rationalisation.
+
+  The three services are semantically equivalent and `equivalence.sh` proves
+  it before any clock starts — same JSON, same statuses, same validation, same
+  error shapes. It has already earned its place: it caught akkar reporting
+  `min is 1` for `/users/0` where the other two said `expected integer`. Zero
+  *is* an integer, so akkar was the precise one, and the fix levelled the other
+  two **up** rather than degrading akkar to match.
+
+  Predictions are recorded in `METHOD.md` in advance, so the result cannot be
+  retrofitted into a story afterwards.
+
 - **Soak test.** Every benchmark so far is twelve to fifteen seconds, which
   says nothing about connection churn, memory growth or GC behaviour over
   hours. Cheap to run now that a machine exists: start it, leave it, come
