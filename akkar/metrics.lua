@@ -139,6 +139,28 @@ function Registry:render()
   return table.concat(out, "\n") .. "\n"
 end
 
+-- Memory, from inside the process and from the kernel.
+--
+-- Two numbers because they answer different questions.  Lua's own heap says
+-- whether the application is holding on to tables; RSS says what the operating
+-- system thinks the process costs, which includes the C side -- socket
+-- buffers, the TLS context, whatever a driver allocated.  A leak that shows in
+-- one and not the other tells you which half to look at.
+function Registry:memory()
+  local lua_bytes = collectgarbage "count" * 1024
+
+  local rss_bytes = 0
+  local statm = io.open "/proc/self/statm"
+  if statm then
+    local fields = statm:read "l"
+    statm:close()
+    local pages = fields and fields:match "%d+%s+(%d+)"
+    if pages then rss_bytes = tonumber(pages) * 4096 end
+  end
+
+  return lua_bytes, rss_bytes
+end
+
 -- ================================================================ integration
 
 --- Middleware that records every request.
@@ -167,6 +189,12 @@ end
 function Registry:serve(app, path, sources)
   local akkar = require "akkar"
   app:get(path or "/metrics", function()
+    -- Memory is always reported: a scrape that cannot answer "is it growing?"
+    -- is missing the question most often asked of one.
+    local lua_bytes, rss_bytes = self:memory()
+    self:gauge("akkar_lua_heap_bytes", math.floor(lua_bytes))
+    self:gauge("akkar_process_resident_bytes", rss_bytes)
+
     for name, source in pairs(sources or {}) do
       local ok, value = pcall(source)
       if ok and type(value) == "number" then self:gauge(name, value) end

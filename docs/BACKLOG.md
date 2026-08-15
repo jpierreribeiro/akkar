@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 152 tests with Postgres, Redis and tl available, no database needed, ~2 s
+busted                      # 169 tests with Postgres, Redis and tl available, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -398,6 +398,38 @@ that accepts anything while looking validated.
   schema matches the table a handler actually returns. Schemas are values built
   at runtime; validation is what checks them. Types narrow the gap, they do not
   close it.
+
+- **In-memory adapters**, `akkar.db.memory` and `akkar.cache.memory`, taken
+  from the pattern in `druse-crystals` where every capability ships a
+  `_memory` alongside its real backend.
+
+  The point is not to have a fake. It is that **the fake is a real, tested,
+  shared implementation of the same contract** instead of something each test
+  file reinvents. The specs had been writing `fake_db` inline: every copy
+  drifts, none is checked against the contract, and nobody outside the
+  repository gets one at all.
+
+  The two are honestly different, and the docs say which is which.
+  `akkar.cache.memory` is a **real implementation** — a cache is a table with
+  expiry, and that is buildable in memory — so it obeys the whole contract,
+  including Redis's `-1`/`-2` ttl semantics, and is usable in a single-process
+  deployment that does not want to run Redis. `akkar.db.memory` is a
+  **stand-in**: it matches queries against programmed responses and does not
+  parse SQL, because pretending to execute SQL would be a second, worse
+  database whose disagreements with Postgres surface as tests that pass and
+  production that does not.
+
+  A query nobody programmed raises rather than returning nil, since a test
+  silently receiving nil from an unplanned query is asserting the wrong thing.
+  Swapping the inline fake for the real adapter immediately caught a spec
+  calling `req.db:many()` with no SQL at all — something no handler does, which
+  the old fake had been hiding by ignoring its argument.
+
+- **Memory metrics.** `akkar_lua_heap_bytes` and
+  `akkar_process_resident_bytes` are in every scrape. Two numbers because they
+  answer different questions: the Lua heap says whether the application is
+  holding tables, RSS says what the OS thinks the process costs including the
+  C side. A leak in one and not the other says which half to look at.
 
 ### Still open
 

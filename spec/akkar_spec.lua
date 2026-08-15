@@ -13,18 +13,17 @@ package.path = "./?.lua;./?/init.lua;" .. package.path
 local akkar = require "akkar"
 local v     = akkar.v
 
--- A fake database.  Not a library mock: a table with four methods, because
--- the adapter surface is deliberately small.
+-- The in-memory adapter rather than a fake written here.  It implements the
+-- same contract the real one does and is tested against it, so a change to
+-- akkar.db cannot leave this quietly wrong -- which is exactly what an inline
+-- fake in every spec file would do.
+local memory_db = require "akkar.db.memory"
+
 local function fake_db(rows)
-  local db = {}
-  function db:one(sql)
-    if sql:match "count" then return { n = #rows } end
-    return rows[1]
-  end
-  function db:many() return rows end
-  function db:exec() return true end
-  function db:transaction(fn) return fn(self) end
-  return function() return db end
+  return memory_db.factory(function(fake)
+    fake:on("count", { n = #rows })
+    fake:on("select", rows)
+  end)
 end
 
 describe("in-process test client", function()
@@ -106,7 +105,9 @@ describe("in-process test client", function()
 
   it("runs against a fake database, with no Postgres", function()
     local app = akkar.new()
-    app:get("/users", function(req) return { users = req.db:many() } end)
+    app:get("/users", function(req)
+      return { users = req.db:many "select id, name from users" }
+    end)
 
     local rows = { { id = 1, name = "ada" }, { id = 2, name = "alan" } }
     local res = app:test({ db = fake_db(rows) }):get "/users"

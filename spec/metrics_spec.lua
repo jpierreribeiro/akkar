@@ -118,3 +118,38 @@ describe("metrics through requests", function()
     assert.equal(200, app:test():get("/metrics").status)
   end)
 end)
+
+describe("memory metrics", function()
+  local metrics = require "akkar.metrics"
+  local akkar = require "akkar"
+
+  it("reports the Lua heap and the process resident size", function()
+    local registry = metrics.new()
+    local lua_bytes, rss_bytes = registry:memory()
+    assert.is_true(lua_bytes > 0)
+    -- Two numbers because they answer different questions: the Lua heap says
+    -- whether the application is holding tables, RSS says what the OS thinks
+    -- the process costs including the C side.
+    assert.is_true(rss_bytes > lua_bytes)
+  end)
+
+  it("always includes them in a scrape", function()
+    local registry = metrics.new()
+    local app = akkar.new()
+    registry:serve(app, "/metrics")
+
+    local text = app:test():get("/metrics").raw
+    assert.is_truthy(text:match "akkar_lua_heap_bytes %d+")
+    assert.is_truthy(text:match "akkar_process_resident_bytes %d+")
+  end)
+
+  it("tracks the heap growing", function()
+    local registry = metrics.new()
+    local before = registry:memory()
+    local ballast = {}
+    for i = 1, 200000 do ballast[i] = { i } end
+    local after = registry:memory()
+    assert.is_true(after > before)
+    ballast = nil
+  end)
+end)
