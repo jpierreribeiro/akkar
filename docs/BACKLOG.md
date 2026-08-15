@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 62 tests with Postgres up, 57 without, no database needed, ~2 s
+busted                      # 77 tests with Postgres and Redis up, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -230,6 +230,10 @@ that accepts anything while looking validated.
   because "still inside a transaction" means something to Postgres and nothing
   to Redis. The existing pool tests passed unchanged, which is the only real
   evidence that a refactor was a refactor.
+
+- **Redis adapter**, `akkar/redis.lua`, RESP2 over a cqueues socket. Written
+  rather than depended upon because no non-blocking client exists for Lua 5.4
+  on cqueues — see `DECISIONS.md` §8. Reuses `akkar.pool` unchanged.
 
 ### Still open
 

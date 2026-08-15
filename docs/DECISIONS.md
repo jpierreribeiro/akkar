@@ -319,6 +319,37 @@ Four methods. That small surface is exactly what lets the fake database in
 `spec/` be a table of four functions rather than a library mock — which is the
 real test of whether a contract is the right size.
 
+### The cache contract
+
+```lua
+cache:get(key)                 -- the value, or nil when absent
+cache:set(key, value, ttl)     -- ttl in seconds, optional
+cache:del(key, ...)            -- count removed
+cache:incr(key)
+cache:expire(key, seconds)
+cache:ttl(key)
+cache:command(name, ...)       -- escape hatch for everything else
+```
+
+`akkar.redis` is the reference implementation. It is **written rather than
+depended upon**, and that needed justifying: no non-blocking Redis client
+exists for Lua 5.4 on cqueues. Every `lua-resty-*` needs OpenResty cosockets,
+`lua-hiredis` blocks, and `lredis` is not packaged for 5.4. A blocking client
+would pass every functional test and still stall the event loop on each
+command, serialising the whole process — the exact failure the watchdog
+reports, and not one to ship deliberately.
+
+RESP2 is small enough that writing it cost less than the risk. The proof it
+works is not that `GET` returns a value: it is that eight concurrent one-second
+`BLPOP` calls through a pool of four complete in 2.07 s, two waves rather than
+eight serial waits.
+
+This is also where the adapter boundary stops being a slogan. Redis reuses
+`akkar.pool` unchanged, supplying its own notion of "fit for reuse", and
+neither adapter knows the other exists. `req.cache` needed **no framework
+change at all** — `cache` was already a guarded slot in the closed capability
+set, so passing `cache = ...` to `app:run{}` was the entire integration.
+
 Not yet decided: whether akkar should verify at startup that a configured
 capability satisfies its contract. It would catch the mistake at boot rather
 than on the first request, matching how duplicate routes already behave. See

@@ -225,6 +225,7 @@ The examples need a database:
 docker run -d --name akkar-pg \
   -e POSTGRES_PASSWORD=akkar -e POSTGRES_DB=akkar \
   -p 55432:5432 postgres:16-alpine
+docker run -d --name akkar-redis -p 6379:6379 redis:7-alpine
 
 docker exec -i akkar-pg psql -U postgres -d akkar <<'SQL'
 create table if not exists users (
@@ -285,8 +286,7 @@ as a timeout.
 |---|---|
 | `response` is documentation only | it feeds OpenAPI; handler output is not validated or filtered against it |
 | No multipart uploads | streaming them interacts with the body limit, so it is not just another content type |
-| No Redis adapter | the contract is settled; the adapter is not written |
-| `log` and `cache` are slots, not implementations | injectable and guarded, but akkar ships neither |
+| `log` is a slot, not an implementation | injectable and guarded, but akkar ships no logger |
 | Linear scan for dynamic routes | a prefix tree is the fix, but this is not urgent |
 | CPU-bound handlers still stall the process | the watchdog reports it; an external queue or separate process is the answer, undecided |
 | Pinned to Lua 5.4 | the blocker is `cqueues`, which pins `lua == 5.4` and has had no release since 2020 — not `lua-http`, which accepts `>= 5.1` |

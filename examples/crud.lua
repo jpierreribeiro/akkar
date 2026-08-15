@@ -13,6 +13,7 @@ package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local akkar = require "akkar"
 local db    = require "akkar.db"
+local redis = require "akkar.redis"
 local openapi = require "akkar.openapi"
 local v     = akkar.v
 
@@ -189,7 +190,21 @@ end)
 app:mount("/health", health)
 
 -- ============================================================================
--- 7. OpenAPI, generated from the schemas already declared above.  No route
+-- 7. The cache capability.  `req.cache` needed no framework change: `cache`
+--    was already a guarded slot, so passing it to app:run{} was enough.
+-- ============================================================================
+
+app:get("/users/:id/views", {
+  params = { id = v.integer { min = 1 } },
+}, function(req)
+  local key = "views:" .. req.params.id
+  local count = req.cache:incr(key)
+  req.cache:expire(key, 3600)
+  return { user = req.params.id, views = count }
+end)
+
+-- ============================================================================
+-- 8. OpenAPI, generated from the schemas already declared above.  No route
 --    describes itself twice.
 -- ============================================================================
 
@@ -203,8 +218,9 @@ app:get("/", function() return { hello = "world" } end)
 if ... == nil then      -- only start a server when run directly, not required
   app:run {
     port = tonumber(os.getenv "PORT") or 8080,
-    db = db.connect { port = 55432, database = "akkar",
-                      user = "postgres", password = "akkar" },
+    db    = db.connect { port = 55432, database = "akkar",
+                         user = "postgres", password = "akkar" },
+    cache = redis.connect { port = 6379 },
   }
 end
 

@@ -1,0 +1,180 @@
+--[[
+akkar.redis — the Redis adapter, speaking RESP2 over a cqueues socket.
+
+Written rather than depended upon, and that needs justifying.
+
+No non-blocking Redis client exists for Lua 5.4 on cqueues.  Every
+`lua-resty-*` client needs OpenResty's cosockets, `lua-hiredis` blocks, and
+`lredis` is not packaged for 5.4.  A blocking client would pass every
+functional test in this file and still be wrong: it would stall the event loop
+on each command, serialising every request in the process.  That is the exact
+failure the watchdog exists to report, and it is not one to ship on purpose.
+
+RESP2 is small enough that writing it is cheaper than the risk.  A command is
+an array of bulk strings; a reply is one of five things.
+
+This is the second adapter, and it is where "akkar owns the contract,
+libraries implement it" stops being a slogan: the pool it uses is the same
+`akkar.pool` the Postgres adapter uses, and neither knows about the other.
+]]
+
+local socket = require "cqueues.socket"
+local Pool   = require "akkar.pool"
+
+local Redis = {}
+Redis.__index = Redis
+
+local CRLF = "\r\n"
+
+-- ================================================================== protocol
+-- A command is an array of bulk strings.  Encoding it as such -- rather than
+-- joining with spaces -- is what makes a value containing a newline or a space
+-- harmless, the same reason parameters are bound rather than spliced in SQL.
+local function encode(...)
+  local parts = { "*" .. select("#", ...) .. CRLF }
+  for i = 1, select("#", ...) do
+    local arg = tostring((select(i, ...)))
+    parts[#parts + 1] = "$" .. #arg .. CRLF .. arg .. CRLF
+  end
+  return table.concat(parts)
+end
+
+-- Reads one reply.  Recursive, because arrays nest.
+--
+-- Returns (value, nil) or (nil, error).  A Redis error reply is an error the
+-- caller should see, not a transport failure, so it comes back as a value in
+-- the second slot rather than raising here.
+local function read_reply(sock)
+  local line, err = sock:read "*L"
+  if not line then return nil, err or "connection closed" end
+  line = line:gsub("\r?\n$", "")
+
+  local tag, rest = line:sub(1, 1), line:sub(2)
+
+  if tag == "+" then return rest end
+  if tag == "-" then return nil, rest end
+  if tag == ":" then return tonumber(rest) end
+
+  if tag == "$" then
+    local length = tonumber(rest)
+    if not length or length < 0 then return nil end     -- $-1 is a nil reply
+    local data, read_err = sock:read(length + 2)        -- payload plus CRLF
+    if not data then return nil, read_err or "truncated bulk reply" end
+    return data:sub(1, length)
+  end
+
+  if tag == "*" then
+    local count = tonumber(rest)
+    if not count or count < 0 then return nil end       -- *-1 is a nil array
+    local out = {}
+    for i = 1, count do
+      local value, item_err = read_reply(sock)
+      if item_err then return nil, item_err end
+      out[i] = value
+    end
+    return out
+  end
+
+  return nil, "unexpected RESP tag '" .. tag .. "'"
+end
+
+Redis._encode = encode          -- exposed for tests; not part of the contract
+Redis._read_reply = read_reply
+
+-- =================================================================== commands
+function Redis:command(...)
+  if not self.sock then error("redis: connection is closed", 0) end
+  local ok, err = self.sock:write(encode(...))
+  if not ok then
+    self.broken = true
+    error("redis: write failed: " .. tostring(err), 0)
+  end
+  local value, reply_err = read_reply(self.sock)
+  if reply_err then
+    -- A protocol-level failure leaves the stream out of step, so the
+    -- connection cannot be handed to the next request.
+    if not value then self.broken = true end
+    error("redis: " .. tostring(reply_err), 0)
+  end
+  return value
+end
+
+--- Returns the value, or nil when the key is absent.  Never a sentinel: the
+--- cjson null sentinel leaking into handlers was a real defect once already.
+function Redis:get(key)
+  return self:command("GET", key)
+end
+
+--- `ttl` is in seconds and optional.
+function Redis:set(key, value, ttl)
+  if ttl then return self:command("SET", key, value, "EX", ttl) end
+  return self:command("SET", key, value)
+end
+
+function Redis:del(...)
+  return self:command("DEL", ...)
+end
+
+function Redis:incr(key)
+  return self:command("INCR", key)
+end
+
+function Redis:expire(key, seconds)
+  return self:command("EXPIRE", key, seconds)
+end
+
+function Redis:ttl(key)
+  return self:command("TTL", key)
+end
+
+function Redis:ping()
+  return self:command "PING"
+end
+
+function Redis:close()
+  if self.sock then pcall(function() self.sock:close() end) end
+  self.sock = nil
+end
+
+function Redis:release()
+  if self.pool then self.pool:put(self) else self:close() end
+end
+
+-- ==================================================================== connect
+local M = {}
+
+function M.connect(config)
+  config = config or {}
+
+  local function open()
+    local sock, err = socket.connect {
+      host = config.host or "127.0.0.1",
+      port = config.port or 6379,
+    }
+    if not sock then error("redis: could not connect: " .. tostring(err), 0) end
+    -- Without this a command would block the loop while waiting, which is the
+    -- whole thing this adapter exists to avoid.
+    sock:setmode("bn", "bn")
+    sock:onerror(function(_, _, why) return why end)
+
+    local conn = setmetatable({ sock = sock }, Redis)
+    if config.password then conn:command("AUTH", config.password) end
+    if config.database then conn:command("SELECT", config.database) end
+    return conn
+  end
+
+  local size = config.pool_size == nil and 10 or config.pool_size
+  if size <= 0 then return open end
+
+  -- Fit for reuse means the stream is still in step: a connection whose reply
+  -- was truncated would give the next request someone else's answer.
+  local pool = Pool.new(open, size, function(conn)
+    return not conn.broken and conn.sock ~= nil
+  end)
+  return setmetatable({ pool = pool }, {
+    __call = function() return pool:get() end,
+  })
+end
+
+M.Redis = Redis
+return M
