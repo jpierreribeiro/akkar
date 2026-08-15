@@ -1,7 +1,51 @@
 # akkar against Gin and FastAPI
 
+> ## ⚠ THE MAGNITUDES BELOW ARE NOT DEFENSIBLE
+>
+> An audit of this harness found four asymmetries running **simultaneously**
+> under every number on this page. The direction of the result — Gin fastest —
+> is very unlikely to flip. The magnitudes are not currently trustworthy, and
+> neither is the scoring of the advance predictions, because a 2:1 CPU
+> handicap manufactures exactly that kind of outcome.
+>
+> **1. Gin was running one process, not three.** `run.sh` starts three
+> `gin-bench` processes on one port; Go's `net.Listen` does not set
+> `SO_REUSEPORT`, so two panicked instantly with `EADDRINUSE` and the harness
+> never checked. The survivor used **6 vCPUs** through goroutines while akkar
+> and FastAPI used **3**, one per single-threaded process.
+>
+> This is the same defect found on akkar during the scaling benchmark, written
+> up at length in `bench/RESULTS.md` as "a configuration that is not the
+> configuration reports a number too" — and then this second harness was
+> written without the check that discovery produced. Verifying the
+> configuration is not a lesson learned until it is a line of code.
+>
+> **2. FastAPI serialised through the Python standard library.** `orjson` was
+> installed and unused; FastAPI ships `ORJSONResponse` for exactly this. That
+> is the encoder half of the same mistake already corrected once on this page
+> (`uvicorn` → `uvicorn[standard]`, worth 16.5x).
+>
+> **3. akkar did strictly more work.** Its route declares a `response` schema,
+> so it filtered and validated the response body. Gin does no output work, and
+> FastAPI's handler returns `JSONResponse` directly, bypassing `response_model`
+> entirely.
+>
+> **4. akkar paid for two features the peers do not offer.** A per-request
+> deadline (a `cqueues` controller per request, ~25 µs) and the blocking
+> watchdog (~1.2 µs) — together about **75% of akkar's 34.7 µs overhead**, for
+> capabilities neither Gin nor uvicorn has at all.
+>
+> A re-run is planned with the parallelism framing declared, the process count
+> verified, `ORJSONResponse` enabled, the response schema removed, and akkar
+> reported twice — as shipped, and with the deadline and watchdog off.
+>
+> **What still stands unaffected:** akkar's degradation *shape* across payload
+> sizes, which is measured against itself; and the 3.91x database fix
+> certified in `docs/PERFORMANCE-STUDY.md`, which is akkar against akkar with
+> identical configuration on both sides.
+
 Method fixed before any of this existed: `METHOD.md`. Read it first — it also
-records what was predicted in advance, and two of those predictions were wrong.
+records what was predicted in advance.
 
 ```
 machine   : AWS c5.2xlarge, Xeon Platinum 8275CL @ 3.00GHz

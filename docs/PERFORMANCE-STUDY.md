@@ -37,8 +37,14 @@ rows    gin r/s   fastapi r/s   akkar r/s   akkar/gin   bytes
 ```
 
 At one row akkar **beats** FastAPI. From ten rows on it loses, and the ratio
-against Gin degrades continuously. **This is the "medium JSON" shape** the
-owner reported hitting in the previous framework, reproduced here.
+against Gin degrades continuously.
+
+> **Caveat added after an audit of the harness.** These ratios were produced
+> while Gin was silently running one process on six vCPUs against akkar's three
+> single-threaded ones, and while FastAPI serialised through the Python
+> standard library rather than `orjson`. See the warning at the top of
+> `bench/compare/RESULTS.md`. **akkar's own degradation shape across payload
+> sizes stands** — it is measured against itself — but the peer ratios do not.
 
 ## Lines of investigation
 
