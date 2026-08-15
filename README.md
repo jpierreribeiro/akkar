@@ -283,7 +283,6 @@ as a timeout.
 
 | | |
 |---|---|
-| Interpolated literals, not prepared statements | safe against injection, but the extended protocol is the right answer |
 | `response` is documentation only | it feeds OpenAPI; handler output is not validated or filtered against it |
 | No multipart uploads | streaming them interacts with the body limit, so it is not just another content type |
 | No Redis adapter | the contract is settled; the adapter is not written |

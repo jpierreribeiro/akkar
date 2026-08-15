@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 57 tests, no database needed, ~2 s
+busted                      # 62 tests with Postgres up, 57 without, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -209,11 +209,24 @@ that accepts anything while looking validated.
   doing — but one line rather than an exercise. Verified: a `SIGTERM` with a
   request in flight let it finish with 200 before the process exited.
 
+### Done, continued
+
+- **Parameter binding over the extended protocol.** pgmoon already implemented
+  it; `akkar/db.lua` was hand-rolling `escape_literal` interpolation on top.
+  Deleting that removed a real defect as well as the redundancy: the old binder
+  substituted `$n` from highest to lowest, so a value bound to `$2` containing
+  the text `$1` was rewritten on the next pass.
+
+  Honest about what it is not: pgmoon sends an **unnamed** statement, so the
+  parse happens per call and there is no server-side plan caching between
+  calls. That is correct binding, not a named prepared statement.
+
+  `spec/db_spec.lua` covers it against a live Postgres and skips cleanly when
+  none is reachable, because binding done by the server cannot be tested
+  against a fake.
+
 ### Still open
 
-- **Prepared statements** over the extended protocol. `akkar/db.lua`
-  interpolates `$1` through `escape_literal` — safe against injection, but not
-  the right mechanism.
 - **Validating handler output against `response`.** Today it is documentation
   only. FastAPI's `response_model` also filters and validates. Whether akkar
   should is a real decision: it catches a handler leaking a field, and it also

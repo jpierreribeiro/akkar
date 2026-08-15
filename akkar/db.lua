@@ -9,9 +9,14 @@ It receives `req.db` and calls `:one`, `:many`, `:exec`, `:transaction`.
 Swapping pgmoon for async libpq inside a C host rewrites this file and
 nothing else.
 
-Known limitation, deliberate for now: `$1` is interpolated through pgmoon's
-escape_literal rather than sent over the extended protocol.  Safe against
-injection, but real prepared statements are the right answer.
+Parameters go over the Postgres extended protocol -- pgmoon sends Parse, Bind,
+Describe and Execute with typed binding -- so a value is never spliced into SQL
+text.  This file used to interpolate `$1` through escape_literal on top of a
+library that already did it properly; deleting that was the fix.
+
+The statement is UNNAMED, meaning the parse happens on every call and there is
+no server-side plan caching between calls.  That is correct, safe binding; it
+is not the same thing as a named prepared statement.
 ]]
 
 local cqueues = require "cqueues"
@@ -20,21 +25,6 @@ local pgmoon  = require "pgmoon"
 
 local Db = {}
 Db.__index = Db
-
-local function bind(pg, sql, ...)
-  local n = select("#", ...)
-  if n == 0 then return sql end
-  local args = { ... }
-  -- Substitute $n down from the highest, so $10 does not become $1 then "0".
-  for i = n, 1, -1 do
-    local value = args[i]
-    local literal
-    if value == nil then literal = "NULL"
-    else literal = pg:escape_literal(value) end
-    sql = sql:gsub("%$" .. i, (literal:gsub("%%", "%%%%")))
-  end
-  return sql
-end
 
 -- pgmoon marks NULL with a sentinel; cjson needs nil.
 local function clean(row, null)
@@ -46,7 +36,7 @@ local function clean(row, null)
 end
 
 function Db:query(sql, ...)
-  local res, err = self.pg:query(bind(self.pg, sql, ...))
+  local res, err = self.pg:query(sql, ...)
   if not res then error("db: " .. tostring(err), 0) end
   return res
 end
