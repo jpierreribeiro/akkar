@@ -624,6 +624,15 @@ end
 
 function App:use(fn)
   self.middleware[#self.middleware + 1] = fn
+  -- The chain is built once and memoised, and `app:test{}` builds it. So a
+  -- middleware registered after the first test client -- or after any earlier
+  -- `app:run` in the same process -- used to be appended to a list nobody
+  -- read again: it was silently ignored, and the failure looks exactly like
+  -- middleware that does not work.
+  --
+  -- Silent is the problem. Authentication registered one line too late is not
+  -- a bug that announces itself.
+  self._chain, self._chain_short = nil, nil
   return self
 end
 
@@ -1434,12 +1443,21 @@ local function handle(app, input)
     local winner, value = with_deadline(input.timeout, function()
       return normalize(chain(app, req))
     end)
-    if is_response(value) then
-      value.headers = value.headers or {}
-      value.headers["x-request-id"] = req.id
-      -- Echoed back so a client can tie the response to the trace it started.
-      if req.trace then value.headers["traceparent"] = req.trace.traceparent end
-    end
+    -- The request id and the traceparent are NOT written onto the response.
+    --
+    -- They used to be: `value.headers["x-request-id"] = req.id`, on whatever
+    -- table the handler returned. A handler is free to return a hoisted or
+    -- memoised response -- a constant 404, a cached payload -- and then one
+    -- table is shared by every request that reaches it, so request A's id was
+    -- written into a table request B was also returning. It is the identical
+    -- aliasing defect the audit fixed for `release`, left standing for
+    -- headers.
+    --
+    -- Copying the response to stamp it safely costs two tables per request,
+    -- and the allocation ceiling measured that at +264 bytes and refused it.
+    -- So neither: these travel BESIDE the response, as extra return values,
+    -- and each writer puts them on the wire itself. Nothing is mutated, and
+    -- the per-request cost is nothing.
     if winner == "TIMEOUT" then
       internal:warn("request deadline exceeded", {
         request_id = req.id, method = req.method, path = req.path,
@@ -1478,12 +1496,15 @@ local function handle(app, input)
     release_all()
   end
 
+  -- Beside the response, never on it. See the note at the stamp site above.
+  local trace_parent = req.trace and req.trace.traceparent
+
   if not ok then
-    if is_response(res) then return res end
+    if is_response(res) then return res, req.id, trace_parent end
     internal:error("middleware raised", { request_id = req.id, detail = tostring(res) })
-    return internal_error(app, res, req)
+    return internal_error(app, res, req), req.id, trace_parent
   end
-  return res
+  return res, req.id, trace_parent
 end
 
 -- ==================================================================== server
@@ -1747,7 +1768,7 @@ function App:run(config)
           else short = response(value.status or 400, { error = value.message }) end
         end
 
-        local res = handle(self, {
+        local res, request_id, trace_parent = handle(self, {
           method = h:get ":method", path = path, query = parse_query(qs),
           body = body, headers = h, timeout = timeout,
           capabilities = config,
@@ -1762,6 +1783,14 @@ function App:run(config)
         rh:append(":status", tostring(res.status))
         if res.headers then
           for name, value in pairs(res.headers) do rh:append(name, value) end
+        end
+        -- Onto the wire, not onto the handler's table. A handler that set one
+        -- of these itself keeps what it chose.
+        if request_id and not (res.headers and res.headers["x-request-id"]) then
+          rh:append("x-request-id", request_id)
+        end
+        if trace_parent and not (res.headers and res.headers["traceparent"]) then
+          rh:append("traceparent", trace_parent)
         end
         local is_head = h:get ":method" == "HEAD"
 
@@ -1790,7 +1819,7 @@ function App:run(config)
               -- chunk is the only signal left: the client sees a truncated
               -- response instead of a complete-looking lie.
               internal:error("stream producer failed", {
-                request_id = res.headers and res.headers["x-request-id"],
+                request_id = request_id,
                 wrote_bytes = wrote,
                 detail = tostring(failure),
                 hint = wrote and "response already committed; connection dropped"
@@ -1865,7 +1894,7 @@ function App:test(config)
     return function(_, path, options)
       options = options or {}
       local p, qs = path:match "^([^?]*)%??(.*)$"
-      local res = handle(self, {
+      local res, request_id, trace_parent = handle(self, {
         method = method, path = p,
         query = parse_query(qs),
         body = options.body,
@@ -1894,8 +1923,22 @@ function App:test(config)
         end
         raw = table.concat(chunks)
       end
-      return { status = res.status, body = res.body, raw = raw,
-               headers = res.headers or {} }
+      -- A fresh table, carrying what the wire would have carried. Allocating
+      -- here is free -- this is a test client -- and returning the handler's
+      -- own table would hand a spec the very aliasing the server refuses to
+      -- create.
+      local seen = {}
+      if res.headers then
+        for name, value in pairs(res.headers) do seen[name] = value end
+      end
+      if request_id and seen["x-request-id"] == nil then
+        seen["x-request-id"] = request_id
+      end
+      if trace_parent and seen["traceparent"] == nil then
+        seen["traceparent"] = trace_parent
+      end
+
+      return { status = res.status, body = res.body, raw = raw, headers = seen }
     end
   end
   for _, m in ipairs { "get", "post", "put", "patch", "delete", "head", "options" } do

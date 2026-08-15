@@ -141,6 +141,49 @@ describe("a streamed response", function()
   end)
 end)
 
+describe("a response the handler reuses", function()
+  it("is never stamped with the request that happened to return it", function()
+    -- `x-request-id` and the traceparent were written onto whatever table the
+    -- handler returned. A handler may return a hoisted or memoised response
+    -- -- a constant 404, a cached payload -- and then one table is shared by
+    -- every request that reaches it, so request A's id landed in a table
+    -- request B was also returning. Identical in shape to the `release`
+    -- aliasing the audit fixed, and left standing for headers.
+    --
+    -- Copying the response to stamp it safely measured +264 bytes per
+    -- request and the allocation ceiling refused it. So nothing is stamped:
+    -- the id travels beside the response and each writer puts it on the wire.
+    local shared = akkar.ok { cached = true }
+    local app = akkar.new()
+    app:get("/cached", function() return shared end)
+
+    local client = app:test {}
+    local first  = client:get "/cached"
+    local second = client:get "/cached"
+
+    assert.is_truthy(first.headers["x-request-id"])
+    assert.is_truthy(second.headers["x-request-id"])
+    assert.are_not.equal(first.headers["x-request-id"],
+                         second.headers["x-request-id"],
+                         "two requests were handed one id")
+
+    assert.is_nil(shared.headers,
+      "the id was written into the table the handler keeps returning")
+  end)
+
+  it("lets a handler keep a header it set itself", function()
+    local app = akkar.new()
+    app:get("/mine", function()
+      local res = akkar.ok { ok = true }
+      res.headers = { ["x-request-id"] = "chosen-by-the-handler" }
+      return res
+    end)
+
+    local res = app:test({}):get "/mine"
+    assert.equal("chosen-by-the-handler", res.headers["x-request-id"])
+  end)
+end)
+
 describe("the sandbox's string bound", function()
   local vm = require "akkar.vm"
 
