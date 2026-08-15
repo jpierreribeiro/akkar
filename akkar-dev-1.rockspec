@@ -58,6 +58,7 @@ build = {
     ["akkar.multipart"] = "akkar/multipart.lua",
     ["akkar.pool"] = "akkar/pool.lua",
     ["akkar.redis"] = "akkar/redis.lua",
+    ["akkar.work"] = "akkar/work.lua",
     ["akkar.openapi"] = "akkar/openapi.lua",
   },
   copy_directories = { "docs", "examples" },

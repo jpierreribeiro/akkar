@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 120 tests with Postgres and Redis up, no database needed, ~2 s
+busted                      # 128 tests with Postgres and Redis up, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -292,15 +292,41 @@ that accepts anything while looking validated.
   picks its own boundary and may use characters Lua patterns treat as magic,
   and file contents may contain CRLF.
 
+- **CPU-bound work**, `akkar/work.lua`, two answers and an honest account of
+  what neither fixes.
+
+  `work.yielding(budget, fn)` gives the scheduler turns inside a Lua loop you
+  control. Measured on a ~200 ms loop:
+
+  | budget | the task | worst neighbour wait |
+  |---|---:|---:|
+  | no yielding | 202 ms | 200.5 ms |
+  | every 50000 | 520 ms | 28.7 ms |
+  | every 2000 | 557 ms | 0.9 ms |
+
+  Neighbour latency falls by two orders of magnitude and the task itself gets
+  about **2.7x slower**, because each yield costs a trip through the
+  scheduler. The first draft of this module claimed the CPU cost was
+  unchanged; measuring it said otherwise, and the docs now carry the numbers.
+
+  `work.queue(cache, name)` is a Redis list — `LPUSH` to enqueue, `BRPOP` to
+  consume, blocking server-side rather than polling. Deliberately not a job
+  framework: no retries, no scheduling, no dead-letter queue. A failing job is
+  logged and dropped, because a retry policy nobody chose hides the failure
+  and repeats the side effects.
+
+  **Neither fixes `bcrypt`.** A C function that runs 250 ms without returning
+  to Lua cannot be yielded — there is no point where Lua regains control. The
+  real answers are N processes, a lower cost factor chosen knowingly, or
+  moving authentication behind the queue and changing what the endpoint
+  promises.
+
 ### Still open
 
 - **Redis adapter.** The contract question is settled (`DECISIONS.md` §8);
   what remains is choosing a library and writing it.
 - **Prefix-tree routing.** Dynamic routes are a linear scan. Not urgent — say
   so honestly rather than optimizing early.
-- **Where CPU-bound work runs.** `bcrypt` at cost 12 takes ~250 ms *by design*
-  and will stall the process. The watchdog reports it; it does not solve it.
-  The answers are an external queue or a separate process. Undecided.
 - **Lua 5.5.** The blocker is `cqueues`, which pins `lua == 5.4` and has had no
   release since 2020 — **not** `lua-http`, which accepts `>= 5.1`. Not in our
   hands. An argument for the adapter boundary, and eventually for owning the

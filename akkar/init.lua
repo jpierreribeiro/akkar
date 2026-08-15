@@ -1142,6 +1142,7 @@ akkar.null = cjson.null
 -- Exposed so the startup checks can be tested without binding a socket.
 akkar.check_capabilities = check_capability_contracts
 akkar.log = log
+akkar.work = require "akkar.work"
 
 akkar.Response = Response
 akkar.guard = guard
