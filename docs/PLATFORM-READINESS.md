@@ -35,7 +35,7 @@ platform:swap_host("acme.example.com", new_app)    -- atomic, no request dropped
 | 4 | ~~**Tenant-scoped `db`.**~~ **Done** — `akkar/scope.lua` | Yes |
 | 5 | ~~**Real jobs.**~~ **Done** — retries, jitter, delay, dead letters, idempotency | Yes |
 | 6 | ~~**Streaming responses.**~~ **Done** — `akkar.stream` | Yes |
-| 7 | **An isolated VM per execution.** Customer-authored logic: memory ceiling, instruction budget, no ambient I/O. | No — only the platform asks for this |
+| 7 | ~~**An isolated VM per execution.**~~ **Done, with its limits stated** — `akkar/vm.lua` | No — only the platform asks for this |
 
 ## Why 3 and 4 are the ones to start with
 
@@ -156,7 +156,7 @@ differs from the real one is how a test proves the wrong thing.
 | 4 | Tenant-scoped `db` | **done** — `akkar/scope.lua` |
 | 5 | Real jobs | **done** — 23 tests, 7 against a live Redis |
 | 6 | Streaming responses | **done** — `akkar.stream`, 10 tests |
-| 7 | Isolated VM per execution | **the one left**, and the only one the list itself said akkar does not need without the platform |
+| 7 | Isolated VM per execution | **done** — `akkar.vm`, 26 tests, most of them attempted escapes |
 
 ## What landed for 1 and 2
 
@@ -188,3 +188,40 @@ one Lua VM runs one coroutine at a time and switches only at a yield, and
 assigning a field yields nowhere. A request already in flight finishes against
 the app it was routed to, which a test proves by swapping while a handler
 sleeps.
+
+
+## What landed for 7, and what it does not claim
+
+`akkar.vm` is a **sandbox inside one Lua state, not an isolated VM**. Lua 5.4
+cannot create a separate state from Lua; that needs C or a subprocess. What it
+does have is a curated `_ENV`, text-only loading, an instruction budget and a
+memory ceiling.
+
+Within those limits it is real. Beyond them it is not a boundary against a
+determined attacker sharing the process, and the module says so at the top:
+**if the code is hostile rather than merely untrusted, run it in a separate
+process with an OS-level sandbox.**
+
+Four escapes are worth recording, because three of them are quiet and two were
+found by tests written to prove they could not happen:
+
+- **Bytecode.** Crafted bytecode reads and writes arbitrary memory; the VM
+  validates very little. Loading is `"t"` with no way to ask for anything else.
+- **Coroutines.** A hook is installed on *one* coroutine, so
+  `coroutine.wrap(function() while true do end end)()` runs with no budget and
+  hangs the process. `coroutine` is not in the environment. This is the one
+  most likely to be missed, because the sandbox otherwise looks complete.
+- **A `pcall` that swallows the budget.** A budget enforced by raising is
+  enforced only if the error escapes, and `while true do pcall(...) end`
+  catches every overrun forever. Lua has no uncatchable error, so the
+  sandbox's `pcall` re-raises anything thrown after the budget is gone. *Found
+  by the test asserting it was impossible — which hung the suite.*
+- **Method syntax on strings.** `("x"):rep(2^30)` resolves through the shared
+  string metatable to the **real** `string` library, never through the copy in
+  the sandbox's `_ENV`. Bounding the sandbox's own `string.rep` did nothing. A
+  curated `_ENV` does not cover strings at all. *Also found by a test.*
+
+One bound was **removed** after a test disproved its premise: `string.format`
+was guarded against a wide field like `%099999999d`, but Lua 5.4 rejects any
+width of 100 or more, so a directive can produce at most 99 bytes. The check
+cost a pattern match per call and bought nothing.

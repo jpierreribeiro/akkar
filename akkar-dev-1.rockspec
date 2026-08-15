@@ -66,6 +66,7 @@ build = {
     ["akkar.redis"] = "akkar/redis.lua",
     ["akkar.sql"] = "akkar/sql.lua",
     ["akkar.scope"] = "akkar/scope.lua",
+    ["akkar.vm"] = "akkar/vm.lua",
     ["akkar.strict"] = "akkar/strict.lua",
     ["akkar.work"] = "akkar/work.lua",
     ["akkar.openapi"] = "akkar/openapi.lua",
