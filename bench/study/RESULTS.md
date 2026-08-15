@@ -165,13 +165,61 @@ worse than Gin's and **better than FastAPI's**.
 
 ---
 
+## 7. Forty-five minutes, because everything above is ten seconds
+
+Every other figure in this study is a ten-second window, and a ten-second
+window cannot see the three things that actually take a service down
+overnight: memory that climbs, descriptors that are never returned, and
+throughput that decays. So this run measures **drift** rather than a number —
+the last quarter against the first — and samples the resources beside it.
+
+45 minutes, 2 processes, `pool_size = 10`, 16 connections, one sample per
+minute, against `/users/42`. Full table in `results/soak.log`.
+
+```
+min      req/s      p50      p99   rss_mb   fds   pg   errors
+1      7373.63   2.15ms   3.12ms       26    60   17        0
+17     7368.77   2.59ms   3.97ms       27    80   21        0
+45     7398.22   2.56ms   3.98ms       27    80   21        0
+```
+
+| | |
+|---|---|
+| Throughput drift, last quarter vs first | **+0.048%** |
+| Spread across all 45 samples | 0.91%, min 7345.10, max 7412.26 |
+| Resident memory | **26 MB → 27 MB, then flat for 44 minutes** |
+| Descriptors | 60 → 80 by minute 17, then flat |
+| Postgres connections | 17 → 21, then flat |
+| Errors | **0**, across roughly 19.9 million requests |
+
+Nothing drifts. The one number that moves is the descriptor count, and it
+stops moving: that is the pool filling to its ceiling and staying there, which
+is what a pool is supposed to do. The 21 Postgres connections are the whole
+capacity — two processes times ten — **plus the `psql` doing the counting**,
+so the pools were genuinely full every time they were sampled.
+
+**What this does not answer.** The question that motivated the soak was pool
+sizing: `/users/:id` showed a 191 ms p99 at 100 connections against
+`pool_size = 10`, where ninety requests queue for a connection. This run used
+16 connections against a capacity of 20, so **nothing ever queued** — it
+proves the absence of a leak, not the behaviour of a saturated pool. The
+sizing guidance is still owed, and it needs a soak run above capacity.
+
+Forty-five minutes is also not a night. It is long enough to rule out a leak
+with a slope this flat, and not long enough to say anything about a weekly
+one.
+
+---
+
 ## What this study is not
 
 - **Not a claim about developer velocity, ecosystem or maintenance**, which
   decide framework choice far more often than throughput does.
 - **Not tuned Postgres, other query shapes, or a realistic mixed workload.**
   Three routes, one box, stock settings.
-- **Not sustained load.** Every figure is ten seconds. A soak is still owed.
+- **Not a saturated pool over hours.** Section 7 sustains 45 minutes and finds
+  no drift, but it runs below pool capacity and nothing queues. The comparison
+  figures themselves are still ten-second windows.
 
 ## What it cost to get
 

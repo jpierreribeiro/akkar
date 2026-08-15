@@ -478,8 +478,8 @@ that accepts anything while looking validated.
 ### Still open
 
 Nothing here blocks using akkar. Two items are closed by measurement rather
-than by work, and the third is the milestone everything else was clearing the
-way for.
+than by work, the soak has now been run and left one question behind it, and
+the milestone everything else was clearing the way for is still the milestone.
 
 - **Port a real service off Gin.** `docs/PLAN.md` names this as the milestone
   never reached, and it is the only honest test of completeness — it will
@@ -501,16 +501,26 @@ way for.
   Predictions are recorded in `METHOD.md` in advance, so the result cannot be
   retrofitted into a story afterwards.
 
-- **Soak test.** Every benchmark so far is twelve to fifteen seconds, which
-  says nothing about connection churn, memory growth or GC behaviour over
-  hours. Cheap to run now that a machine exists: start it, leave it, come
-  back. For a framework meant for production this is the largest unmeasured
-  thing left.
+- ~~**Soak test.**~~ **Run**, 45 minutes — `bench/study/results/soak.log`, written
+  up as section 7 of `bench/study/RESULTS.md`.
 
-  One specific question to answer with it: `/users/:id` p99 was 191 ms at one
-  process with 100 concurrent connections against `pool_size = 10`, so ninety
-  requests were queuing for a connection. Pool sizing against concurrency is
-  currently undocumented, and a soak run is where the guidance comes from.
+  Throughput drifted **+0.048%** from the first quarter to the last, resident
+  memory went 26 MB → 27 MB and then sat there for forty-four minutes,
+  descriptors climbed 60 → 80 by minute seventeen and stopped, and there were
+  **zero errors in roughly 19.9 million requests**. No leak of memory, of
+  descriptors or of database connections — which is the one thing this
+  project's ten-second measurements were never able to assert.
+
+  **The specific question it was supposed to answer is still open.**
+  `/users/:id` p99 was 191 ms at one process with 100 concurrent connections
+  against `pool_size = 10`, so ninety requests were queuing for a connection.
+  The soak ran 16 connections against a capacity of 20, so nothing queued: it
+  proves the absence of a leak and says nothing about a saturated pool. Pool
+  sizing against concurrency remains undocumented, and the run that produces
+  the guidance has to push past capacity.
+
+  Forty-five minutes also is not a night. The slope is flat enough to rule out
+  a leak at this timescale and not long enough to speak about a weekly one.
 
 - **Prefix-tree routing — measured, and the answer is no.** Worst-case dynamic
   match is 33 µs at 50 routes and 95 µs at 200, against roughly 4000 µs for one
