@@ -277,4 +277,55 @@ rows in the interpreter, and 55% of a thousand-row query is that decoding —
 not reachable without a driver written in C. The socket half is reachable,
 and that is what finding 8 measures.
 
+### 8. Serving pgmoon's socket reads from one buffer — **certified, 1.05x**
+
+The recoverable part of the 30%. pgmoon asks the socket for five bytes and
+then a body, once per protocol message, and Postgres sends one message per
+row: 2,006 Lua-level calls for a thousand rows. Serving them out of one large
+read, on a 200-row query:
+
+```
+variant      req/s        p50         p99    spread
+before     2433.52    38.20ms    106.16ms      1.4%
+after      2543.76    36.61ms     84.91ms      1.6%
+
+change : +4.5%  (1.05x)      floor: 1.6%      VERDICT: CERTIFIED
+```
+
+The throughput is the smaller half of it. **p99 fell 20%**, 106 ms to 85 ms,
+which is what removing two thousand small allocations from a request tends to
+look like.
+
+It is the only place akkar reaches into a dependency's internals, so it lives
+in the file whose whole job is isolating pgmoon, it has an off switch that
+needs no fork, and what it produces is proven identical rather than assumed:
+row counts of 1, 100 and 2,000 straddling the 64 KB read, plus a single
+200 KB field that forces the refill loop.
+
+## Where this leaves the numbers
+
+Each fix is certified against its own before and after. **There is no single
+"akkar is N times faster" figure, and multiplying these together would be
+wrong**, because they act on different paths: `/ping` never decodes a body or
+touches the database, and the parameter-typing fix does nothing for a route
+that has no parameters.
+
+Per path, against the state at the top of this document:
+
+| path | what moved it | certified |
+|---|---|---|
+| any parameterised query | parameter typing | **3.91x** |
+| the database path, again | buffered socket reads | **1.05x**, p99 −20% |
+| a body of any size | the double null walk | **1.47x** |
+| every request | the deadline controller pool | **1.21x** |
+
+**Not measured: the old baseline against current HEAD, end to end.** That is
+one A/B and nobody has run it.
+
+**Not measured either: anything against another framework.** The comparison in
+`bench/compare/RESULTS.md` is retracted — four asymmetries ran simultaneously
+under every number on that page — and the re-run it promises has not happened.
+So the honest statement today is that akkar is measurably faster **than
+itself**, and where it stands against Gin or FastAPI is currently unknown.
+
 *(more as the remaining lines of enquiry land)*
