@@ -256,9 +256,18 @@ function M.connect(config)
     -- vanish outside one, which is where most queries run.
     if config.statement_timeout then
       local ms = math.floor(config.statement_timeout * 1000)
-      local ok, err = pg:query("set statement_timeout = " .. ms)
-      if not ok then
-        error("db: could not set statement_timeout: " .. tostring(err), 0)
+      local set, set_err = pg:query("set statement_timeout = " .. ms)
+      if not set then
+        -- DISCONNECT BEFORE RAISING. The connection is already open and
+        -- authenticated at this point, so raising out of `open` left a live
+        -- Postgres backend with nothing in this process referencing it. The
+        -- pool restores its slot on the error path and the descriptor does
+        -- not come back, so a database that fails this one statement --
+        -- because `statement_timeout` is not settable for that role, say --
+        -- burned a backend per attempt while the pool reported itself
+        -- healthy.
+        pcall(function() pg:disconnect() end)
+        error("db: could not set statement_timeout: " .. tostring(set_err), 0)
       end
     end
 

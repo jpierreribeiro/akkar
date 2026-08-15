@@ -194,8 +194,22 @@ function M.connect(config)
     sock:onerror(function(_, _, why) return why end)
 
     local conn = setmetatable({ sock = sock }, Redis)
-    if config.password then conn:command("AUTH", config.password) end
-    if config.database then conn:command("SELECT", config.database) end
+
+    -- CLOSE THE SOCKET BEFORE RAISING. AUTH and SELECT run on a connection
+    -- that is already open, and raising out of `open` left it with nothing in
+    -- this process referencing it. The pool restores its slot on the error
+    -- path; the descriptor does not come back. A wrong password therefore
+    -- leaked one socket per attempt, for as long as something kept retrying
+    -- -- which is exactly what a pool under load does.
+    local ok, err_setup = pcall(function()
+      if config.password then conn:command("AUTH", config.password) end
+      if config.database then conn:command("SELECT", config.database) end
+    end)
+    if not ok then
+      pcall(function() conn:close() end)
+      error(err_setup, 0)
+    end
+
     return conn
   end
 

@@ -113,6 +113,39 @@ if not reachable() then
   return
 end
 
+describe("a handshake the server refuses", function()
+  -- AUTH and SELECT run on a socket that is already open. Raising out of
+  -- `open` left it with nothing in this process referencing it: the pool
+  -- restores its slot on the error path, and the descriptor does not come
+  -- back. A wrong password therefore leaked one socket per attempt -- and a
+  -- pool under load retries, so that is one per request.
+  --
+  -- Counted rather than reasoned about, and deliberately WITHOUT forcing a
+  -- collection first: a descriptor that only returns when the collector runs
+  -- is the trap this project already recorded once, where an OS limit was
+  -- quietly tied to the pace of the GC.
+  local function open_fds()
+    local pid = io.open("/proc/self/stat"):read "n"
+    local n = 0
+    for _ in io.popen("ls /proc/" .. pid .. "/fd 2>/dev/null"):lines() do n = n + 1 end
+    return n
+  end
+
+  it("does not leave the socket open", function()
+    local before = open_fds()
+    for _ = 1, 25 do
+      local ok = pcall(function()
+        return redis.connect { pool_size = 0, password = "definitely-not-the-password" }()
+      end)
+      assert.is_false(ok, "Redis accepted a password it should not have")
+    end
+    local after = open_fds()
+
+    assert.is_true(after - before < 10,
+      ("25 refused handshakes leaked descriptors: %d -> %d"):format(before, after))
+  end)
+end)
+
 describe("akkar.redis against a real server", function()
   local conn
   before_each(function() conn = redis.connect { pool_size = 0 }() end)
