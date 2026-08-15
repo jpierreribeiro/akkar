@@ -163,6 +163,7 @@ local SETTINGS = {
   host = true, port = true, tls = true, ctx = true,
   body_limit = true, timeout = true, shutdown_grace = true,
   check_capabilities = true, reuseport = true, strict = true,
+  max_concurrent = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -1399,9 +1400,62 @@ function App:run(config)
   -- Without it the second process dies with EADDRINUSE, and a benchmark that
   -- starts N processes silently measures one.  That is not hypothetical: it
   -- is what the first scaling run on a c5.2xlarge actually did.
+  -- ================================================== the descriptor ceiling
+  --
+  -- Every in-flight request holds a `cqueues` controller for its deadline,
+  -- and a controller costs exactly two file descriptors. Measured, at the
+  -- concurrency that matters:
+  --
+  --     concurrent      fds     per request
+  --     64              134            2.09
+  --     256             518            2.02
+  --     512            1030            2.01
+  --
+  -- Against the common default of `ulimit -n 1024`, that puts the wall at
+  -- about 500 concurrent requests per process -- and hitting it does not
+  -- produce a clean error. `accept` starts failing, every socket operation
+  -- starts failing, and the process flails. A machine was lost this way
+  -- during a 512-connection sweep.
+  --
+  -- Pooling the controllers does not help here. The pool serves SEQUENTIAL
+  -- reuse; five hundred requests in flight at once need five hundred
+  -- controllers whatever its size.
+  --
+  -- So the ceiling is declared to lua-http, which stops accepting beyond it
+  -- and lets the kernel queue instead. Backpressure rather than collapse:
+  -- slow is a state a server can be in, out of descriptors is not.
+  --
+  -- The real fix is not to spend a controller per request at all -- a
+  -- `condition` costs zero descriptors and would do the same arbitration.
+  -- That is not a drop-in, and the reason is worth writing down: today an
+  -- abandoned handler sits in an orphaned controller nothing ever steps, so
+  -- it is inert. Move it to the outer controller and it keeps running, wakes
+  -- after the 503, and touches a connection that has already gone back to
+  -- the pool -- trading a descriptor leak for a data bug.
+  local function descriptor_ceiling()
+    local limits = io.open "/proc/self/limits"
+    if not limits then return nil end
+    local soft
+    for line in limits:lines() do
+      soft = soft or line:match "^Max open files%s+(%d+)"
+    end
+    limits:close()
+    if not soft then return nil end
+
+    -- Two per in-flight request, and leave a third of the budget for the
+    -- listening socket, the database pool, the log sink and whatever else
+    -- the application opens.
+    local ceiling = math.floor(tonumber(soft) * 0.66 / 2)
+    return math.max(ceiling, 16)
+  end
+
+  local max_concurrent = config.max_concurrent
+  if max_concurrent == nil then max_concurrent = descriptor_ceiling() end
+
   local s = assert(server.listen {
     host = host, port = port, tls = config.tls or false, ctx = config.ctx,
     reuseport = config.reuseport,
+    max_concurrent = max_concurrent,
     onstream = function(_, stream)
       self.in_flight = self.in_flight + 1
       local ok, err = pcall(function()

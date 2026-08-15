@@ -328,4 +328,41 @@ under every number on that page — and the re-run it promises has not happened.
 So the honest statement today is that akkar is measurably faster **than
 itself**, and where it stands against Gin or FastAPI is currently unknown.
 
+### 9. Concurrency has a hard ceiling, and it is descriptors — **measured**
+
+Deterministic, so it needs no quiet machine and has no noise floor to hide in:
+
+```
+concurrent in flight      open fds      per request
+1                                8             8.00
+16                              38             2.38
+64                             134             2.09
+128                            262             2.05
+256                            518             2.02
+512                           1030             2.01
+```
+
+Every in-flight request holds a controller for its deadline, and a controller
+costs **exactly two descriptors**. Against the common default of `ulimit -n
+1024`, that is a wall at about **500 concurrent requests per process** — and
+reaching it is not a clean error. `accept` starts failing, every socket
+operation starts failing, and the process flails. The benchmark machine was
+lost this way during a 512-connection sweep, which is how this was found.
+
+Pooling the controllers does not help. The pool serves *sequential* reuse;
+five hundred requests in flight at once need five hundred controllers whatever
+its size.
+
+**Shipped:** the ceiling is read from `/proc/self/limits` at boot and declared
+to lua-http, which stops accepting beyond it and lets the kernel queue. Forty
+requests against a ceiling of eight: all forty answered, none failed.
+
+**Not shipped, and the reason matters.** The real fix is to stop spending a
+controller per request. A `condition` does the same arbitration for **0.00
+descriptors** — measured alongside the above. It is not a drop-in: today an
+abandoned handler sits in an orphaned controller nothing ever steps, so it is
+inert. Move it to the outer controller and it keeps running, wakes after the
+503, and touches a connection that has already gone back to the pool. That
+trades a descriptor leak for a data bug, and the data bug is worse.
+
 *(more as the remaining lines of enquiry land)*

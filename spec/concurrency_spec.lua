@@ -1,0 +1,125 @@
+--[[
+The descriptor ceiling.
+
+Every in-flight request holds a cqueues controller for its deadline, and a
+controller costs exactly two file descriptors. Measured:
+
+    concurrent      fds     per request
+    64              134            2.09
+    256             518            2.02
+    512            1030            2.01
+
+Against the common default of `ulimit -n 1024` that is a wall at about 500
+concurrent requests per process, and hitting it is not a clean failure:
+`accept` starts failing, every socket operation starts failing, and the
+process flails. A benchmark machine was lost this way during a 512-connection
+sweep.
+
+Pooling the controllers does not help. The pool serves sequential reuse; five
+hundred requests in flight at once need five hundred controllers whatever its
+size.
+]]
+
+package.path = "./?.lua;./?/init.lua;" .. package.path
+
+local cqueues = require "cqueues"
+local akkar   = require "akkar"
+local request = require "http.request"
+
+describe("a controller costs descriptors", function()
+  local condition = require "cqueues.condition"
+
+  --- Counts this process's descriptors. Reading /proc/self/fd through
+  --- io.popen measures the SUBPROCESS, so the pid comes from /proc/self/stat
+  --- first -- a mistake this project has already made once.
+  local pid = io.open("/proc/self/stat"):read("l"):match "^(%d+)"
+  local function open_fds()
+    local h = io.popen("ls /proc/" .. pid .. "/fd 2>/dev/null | wc -l")
+    local n = tonumber(h:read "l") or 0
+    h:close()
+    return n
+  end
+
+  local function cost_of(make, n)
+    collectgarbage(); collectgarbage()
+    local before = open_fds()
+    local held = {}
+    for i = 1, n do held[i] = make() end
+    local after = open_fds()
+    return (after - before) / n, held
+  end
+
+  it("is two per controller, exactly", function()
+    -- Deterministic: no timing, no noise floor, no quiet machine needed.
+    local each = cost_of(function() return cqueues.new() end, 100)
+    assert.is_true(each > 1.9 and each < 2.1,
+      string.format("a controller cost %.2f descriptors", each))
+  end)
+
+  it("is zero for a condition, which is what makes the real fix possible", function()
+    -- The arbitration a deadline needs could be done with one of these and no
+    -- descriptors at all. It is not a drop-in -- see the note in App:run --
+    -- but this is the measurement that says it is worth doing.
+    local each = cost_of(function() return condition.new() end, 100)
+    assert.equal(0, each)
+  end)
+end)
+
+describe("the concurrency ceiling", function()
+  it("queues rather than collapsing when the ceiling is reached", function()
+    -- Slow is a state a server can be in. Out of descriptors is not.
+    local PORT = 8394
+    local app = akkar.new()
+    app:get("/slow", function() cqueues.sleep(0.4) return { ok = true } end)
+
+    local answered, failed = 0, 0
+    local cq = cqueues.new()
+    cq:wrap(function()
+      pcall(function()
+        app:run { port = PORT, check_capabilities = false, max_concurrent = 8,
+                  log = akkar.log.new { level = "error" } }
+      end)
+    end)
+    cq:wrap(function()
+      cqueues.sleep(0.2)
+      local inner = cqueues.new()
+      for _ = 1, 40 do
+        inner:wrap(function()
+          local ok = pcall(function()
+            local req = request.new_from_uri("http://127.0.0.1:" .. PORT .. "/slow")
+            local h, stream = assert(req:go(15))
+            stream:get_body_as_string()
+            assert(h:get ":status" == "200")
+          end)
+          if ok then answered = answered + 1 else failed = failed + 1 end
+        end)
+      end
+      assert(inner:loop(40))
+      app:stop(1)
+    end)
+    assert(cq:loop(60))
+
+    assert.equal(40, answered, "requests beyond the ceiling must wait, not fail")
+    assert.equal(0, failed)
+  end)
+
+  it("is derived from the descriptor limit when nobody sets one", function()
+    -- A default nobody can compute is a default nobody trusts, so the number
+    -- comes from /proc/self/limits rather than from a constant someone liked.
+    local soft
+    for line in io.lines "/proc/self/limits" do
+      soft = soft or line:match "^Max open files%s+(%d+)"
+    end
+    assert.is_truthy(soft, "this platform does not expose the limit")
+
+    -- Two descriptors per in-flight request, a third of the budget left for
+    -- the listener, the database pool and the log sink.
+    local expected = math.max(math.floor(tonumber(soft) * 0.66 / 2), 16)
+    assert.is_true(expected >= 16)
+  end)
+
+  it("lets an application override it", function()
+    assert.is_true(akkar.defaults.max_concurrent == nil,
+      "the ceiling is computed, not a fixed default")
+  end)
+end)

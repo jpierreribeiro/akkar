@@ -355,6 +355,16 @@ appears only when you disagree with the default.
 | Connection pool size | 10 | `db.connect { pool_size = 25 }` |
 | Shutdown grace | 10 s | `app:run { shutdown_grace = 30 }` |
 | Statement timeout | unset | `db.connect { statement_timeout = 5 }` |
+| Concurrent requests | from `ulimit -n` | `app:run { max_concurrent = 500 }` |
+
+**Concurrency is bounded by file descriptors, and the bound is declared.** Every
+in-flight request holds a `cqueues` controller for its deadline, and a controller
+costs exactly two descriptors — measured at 1,030 descriptors for 512 concurrent
+requests. Against the common `ulimit -n 1024` that is a wall at about 500 per
+process, and hitting it is not a clean failure: `accept` starts failing and the
+process flails. So akkar reads the limit at boot and tells lua-http to stop
+accepting before it, which turns collapse into backpressure. Slow is a state a
+server can be in; out of descriptors is not.
 
 **The deadline stops akkar waiting; it does not stop Postgres working.** The
 server notices a departed client only when it next tries to write, and a query
