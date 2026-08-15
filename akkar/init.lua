@@ -1186,16 +1186,55 @@ function App:run(config)
         if res.headers then
           for name, value in pairs(res.headers) do rh:append(name, value) end
         end
-        local payload = res.raw or (res.body and cjson.encode(res.body)) or nil
-        if payload then
+        local is_head = h:get ":method" == "HEAD"
+
+        if res.stream then
+          -- No content-length, because the length is not known: lua-http
+          -- answers with chunked transfer encoding, which is what streaming
+          -- means on HTTP/1.1.  A HEAD gets the headers and the producer is
+          -- never run -- running it to throw the bytes away would perform the
+          -- side effects of a body nobody asked for.
           rh:append("content-type", res.content_type or "application/json")
-          rh:append("content-length", tostring(#payload))
+          stream:write_headers(rh, is_head)
+
+          if not is_head then
+            local wrote = false
+            local produced, failure = pcall(res.stream, function(chunk)
+              if chunk == nil or chunk == "" then return end
+              wrote = true
+              assert(stream:write_chunk(tostring(chunk), false))
+            end)
+
+            if produced then
+              stream:write_chunk("", true)          -- the terminating chunk
+            else
+              -- The status went out with the first byte, so this cannot
+              -- become a 500.  Dropping the connection without the terminating
+              -- chunk is the only signal left: the client sees a truncated
+              -- response instead of a complete-looking lie.
+              internal:error("stream producer failed", {
+                request_id = res.headers and res.headers["x-request-id"],
+                wrote_bytes = wrote,
+                detail = tostring(failure),
+                hint = wrote and "response already committed; connection dropped"
+                              or "nothing was written yet, but the status was",
+              })
+            end
+          end
+
+          if res.release then res.release() end
+        else
+          local payload = res.raw or (res.body and cjson.encode(res.body)) or nil
+          if payload then
+            rh:append("content-type", res.content_type or "application/json")
+            rh:append("content-length", tostring(#payload))
+          end
+          -- HEAD carries the headers a GET would, including content-length, and
+          -- no body.  That is the point of HEAD.
+          local send_body = payload ~= nil and not is_head
+          stream:write_headers(rh, not send_body)
+          if send_body then stream:write_chunk(payload, true) end
         end
-        -- HEAD carries the headers a GET would, including content-length, and
-        -- no body.  That is the point of HEAD.
-        local send_body = payload ~= nil and h:get ":method" ~= "HEAD"
-        stream:write_headers(rh, not send_body)
-        if send_body then stream:write_chunk(payload, true) end
       end)
       if not ok then internal:error("stream failed", { detail = tostring(err) }) end
       stream:shutdown()
@@ -1247,7 +1286,28 @@ function App:test(config)
         timeout = options.timeout or config.timeout,
         capabilities = config,
       })
-      return { status = res.status, body = res.body, raw = res.raw,
+      -- A streamed body is produced here and handed back as `raw`, so a test
+      -- asserts on what the client would have received rather than on the
+      -- producer function.  The whole body lands in memory, which is the
+      -- opposite of the point of streaming and exactly right for a test.
+      local raw = res.raw
+      if res.stream then
+        local chunks = {}
+        local ok_stream, failure = pcall(res.stream, function(chunk)
+          if chunk ~= nil and chunk ~= "" then chunks[#chunks + 1] = tostring(chunk) end
+        end)
+        if res.release then res.release() end
+        if not ok_stream then
+          -- On a real connection this is a truncated response, which a test
+          -- client cannot express.  Raising is the closest honest equivalent:
+          -- silently returning the partial body would let a broken producer
+          -- pass its tests.
+          error("akkar: stream producer failed after " .. #chunks ..
+                " chunk(s): " .. tostring(failure), 0)
+        end
+        raw = table.concat(chunks)
+      end
+      return { status = res.status, body = res.body, raw = raw,
                headers = res.headers or {} }
     end
   end

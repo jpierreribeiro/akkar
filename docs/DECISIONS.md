@@ -357,6 +357,56 @@ than on the first request, matching how duplicate routes already behave. See
 
 ---
 
+## 10. Streaming keeps the return, and states what it costs ✅ **settled**
+
+A 200 MB export does not fit inside "the handler returns the response", and
+that invariant is the one everything else in akkar rests on: it is why writing
+the response twice is structurally impossible.
+
+The way out is that the handler still returns a **value** — one that describes
+a body produced on demand rather than one already in hand:
+
+```lua
+return akkar.stream(function(write)
+  write '{"rows":['
+  for row in rows() do write(cjson.encode(row)) end
+  write ']}'
+end)
+```
+
+The producer receives `write` and nothing else. No connection, no status, no
+headers — so it still cannot answer twice, and there is still no `c.JSON()`.
+
+**What was rejected.** Handing the handler the `stream` object, which is what
+most frameworks do. It would make every existing invariant conditional: a
+handler could write and then return a response, or write twice, or set a
+status after committing one. One escape hatch would undo the guarantee for
+all routes, not just the streaming ones.
+
+**Three costs, stated rather than discovered:**
+
+1. **The status commits with the first byte.** A producer that raises
+   afterwards cannot become a 500 — the 200 is already on the wire. akkar logs
+   it and drops the connection without the terminating chunk, so the client
+   sees a truncated response rather than a complete-looking lie. Validation
+   belongs before the first `write`, where an ordinary response still works.
+
+2. **Capabilities outlive the handler.** A stream reading from `req.db` holds
+   that connection until the last byte, because releasing it at return would
+   hand a live cursor to the next request. A slow client therefore holds a
+   pool slot for as long as it reads. That is the real cost of streaming out
+   of a database.
+
+3. **The deadline covers the handler, not the body.** An export is meant to
+   outlive a 30-second request budget. The watchdog still applies: a producer
+   that burns CPU without yielding stalls the process exactly as a handler
+   would.
+
+**No content-length is sent**, because the length is not known; its absence is
+what makes the response chunked. A `HEAD` gets the headers and the producer is
+never run — running it to discard the bytes would perform the side effects of
+a body nobody asked for.
+
 ## 9. Smaller decisions still open
 
 - **422 or 400** for validation. Currently 422.
