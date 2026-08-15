@@ -356,6 +356,14 @@ appears only when you disagree with the default.
 | Shutdown grace | 10 s | `app:run { shutdown_grace = 30 }` |
 | Statement timeout | unset | `db.connect { statement_timeout = 5 }` |
 | Concurrent requests | from `ulimit -n` | `app:run { max_concurrent = 500 }` |
+| Trusted proxies | none | `app:run { trusted_proxies = { "10.0.0.0/8" } }` |
+
+**`req.ip` is the socket's peer, not a header.** `X-Forwarded-For` is a string
+the client typed, and akkar believes it only when the connection came from a
+proxy the application named in `trusted_proxies` — and then walks the chain
+from the *right*, past every trusted hop, because the leftmost entry is
+whatever the client chose to send. An unparseable address is never trusted, so
+the failure is closed.
 
 **Concurrency is bounded by file descriptors, and the bound is declared.** Every
 in-flight request holds a `cqueues` controller for its deadline, and a controller

@@ -163,7 +163,7 @@ local SETTINGS = {
   host = true, port = true, tls = true, ctx = true,
   body_limit = true, timeout = true, shutdown_grace = true,
   check_capabilities = true, reuseport = true, strict = true,
-  max_concurrent = true,
+  max_concurrent = true, trusted_proxies = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -1208,6 +1208,76 @@ local function normalize_headers(source)
   return out
 end
 
+-- ============================================================== client address
+--
+-- Who the caller IS, which is a different question from what the caller SAYS.
+--
+-- `akkar.limit` shipped keying its buckets on `X-Forwarded-For`, falling back
+-- to `X-Real-IP`, with nothing else available -- because nothing else WAS
+-- available: the peer address was never plumbed to `req`. Both of those are
+-- client-supplied strings. Any caller could send a fresh one per request and
+-- mint a fresh rate-limit bucket each time, which defeats the limiter with a
+-- single header.
+--
+-- So `req.ip` is the address of the socket, always. `X-Forwarded-For` is
+-- believed only when the connection came FROM a proxy the application named,
+-- and then only as far back as the trusted hops go: walking the list from the
+-- right, the first address that is not itself a trusted proxy is the client,
+-- and everything to its left is whatever that client chose to send.
+local function ipv4_to_int(address)
+  local a, b, c, d = address:match "^(%d+)%.(%d+)%.(%d+)%.(%d+)$"
+  if not a then return nil end
+  a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+  if a > 255 or b > 255 or c > 255 or d > 255 then return nil end
+  return a * 16777216 + b * 65536 + c * 256 + d
+end
+
+--- Is `address` inside `cidr`? IPv4 only, and it says so rather than
+--- pretending: an IPv6 peer simply never matches, which fails CLOSED --
+--- forwarded headers are ignored rather than believed.
+local function in_cidr(address, cidr)
+  local base, bits = cidr:match "^([%d%.]+)/(%d+)$"
+  if not base then base, bits = cidr, "32" end
+  bits = tonumber(bits)
+  local a, b = ipv4_to_int(address), ipv4_to_int(base)
+  if not a or not b or not bits or bits < 0 or bits > 32 then return false end
+  if bits == 0 then return true end
+  local mask = (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF
+  return (a & mask) == (b & mask)
+end
+akkar.in_cidr = in_cidr
+
+local function is_trusted(address, trusted)
+  if not address or not trusted then return false end
+  for _, cidr in ipairs(trusted) do
+    if in_cidr(address, cidr) then return true end
+  end
+  return false
+end
+
+--- The client address, given the socket's peer and the forwarded header.
+---
+--- Exported because it is worth testing directly: the walk is the whole
+--- security property, and it is easy to get backwards. Taking the LEFTMOST
+--- entry -- which is what most implementations do -- is exactly the spoofable
+--- version, since the leftmost entry is whatever the client typed.
+local function client_ip(peer, forwarded, trusted)
+  if not peer then return nil end
+  if not forwarded or not is_trusted(peer, trusted) then return peer end
+
+  local hops = {}
+  for hop in tostring(forwarded):gmatch "[^,]+" do
+    hops[#hops + 1] = hop:match "^%s*(.-)%s*$"
+  end
+
+  for i = #hops, 1, -1 do
+    if not is_trusted(hops[i], trusted) then return hops[i] end
+  end
+  -- Every hop is a trusted proxy: the peer is the best answer there is.
+  return peer
+end
+akkar.client_ip = client_ip
+
 local function parse_query(qs)
   local out = {}
   if not qs or qs == "" then return out end
@@ -1297,6 +1367,23 @@ local function handle(app, input)
       --
       -- Only cached when there is something to cache: a nil result leaves the
       -- table exactly as it was, so a request without the header stays free.
+      -- Read from the closure over `input` rather than from fields on `req`.
+      -- Putting the peer and the proxy list in the constructor added two
+      -- fields, grew the table's hash part and cost 392 bytes on EVERY
+      -- request -- the same trap `trace` fell into, caught by the same
+      -- allocation ceiling.
+      if key == "ip" then
+        -- `capabilities` IS the config table, so the proxy list is already
+        -- reachable without adding a field to anything. Two extra keys on the
+        -- test client's input table alone cost 200 bytes a request.
+        local settings = input.capabilities or {}
+        local address = client_ip(input.peer or settings.peer,
+                                  rawget(self, "headers")["x-forwarded-for"],
+                                  settings.trusted_proxies)
+        if address then rawset(self, "ip", address) end
+        return address
+      end
+
       if key == "trace" then
         local parsed = trace_context(rawget(self, "headers"))
         if parsed then rawset(self, "trace", parsed) end
@@ -1601,6 +1688,13 @@ function App:run(config)
       self.in_flight = self.in_flight + 1
       local ok, err = pcall(function()
         local h = assert(stream:get_headers())
+        -- The socket's own idea of who connected. Everything else about the
+        -- client's identity is something the client typed.
+        local peer
+        do
+          local ok_peer, _, address = pcall(function() return stream:peername() end)
+          if ok_peer then peer = address end
+        end
         local target = h:get ":path" or "/"
         local path, qs = target:match "^([^?]*)%??(.*)$"
 
@@ -1619,6 +1713,7 @@ function App:run(config)
           method = h:get ":method", path = path, query = parse_query(qs),
           body = body, headers = h, timeout = timeout,
           capabilities = config,
+          peer = peer,
           short = short, stripped = true,
         })
 
@@ -1709,7 +1804,8 @@ end
 function App:test(config)
   config = config or {}
 
-  local allowed = { timeout = true, log = true }
+  local allowed = { timeout = true, log = true,
+                    peer = true, trusted_proxies = true }
   for k in pairs(CAPABILITIES) do allowed[k] = true end
   check_config(config, allowed, "app:test{}")
 

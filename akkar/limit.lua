@@ -191,10 +191,27 @@ local function key_for(options, req)
   -- The default is the authenticated caller when there is one and the client
   -- address otherwise. Never the path: limiting per path lets one caller
   -- exhaust every route in turn.
-  local user = rawget(req, "user")
-  if type(user) == "table" and user.id then return "user:" .. tostring(user.id) end
-  return "ip:" .. tostring(req.headers["x-forwarded-for"] or
-                           req.headers["x-real-ip"] or "unknown")
+  -- `req.user` is never nil: an app with no authentication middleware gets a
+  -- GUARD object there, whose whole job is to raise a useful message when
+  -- read. `rawget` returns the guard, `type()` says table, and `.id` then
+  -- raises -- so the default key function blew up on every request in every
+  -- app without auth, which is most of them. No test caught it because every
+  -- earlier test supplied its own `key`.
+  local ok, id = pcall(function()
+    local user = req.user
+    return type(user) == "table" and user.id or nil
+  end)
+  if ok and id then return "user:" .. tostring(id) end
+
+  -- `req.ip` is the SOCKET's peer, and honours `X-Forwarded-For` only when the
+  -- connection came from a proxy the application named in
+  -- `app:run { trusted_proxies = ... }`.
+  --
+  -- This used to read the header directly, which meant any caller could send
+  -- a fresh value per request and mint a fresh bucket each time -- a rate
+  -- limiter defeated by one header. Found by asking what a real admin IP
+  -- allowlist would need and discovering the framework had no answer.
+  return "ip:" .. tostring(req.ip or "unknown")
 end
 
 local function too_many(retry_after_ms)
