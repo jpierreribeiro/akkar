@@ -433,11 +433,42 @@ Likewise an `UPDATE` or `DELETE` with no `WHERE` is refused until you call
 `:all_rows()`. That shape is legitimate in a migration and almost never in a
 handler.
 
+## Jobs that survive failing
+
+Retries are **off unless asked for**, which is the same position the old
+"logged and dropped" behaviour was defending — a retry policy nobody chose
+hides the failure and repeats whatever side effects already happened. The fix
+was to make the choice explicit, not to leave the capability out.
+
+```lua
+local queue = jobs.new(store, "email", {
+  retries = 3,                       -- attempts after the first
+  backoff = { base = 2, max = 300 }, -- 2s, 4s, 8s ... capped at five minutes
+})
+
+queue:push("charge", { order = 41 }, { id = "charge:order:41" })  -- once only
+queue:push("digest", { user = 7 }, { delay = 3600 })              -- in an hour
+```
+
+Backoff carries **full jitter** by default: a hundred jobs that failed against
+a database which has just come back would otherwise all retry on the same
+second and knock it over again.
+
+What finally fails is kept rather than dropped, capped so the dead-letter
+queue cannot become a memory leak with a respectable name, and readable with
+`queue:dead_letters()`. A job with no registered handler goes the same way —
+that is usually a deploy in progress, and dropping it loses work that
+finishing the deploy would have run.
+
+The store contract stays three methods; scheduling, claiming, peeking and
+trimming are optional. Asking for a retry policy, a delay or an idempotency
+key that the store cannot honour is **an error at the call**, never a feature
+that quietly does nothing.
+
 ## Known gaps
 
 | | |
 |---|---|
-| No retries or scheduling in `akkar.jobs` | a failing job is logged and dropped; a retry policy nobody chose hides the failure and repeats side effects |
 | Uploads are buffered, not streamed | a multipart body is held in memory under `body_limit` |
 | `akkar.cache.memory` is per-process | two processes have two caches, and akkar's answer to more CPU is more processes |
 | Teal does not check schemas against handler output | schemas are runtime values; validation is what checks those |

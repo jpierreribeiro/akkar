@@ -18,16 +18,53 @@ would then be free to disagree.
     store:dequeue(key, timeout)   -- oldest entry, or nil on timeout
     store:depth(key)              -- how many are waiting
 
-Three methods, deliberately. Anything a job queue needs beyond that -- retries,
-scheduling, dead letters -- is semantics and belongs here, not in a backend.
+Three methods, and everything a job queue needs beyond that is semantics and
+belongs here.
 
-## What is deliberately absent
+## What a store MAY provide, and what it buys
 
-No retries with backoff, no scheduled jobs, no dead-letter queue, no
-dashboard. Those are real needs and they are a different project. A failing
-job is logged and dropped, because a retry policy nobody chose is worse than
-none: it hides the failure and repeats whatever side effects already
-happened.
+    store:schedule(key, encoded, run_at)  -- hold until a wall-clock time
+    store:promote(key, now)               -- move what is due into the queue
+    store:claim(key, id, ttl)             -- false if this id was seen already
+    store:peek(key, limit)                -- read without removing
+    store:trim(key, keep)                 -- cap a list's length
+
+Optional, because a store that cannot hold a job until Tuesday is still a
+useful store. But they are not optional *silently*: asking for retries with
+backoff, or for a delay, or for an idempotency key against a store that
+cannot do it is an error at the call rather than a feature that quietly does
+nothing.
+
+## Retries, and why they were absent for so long
+
+This module used to log a failing job and drop it, with a comment defending
+the choice: "a retry policy nobody chose is worse than none -- it hides the
+failure and repeats whatever side effects already happened."
+
+That was right about the danger and wrong about the conclusion. The danger is
+a policy nobody chose, so the fix is to make the choice explicit rather than
+to remove the capability. Retries are **off unless asked for**:
+
+    local queue = jobs.new(store, "email", {
+      retries = 3,                       -- attempts after the first
+      backoff = { base = 2, max = 300 }, -- 2s, 4s, 8s ... capped at five minutes
+      dead_letter = true,                -- keep what finally failed
+    })
+
+`retries = 0` is the old behaviour and it is still the default. Nothing
+changes for anyone who does not ask.
+
+## Repeating side effects
+
+A retry re-runs a handler that may already have charged a card. akkar cannot
+know which half of a handler is safe to repeat, so it offers the one thing it
+can: an id the store refuses to accept twice.
+
+    queue:push("charge", { order = 41 }, { id = "charge:order:41" })
+
+The second push returns `false, "duplicate"`. That is deduplication at the
+door, which is a different thing from an idempotent handler and does not
+pretend to replace one.
 ]]
 
 local cjson = require "cjson"
@@ -37,31 +74,103 @@ Queue.__index = Queue
 
 local M = {}
 
+-- Exponential backoff with full jitter.  The jitter is not decoration: a
+-- hundred jobs that failed against a database which has just come back will
+-- otherwise all retry on the same second and knock it over again.  "Full"
+-- jitter -- a uniform draw across the whole interval rather than a wobble
+-- around its end -- is the variant that measured best among the simple
+-- strategies, and it costs one line.
+local function delay_for(attempt, backoff)
+  local base = backoff.base or 2
+  local max  = backoff.max or 300
+  local window = math.min(max, base ^ attempt)
+  if backoff.jitter == false then return window end
+  return math.random() * window
+end
+
+local function supports(store, method)
+  return type(store[method]) == "function"
+end
+
 --- Wraps a store with the queue semantics.
-function M.new(store, name)
+function M.new(store, name, options)
   for _, method in ipairs { "enqueue", "dequeue", "depth" } do
     if type(store[method]) ~= "function" then
       error("akkar.jobs: store does not satisfy the contract; missing :" ..
             method, 2)
     end
   end
+
+  options = options or {}
+  local retries = options.retries or 0
+
+  -- Refused at construction rather than at the first failure.  A queue that
+  -- accepts a retry policy it cannot honour is the silent degradation this
+  -- module exists to avoid.
+  if retries > 0 and not (supports(store, "schedule") and supports(store, "promote")) then
+    error("akkar.jobs: retries need a store that can schedule, and this one " ..
+          "implements neither :schedule nor :promote -- a retry could only " ..
+          "run immediately, which hammers whatever just failed", 2)
+  end
+
   return setmetatable({
     store = store,
     key = "akkar:queue:" .. (name or "default"),
+    retries = retries,
+    backoff = options.backoff or {},
+    dead_letter = options.dead_letter ~= false,
+    max_dead = options.max_dead or 1000,
   }, Queue)
 end
 
---- Enqueues a job.  Returns the depth after the push.
-function Queue:push(kind, payload)
-  return self.store:enqueue(self.key, cjson.encode {
+function Queue:dead_key() return self.key .. ":dead" end
+
+--- Enqueues a job.
+---
+--- `options.delay` holds it for that many seconds; `options.id` refuses it if
+--- the same id was pushed within `options.id_ttl` (an hour by default).
+---
+--- Returns the depth after the push, or `false, "duplicate"`.
+function Queue:push(kind, payload, options)
+  options = options or {}
+
+  if options.id then
+    if not supports(self.store, "claim") then
+      error("akkar.jobs: this store cannot deduplicate -- it implements no " ..
+            ":claim, and taking the id while ignoring it would be worse than " ..
+            "refusing it", 2)
+    end
+    if not self.store:claim(self.key, options.id, options.id_ttl or 3600) then
+      return false, "duplicate"
+    end
+  end
+
+  local encoded = cjson.encode {
+    id = options.id,
     kind = kind,
     payload = payload,
     queued_at = os.time(),
-  })
+    attempts = 0,
+  }
+
+  if options.delay and options.delay > 0 then
+    if not supports(self.store, "schedule") then
+      error("akkar.jobs: this store cannot delay a job; it implements no " ..
+            ":schedule", 2)
+    end
+    return self.store:schedule(self.key, encoded, os.time() + options.delay)
+  end
+
+  return self.store:enqueue(self.key, encoded)
 end
 
 --- Waits for one job, up to `timeout` seconds.  Returns nil on timeout.
 function Queue:pop(timeout)
+  -- Anything whose time has come joins the queue before we look at it.
+  if supports(self.store, "promote") then
+    self.store:promote(self.key, os.time())
+  end
+
   local encoded = self.store:dequeue(self.key, timeout or 5)
   if not encoded then return nil end
   local ok, job = pcall(cjson.decode, encoded)
@@ -75,12 +184,57 @@ function Queue:depth()
   return self.store:depth(self.key)
 end
 
+--- How many jobs finally failed.  A dead-letter queue nobody can measure is a
+--- dead-letter queue nobody looks at.
+function Queue:dead_depth()
+  return self.store:depth(self:dead_key())
+end
+
+--- Reads the dead letters without removing them, when the store can.
+function Queue:dead_letters(limit)
+  if not supports(self.store, "peek") then
+    error("akkar.jobs: this store cannot list dead letters; it implements " ..
+          "no :peek", 2)
+  end
+  local out = {}
+  for _, encoded in ipairs(self.store:peek(self:dead_key(), limit or 100)) do
+    local ok, job = pcall(cjson.decode, encoded)
+    if ok then out[#out + 1] = job end
+  end
+  return out
+end
+
+--- Puts a failed job back after its backoff, or buries it.
+--- Returns "retried", "buried" or "dropped", plus the delay when retried.
+function Queue:fail(job, err)
+  job.attempts = (job.attempts or 0) + 1
+  job.last_error = tostring(err)
+  job.first_failed_at = job.first_failed_at or os.time()
+
+  if job.attempts <= self.retries then
+    local delay = delay_for(job.attempts, self.backoff)
+    self.store:schedule(self.key, cjson.encode(job), os.time() + delay)
+    return "retried", delay
+  end
+
+  if not self.dead_letter then return "dropped" end
+
+  job.died_at = os.time()
+  self.store:enqueue(self:dead_key(), cjson.encode(job))
+
+  -- An unbounded dead-letter queue is a memory leak with a respectable name.
+  if supports(self.store, "trim") then
+    self.store:trim(self:dead_key(), self.max_dead)
+  end
+  return "buried"
+end
+
 --- Consumes until `should_stop()` returns true.
 function Queue:consume(handlers, options)
   options = options or {}
   local log = options.log
   local should_stop = options.should_stop or function() return false end
-  local handled, failed = 0, 0
+  local handled, failed, retried, buried = 0, 0, 0, 0
 
   while not should_stop() do
     local job, decode_error = self:pop(options.timeout or 1)
@@ -89,25 +243,35 @@ function Queue:consume(handlers, options)
     elseif job then
       local handler = handlers[job.kind]
       if not handler then
+        -- A job with no handler is usually a deployment in progress -- a
+        -- worker running older code than the producer -- so it goes through
+        -- the same failure path rather than being dropped.  Dropping it
+        -- loses work that finishing the deploy would have run.
         if log then log:warn("jobs: no handler", { kind = job.kind }) end
+        self:fail(job, "no handler registered for kind '" .. tostring(job.kind) .. "'")
       else
         local ok, err = pcall(handler, job.payload, job)
         if ok then
           handled = handled + 1
         else
           failed = failed + 1
-          -- Logged and dropped.  A retry policy nobody chose hides the
-          -- failure and repeats the side effects already committed.
+          local outcome, delay = self:fail(job, err)
+          if outcome == "retried" then retried = retried + 1 else buried = buried + 1 end
           if log then
-            log:error("jobs: job failed", { kind = job.kind, detail = tostring(err) })
+            log:error("jobs: job failed", {
+              kind = job.kind, attempt = job.attempts, outcome = outcome,
+              retry_in_s = delay and math.floor(delay * 10) / 10 or nil,
+              detail = tostring(err),
+            })
           end
         end
       end
     end
   end
 
-  return { handled = handled, failed = failed }
+  return { handled = handled, failed = failed, retried = retried, buried = buried }
 end
 
 M.Queue = Queue
+M.delay_for = delay_for
 return M

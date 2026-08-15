@@ -8,6 +8,11 @@ of the store contract beats a fake per test file.
 only arrive from the same process -- if the queue is empty it will stay empty
 until this coroutine yields, so blocking would be a deadlock rather than a
 wait.
+
+It implements the optional half of the contract too -- scheduling, claiming,
+peeking, trimming -- so that retries, delays and idempotency can be tested
+without Redis. A fake that supports less than the real store means the tests
+prove less than they appear to.
 ]]
 
 local jobs = require "akkar.jobs"
@@ -35,8 +40,80 @@ function Store:depth(key)
   return list and #list or 0
 end
 
+-- ============================================================ the optional half
+
+--- Holds a job until `run_at`.  A list scanned on promote, not a heap: a
+--- process-local queue with enough scheduled jobs for that to matter has
+--- outgrown a process-local queue.
+function Store:schedule(key, encoded, run_at)
+  local pending = self.scheduled[key]
+  if not pending then pending = {} self.scheduled[key] = pending end
+  pending[#pending + 1] = { run_at = run_at, encoded = encoded }
+  return #pending
+end
+
+--- Moves everything due into the queue proper, oldest first, and returns how
+--- many moved.  Ordering by `run_at` matters: two jobs that came due while
+--- nobody was looking should run in the order they were meant to.
+function Store:promote(key, now)
+  local pending = self.scheduled[key]
+  if not pending or #pending == 0 then return 0 end
+
+  local due = {}
+  local waiting = {}
+  for _, entry in ipairs(pending) do
+    if entry.run_at <= now then due[#due + 1] = entry else waiting[#waiting + 1] = entry end
+  end
+  table.sort(due, function(a, b) return a.run_at < b.run_at end)
+  for _, entry in ipairs(due) do self:enqueue(key, entry.encoded) end
+
+  self.scheduled[key] = waiting
+  return #due
+end
+
+--- True the first time an id is seen, false afterwards, until the ttl expires.
+function Store:claim(key, id, ttl)
+  local seen = self.claims[key]
+  if not seen then seen = {} self.claims[key] = seen end
+
+  local now = os.time()
+  local held = seen[id]
+  if held and held > now then return false end
+  seen[id] = now + (ttl or 3600)
+  return true
+end
+
+--- Reads without removing, oldest first, to match what a reader expects.
+function Store:peek(key, limit)
+  local list = self.lists[key]
+  if not list then return {} end
+  local out = {}
+  for i = #list, math.max(1, #list - (limit or 100) + 1), -1 do
+    out[#out + 1] = list[i]
+  end
+  return out
+end
+
+--- Keeps the newest `keep` entries.  An unbounded dead-letter list is a
+--- memory leak with a respectable name.
+function Store:trim(key, keep)
+  local list = self.lists[key]
+  if not list then return 0 end
+  local removed = 0
+  while #list > keep do
+    table.remove(list)          -- the tail is the oldest
+    removed = removed + 1
+  end
+  return removed
+end
+
+function Store:scheduled_depth(key)
+  local pending = self.scheduled[key]
+  return pending and #pending or 0
+end
+
 function M.store()
-  return setmetatable({ lists = {} }, Store)
+  return setmetatable({ lists = {}, scheduled = {}, claims = {} }, Store)
 end
 
 function M.new(name)
