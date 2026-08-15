@@ -474,7 +474,9 @@ that quietly does nothing.
 | Teal does not check schemas against handler output | schemas are runtime values; validation is what checks those |
 | Linear scan for dynamic routes | measured: 33 µs worst case at 50 routes against ~4000 µs for one query. Revisit past ~500 dynamic routes |
 | Pinned to Lua 5.4 | `cqueues` pins `lua == 5.4` and has had no release since 2020 — not `lua-http`, which accepts `>= 5.1` |
-| No sustained-load numbers yet | every benchmark is fifteen seconds; a soak is running |
+| `akkar.vm` is a sandbox, not an isolated VM | Lua 5.4 cannot make a separate state from Lua. Real within its stated limits; against hostile code, use a separate process |
+| Streaming holds its capabilities open | a slow client reading a streamed export keeps a pool slot for as long as it reads |
+| The database path is pgmoon in pure Lua | decoding rows into tables is 55% of a thousand-row query and needs a C driver to move |
 
 ## License
 
