@@ -272,6 +272,7 @@ PORT=8099 lua5.4 examples/crud.lua
 | `docs/DECISIONS.md` | nine design decisions, with alternatives side by side |
 | `docs/BACKLOG.md` | what is done, what is next, and what is deliberately not built |
 | `docs/substrate/RESULT.md` | substrate proof: TLS, driver concurrency, CRUD |
+| `bench/README.md` | throughput, multicore scaling, and what a blocking handler costs |
 | `examples/crud.lua` | ten scenarios against a real Postgres |
 
 ## Safe defaults

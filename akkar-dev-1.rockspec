@@ -62,5 +62,5 @@ build = {
     ["akkar.work"] = "akkar/work.lua",
     ["akkar.openapi"] = "akkar/openapi.lua",
   },
-  copy_directories = { "docs", "examples" },
+  copy_directories = { "docs", "examples", "bench" },
 }

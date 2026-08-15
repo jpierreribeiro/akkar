@@ -338,12 +338,22 @@ that accepts anything while looking validated.
 
 - **Redis adapter.** The contract question is settled (`DECISIONS.md` §8);
   what remains is choosing a library and writing it.
-- **Prefix-tree routing.** Dynamic routes are a linear scan. Not urgent — say
-  so honestly rather than optimizing early.
-- **Lua 5.5.** The blocker is `cqueues`, which pins `lua == 5.4` and has had no
-  release since 2020 — **not** `lua-http`, which accepts `>= 5.1`. Not in our
-  hands. An argument for the adapter boundary, and eventually for owning the
-  substrate.
+- **Prefix-tree routing — measured, and the answer is no.** Worst-case dynamic
+  match is 33 µs at 50 routes and 95 µs at 200, against roughly 4000 µs for one
+  Postgres query. A prefix tree would buy 0.8% of a request. Revisit past ~500
+  dynamic routes; until then this is optimising noise.
+- **Lua 5.5 — blocked, and not by a decision.** `cqueues` pins `lua == 5.4`
+  and has had no release since 2020. Supporting 5.5 would mean building Lua
+  5.5, forking `cqueues`, possibly adapting its C to 5.5 API changes, and
+  repeating for `luaossl`. That is taking on maintenance of a C library, not a
+  backlog item. It is the strongest argument yet for the adapter boundary, and
+  eventually for owning the substrate.
+
+- **Benchmarks**, `bench/`, written for a machine with real cores. Three
+  targets: throughput, N-process scaling under `SO_REUSEPORT`, and what one
+  blocking handler costs at N=1 versus N=8. Results go in `bench/RESULTS.md`
+  with the instance type, because a number without its machine is not a
+  result.
 
 ---
 
