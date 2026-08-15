@@ -134,15 +134,16 @@ function Queue:dead_key() return self.key .. ":dead" end
 function Queue:push(kind, payload, options)
   options = options or {}
 
-  if options.id then
-    if not supports(self.store, "claim") then
-      error("akkar.jobs: this store cannot deduplicate -- it implements no " ..
-            ":claim, and taking the id while ignoring it would be worse than " ..
-            "refusing it", 2)
-    end
-    if not self.store:claim(self.key, options.id, options.id_ttl or 3600) then
-      return false, "duplicate"
-    end
+  if options.id and not supports(self.store, "claim") then
+    error("akkar.jobs: this store cannot deduplicate -- it implements no " ..
+          ":claim, and taking the id while ignoring it would be worse than " ..
+          "refusing it", 2)
+  end
+
+  local delayed = options.delay and options.delay > 0
+  if delayed and not supports(self.store, "schedule") then
+    error("akkar.jobs: this store cannot delay a job; it implements no " ..
+          ":schedule", 2)
   end
 
   local encoded = cjson.encode {
@@ -153,12 +154,31 @@ function Queue:push(kind, payload, options)
     attempts = 0,
   }
 
-  if options.delay and options.delay > 0 then
-    if not supports(self.store, "schedule") then
-      error("akkar.jobs: this store cannot delay a job; it implements no " ..
-            ":schedule", 2)
+  local run_at = delayed and (os.time() + options.delay) or 0
+
+  -- CLAIMING AND PUSHING ARE ONE STEP where the store can do it.
+  --
+  -- As two calls, a coroutine abandoned between them -- a request deadline
+  -- firing, which is ordinary -- left the id claimed for the full ttl with no
+  -- job anywhere. Every retry for the next hour is then refused as a
+  -- duplicate, about a job that was never queued. The mechanism that exists
+  -- to make a retry safe was the thing that made it useless.
+  if options.id and supports(self.store, "claim_and_enqueue") then
+    return self.store:claim_and_enqueue(self.key, options.id,
+                                        options.id_ttl or 3600, encoded, run_at)
+  end
+
+  -- The two-step path, kept for a store that implements `claim` and not
+  -- `claim_and_enqueue`. The window above is open here, and it is open in
+  -- the direction of losing the job rather than running it twice.
+  if options.id then
+    if not self.store:claim(self.key, options.id, options.id_ttl or 3600) then
+      return false, "duplicate"
     end
-    return self.store:schedule(self.key, encoded, os.time() + options.delay)
+  end
+
+  if delayed then
+    return self.store:schedule(self.key, encoded, run_at)
   end
 
   return self.store:enqueue(self.key, encoded)
@@ -230,6 +250,26 @@ function Queue:fail(job, err)
 end
 
 --- Consumes until `should_stop()` returns true.
+---
+--- **AT MOST ONCE. Read this before putting anything that matters through it.**
+---
+--- `pop` is destructive: `BRPOP` removes the job from Redis and returns it,
+--- and from that moment until the handler finishes the job exists only in
+--- this worker's local variable. A process killed there -- an ordinary deploy,
+--- an OOM kill, a machine going away -- loses it, silently and with nothing
+--- anywhere recording that it existed. The retry policy does not cover this:
+--- retries are for a handler that RAISED, and a worker that died raised
+--- nothing.
+---
+--- That is a real property of this design and not a bug to be reported. It is
+--- written here because nobody discovers it from the API, and because the
+--- obvious assumption -- that a queue with retries, backoff and a dead-letter
+--- queue also survives a worker dying -- is the opposite of the truth.
+---
+--- Use it for work that can be lost: cache warming, non-critical mail,
+--- analytics. Do not use it for anything a customer paid for. At-least-once
+--- delivery needs a claim on pop and an acknowledgement after the handler,
+--- which changes this API and is not built.
 function Queue:consume(handlers, options)
   options = options or {}
   local log = options.log

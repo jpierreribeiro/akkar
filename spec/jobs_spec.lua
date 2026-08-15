@@ -78,6 +78,49 @@ local function behaves_like_a_queue(label, make)
       assert.equal(1, result.failed)
     end)
 
+    it("takes the id and queues the job as one step", function()
+      -- As two calls, a coroutine abandoned between the claim and the push
+      -- left the id held for the full ttl with no job anywhere, and every
+      -- retry for the next hour was refused as a duplicate of a job that had
+      -- never been queued. Both stores answer the single-step contract now,
+      -- so the semantics can be stated once and checked against each.
+      assert.is_function(queue.store.claim_and_enqueue,
+        "this store cannot claim and enqueue in one step")
+
+      -- A fresh id per run. A claim outlives the suite -- an hour by default
+      -- -- so a fixed id would make the second run of the day fail on the
+      -- first run's success.
+      local id = "inv-" .. math.random(1, 1e9)
+
+      assert.equal(1, queue:push("charge", { amount = 10 }, { id = id }))
+      assert.equal(1, queue:depth())
+
+      local ok, why = queue:push("charge", { amount = 10 }, { id = id })
+      assert.is_false(ok)
+      assert.equal("duplicate", why)
+      assert.equal(1, queue:depth(), "the refused push still queued a job")
+
+      -- A different id is a different job.
+      queue:push("charge", { amount = 20 }, { id = id .. "-b" })
+      assert.equal(2, queue:depth())
+    end)
+
+    it("takes the id and schedules a delayed job as one step", function()
+      -- The delayed branch goes to the sorted set instead of the list, and it
+      -- is the branch a retry most often takes.
+      local id = "inv-" .. math.random(1, 1e9)
+
+      queue:push("charge", { amount = 10 }, { id = id, delay = 60 })
+      assert.equal(0, queue:depth(), "a delayed job must not be immediately poppable")
+      assert.equal(1, queue.store:scheduled_depth(queue.key))
+
+      local ok, why = queue:push("charge", { amount = 10 }, { id = id, delay = 60 })
+      assert.is_false(ok)
+      assert.equal("duplicate", why)
+      assert.equal(1, queue.store:scheduled_depth(queue.key),
+        "the refused push still scheduled a job")
+    end)
+
     it("warns about a job kind nobody handles", function()
       queue:push("unknown_kind", {})
       local warned = 0
@@ -103,7 +146,11 @@ end
 if redis_reachable() then
   behaves_like_a_queue("redis", function()
     local cache = redis.connect { pool_size = 0 }()
+    -- The scheduled set as well as the list. Redis outlives the suite, so a
+    -- delayed job left by an earlier run is state the next run inherits --
+    -- and a test that reads a depth would then be measuring history.
     cache:del "akkar:queue:spec-redis"
+    cache:del "akkar:queue:spec-redis:scheduled"
     return jobs_redis.new(cache, "spec-redis")
   end)
 else

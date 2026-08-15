@@ -70,9 +70,23 @@ local M = {}
 -- Claim, replay, or refuse -- decided in one atomic step, because the whole
 -- mechanism is read-then-write and the retry that matters is the one arriving
 -- while the first request is still running.
+-- TWO TTLs, and the difference is the whole point.
+--
+-- `lock_ttl` bounds the RUNNING record; the full `ttl` is set by STORE_SCRIPT
+-- only once there is a stored response to replay.
+--
+-- With one TTL, a request abandoned mid-flight -- which is what a deadline
+-- firing does, and a deadline firing is ordinary -- left the record `running`
+-- for the whole day. Every retry then got 409 "already in progress" about a
+-- request that had stopped existing, for twenty-four hours, from the module
+-- whose entire purpose is to make the retry safe.
+--
+-- No code around the handler can fix that: an abandoned coroutine runs
+-- nothing, so nothing it would have released is ever released. The lock has
+-- to expire on its own, and it has to outlive a request rather than a day.
 local CLAIM_SCRIPT = [[
 local key         = KEYS[1]
-local ttl         = tonumber(ARGV[1])
+local lock_ttl    = tonumber(ARGV[1])
 local fingerprint = ARGV[2]
 
 local found = redis.call('HMGET', key, 'state', 'fingerprint', 'status', 'body')
@@ -80,7 +94,7 @@ local state = found[1]
 
 if not state then
   redis.call('HSET', key, 'state', 'running', 'fingerprint', fingerprint)
-  redis.call('EXPIRE', key, ttl)
+  redis.call('EXPIRE', key, lock_ttl)
   return { 'run' }
 end
 
@@ -155,6 +169,13 @@ M.fingerprint_of = fingerprint_of
 function M.new(options)
   options = options or {}
   local ttl        = options.ttl or 86400
+  -- How long a request may be "in progress" before the claim expires on its
+  -- own. It must OUTLIVE a request and it must not outlive the day: sixty
+  -- seconds against the 30-second default deadline. Raise it if you raised
+  -- `timeout`, because a claim that expires while its request is still
+  -- running lets a retry through beside it, which is the double charge this
+  -- module prevents.
+  local lock_ttl   = options.lock_ttl or 60
   local prefix     = options.prefix or "akkar:idem:"
   local header     = options.header or "idempotency-key"
   local max_bytes  = options.max_bytes or 64 * 1024
@@ -192,7 +213,7 @@ function M.new(options)
     local record = prefix .. key
     local fingerprint = fingerprint_of(req)
 
-    local verdict = claim(cache, { record }, { ttl, fingerprint })
+    local verdict = claim(cache, { record }, { lock_ttl, fingerprint })
     local state = verdict[1]
 
     if state == "mismatch" then

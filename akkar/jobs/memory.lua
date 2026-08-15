@@ -83,6 +83,22 @@ function Store:claim(key, id, ttl)
   return true
 end
 
+--- Claims the id and enqueues the job as one indivisible step.
+---
+--- In one process with one coroutine at a time this is atomic by
+--- construction: nothing here yields, so nothing can be scheduled between the
+--- claim and the push. The method exists anyway, rather than letting
+--- `Queue:push` fall back to two calls, because the two stores must answer
+--- the same contract -- a fake whose safety property differs from the real
+--- one is how a test proves the wrong thing.
+function Store:claim_and_enqueue(key, id, ttl, encoded, run_at)
+  if not self:claim(key, id, ttl) then return false, "duplicate" end
+  if run_at and run_at > 0 then
+    return self:schedule(key, encoded, run_at)
+  end
+  return self:enqueue(key, encoded)
+end
+
 --- Reads without removing, oldest first, to match what a reader expects.
 function Store:peek(key, limit)
   local list = self.lists[key]

@@ -48,25 +48,93 @@ function Store:schedule(key, encoded, run_at)
   return self.cache:command("ZADD", self:scheduled_key(key), run_at, encoded)
 end
 
---- Moves everything due into the list, oldest due first.
----
---- Not atomic: another worker can take the same entry between the range read
---- and the remove, which would run a job twice. `ZREM` is the arbiter -- only
---- the worker whose remove returns 1 enqueues it -- so a race costs a wasted
---- read rather than a duplicate job.
-function Store:promote(key, now)
-  local zkey = self:scheduled_key(key)
-  local due = self.cache:command("ZRANGEBYSCORE", zkey, "-inf", now)
-  if type(due) ~= "table" then return 0 end
+-- Read, remove and push, in one script.
+--
+-- This used to be a range read followed by a `ZREM` and an `LPUSH` per entry,
+-- three round trips deep, and its docstring reasoned only about two workers
+-- racing. The case it did not consider is one worker being ABANDONED -- a
+-- request deadline firing between the remove and the push -- and that does not
+-- run a job twice. It DESTROYS the job: gone from the schedule, never in the
+-- queue, and nothing anywhere records that it existed.
+--
+-- A script removes the window rather than narrowing it, and costs one round
+-- trip instead of 2N+1.
+local PROMOTE_SCRIPT = [[
+local zkey  = KEYS[1]
+local lkey  = KEYS[2]
+local now   = tonumber(ARGV[1])
 
-  local moved = 0
-  for _, encoded in ipairs(due) do
-    if tonumber(self.cache:command("ZREM", zkey, encoded)) == 1 then
-      self:enqueue(key, encoded)
-      moved = moved + 1
-    end
+local due = redis.call('ZRANGEBYSCORE', zkey, '-inf', now)
+local moved = 0
+for i = 1, #due do
+  if redis.call('ZREM', zkey, due[i]) == 1 then
+    redis.call('LPUSH', lkey, due[i])
+    moved = moved + 1
   end
-  return moved
+end
+return moved
+]]
+
+-- Take the id and push the job, in one script.
+--
+-- Two calls meant a coroutine abandoned between them left the id claimed for
+-- the full TTL -- an hour by default -- with no job anywhere. The retry that
+-- deduplication exists to make safe is then answered `false, "duplicate"`
+-- for an hour, about a job that was never queued. Worse than a double push,
+-- because a double push is visible and this is not.
+local CLAIM_AND_PUSH_SCRIPT = [[
+local claim_key = KEYS[1]
+local lkey      = KEYS[2]
+local zkey      = KEYS[3]
+local encoded   = ARGV[1]
+local ttl       = tonumber(ARGV[2])
+local run_at    = tonumber(ARGV[3])
+
+if not redis.call('SET', claim_key, '1', 'NX', 'EX', ttl) then
+  return -1
+end
+
+if run_at > 0 then
+  return redis.call('ZADD', zkey, run_at, encoded)
+end
+return redis.call('LPUSH', lkey, encoded)
+]]
+
+-- Sent as `EVAL` rather than cached as `EVALSHA`. `akkar.limit` caches,
+-- because it runs on every request and a kilobyte on the wire against a
+-- decision measured in microseconds is a bad trade. A job push is not that:
+-- it happens once per job, and the second round trip a cache miss costs is
+-- invisible beside the work the job represents. Correctness first, and no
+-- third copy of a SHA cache to keep in step with the other two.
+local function eval(cache, script, keys, args)
+  local argv = { #keys }
+  for _, k in ipairs(keys) do argv[#argv + 1] = k end
+  for _, a in ipairs(args) do argv[#argv + 1] = a end
+  return cache:command("EVAL", script, table.unpack(argv))
+end
+
+--- Moves everything due into the list, oldest due first, atomically.
+---
+--- Two workers can still both read the same entry as due; `ZREM` is the
+--- arbiter, and only the one whose remove returns 1 pushes it. That race
+--- costs a wasted read and never a duplicate job -- and now it cannot lose
+--- one either.
+function Store:promote(key, now)
+  local moved = eval(self.cache, PROMOTE_SCRIPT,
+                     { self:scheduled_key(key), key }, { now })
+  return tonumber(moved) or 0
+end
+
+--- Claims the id and enqueues the job in one round trip.
+---
+--- Returns the depth after the push, or `false, "duplicate"`.
+function Store:claim_and_enqueue(key, id, ttl, encoded, run_at)
+  local reply = eval(self.cache, CLAIM_AND_PUSH_SCRIPT,
+                     { key .. ":claim:" .. id, key, self:scheduled_key(key) },
+                     { encoded, ttl or 3600, run_at or 0 })
+  local n = tonumber(reply)
+  if n == -1 then return false, "duplicate" end
+  return n
 end
 
 --- `SET NX EX` -- atomic across every process, which is the whole point.

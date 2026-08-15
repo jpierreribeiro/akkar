@@ -226,3 +226,53 @@ describe("which requests it touches", function()
     end)
   end)
 end)
+
+describe("a request that never finished", function()
+  it("holds the key for lock_ttl, not for the replay ttl", function()
+    -- The claim and the stored response used ONE ttl. A request abandoned
+    -- mid-flight -- which is what a deadline firing does, and a deadline
+    -- firing is ordinary -- therefore left the record `running` for the whole
+    -- day, and every retry got 409 "already in progress" about a request that
+    -- had stopped existing. Twenty-four hours of refusals, from the module
+    -- whose entire purpose is to make the retry safe.
+    --
+    -- No code around the handler can fix it: an abandoned coroutine runs
+    -- nothing, so nothing it would have released is released. The lock has to
+    -- expire on its own, which means it must outlive a request and must not
+    -- outlive a day.
+    in_controller(function()
+      local p = prefix()
+      local app = akkar.new()
+      app:use(akkar.idempotency { prefix = p, ttl = 86400, lock_ttl = 90 })
+      app:post("/slow", function()
+        cqueues.sleep(0.3)
+        return akkar.created { ok = true }
+      end)
+
+      local client = app:test { cache = redis.connect { pool_size = 4 } }
+      local observer = redis.connect { pool_size = 0 }()
+
+      local in_flight
+      local cq = cqueues.new()
+      cq:wrap(function()
+        client:post("/slow", { body = {}, headers = { ["idempotency-key"] = "k1" } })
+      end)
+      cq:wrap(function()
+        cqueues.sleep(0.1)          -- the handler is still running here
+        in_flight = tonumber(observer:command("TTL", p .. "k1"))
+      end)
+      assert(cq:loop(20))
+
+      assert.is_truthy(in_flight, "the claim was not in Redis while running")
+      assert.is_true(in_flight > 0 and in_flight <= 90,
+        "an in-flight claim carried the full replay ttl: " .. tostring(in_flight) .. "s")
+
+      -- Once there is a response to replay, the record earns the long ttl.
+      local stored = tonumber(observer:command("TTL", p .. "k1"))
+      assert.is_true(stored > 90,
+        "the stored response must live for the replay ttl, not the lock: " ..
+        tostring(stored) .. "s")
+      observer:close()
+    end)
+  end)
+end)
