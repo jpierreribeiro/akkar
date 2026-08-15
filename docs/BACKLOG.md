@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 54 tests, no database needed, ~2 s
+busted                      # 57 tests, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -37,10 +37,15 @@ insert into users (name, email) values
 SQL
 ```
 
-**Verify against a running server, not only through `busted`.** Both defects
-found so far were invisible to the in-process suite: the oversized-body hole,
-and a `headers:get` call that returned zero values rather than `nil` and broke
-every `GET`. `lua-http` behaviour is only exercised by a real request.
+**Verify against a running server, not only through `busted`.** Every defect
+found so far was invisible to the in-process suite until someone probed a live
+server: the oversized-body hole, a `headers:get` returning zero values rather
+than `nil` which broke every `GET`, and cjson's null sentinel rejecting
+`{"email": null}` on an optional field. `lua-http` and `cjson` behaviour is
+only exercised by a real request.
+
+The habit that finds them: pick ten edge cases nothing tests yet, throw them
+at a running server, and read the log as well as the responses.
 
 ---
 

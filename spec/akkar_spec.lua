@@ -726,3 +726,39 @@ describe("CORS", function()
     assert.equal("*", res.headers["access-control-allow-origin"])
   end)
 end)
+
+describe("JSON null handling", function()
+  -- cjson represents null with a sentinel userdata, not nil.  Left alone it
+  -- leaks into user code; these pin that it does not.
+  local app_with_optional = function()
+    local app = akkar.new()
+    app:post("/u", {
+      body = { name = "string", email = "string?" },
+    }, function(req) return { name = req.body.name, email = req.body.email } end)
+    return app
+  end
+
+  it("treats an explicit null on an optional field as absent", function()
+    local app = app_with_optional()
+    -- A client sending {"email": null} used to get 422 "expected string".
+    local res = app:test():post("/u", { body = { name = "ada", email = akkar.null } })
+    assert.equal(200, res.status)
+    assert.equal("ada", res.body.name)
+    assert.is_nil(res.body.email)
+  end)
+
+  it("rejects a scalar body instead of failing inside validation", function()
+    local app = app_with_optional()
+    local res = app:test():post("/u", { body = 42 })
+    assert.equal(400, res.status)
+    assert.is_truthy(res.body.error:match "JSON object")
+  end)
+
+  it("treats a null body as no body at all", function()
+    local app = app_with_optional()
+    -- Used to reach the validator as userdata and become a 500.
+    local res = app:test():post("/u", { body = akkar.null })
+    assert.equal(422, res.status)
+    assert.equal("required", res.body.fields["body.name"])
+  end)
+end)

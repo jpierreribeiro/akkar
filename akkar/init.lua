@@ -162,6 +162,25 @@ local function acquire(configured, guard_for)
   return out, to_release
 end
 
+-- cjson represents JSON null with a sentinel userdata rather than nil, because
+-- a Lua table cannot hold a nil value.  Left alone it leaks into user code in
+-- two ugly ways: `{"email": null}` on an OPTIONAL field was rejected as
+-- "expected string", and a body of bare `null` reached the validator as
+-- userdata and became a 500.
+--
+-- JSON null means absent, so it is turned back into absent here, once, at the
+-- edge -- rather than making every handler and every schema know about a
+-- sentinel.
+local function strip_nulls(value)
+  if value == cjson.null then return nil end
+  if type(value) ~= "table" then return value end
+  for key, inner in pairs(value) do
+    if inner == cjson.null then value[key] = nil
+    elseif type(inner) == "table" then strip_nulls(inner) end
+  end
+  return value
+end
+
 -- ================================================================ validation
 -- Two spellings of the same thing.  The short one expands into the long one:
 --   "string?"                    ==  v.string { optional = true }
@@ -243,7 +262,9 @@ end
 
 -- Returns (clean_table, nil) or (nil, failures_by_field)
 local function validate(input, schema, coerce)
-  input = input or {}
+  -- Defensive: anything that is not a table is treated as absent, so a
+  -- surprising body shape becomes a field-level error rather than a 500.
+  if type(input) ~= "table" then input = {} end
   local cleaned, failures, any = {}, {}, false
   for field, rule in pairs(schema) do
     local expanded = expand(rule)
@@ -628,12 +649,22 @@ akkar.parse_query = parse_query
 local function handle(app, input)
   local normal, short = chains(app)
 
+  -- Body shape is checked here rather than in the wire decoder, because the
+  -- test client hands a Lua value over directly and the two paths have to
+  -- agree.  A scalar cannot be indexed by field name, so it is rejected with
+  -- a message rather than blowing up inside validation.
+  local body = strip_nulls(input.body)
+  if body ~= nil and type(body) ~= "table" then
+    input.short = input.short or
+      response(400, { error = "request body must be a JSON object or array" })
+  end
+
   -- Request data.
   local req = {
     method  = input.method,
     path    = normalize_path(input.path),
     query   = input.query or {},
-    body    = input.body,
+    body    = body,
     headers = normalize_headers(input.headers),
     user    = guard("req.user", "req.user is not set; this route is missing the authentication middleware"),
   }
@@ -698,8 +729,8 @@ local function decode_body(raw, content_type)
 
   if kind == "" or kind == "application/json" or kind:match "%+json$" then
     local ok, value = pcall(cjson.decode, raw)
-    if ok then return true, value end
-    return false, { status = 400, message = "invalid JSON body" }
+    if not ok then return false, { status = 400, message = "invalid JSON body" } end
+    return true, strip_nulls(value)
   end
 
   if kind == "application/x-www-form-urlencoded" then
@@ -963,6 +994,9 @@ function App:handle_signals(signals)
   end
   return self
 end
+
+-- Exposed so tests can express a JSON null without going through the wire.
+akkar.null = cjson.null
 
 akkar.Response = Response
 akkar.guard = guard
