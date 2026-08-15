@@ -274,8 +274,33 @@ function M.concurrent(options)
     -- Released on EVERY exit, including a raised response and a handler
     -- error, for the same reason the connection pool releases on every exit:
     -- a slot that leaks on the error path leaks exactly when load is highest.
+    local function give_back()
+      pcall(function() release(cache, { key }, { req.id }) end)
+    end
+
     local ok, result = pcall(next, req)
-    pcall(function() release(cache, { key }, { req.id }) end)
+
+    -- A STREAM HAS NOT WRITTEN A BYTE WHEN THIS RETURNS. The producer runs
+    -- later, on the server's write path, and it holds the database connection
+    -- for as long as the client takes to read. Releasing the slot here left
+    -- streams as the one shape this module did not limit -- precisely the
+    -- scenario it was built from, since a slow reader on an export is exactly
+    -- the caller who should be counted.
+    --
+    -- So the release is DEFERRED onto the response, and COMPOSED rather than
+    -- overwritten: another middleware may already have deferred work of its
+    -- own, and akkar's dispatch composes ours with `release_all` in turn.
+    -- The TTL on the slot remains the backstop for a body nobody ever reads.
+    if ok and type(result) == "table" and result.stream then
+      local deferred = result.release
+      result.release = function()
+        if deferred then pcall(deferred) end
+        give_back()
+      end
+      return result
+    end
+
+    give_back()
     if not ok then error(result, 0) end
     return result
   end

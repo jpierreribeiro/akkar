@@ -175,6 +175,48 @@ describe("the concurrency limiter", function()
     end)
   end)
 
+  it("holds the slot until a streamed body has finished writing", function()
+    -- The defect this pins was CLAIMED as fixed by commit d1e5d45 and never
+    -- was: that commit's message says "The release joins the deferred chain",
+    -- and `akkar/limit.lua` is not in its diff. The release stayed where it
+    -- was, immediately after the handler returned.
+    --
+    -- A streamed response has produced nothing at that point. The body is
+    -- written afterwards, on the write path, holding a pool connection for as
+    -- long as the reader takes -- so a caller could hold unlimited concurrent
+    -- exports while the limiter counted none of them. Streams were the one
+    -- shape the concurrency limiter did not limit.
+    in_controller(function()
+      local app = akkar.new()
+      app:use(akkar.limit.concurrent { limit = 1, prefix = prefix(),
+                                       key = function() return "fixed" end })
+      app:get("/export", function()
+        return akkar.stream(function(write)
+          for i = 1, 3 do
+            write('{"row":' .. i .. "}")
+            cqueues.sleep(0.12)
+          end
+        end)
+      end)
+      app:get("/fine", function() return { ok = true } end)
+      local client = app:test { cache = redis.connect { pool_size = 4 } }
+
+      local during
+      local cq = cqueues.new()
+      cq:wrap(function() client:get "/export" end)
+      cq:wrap(function()
+        cqueues.sleep(0.1)          -- the producer is mid-body here
+        during = client:get("/fine").status
+      end)
+      assert(cq:loop(20))
+
+      assert.equal(429, during,
+        "the slot was free while the body was still being written")
+      assert.equal(200, client:get("/fine").status,
+        "the deferred release never gave the slot back")
+    end)
+  end)
+
   it("releases the slot when a response is thrown on purpose", function()
     in_controller(function()
       local app = akkar.new()
