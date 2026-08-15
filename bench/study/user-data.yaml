@@ -1,0 +1,16 @@
+#cloud-config
+# Launch configuration for a study box.
+#
+# The password exists for ONE reason: when a benchmark machine stops answering
+# on the network, the EC2 serial console is the only way in, and an Ubuntu
+# cloud image has no password set for `ubuntu` -- so the console sits at a
+# login prompt that cannot be satisfied. That happened on the third machine,
+# with the evidence we needed sitting in a file eighteen inches away.
+#
+# It opens nothing on the network: ssh_pwauth stays false, so SSH remains
+# key-only. The password is reachable only from the serial console, which
+# requires AWS credentials and an explicit action to attach.
+password: akkar-study
+chpasswd:
+  expire: false
+ssh_pwauth: false

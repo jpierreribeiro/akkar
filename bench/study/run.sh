@@ -151,8 +151,19 @@ part_cumulative() {
   echo "Same harness, same machine, same processes, alternating order."
   echo
 
-  for target in ${TARGETS:-/ping /users/42 /rows/200}; do
+  # Concurrency per target, and for the database routes it is sized to the
+  # POOL. $PROCS processes x $POOL connections is the real ceiling; offering
+  # five times that measures how long a queue got, not how fast the server is.
+  # The first run on this host produced a p99 of 5.3 SECONDS on /rows/200 and
+  # reported it as a result.
+  local db_conns=$(( PROCS * POOL - 4 ))
+  [ "$db_conns" -lt 4 ] && db_conns=4
+
+  for entry in "/ping 100" "/users/42 $db_conns" "/rows/200 $db_conns"; do
+    set -- $entry
+    local target=$1 conns=$2
     declare -A got
+    RETRIES=0
     for rep in $(seq 1 "$REPS"); do
       for variant in baseline head; do
         local tree=$BASE_TREE
@@ -163,7 +174,7 @@ part_cumulative() {
             echo "REFUSING on $target ($variant): $body"; exit 1; }
           eval "body_$variant=\$body"
         }
-        local line; line=$(run_wrk "http://127.0.0.1:$PORT$target" "$DURATION" "$CONNS" "$THREADS") || exit 1
+        local line; line=$(run_wrk_retry "http://127.0.0.1:$PORT$target" "$DURATION" "$conns" "$THREADS") || exit 1
         got[$variant]="${got[$variant]:-}$line"$'\n'
       done
     done
@@ -173,7 +184,7 @@ part_cumulative() {
       exit 1
     fi
 
-    echo "$target  (identical responses from both trees)"
+    echo "$target at $conns connections  (identical responses from both trees)${RETRIES:+  [$RETRIES retried]}"
     printf "  %-9s %12s %10s %10s %8s\n" variant req/s p50 p99 spread
     local rb rh
     rb=$(echo "${got[baseline]}" | grep -v '^$' | summarise)
@@ -202,7 +213,10 @@ part_compare() {
   # out and the run reports the generator's rate rather than the server's
   # capacity.  Every framework gets the same number on the same target, so
   # none of them is advantaged.
-  for entry in "/ping 100" "/users/42 100" "/rows/200 16"; do
+  local db_conns=$(( PROCS * POOL - 4 ))
+  [ "$db_conns" -lt 4 ] && db_conns=4
+
+  for entry in "/ping 100" "/users/42 $db_conns" "/rows/200 $db_conns"; do
     set -- $entry
     local target=$1 conns=$2
     declare -A got bodies
@@ -219,7 +233,7 @@ part_compare() {
             echo "REFUSING on $target ($fw): $body"; exit 1; }
           bodies[$fw]=$body
         }
-        local line; line=$(run_wrk "http://127.0.0.1:$PORT$target" "$DURATION" "$conns" "$THREADS") || exit 1
+        local line; line=$(run_wrk_retry "http://127.0.0.1:$PORT$target" "$DURATION" "$conns" "$THREADS") || exit 1
         got[$fw]="${got[$fw]:-}$line"$'\n'
       done
     done
@@ -374,7 +388,7 @@ part_deadline() {
       local lean=0; [ "$variant" = lean ] && lean=1
       start_akkar "$HEAD_TREE" "$PROCS" "$SERVERS" "$lean"
       probe_body "http://127.0.0.1:$PORT/users/42" >/dev/null || { echo "  bad body"; exit 1; }
-      local line; line=$(run_wrk "http://127.0.0.1:$PORT/users/42" "$DURATION" 100 "$THREADS") || exit 1
+      local line; line=$(run_wrk_retry "http://127.0.0.1:$PORT/users/42" "$DURATION" 100 "$THREADS") || exit 1
       got[$variant]="${got[$variant]:-}$line"$'\n'
     done
   done

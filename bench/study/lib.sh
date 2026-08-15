@@ -167,6 +167,23 @@ run_wrk() {
     END             { print rps, p50, p99 }'
 }
 
+# One retry per repetition, reported.
+#
+# A single transient repetition aborted a whole run twice: a handful of
+# timeouts out of half a million requests, on a configuration that then ran
+# five clean repetitions when asked again. Failing the run on that is bad
+# harness design and swallowing it is worse, so RETRIES comes back with the
+# numbers and any caller that cares prints it.
+run_wrk_retry() {
+  local line
+  line=$(run_wrk "$@") || {
+    RETRIES=$(( ${RETRIES:-0} + 1 ))
+    sleep 3
+    line=$(run_wrk "$@") || return 1
+  }
+  echo "$line"
+}
+
 # Nearest-rank median and the spread across repetitions, which IS the floor.
 summarise() {
   sort -n | awk '
