@@ -23,9 +23,15 @@ app:run()
 ## Status
 
 **Under construction, for my own use.** The substrate is proven and the
-ergonomics are settled — see `docs/substrate/RESULT.md`. Body limits, request
-deadlines, connection pooling, graceful shutdown and OpenAPI generation are in.
-See "Known gaps" for what is not.
+ergonomics are settled — see `docs/substrate/RESULT.md`. Production shape is
+in: body limits, deadlines, pooling, graceful shutdown, structured logs,
+metrics, OpenAPI, multipart, an in-memory adapter for every capability, Teal
+declarations, and a strict mode that turns an accidental global into an error.
+
+Measured on a c5.2xlarge: linear scaling across physical cores, and the
+database dominating a real request twelve to one. See `bench/RESULTS.md`.
+
+There is no compatibility policy. The API will change.
 
 There is no compatibility policy. The API will change.
 
@@ -330,6 +336,7 @@ PORT=8099 lua5.4 examples/crud.lua
 |---|---|
 | `docs/PLAN.md` | objective, the verified ladder, invariants, risks, milestones |
 | `docs/DECISIONS.md` | nine design decisions, with alternatives side by side |
+| `types/` | Teal declarations, checked on every test run |
 | `docs/BACKLOG.md` | what is done, what is next, and what is deliberately not built |
 | `docs/substrate/RESULT.md` | substrate proof: TLS, driver concurrency, CRUD |
 | `bench/README.md` | throughput, multicore scaling, and what a blocking handler costs |
@@ -381,10 +388,13 @@ as a timeout.
 
 | | |
 |---|---|
-| Uploads are buffered, not streamed | a multipart body is held in memory under `body_limit`; streaming parts to disk is a separate feature |
-| Linear scan for dynamic routes | measured: 33 µs worst case at 50 routes, against ~4000 µs for one query. A prefix tree would buy 0.8% of a request; revisit past ~500 dynamic routes |
-| `bcrypt` and other C calls still stall the process | `work.yielding` only helps loops written in Lua; a C function that does not return cannot be yielded. Run N processes or move it behind the queue |
-| Pinned to Lua 5.4 | the blocker is `cqueues`, which pins `lua == 5.4` and has had no release since 2020 — not `lua-http`, which accepts `>= 5.1` |
+| No retries or scheduling in `akkar.jobs` | a failing job is logged and dropped; a retry policy nobody chose hides the failure and repeats side effects |
+| Uploads are buffered, not streamed | a multipart body is held in memory under `body_limit` |
+| `akkar.cache.memory` is per-process | two processes have two caches, and akkar's answer to more CPU is more processes |
+| Teal does not check schemas against handler output | schemas are runtime values; validation is what checks those |
+| Linear scan for dynamic routes | measured: 33 µs worst case at 50 routes against ~4000 µs for one query. Revisit past ~500 dynamic routes |
+| Pinned to Lua 5.4 | `cqueues` pins `lua == 5.4` and has had no release since 2020 — not `lua-http`, which accepts `>= 5.1` |
+| No sustained-load numbers yet | every benchmark is fifteen seconds; a soak is running |
 
 ## License
 
