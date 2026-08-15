@@ -354,6 +354,16 @@ appears only when you disagree with the default.
 | Request deadline | 30 s | `app:run { timeout = 5 }` |
 | Connection pool size | 10 | `db.connect { pool_size = 25 }` |
 | Shutdown grace | 10 s | `app:run { shutdown_grace = 30 }` |
+| Statement timeout | unset | `db.connect { statement_timeout = 5 }` |
+
+**The deadline stops akkar waiting; it does not stop Postgres working.** The
+server notices a departed client only when it next tries to write, and a query
+producing no output until it completes may not try for minutes — so under load
+a timeout can leave the database busier than no timeout would. Set
+`statement_timeout` to match the request deadline and the server enforces it
+too. akkar asks once at boot and warns if a deadline exists without one; it is
+not on by default because turning it on silently would cancel somebody's
+migration.
 
 Configured capabilities are checked against their contracts at startup, so a
 misconfigured adapter fails at boot rather than on the first request that

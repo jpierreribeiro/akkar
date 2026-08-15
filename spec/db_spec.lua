@@ -216,3 +216,111 @@ describe("akkar.db buffered reads", function()
     conn:close()
   end)
 end)
+
+describe("akkar.db statement_timeout", function()
+  -- akkar's deadline stops akkar waiting. It does not stop Postgres working:
+  -- the server notices a departed client only when it next tries to write,
+  -- and a query producing no output until it completes may not try for
+  -- minutes. Under load that leaves the database busier after a timeout than
+  -- before one, which is the opposite of the point.
+  --- `pooled` matters: CONFIG uses pool_size 0, which returns the bare open
+  --- function rather than a pool, and the reuse test needs a real one.
+  local function config_with(seconds, pooled)
+    local c = {}
+    for k, v in pairs(CONFIG) do c[k] = v end
+    c.statement_timeout = seconds
+    if pooled then c.pool_size = 1 end
+    return c
+  end
+
+  it("is unset unless asked for", function()
+    -- Turning this on by default would kill somebody's migration mid-flight.
+    local conn = db.connect(CONFIG)()
+    assert.equal("0", conn:one("show statement_timeout").statement_timeout)
+    conn:close()
+  end)
+
+  it("tells the server, in the server's own units", function()
+    local conn = db.connect(config_with(2))()
+    assert.equal("2s", conn:one("show statement_timeout").statement_timeout)
+    conn:close()
+  end)
+
+  it("accepts fractions of a second", function()
+    local conn = db.connect(config_with(0.25))()
+    assert.equal("250ms", conn:one("show statement_timeout").statement_timeout)
+    conn:close()
+  end)
+
+  it("actually cancels a query that overruns", function()
+    local conn = db.connect(config_with(1))()
+    local started = os.clock()
+    local ok, err = pcall(function() return conn:one "select pg_sleep(5)" end)
+
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):match "statement timeout")
+    conn:close()
+  end)
+
+  it("leaves the connection usable, because a query error is not a protocol error", function()
+    -- If a cancelled query cost a reconnect, every slow query would pay for
+    -- one and the pool would stop being a pool.
+    local factory = db.connect(config_with(1, true))
+    local conn = factory()
+
+    pcall(function() return conn:one "select pg_sleep(5)" end)
+
+    assert.is_nil(conn.broken)
+    assert.is_false(conn.in_flight)
+    assert.equal("STILL-GOOD", conn:one("select 'STILL-GOOD' as who").who)
+
+    conn:release()
+    assert.equal(1, #factory.pool.idle, "the connection was discarded needlessly")
+  end)
+end)
+
+describe("the boot-time warning about unbounded statements", function()
+  -- Forgetting statement_timeout is silent and costly: the deadline appears
+  -- to work, requests get their 503, and the database keeps running every
+  -- query that was abandoned. Asked once at boot on a connection the contract
+  -- check has already opened, so it costs nothing per request.
+  local akkar = require "akkar"
+  local cqueues = require "cqueues"
+
+  local function boot(statement_timeout)
+    local lines = {}
+    local cfg = {}
+    for k, v in pairs(CONFIG) do cfg[k] = v end
+    cfg.pool_size = 1
+    cfg.statement_timeout = statement_timeout
+
+    local cq = cqueues.new()
+    cq:wrap(function()
+      akkar.check_capabilities {
+        db = db.connect(cfg),
+        timeout = 5,
+        log = akkar.log.new { level = "warn", format = "text",
+                              sink = function(l) lines[#lines + 1] = l end },
+      }
+    end)
+    assert(cq:loop(20))
+    return table.concat(lines)
+  end
+
+  it("says so when the deadline cannot reach the database", function()
+    local out = boot(nil)
+    assert.is_truthy(out:find("no statement_timeout", 1, true))
+    assert.is_truthy(out:find("statement_timeout = <seconds>", 1, true),
+      "the warning must say what to do about it")
+  end)
+
+  it("says nothing once it is configured", function()
+    assert.is_nil(boot(5):find("no statement_timeout", 1, true))
+  end)
+
+  it("speaks through the logger the application configured", function()
+    -- A boot warning that ignores the configured sink never reaches whatever
+    -- collects logs in production.
+    assert.is_truthy(boot(nil):find("WARN", 1, true))
+  end)
+end)

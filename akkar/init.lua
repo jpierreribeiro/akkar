@@ -212,6 +212,39 @@ end
 -- unreachable.  That is right for a service whose every route needs it, and
 -- wrong for one that should come up degraded and serve a health endpoint --
 -- hence `check_capabilities = false`.
+--- A deadline the database has never heard of.
+---
+--- akkar's deadline stops akkar waiting. It does not stop Postgres working:
+--- the server notices a departed client only when it next tries to write, and
+--- a query producing no output until it completes may not try for minutes. So
+--- under load a timeout can leave the database BUSIER than no timeout at all,
+--- which is the opposite of the point.
+---
+--- Asked once, at boot, on a connection that is already open for the contract
+--- check -- so it costs nothing per request and it is loud exactly once.
+local function warn_unbounded_statements(instance, config)
+  if config.timeout == nil and akkar.defaults.timeout == nil then return end
+  if type(instance) ~= "table" or type(instance.one) ~= "function" then return end
+
+  local ok, row = pcall(function() return instance:one "show statement_timeout" end)
+  if not ok or type(row) ~= "table" then return end        -- not Postgres; fine
+
+  -- Through the logger the application configured, not the framework's own.
+  -- A boot-time warning that ignores the configured sink is a warning that
+  -- never reaches whatever collects logs in production.
+  local log_to = config.log or internal
+
+  local setting = row.statement_timeout
+  if setting == nil or setting == "0" then
+    log_to:warn("db has no statement_timeout, so a request deadline does " ..
+                  "not stop the query", {
+      request_deadline_s = config.timeout or akkar.defaults.timeout,
+      consequence = "an abandoned query keeps a backend busy after the 503",
+      fix = "db.connect { statement_timeout = <seconds> }, matching the deadline",
+    })
+  end
+end
+
 local function check_capability_contracts(config)
   for name, methods in pairs(CONTRACTS) do
     local provided = config[name]
@@ -233,6 +266,10 @@ local function check_capability_contracts(config)
         if type(instance) ~= "table" or type(instance[method]) ~= "function" then
           missing[#missing + 1] = ":" .. method
         end
+      end
+
+      if name == "db" and #missing == 0 then
+        pcall(warn_unbounded_statements, instance, config)
       end
 
       -- Release before raising, so a failed check does not also leak the

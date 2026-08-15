@@ -237,6 +237,31 @@ function M.connect(config)
       pg.sock.receive = buffered_receive(pg.sock.sock)
     end
 
+    -- Tell POSTGRES about the deadline, not just the client.
+    --
+    -- Abandoning a query and closing its connection frees akkar's pool slot
+    -- immediately, but it does not necessarily stop the query: Postgres
+    -- notices a gone client when it next tries to write, and a query that
+    -- produces no output until it finishes may not try for minutes. Under
+    -- load that means a timeout makes the database *busier*, which is the
+    -- opposite of what a timeout is for.
+    --
+    -- Set once per connection rather than per query. Per query would be a
+    -- second round trip on a path measured at ~10k requests a second, and it
+    -- would buy nothing: akkar's deadline is one number for the whole app, so
+    -- the remaining time is never meaningfully different between two requests
+    -- of the same shape.
+    --
+    -- Deliberately NOT `set local`: that is transaction-scoped and would
+    -- vanish outside one, which is where most queries run.
+    if config.statement_timeout then
+      local ms = math.floor(config.statement_timeout * 1000)
+      local ok, err = pg:query("set statement_timeout = " .. ms)
+      if not ok then
+        error("db: could not set statement_timeout: " .. tostring(err), 0)
+      end
+    end
+
     -- `null` was read from `pgmoon.null`, which does not exist -- the module
     -- exports only VERSION, Postgres and new.  So the row-cleaning pass that
     -- used it compared every field against nil and removed nothing, on every
