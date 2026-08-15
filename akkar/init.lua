@@ -56,6 +56,55 @@ function akkar.raw(body, content_type, status)
   return res
 end
 
+--- A response whose body is produced as it is written, for the case that does
+--- not fit inside "the handler returns the response": an export nobody wants
+--- to hold in memory.
+---
+---     return akkar.stream(function(write)
+---       write '{"rows":['
+---       for i, row in ipairs(rows) do
+---         if i > 1 then write "," end
+---         write(cjson.encode(row))
+---       end
+---       write ']}'
+---     end)
+---
+--- The invariant survives, and that is why it is shaped this way. The handler
+--- still **returns a value**. It never receives a connection to write into,
+--- never sets a status out of band, and cannot answer twice. The value simply
+--- describes a body produced on demand rather than one already in hand.
+---
+--- Three consequences, none of them hidden:
+---
+--- **The status is committed with the first byte.** A producer that raises
+--- after writing cannot become a 500 -- the 200 is already on the wire. akkar
+--- logs it and drops the connection, which is the only honest signal left, and
+--- the client sees a truncated response rather than a plausible lie. Validate
+--- before the first `write`, where returning or raising a normal response
+--- still works.
+---
+--- **Capabilities stay alive until the body is finished.** A stream reading
+--- from `req.db` holds that connection for the whole write, because releasing
+--- it when the handler returned would hand a live cursor to the next request.
+--- A slow client therefore holds a pool slot for as long as it reads. That is
+--- the cost of streaming out of a database, and it is better stated here than
+--- discovered in production.
+---
+--- **The deadline covers the handler, not the body.** A 200 MB export is meant
+--- to outlive a 30-second request budget. The watchdog still applies: a
+--- producer that burns CPU without yielding stalls the process exactly as a
+--- handler would.
+function akkar.stream(producer, options)
+  if type(producer) ~= "function" then
+    error("akkar.stream needs a function(write); got " .. type(producer), 2)
+  end
+  options = options or {}
+  local res = response(options.status or 200, nil, options.headers)
+  res.stream = producer
+  res.content_type = options.content_type or "application/json"
+  return res
+end
+
 -- 405 carries Allow.  A 405 without it tells the client it guessed wrong but
 -- not what would have been right, which is the whole value of the status.
 akkar.method_not_allowed = function(allowed)
@@ -925,7 +974,15 @@ local function handle(app, input)
     end
     return value
   end)
-  release_all()
+  -- A streamed body has not been produced yet, so its capabilities cannot be
+  -- released here.  Releasing a database connection at this point would hand
+  -- a live cursor to the next request.  The writer calls this instead, once
+  -- the last byte is out.
+  if ok and is_response(res) and res.stream then
+    res.release = release_all
+  else
+    release_all()
+  end
 
   if not ok then
     if is_response(res) then return res end

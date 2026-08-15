@@ -192,8 +192,89 @@ connection pool already uses for a transaction left open. Three tests pin it,
 including one that abandons a handler by deadline and then asserts five
 subsequent requests are clean.
 
-**Timing not yet certified.** The A/B measured +33% but the machine's noise
-floor was 71.2% at the time, against 0.7% when it is alone. Inside the noise
-is not a result, and it is not being reported as one.
+**Certified**, once the machine was quiet and the harness was made to prove
+which tree it had loaded:
+
+```
+variant      req/s        p50        p99    spread
+before    33884.17     2.91ms     4.57ms      1.1%
+after     41071.65     2.38ms     3.58ms      2.5%
+
+change : +21.2%  (1.21x)      floor: 2.5%      VERDICT: CERTIFIED
+```
+
+Goodput and latency moved together — p50 down 18%, p99 down 22% — so this is
+service time rather than queue depth wearing a latency label.
+
+### 5. Every body was walked twice looking for nulls that were not there — **certified, 1.47x**
+
+The wire decoder stripped cjson's null sentinel, and then the request handler
+stripped the same body again. Two full walks of every field of every row, on
+every request, and the second could never find anything the first had not
+already removed.
+
+The remaining walk now runs only when it *can* find something. A JSON null can
+exist in the decoded value only if the literal bytes `null` appear in the
+document, so a substring scan in C decides it. The test is conservative in the
+safe direction: `"nullable"` matches and the walk happens anyway, which is
+exactly the old behaviour, and no document containing a null can be missed.
+
+```
+variant      req/s        p50        p99    spread
+before    14480.24     6.45ms    10.74ms      0.9%
+after     21249.37     4.24ms     6.92ms      2.0%
+
+change : +46.7%  (1.47x)      floor: 2.0%      VERDICT: CERTIFIED
+```
+
+On a 4,530-byte body — the "medium JSON" shape this study exists for.
+
+### 6. Allocation is not throughput — **measured, reverted**
+
+Three per-request allocations were removed: the guard objects (a table, a
+metatable and three closures, for an object that is immutable and carries no
+identity), the two RNG calls behind the request id, and the watchdog's hook
+closure. Allocation fell from **2,814 to 2,166 bytes per request, −23%**,
+measured exactly with the collector stopped.
+
+Throughput: **+2.1% against a 3.4% noise floor. Not a result.**
+
+The watchdog pool — the only part that added machinery — was taken back out
+and the reasoning recorded in the source, because it was the same reasoning
+that made the deadline controllers worth pooling, and someone will have it
+again. The guards and the request id stayed, on the grounds that they are
+simpler code rather than faster code: sharing a guard needs `__newindex`,
+which turns `req.user.id = 1` on an unauthenticated request from a silently
+lost write into an error, and a counter cannot collide within a process where
+two 48-bit draws can.
+
+This is the third time this project has been taught that a profile share is
+not a gain, and the first time it has been taught that an allocation cut is
+not one either.
+
+### 7. Two claims from earlier in this study were wrong
+
+**"2,006 socket reads averaging 22 bytes."** True as written, but it was read
+as syscalls, and pgmoon opening the connection with `setmode("bn", "bn")` —
+unbuffered — made that reading look obvious. Counted with `strace`, a
+thousand-row query costs about **a hundred read syscalls in the whole
+process**, not two thousand: cqueues buffers internally whatever the mode
+says. Asking cqueues for full buffering measured *slower*.
+
+So the socket cost is not I/O. It is 2,006 Lua-level calls and the strings
+they allocate. Decomposed against a live Postgres:
+
+```
+total 1000-row query        10,360 us
+  receive_message            4,650 us  (44.9%)   1,003 calls
+    of which socket reads    3,085 us  (29.8%)   2,006 calls
+  row decoding and tables    5,710 us  (55.1%)
+```
+
+**"The framework is not the limit; Postgres is."** Already retracted in
+`bench/compare/RESULTS.md`. What replaces it: the limit is pgmoon decoding
+rows in the interpreter, and 55% of a thousand-row query is that decoding —
+not reachable without a driver written in C. The socket half is reachable,
+and that is what finding 8 measures.
 
 *(more as the remaining lines of enquiry land)*
