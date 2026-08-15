@@ -319,7 +319,7 @@ as a timeout.
 
 | | |
 |---|---|
-| No multipart uploads | streaming them interacts with the body limit, so it is not just another content type |
+| Uploads are buffered, not streamed | a multipart body is held in memory under `body_limit`; streaming parts to disk is a separate feature |
 | Linear scan for dynamic routes | a prefix tree is the fix, but this is not urgent |
 | CPU-bound handlers still stall the process | the watchdog reports it; an external queue or separate process is the answer, undecided |
 | Pinned to Lua 5.4 | the blocker is `cqueues`, which pins `lua == 5.4` and has had no release since 2020 — not `lua-http`, which accepts `>= 5.1` |

@@ -18,6 +18,7 @@ local server  = require "http.server"
 local headers = require "http.headers"
 local cjson   = require "cjson"
 local log     = require "akkar.log"
+local multipart = require "akkar.multipart"
 
 local akkar = {}
 
@@ -862,11 +863,17 @@ local function decode_body(raw, content_type)
     return true, parse_query(raw)
   end
 
+  if kind == "multipart/form-data" then
+    local fields, err = multipart.parse(raw, multipart.boundary(content_type))
+    if not fields then return false, { status = 400, message = err } end
+    return true, fields
+  end
+
   return false, {
     status = 415,
     message = "unsupported content type '" .. kind ..
-              "'; this endpoint reads application/json or " ..
-              "application/x-www-form-urlencoded",
+              "'; this endpoint reads application/json, " ..
+              "application/x-www-form-urlencoded or multipart/form-data",
   }
 end
 

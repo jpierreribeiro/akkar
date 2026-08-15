@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 108 tests with Postgres and Redis up, no database needed, ~2 s
+busted                      # 120 tests with Postgres and Redis up, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -278,10 +278,22 @@ that accepts anything while looking validated.
   sees. Every `io.stderr:write` inside the framework is gone; the only one left
   is the logger's own default sink.
 
+- **Multipart uploads.** A parsed body reaches the handler as an ordinary
+  table, so handlers and schemas learn no new shape: `req.body.avatar.filename`,
+  `.content_type`, `.data`, `.size`.
+
+  **Buffered, not streamed.** The body is held in memory, bounded by
+  `body_limit`. A 200 MB upload needs `body_limit` set to 200 MB and then costs
+  200 MB of RSS per concurrent upload. Streaming parts to disk is a different
+  feature with a different shape, and pretending otherwise would be the
+  framework lying about what it does.
+
+  Tests build wire bytes by hand, because what matters is framing: a browser
+  picks its own boundary and may use characters Lua patterns treat as magic,
+  and file contents may contain CRLF.
+
 ### Still open
 
-- **Multipart uploads.** Streaming them properly interacts with the body
-  limit, so this is not just another content type.
 - **Redis adapter.** The contract question is settled (`DECISIONS.md` §8);
   what remains is choosing a library and writing it.
 - **Prefix-tree routing.** Dynamic routes are a linear scan. Not urgent — say

@@ -214,7 +214,23 @@ app:get("/users/:id/views", {
 end)
 
 -- ============================================================================
--- 8. OpenAPI, generated from the schemas already declared above.  No route
+-- 8. File upload.  A multipart body reaches the handler as an ordinary table,
+--    so the schema looks like any other.
+-- ============================================================================
+
+app:post("/uploads", {
+  body = { title = "string", file = "table" },
+}, function(req)
+  return akkar.created {
+    title = req.body.title,
+    filename = req.body.file.filename,
+    content_type = req.body.file.content_type,
+    bytes = req.body.file.size,
+  }
+end)
+
+-- ============================================================================
+-- 9. OpenAPI, generated from the schemas already declared above.  No route
 --    describes itself twice.
 -- ============================================================================
 
