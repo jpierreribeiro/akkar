@@ -1,0 +1,127 @@
+--[[
+akkar.sql — composing SQL from data without being able to concatenate.
+
+The tests that matter most are the ones proving a hostile value cannot escape
+parameterisation, and that there is no door left open for it to escape
+through.
+]]
+
+package.path = "./?.lua;./?/init.lua;" .. package.path
+
+local sql = require "akkar.sql"
+
+describe("building a query", function()
+  it("numbers placeholders once, at the end", function()
+    -- The reason people give up and concatenate is tracking $1 by hand across
+    -- conditions added in different places.
+    local q = sql.select("id, name"):from("users")
+      :where("name = ?", "ada")
+      :where("age >= ?", 18)
+    local text, a, b = q:build()
+    assert.equal("select id, name from users where name = $1 and age >= $2", text)
+    assert.equal("ada", a)
+    assert.equal(18, b)
+  end)
+
+  it("binds limit and offset rather than writing them in", function()
+    local text, a, b = sql.select("*"):from("users"):limit(10):offset(20):build()
+    assert.equal("select * from users limit $1 offset $2", text)
+    assert.equal(10, a)
+    assert.equal(20, b)
+  end)
+
+  it("expands IN with one placeholder per element", function()
+    local q = sql.select("*"):from("users"):where_in("id", { 1, 2, 3 })
+    local text = q:to_string()
+    assert.equal("select * from users where id in ($1, $2, $3)", text)
+    assert.same({ 1, 2, 3 }, q:values())
+  end)
+
+  it("turns an empty IN into false, not into every row", function()
+    -- `in ()` is a syntax error, and dropping the condition would return
+    -- everything instead of nothing -- the dangerous direction.
+    local q = sql.select("*"):from("users"):where_in("id", {})
+    assert.equal("select * from users where false", q:to_string())
+  end)
+end)
+
+describe("values can never become SQL", function()
+  it("keeps an injection attempt as a value", function()
+    local hostile = "'; drop table users; --"
+    local q = sql.select("*"):from("users"):where("name = ?", hostile)
+
+    assert.equal("select * from users where name = $1", q:to_string())
+    assert.same({ hostile }, q:values())
+    -- The text contains no part of the attack.
+    assert.is_nil(q:to_string():find("drop", 1, true))
+  end)
+
+  it("keeps a value that looks like a placeholder", function()
+    local q = sql.select("*"):from("users"):where("name = ?", "$1 or 1=1")
+    assert.equal("select * from users where name = $1", q:to_string())
+    assert.same({ "$1 or 1=1" }, q:values())
+  end)
+
+  it("refuses a condition whose placeholders and values disagree", function()
+    -- Silently binding the wrong number is how a value lands in the wrong
+    -- column, or a condition quietly does nothing.
+    local ok, err = pcall(function()
+      sql.select("*"):from("users"):where("a = ? and b = ?", 1)
+    end)
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):match "2 placeholder%(s%) but 1 value")
+  end)
+
+  it("offers no raw-SQL escape hatch", function()
+    -- An escape hatch is where the injection goes.  Assert the door does not
+    -- exist rather than trusting nobody opens it.
+    local q = sql.select("*"):from("users")
+    assert.is_nil(q.where_raw)
+    assert.is_nil(q.raw)
+    assert.is_nil(q.append)
+    assert.is_nil(sql.raw)
+  end)
+end)
+
+describe("identifiers are checked, because they cannot be parameterised", function()
+  it("accepts a plain and a qualified name", function()
+    assert.equal("users", sql.identifier("users", nil, "table"))
+    assert.equal("public.users", sql.identifier("public.users", nil, "table"))
+  end)
+
+  it("refuses anything that is not an identifier", function()
+    for _, bad in ipairs { "users; drop table x", "users--", "1users",
+                           "us ers", "users)", "" } do
+      local ok = pcall(sql.identifier, bad, nil, "table")
+      assert.is_false(ok, "accepted a bad identifier: " .. bad)
+    end
+  end)
+
+  it("requires an order column to be on the allow list", function()
+    local q = sql.select("*"):from("users")
+    -- A real column the route never meant to expose is still refused.
+    local ok, err = pcall(function()
+      q:order_by("password_hash", { "id", "name" })
+    end)
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):match "not in the allowed list")
+  end)
+
+  it("accepts an allow-listed order column with a direction", function()
+    local q = sql.select("*"):from("users"):order_by("name", { "id", "name" }, "desc")
+    assert.equal("select * from users order by name desc", q:to_string())
+  end)
+
+  it("refuses an order direction that is not asc or desc", function()
+    local ok = pcall(function()
+      sql.select("*"):from("users"):order_by("id", { "id" }, "asc; drop table users")
+    end)
+    assert.is_false(ok)
+  end)
+
+  it("refuses a non-integer limit", function()
+    assert.is_false((pcall(function() sql.select("*"):from("u"):limit("10; drop") end)))
+    assert.is_false((pcall(function() sql.select("*"):from("u"):limit(-1) end)))
+    assert.is_false((pcall(function() sql.select("*"):from("u"):limit(1.5) end)))
+  end)
+end)

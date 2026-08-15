@@ -384,6 +384,55 @@ arbitrating event and a late event never overturns it.** A handler that
 finishes at 4.99 s against a 5 s deadline has completed, and is never reported
 as a timeout.
 
+## Queries a tenant cannot escape
+
+Two of akkar's invariants are about the database, and both work the same way as
+the rest: the mistake is not discouraged, it is unavailable.
+
+```lua
+local sql = require "akkar.sql"
+
+app:get("/documents", { query = { sort = "string?" } }, function(req)
+  local db = req.db:scope("project_id", req.user.project_id)
+
+  local q = sql.select("id, title"):from "documents"
+  if req.query.sort then
+    q:order_by(req.query.sort, { "id", "title", "created_at" })
+  end
+
+  return db:many(q:limit(50))
+end)
+```
+
+**A value can never become SQL.** `?` marks a value; the numbering into
+`$1, $2` happens once at assembly, so conditions added in different places
+compose without anyone tracking indices — the reason people give up and
+concatenate. There is no `where_raw`; an escape hatch is where the injection
+goes.
+
+**A column name is not a value**, because Postgres has no placeholder for one.
+So sorting by a client-supplied field is checked against a list the route
+declares: the pattern rejects a crafted string, and the list rejects a real
+column the route never meant to expose.
+
+**A scoped handle refuses raw SQL.** A string cannot be scoped without parsing
+it, so `db` above takes a query and applies `project_id` itself — the unscoped
+statement is never assembled. An insert overrides a `project_id` the client
+supplied, a `nil` tenant id raises instead of matching every row, and a
+transaction hands the closure the scoped handle so nothing inside can reach
+past it.
+
+Crossing tenants is real work, so it is possible, but it has to be said out
+loud — which makes `grep -rn ':unscoped()'` the complete list:
+
+```lua
+req.db:unscoped():many "select count(*) from documents"
+```
+
+Likewise an `UPDATE` or `DELETE` with no `WHERE` is refused until you call
+`:all_rows()`. That shape is legitimate in a migration and almost never in a
+handler.
+
 ## Known gaps
 
 | | |

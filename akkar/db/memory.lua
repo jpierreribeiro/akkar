@@ -40,6 +40,8 @@ that silently gets nil back from an unplanned query is a test asserting the
 wrong thing.
 ]]
 
+local Scope = require "akkar.scope"
+
 local Memory = {}
 Memory.__index = Memory
 
@@ -74,6 +76,10 @@ local function find(self, sql)
 end
 
 function Memory:query(sql, ...)
+  -- An `akkar.sql` builder is assembled here, exactly as the real adapter
+  -- assembles it, so a test sees the SQL the server would have sent.
+  if type(sql) == "table" and sql.build then return self:query(sql:build()) end
+
   if type(sql) ~= "string" then
     error("akkar.db.memory: query needs SQL, got " .. type(sql) ..
           "\n  the real adapter would fail the same way; a fake that accepts " ..
@@ -129,6 +135,10 @@ function Memory:transaction(fn)
   self.committed = true
   return result
 end
+
+--- Same scoping as the real adapter, through the same module.
+function Memory:scope(column, value) return Scope.wrap(self, column, value) end
+function Memory:unscoped() return self end
 
 function Memory:release() end
 function Memory:close() end

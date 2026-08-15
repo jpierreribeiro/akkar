@@ -25,6 +25,7 @@ is not the same thing as a named prepared statement.
 
 local pgmoon = require "pgmoon"
 local Pool   = require "akkar.pool"
+local Scope  = require "akkar.scope"
 
 local Db = {}
 Db.__index = Db
@@ -54,8 +55,16 @@ local function serialize_number(_, v)
   return FLOAT8, tostring(v)
 end
 
+-- A query may arrive as text with parameters, or as an `akkar.sql` builder.
+-- The builder is the safe path, so it must be the convenient one too: a path
+-- that is safe but awkward loses to concatenation every time.
+local function statement(sql, ...)
+  if type(sql) == "table" and sql.build then return sql:build() end
+  return sql, ...
+end
+
 function Db:query(sql, ...)
-  local res, err = self.pg:query(sql, ...)
+  local res, err = self.pg:query(statement(sql, ...))
   if not res then error("db: " .. tostring(err), 0) end
   return res
 end
@@ -93,6 +102,18 @@ function Db:transaction(fn)
   self.in_transaction = false
   return result
 end
+
+-- ===================================================================== scoping
+-- The mechanism lives in `akkar.scope`, at the contract level, so the
+-- in-memory adapter scopes identically.  A fake whose safety property differs
+-- from the real one is how a test proves the wrong thing.
+function Db:scope(column, value)
+  return Scope.wrap(self, column, value)
+end
+
+-- A no-op that reads as an assertion at the call site, so
+-- `grep -rn ':unscoped()'` lists every query that crosses tenants.
+function Db:unscoped() return self end
 
 function Db:close()
   if self.pg then self.pg:disconnect() end
@@ -159,4 +180,5 @@ function M.connect(config)
 end
 
 M.Pool = Pool
+M.scope = Scope.wrap
 return M
