@@ -201,3 +201,65 @@ describe("akkar.stream over a real socket", function()
     assert.equal("", answers.HEAD.body)
   end)
 end)
+
+describe("a streamed response the server cannot write", function()
+  -- A stream's release is deferred onto the response and called by the server
+  -- once the body has gone out. It sat AFTER `write_headers` and after the
+  -- terminating chunk, both of which are outside the producer's own pcall --
+  -- so anything raising there skipped the release entirely and leaked one
+  -- pool slot, permanently, per occurrence.
+  --
+  -- The suite could not see it. Every other release test goes through
+  -- `App:test`, which releases on both paths where the server did not, so the
+  -- copy that was correct is the copy that was tested.
+  local cqueues = require "cqueues"
+  local request = require "http.request"
+  local PORT = 8391
+
+  it("still releases what the request acquired", function()
+    local acquired, released = 0, 0
+    local function db_factory()
+      acquired = acquired + 1
+      return {
+        release = function() released = released + 1 end,
+        one = function() end, many = function() end,
+        exec = function() end, transaction = function() end,
+      }
+    end
+
+    local app = akkar.new()
+    app:get("/export", function(req)
+      local _ = req.db                  -- acquire, so there is something to leak
+      -- A header value that is not a string. It is refused when the headers
+      -- are written, which is after the handler returned and after the
+      -- capability was taken: an ordinary handler bug that must not cost a
+      -- connection for the life of the process.
+      return akkar.stream(function(write) write '{"ok":true}' end,
+                          { headers = { ["x-rows"] = 12 } })
+    end)
+
+    local cq = cqueues.new()
+    cq:wrap(function()
+      pcall(function()
+        app:run { port = PORT, check_capabilities = false, db = db_factory,
+                  log = akkar.log.new { level = "error", sink = function() end } }
+      end)
+    end)
+    cq:wrap(function()
+      cqueues.sleep(0.15)
+      pcall(function()
+        local req = request.new_from_uri("http://127.0.0.1:" .. PORT .. "/export")
+        local _, stream = req:go(5)
+        if stream then pcall(function() stream:get_body_as_string(2) end) end
+      end)
+      cqueues.sleep(0.2)
+      app:stop(2)
+    end)
+    assert(cq:loop(30))
+
+    assert.equal(1, acquired, "the handler never took the capability")
+    assert.equal(acquired, released,
+      "the response could not be written and the capability leaked with it")
+    assert.equal(0, app.in_flight, "the in-flight count never came back")
+  end)
+end)

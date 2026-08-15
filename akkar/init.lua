@@ -1713,6 +1713,17 @@ function App:run(config)
     max_concurrent = max_concurrent,
     onstream = function(_, stream)
       self.in_flight = self.in_flight + 1
+
+      -- Held out here because the WRITES BELOW CAN RAISE, and until they were
+      -- allowed to raise past a release this was a capability leak on the
+      -- most ordinary event a server sees: a client that goes away in the
+      -- middle of a body. `write_headers` and the terminating chunk both sit
+      -- outside the producer's own pcall, so a dead peer skipped
+      -- `res.release()` entirely -- one pool slot per occurrence, held for
+      -- the life of the process, and invisible to the suite because the test
+      -- client releases on both paths where the server did not.
+      local pending_release
+
       local ok, err = pcall(function()
         local h = assert(stream:get_headers())
         -- The socket's own idea of who connected. Everything else about the
@@ -1743,6 +1754,9 @@ function App:run(config)
           peer = peer,
           short = short, stripped = true,
         })
+        -- Nil for anything that is not a stream: dispatch has already run
+        -- `release_all` for those. Captured before a single byte goes out.
+        pending_release = res.release
 
         local rh = headers.new()
         rh:append(":status", tostring(res.status))
@@ -1785,7 +1799,6 @@ function App:run(config)
             end
           end
 
-          if res.release then res.release() end
         else
           local payload = res.raw or (res.body and cjson.encode(res.body)) or nil
           if payload then
@@ -1799,8 +1812,18 @@ function App:run(config)
           if send_body then stream:write_chunk(payload, true) end
         end
       end)
+
+      -- On EVERY path, including the writes raising above.
+      if pending_release then pcall(pending_release) end
+
       if not ok then internal:error("stream failed", { detail = tostring(err) }) end
-      stream:shutdown()
+
+      -- `shutdown` guarded, and the count decremented behind nothing that can
+      -- raise. `App:stop` drains on `while in_flight > 0`, so a single raise
+      -- here used to park the shutdown state machine in DRAINING for ever:
+      -- the process would refuse to finish stopping, and the diagnostic it
+      -- printed would say it was still waiting for a request that had ended.
+      pcall(stream.shutdown, stream)
       self.in_flight = self.in_flight - 1
     end,
     onerror = function(_, _, op, e) internal:warn("transport", { op = op, detail = tostring(e) }) end,
