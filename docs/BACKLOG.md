@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 95 tests with Postgres and Redis up, no database needed, ~2 s
+busted                      # 108 tests with Postgres and Redis up, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -262,13 +262,28 @@ that accepts anything while looking validated.
   it — so the opt-out did not actually let anything come up degraded. Eager
   acquisition was also taking a pool slot for requests that never queried.
 
+- **Structured logging and request correlation.** `akkar.log` has levels, JSON
+  or text output and an injectable sink. A request id comes from
+  `x-request-id` when the client sends one — so a trace survives across
+  services — and is generated otherwise; it lands on `req.id` and on the
+  response header.
+
+  `req.log` is the logger already bound to that id, so a handler writes
+  `req.log:info("charged", { amount = 10 })` and correlation happens without
+  the call site doing anything. A rule nobody has to follow beats a rule
+  everybody has to.
+
+  `log` is the one capability with a **default** rather than a guard, because
+  diagnostics that need configuring before they appear are diagnostics nobody
+  sees. Every `io.stderr:write` inside the framework is gone; the only one left
+  is the logger's own default sink.
+
 ### Still open
 
 - **Multipart uploads.** Streaming them properly interacts with the body
   limit, so this is not just another content type.
 - **Redis adapter.** The contract question is settled (`DECISIONS.md` §8);
   what remains is choosing a library and writing it.
-- **Structured logging**, and `log` as a real capability rather than a slot.
 - **Prefix-tree routing.** Dynamic routes are a linear scan. Not urgent — say
   so honestly rather than optimizing early.
 - **Where CPU-bound work runs.** `bcrypt` at cost 12 takes ~250 ms *by design*

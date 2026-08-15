@@ -17,6 +17,7 @@ local cqueues = require "cqueues"
 local server  = require "http.server"
 local headers = require "http.headers"
 local cjson   = require "cjson"
+local log     = require "akkar.log"
 
 local akkar = {}
 
@@ -89,7 +90,12 @@ local CAPABILITIES = { db = true, cache = true, log = true, clock = true }
 local CONTRACTS = {
   db    = { "one", "many", "exec", "transaction" },
   cache = { "get", "set", "del" },
+  log   = { "debug", "info", "warn", "error", "with" },
 }
+
+-- The framework's own voice.  Replaced by `app:run { log = ... }`, but present
+-- so nothing has to be configured for diagnostics to appear.
+local internal = log.new { level = "info", format = "text" }
 
 -- Everything else app:run{} accepts.  Listed so that a typo is an error rather
 -- than silence: `app:run { timout = 5 }` used to be ignored, leaving a server
@@ -325,10 +331,12 @@ local function install_watchdog(where)
     if dt < 0.050 then cpu = cpu + dt else cpu = 0 end
     if cpu > WATCHDOG_LIMIT and not warned then
       warned = true
-      io.stderr:write(string.format(
-        "\n[akkar] WARNING: handler blocked the loop for %.0f ms without yielding\n" ..
-        "  at %s\n%s\n  this stalls every request in this process.\n\n",
-        cpu * 1000, where, debug.traceback("", 2)))
+      internal:warn("handler blocked the event loop without yielding", {
+        blocked_ms = math.floor(cpu * 1000),
+        at = where,
+        traceback = debug.traceback("", 2),
+        hint = "this stalls every request in this process",
+      })
     end
   end, "", WATCHDOG_INSTRUCTIONS)
 end
@@ -546,9 +554,9 @@ local function apply_response_schema(res, schema, where)
     local detail = {}
     for field, why in pairs(failures) do detail[#detail + 1] = field .. ": " .. why end
     table.sort(detail)
-    io.stderr:write(string.format(
-      "[akkar] response does not match its schema at %s -- %s\n",
-      where, table.concat(detail, "; ")))
+    internal:error("response does not match its schema", {
+      at = where, fields = table.concat(detail, "; "),
+    })
     return response(500, { error = "internal server error" })
   end
   return response(res.status, cleaned, res.headers)
@@ -634,7 +642,9 @@ local function dispatch(app, req)
     -- Response-as-error: a deep layer can signal HTTP without threading a
     -- return value back through every frame.
     if is_response(result) then return result end
-    io.stderr:write("[akkar] error at " .. route.where .. ": " .. tostring(result) .. "\n")
+    internal:error("handler raised", {
+      request_id = req.id, at = route.where, detail = tostring(result),
+    })
     return response(500, { error = "internal server error" })
   end
 
@@ -683,6 +693,16 @@ end
 -- a handler had to write
 --   req.headers.authorization or (req.headers.get and req.headers:get "...")
 -- which is the framework leaking lua-http into user code.
+-- A request id, taken from the client when it sends one so a trace survives
+-- across services, generated otherwise.  Not a UUID: this only has to be
+-- unique enough to correlate lines within a window, and pulling in a UUID
+-- library for that would be a dependency bought with nothing.
+local function request_id(headers)
+  local given = headers and headers["x-request-id"]
+  if given and #given > 0 and #given <= 200 then return given end
+  return string.format("%08x%04x", math.random(0, 0xffffffff), math.random(0, 0xffff))
+end
+
 local function normalize_headers(source)
   local out = {}
   if not source then return out end
@@ -726,12 +746,14 @@ local function handle(app, input)
   end
 
   -- Request data.
+  local request_headers = normalize_headers(input.headers)
   local req = {
     method  = input.method,
     path    = normalize_path(input.path),
     query   = input.query or {},
     body    = body,
-    headers = normalize_headers(input.headers),
+    headers = request_headers,
+    id      = request_id(request_headers),
     user    = guard("req.user", "req.user is not set; this route is missing the authentication middleware"),
   }
 
@@ -752,7 +774,13 @@ local function handle(app, input)
       if not CAPABILITIES[key] then return nil end
       local provided = input.capabilities and input.capabilities[key]
       local value
-      if provided == nil then
+      if key == "log" then
+        -- `log` is the one capability with a default, because diagnostics
+        -- that need configuring before they appear are diagnostics nobody
+        -- sees.  Bound to the request id here, so a handler writing
+        -- `req.log:info(...)` correlates without doing anything.
+        value = (provided or internal):with { request_id = self.id }
+      elseif provided == nil then
         value = guard("req." .. key,
                       "req." .. key .. " is not configured; pass " ..
                       key .. " = ... to app:run{}")
@@ -787,9 +815,15 @@ local function handle(app, input)
     local winner, value = with_deadline(input.timeout, function()
       return normalize(chain(app, req))
     end)
+    if is_response(value) then
+      value.headers = value.headers or {}
+      value.headers["x-request-id"] = req.id
+    end
     if winner == "TIMEOUT" then
-      io.stderr:write(string.format("[akkar] deadline: %s %s exceeded %.1fs\n",
-                                    req.method, req.path, input.timeout))
+      internal:warn("request deadline exceeded", {
+        request_id = req.id, method = req.method, path = req.path,
+        timeout_s = input.timeout,
+      })
       return response(503, { error = "request deadline exceeded" })
     end
     return value
@@ -798,7 +832,7 @@ local function handle(app, input)
 
   if not ok then
     if is_response(res) then return res end
-    io.stderr:write("[akkar] middleware error: " .. tostring(res) .. "\n")
+    internal:error("middleware raised", { request_id = req.id, detail = tostring(res) })
     return response(500, { error = "internal server error" })
   end
   return res
@@ -879,7 +913,7 @@ function App:stop(grace)
   grace = grace or self.shutdown_grace or 10
 
   self.state = "STOP_ACCEPTING"
-  io.stderr:write("[akkar] shutdown: no longer accepting connections\n")
+  internal:info("shutdown: no longer accepting connections")
   pcall(function() self.server:pause() end)
 
   self.state = "DRAINING"
@@ -888,20 +922,20 @@ function App:stop(grace)
   while self.in_flight > 0 do
     if cqueues.monotime() > deadline and not warned then
       warned = true
-      io.stderr:write(string.format(
-        "[akkar] shutdown STALLED: %d request(s) still in flight after %gs;" ..
-        " still waiting, nothing is being forced\n", self.in_flight, grace))
+      internal:warn("shutdown stalled; still waiting, nothing is being forced", {
+        in_flight = self.in_flight, grace_s = grace,
+      })
     end
     cqueues.poll(0.02)
   end
-  if warned then io.stderr:write("[akkar] shutdown: drain completed\n") end
+  if warned then internal:info("shutdown: drain completed") end
 
   self.state = "CLOSING"
   for _, closer in ipairs(self.closers) do pcall(closer) end
   pcall(function() self.server:close() end)
 
   self.state = "STOPPED"
-  io.stderr:write("[akkar] shutdown: stopped cleanly\n")
+  internal:info("shutdown: stopped cleanly")
   return self.state
 end
 
@@ -923,6 +957,9 @@ function App:run(config)
   local host = config.host or "127.0.0.1"
   local body_limit = config.body_limit or akkar.defaults.body_limit
   local timeout    = config.timeout    or akkar.defaults.timeout
+  -- An app-supplied logger replaces the framework's own voice, so a service
+  -- gets one stream in one format rather than two.
+  if config.log then internal = config.log end
   self.shutdown_grace = config.shutdown_grace or akkar.defaults.shutdown_grace
   self.state, self.in_flight, self.closers = "RUNNING", 0, {}
 
@@ -981,17 +1018,19 @@ function App:run(config)
         stream:write_headers(rh, not send_body)
         if send_body then stream:write_chunk(payload, true) end
       end)
-      if not ok then io.stderr:write("[akkar] stream: " .. tostring(err) .. "\n") end
+      if not ok then internal:error("stream failed", { detail = tostring(err) }) end
       stream:shutdown()
       self.in_flight = self.in_flight - 1
     end,
-    onerror = function(_, _, op, e) io.stderr:write(("[akkar] %s: %s\n"):format(op, tostring(e))) end,
+    onerror = function(_, _, op, e) internal:warn("transport", { op = op, detail = tostring(e) }) end,
   })
 
   assert(s:listen())
   local _, bh, bp = s:localname()
-  io.stderr:write(string.format("[akkar] listening on %s://%s:%s\n",
-                  config.tls and "https" or "http", bh or host, tostring(bp or port)))
+  internal:info("listening", {
+    url = string.format("%s://%s:%s", config.tls and "https" or "http",
+                        bh or host, tostring(bp or port)),
+  })
   self.server = s
 
   -- The signal task, if one was installed, runs alongside the server rather
@@ -1011,7 +1050,7 @@ end
 function App:test(config)
   config = config or {}
 
-  local allowed = { timeout = true }
+  local allowed = { timeout = true, log = true }
   for k in pairs(CAPABILITIES) do allowed[k] = true end
   check_config(config, allowed, "app:test{}")
 
@@ -1074,7 +1113,7 @@ end
 function App:handle_signals(signals)
   local ok, signal = pcall(require, "cqueues.signal")
   if not ok then
-    io.stderr:write("[akkar] cqueues.signal unavailable; signals not handled\n")
+    internal:warn("cqueues.signal unavailable; signals not handled")
     return self
   end
   signals = signals or { signal.SIGTERM, signal.SIGINT }
@@ -1084,7 +1123,7 @@ function App:handle_signals(signals)
   local app = self
   self.signal_task = function()
     listener:wait()
-    io.stderr:write("[akkar] signal received\n")
+    internal:info("signal received")
     app:stop()
   end
   return self
@@ -1095,6 +1134,7 @@ akkar.null = cjson.null
 
 -- Exposed so the startup checks can be tested without binding a socket.
 akkar.check_capabilities = check_capability_contracts
+akkar.log = log
 
 akkar.Response = Response
 akkar.guard = guard

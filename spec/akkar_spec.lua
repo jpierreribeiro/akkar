@@ -232,17 +232,27 @@ end)
 
 describe("the capability boundary", function()
 
-  it("guards every unconfigured capability, not just db", function()
+  it("guards every unconfigured capability", function()
     local app = akkar.new()
     app:get("/db",    function(req) return { x = req.db.anything } end)
     app:get("/cache", function(req) return { x = req.cache.anything } end)
-    app:get("/log",   function(req) return { x = req.log.anything } end)
     app:get("/clock", function(req) return { x = req.clock.anything } end)
 
     local c = app:test()
-    for _, path in ipairs { "/db", "/cache", "/log", "/clock" } do
+    for _, path in ipairs { "/db", "/cache", "/clock" } do
       assert.equal(500, c:get(path).status)
     end
+  end)
+
+  it("gives req.log a working default instead of a guard", function()
+    -- The one deliberate exception.  Diagnostics that need configuring before
+    -- they appear are diagnostics nobody sees.
+    local app = akkar.new()
+    app:get("/log", function(req)
+      req.log:info "handler said something"
+      return { ok = true }
+    end)
+    assert.equal(200, app:test():get("/log").status)
   end)
 
   it("injects a capability given as a plain value", function()

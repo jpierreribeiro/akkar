@@ -203,6 +203,20 @@ app:get("/users/:id", {
 end)
 ```
 
+**Logs that correlate without being asked to.** A request id is taken from
+`x-request-id` or generated, echoed on the response, and bound into `req.log`:
+
+```lua
+app:post("/charges", function(req)
+  req.log:info("charged", { amount = 10 })   -- request_id attached for you
+  return akkar.created {}
+end)
+```
+
+```json
+{"level":"info","message":"charged","amount":10,"request_id":"minha-trace-123","time":1786757421}
+```
+
 **OpenAPI, generated from what you already wrote.** The schema declared for
 validation is the schema in the document — no route describes itself twice:
 
@@ -306,7 +320,6 @@ as a timeout.
 | | |
 |---|---|
 | No multipart uploads | streaming them interacts with the body limit, so it is not just another content type |
-| `log` is a slot, not an implementation | injectable and guarded, but akkar ships no logger |
 | Linear scan for dynamic routes | a prefix tree is the fix, but this is not urgent |
 | CPU-bound handlers still stall the process | the watchdog reports it; an external queue or separate process is the answer, undecided |
 | Pinned to Lua 5.4 | the blocker is `cqueues`, which pins `lua == 5.4` and has had no release since 2020 — not `lua-http`, which accepts `>= 5.1` |

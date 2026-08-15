@@ -54,6 +54,7 @@ build = {
   modules = {
     ["akkar"]    = "akkar/init.lua",
     ["akkar.db"] = "akkar/db.lua",
+    ["akkar.log"] = "akkar/log.lua",
     ["akkar.pool"] = "akkar/pool.lua",
     ["akkar.redis"] = "akkar/redis.lua",
     ["akkar.openapi"] = "akkar/openapi.lua",

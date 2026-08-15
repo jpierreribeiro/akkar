@@ -14,6 +14,7 @@ package.path = "./?.lua;./?/init.lua;" .. package.path
 local akkar = require "akkar"
 local db    = require "akkar.db"
 local redis = require "akkar.redis"
+local logging = require "akkar.log"
 local openapi = require "akkar.openapi"
 local v     = akkar.v
 
@@ -26,8 +27,11 @@ local app = akkar.new()
 app:use(function(req, next)
   local t0 = require("cqueues").monotime()
   local res = next(req)
-  io.stderr:write(string.format("[log] %-6s %-28s %d  %.1f ms\n",
-    req.method, req.path, res.status, (require("cqueues").monotime() - t0) * 1000))
+  -- req.log already carries the request id; nothing here has to pass it.
+  req.log:info("request", {
+    method = req.method, path = req.path, status = res.status,
+    duration_ms = math.floor((require("cqueues").monotime() - t0) * 1000),
+  })
   return res
 end)
 
@@ -227,6 +231,7 @@ if ... == nil then      -- only start a server when run directly, not required
     db    = db.connect { port = 55432, database = "akkar",
                          user = "postgres", password = "akkar" },
     cache = redis.connect { port = 6379 },
+    log   = logging.new { format = os.getenv "AKKAR_LOG_JSON" and "json" or "text" },
   }
 end
 
