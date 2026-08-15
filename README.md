@@ -190,6 +190,19 @@ health:test():get "/live"            -- standalone
 app:test():get "/health/live"        -- mounted
 ```
 
+**A `response` schema is enforced, not just documented.** Declaring the shape
+filters undeclared fields out of the body — a handler doing `select *` cannot
+leak `password_hash` — and a mismatch is a 500, because a response that breaks
+its own contract is the server's fault, not the client's:
+
+```lua
+app:get("/users/:id", {
+  response = { id = "integer", name = "string", email = "string?" },
+}, function(req)
+  return req.db:one("select * from users where id = $1", req.params.id)
+end)
+```
+
 **OpenAPI, generated from what you already wrote.** The schema declared for
 validation is the schema in the document — no route describes itself twice:
 
@@ -284,7 +297,6 @@ as a timeout.
 
 | | |
 |---|---|
-| `response` is documentation only | it feeds OpenAPI; handler output is not validated or filtered against it |
 | No multipart uploads | streaming them interacts with the body limit, so it is not just another content type |
 | `log` is a slot, not an implementation | injectable and guarded, but akkar ships no logger |
 | Linear scan for dynamic routes | a prefix tree is the fix, but this is not urgent |

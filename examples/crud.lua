@@ -119,9 +119,15 @@ local function find_user_or_404(database, id)
   return user
 end
 
-app:get("/users/:id", { params = { id = v.integer { min = 1 } } }, function(req)
-  -- No `if not user then return ...` here: the layer below already signalled.
-  return find_user_or_404(req.db, req.params.id)
+-- The response schema is not decoration.  This handler does `select *` on
+-- purpose: without the schema the password hash would go over the wire.
+app:get("/users/:id", {
+  params   = { id = v.integer { min = 1 } },
+  response = { id = "integer", name = "string", email = "string?" },
+}, function(req)
+  local user = req.db:one("select * from users where id = $1", req.params.id)
+  if not user then error(akkar.not_found("user " .. req.params.id .. " not found")) end
+  return user
 end)
 
 -- ============================================================================

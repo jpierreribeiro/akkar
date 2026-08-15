@@ -762,3 +762,85 @@ describe("JSON null handling", function()
     assert.equal("required", res.body.fields["body.name"])
   end)
 end)
+
+describe("response schema", function()
+  local v = akkar.v
+
+  it("filters out a field the schema does not declare", function()
+    local app = akkar.new()
+    app:get("/u", { response = { id = "integer", name = "string" } }, function()
+      -- What `select *` gives you.
+      return { id = 1, name = "ada", password_hash = "$2b$12$verysecret" }
+    end)
+
+    local res = app:test():get "/u"
+    assert.equal(200, res.status)
+    assert.equal("ada", res.body.name)
+    assert.is_nil(res.body.password_hash)     -- removed, not merely documented
+  end)
+
+  it("turns a schema mismatch into 500, not 422", function()
+    local app = akkar.new()
+    app:get("/u", { response = { id = "integer" } }, function()
+      return { id = "not a number" }
+    end)
+
+    local res = app:test():get "/u"
+    -- A response that breaks its own contract is the server's fault; 422
+    -- would blame the client for something it did not do.
+    assert.equal(500, res.status)
+    assert.equal("internal server error", res.body.error)
+    assert.is_nil(res.body.fields)            -- no schema detail leaks out
+  end)
+
+  it("reports a missing declared field", function()
+    local app = akkar.new()
+    app:get("/u", { response = { id = "integer", name = "string" } }, function()
+      return { id = 1 }
+    end)
+    assert.equal(500, app:test():get("/u").status)
+  end)
+
+  it("allows an optional field to be absent", function()
+    local app = akkar.new()
+    app:get("/u", { response = { id = "integer", email = "string?" } }, function()
+      return { id = 1 }
+    end)
+    local res = app:test():get "/u"
+    assert.equal(200, res.status)
+    assert.equal(1, res.body.id)
+  end)
+
+  it("leaves error responses alone", function()
+    local app = akkar.new()
+    app:get("/u", { response = { id = "integer" } }, function()
+      return akkar.not_found "gone"
+    end)
+    local res = app:test():get "/u"
+    assert.equal(404, res.status)
+    assert.equal("gone", res.body.error)      -- not filtered against the schema
+  end)
+
+  it("leaves an array body alone", function()
+    local app = akkar.new()
+    app:get("/u", { response = { id = "integer" } }, function()
+      return { { id = 1 }, { id = 2 } }
+    end)
+    local res = app:test():get "/u"
+    assert.equal(200, res.status)
+    assert.equal(2, #res.body)
+  end)
+
+  it("changes nothing for a route without a response schema", function()
+    local app = akkar.new()
+    app:get("/u", function() return { id = 1, extra = "kept" } end)
+    assert.equal("kept", app:test():get("/u").body.extra)
+  end)
+
+  it("honours constraints, not just types", function()
+    local app = akkar.new()
+    app:get("/u", { response = { role = v.string { one_of = { "admin", "user" } } } },
+      function() return { role = "root" } end)
+    assert.equal(500, app:test():get("/u").status)
+  end)
+end)

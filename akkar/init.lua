@@ -492,6 +492,39 @@ local function normalize(value)
   return response(200, value)
 end
 
+-- Applies a route's `response` schema to what the handler produced.
+--
+-- Filtering first is the part that earns its keep: a handler doing `select *`
+-- and returning the row leaks whatever the table happens to hold, and
+-- `password_hash` is the classic.  Declaring the shape now removes the field
+-- instead of merely documenting that it should not be there.
+--
+-- A mismatch is a 500, not a 422.  A response that does not match its own
+-- contract is a server bug, and telling the client it sent bad input would be
+-- a lie about whose fault it is.
+--
+-- Only success bodies are touched.  An error response is the framework's own
+-- shape and has nothing to do with the route's schema.
+local function apply_response_schema(res, schema, where)
+  if res.status < 200 or res.status >= 300 then return res end
+  if type(res.body) ~= "table" then return res end
+  -- An array body is out of scope: `response` describes an object, and a list
+  -- schema is a separate decision rather than an oversight.
+  if res.body[1] ~= nil then return res end
+
+  local cleaned, failures = validate(res.body, schema, false)
+  if failures then
+    local detail = {}
+    for field, why in pairs(failures) do detail[#detail + 1] = field .. ": " .. why end
+    table.sort(detail)
+    io.stderr:write(string.format(
+      "[akkar] response does not match its schema at %s -- %s\n",
+      where, table.concat(detail, "; ")))
+    return response(500, { error = "internal server error" })
+  end
+  return response(res.status, cleaned, res.headers)
+end
+
 local function dispatch(app, req)
   local route, params = app:match(req.method, req.path)
 
@@ -574,6 +607,10 @@ local function dispatch(app, req)
     if is_response(result) then return result end
     io.stderr:write("[akkar] error at " .. route.where .. ": " .. tostring(result) .. "\n")
     return response(500, { error = "internal server error" })
+  end
+
+  if opts and opts.response then
+    result = apply_response_schema(result, opts.response, route.where)
   end
   return result
 end

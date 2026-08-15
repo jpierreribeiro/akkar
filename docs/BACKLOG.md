@@ -19,7 +19,7 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 77 tests with Postgres and Redis up, no database needed, ~2 s
+busted                      # 85 tests with Postgres and Redis up, no database needed, ~2 s
 ```
 
 Only the examples and the substrate scripts need Postgres:
@@ -235,12 +235,19 @@ that accepts anything while looking validated.
   rather than depended upon because no non-blocking client exists for Lua 5.4
   on cqueues — see `DECISIONS.md` §8. Reuses `akkar.pool` unchanged.
 
+- **`response` filters and validates**, not just documents. A handler doing
+  `select *` no longer leaks whatever the table holds: undeclared fields are
+  removed before the body is serialised. A mismatch is a **500**, not a 422 —
+  a response that breaks its own contract is a server bug, and blaming the
+  client would be a lie about whose fault it is. Arrays are out of scope;
+  `response` describes an object.
+
+  `examples/crud.lua` now does `select *` deliberately, with a real
+  `password_hash` column in the table, so the filtering is demonstrated rather
+  than asserted.
+
 ### Still open
 
-- **Validating handler output against `response`.** Today it is documentation
-  only. FastAPI's `response_model` also filters and validates. Whether akkar
-  should is a real decision: it catches a handler leaking a field, and it also
-  means a handler can fail on the way out.
 - **Multipart uploads.** Streaming them properly interacts with the body
   limit, so this is not just another content type.
 - **Redis adapter.** The contract question is settled (`DECISIONS.md` §8);
