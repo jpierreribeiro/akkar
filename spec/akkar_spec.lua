@@ -1110,3 +1110,100 @@ describe("the deadline controller pool", function()
     for _, correct in ipairs(seen) do assert.is_true(correct) end
   end)
 end)
+
+describe("null handling on the wire path", function()
+  -- The first live-HTTP tests in this suite, and they are here because the
+  -- change they pin lives on a path the in-process client does not travel:
+  -- the raw request text.  Every defect this project has found so far was
+  -- invisible until someone hit a real server.
+  local cqueues = require "cqueues"
+  local request = require "http.request"
+  local cjson   = require "cjson"
+
+  local PORT = 8397
+  local answers = {}
+
+  -- One server, one loop, every request inside it.  A server per test would
+  -- race the previous one off the port.
+  setup(function()
+    local app = akkar.new()
+    app:post("/echo", { body = { name = "string", nick = "string?" } },
+      function(req) return { name = req.name, nick = req.nick or "(none)" } end)
+    app:post("/any", function(req) return { got = req.body } end)
+
+    local cases = {
+      optional_null = { "/echo", '{"name":"ada","nick":null}' },
+      required_null = { "/echo", '{"name":null}' },
+      nested_null   = { "/any",  '{"a":{"b":null,"c":1},"list":[{"d":null,"e":2}]}' },
+      null_in_text  = { "/any",  '{"note":"nullable field"}' },
+      no_null       = { "/any",  '{"a":1,"b":[1,2,3]}' },
+    }
+
+    local cq = cqueues.new()
+    cq:wrap(function()
+      pcall(function()
+        app:run { port = PORT, check_capabilities = false,
+                  log = akkar.log.new { level = "error" } }
+      end)
+    end)
+    cq:wrap(function()
+      cqueues.sleep(0.20)
+      for name, case in pairs(cases) do
+        local req = request.new_from_uri("http://127.0.0.1:" .. PORT .. case[1])
+        req.headers:upsert(":method", "POST")
+        req.headers:upsert("content-type", "application/json")
+        req:set_body(case[2])
+        local headers, stream = assert(req:go(5))
+        answers[name] = {
+          status = tonumber(headers:get ":status"),
+          body = cjson.decode(stream:get_body_as_string()),
+        }
+      end
+      app:stop(1)
+    end)
+    assert(cq:loop(20))
+  end)
+
+  it("treats an explicit null on an optional field as absent", function()
+    assert.equal(200, answers.optional_null.status)
+    assert.equal("(none)", answers.optional_null.body.nick)
+  end)
+
+  it("treats an explicit null on a required field as missing", function()
+    assert.equal(422, answers.required_null.status)
+  end)
+
+  it("strips a null nested inside an object and an array", function()
+    local body = answers.nested_null.body
+    assert.equal(200, answers.nested_null.status)
+    assert.is_nil(body.got.a.b)
+    assert.equal(1, body.got.a.c)
+    assert.is_nil(body.got.list[1].d)
+  end)
+
+  it("does not mistake the word null inside a string for a null", function()
+    -- The scan that skips the walk matches on the bytes `null`, so a string
+    -- containing them must still round-trip intact.
+    assert.equal(200, answers.null_in_text.status)
+    assert.equal("nullable field", answers.null_in_text.body.got.note)
+  end)
+
+  it("leaves a body with no null untouched", function()
+    assert.equal(200, answers.no_null.status)
+    assert.same({ 1, 2, 3 }, answers.no_null.body.got.b)
+  end)
+end)
+
+describe("null handling through the test client", function()
+  it("still strips a sentinel handed straight over", function()
+    -- No raw text exists on this path, so the scan cannot apply and the walk
+    -- must still happen.
+    local cjson = require "cjson"
+    local app = akkar.new()
+    app:post("/echo", { body = { name = "string", nick = "string?" } },
+      function(req) return { nick = req.nick or "(none)" } end)
+    local res = app:test():post("/echo", { body = { name = "ada", nick = cjson.null } })
+    assert.equal(200, res.status)
+    assert.equal("(none)", res.body.nick)
+  end)
+end)

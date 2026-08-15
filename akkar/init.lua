@@ -226,6 +226,20 @@ local function strip_nulls(value)
   return value
 end
 
+-- Walking every field of every row costs real time on a large body, and on
+-- almost every body it finds nothing.  A JSON null can only exist in the
+-- decoded value if the literal bytes `null` appear in the document, so a
+-- substring scan -- one pass in C, no allocation -- rules the walk out
+-- entirely.
+--
+-- The test is conservative in the safe direction.  A string value like
+-- "nullable" matches and we walk anyway, which is exactly today's behaviour;
+-- there is no document containing a null that this scan can miss.
+local function strip_nulls_in(raw, value)
+  if raw:find("null", 1, true) then return strip_nulls(value) end
+  return value
+end
+
 -- ================================================================ validation
 -- Two spellings of the same thing.  The short one expands into the long one:
 --   "string?"                    ==  v.string { optional = true }
@@ -332,25 +346,48 @@ akkar.validate = validate
 local WATCHDOG_INSTRUCTIONS = 200000
 local WATCHDOG_LIMIT        = 0.100   -- seconds of uninterrupted CPU
 
-local function install_watchdog(where)
-  local cpu, last, warned = 0, cqueues.monotime(), false
-  debug.sethook(function()
-    local t = cqueues.monotime()
-    local dt = t - last
-    last = t
-    if dt < 0.050 then cpu = cpu + dt else cpu = 0 end
-    if cpu > WATCHDOG_LIMIT and not warned then
-      warned = true
+-- The hook closure and its state are pooled, for the same reason the deadline
+-- controllers are: this is per request, on every request, and it is the same
+-- object every time.  The state lives in a table the closure captures once
+-- rather than in fresh upvalues, so a reused watchdog is reset rather than
+-- rebuilt.
+local watchdog_pool = {}
+local WATCHDOG_POOL_LIMIT = 64
+
+local function new_watchdog()
+  local state = { cpu = 0, last = 0, warned = false, where = nil }
+  local hook = function()
+    local now = cqueues.monotime()
+    local dt = now - state.last
+    state.last = now
+    if dt < 0.050 then state.cpu = state.cpu + dt else state.cpu = 0 end
+    if state.cpu > WATCHDOG_LIMIT and not state.warned then
+      state.warned = true
       internal:warn("handler blocked the event loop without yielding", {
-        blocked_ms = math.floor(cpu * 1000),
-        at = where,
+        blocked_ms = math.floor(state.cpu * 1000),
+        at = state.where,
         traceback = debug.traceback("", 2),
         hint = "this stalls every request in this process",
       })
     end
-  end, "", WATCHDOG_INSTRUCTIONS)
+  end
+  return { state = state, hook = hook }
 end
-local function remove_watchdog() debug.sethook() end
+
+local function install_watchdog(where)
+  local w = table.remove(watchdog_pool) or new_watchdog()
+  local state = w.state
+  state.cpu, state.last, state.warned, state.where = 0, cqueues.monotime(), false, where
+  debug.sethook(w.hook, "", WATCHDOG_INSTRUCTIONS)
+  return w
+end
+
+local function remove_watchdog(w)
+  debug.sethook()
+  if w and #watchdog_pool < WATCHDOG_POOL_LIMIT then
+    watchdog_pool[#watchdog_pool + 1] = w
+  end
+end
 
 -- ================================================================== deadline
 -- Wall-clock budget for one request.
@@ -431,10 +468,27 @@ end
 -- ==================================================================== guards
 -- Invariant: reading something that was never configured gives a useful
 -- message, not "attempt to index a nil value".
+-- A guard is immutable and its identity carries no meaning, so one per name
+-- is built once and shared.  Every request was allocating a table, a
+-- metatable and three closures to represent the same nothing.
+--
+-- `__newindex` is what makes sharing safe: without it, `req.user.id = 1` on
+-- an unauthenticated request would silently write into an object every other
+-- request also holds.  With it, that line says what is actually wrong.
+local guards = {}
 local function guard(name, hint)
-  return setmetatable({}, { __index = function() error(hint, 2) end,
-                            __call  = function() error(hint, 2) end,
-                            __tostring = function() return "<" .. name .. " missing>" end })
+  local existing = guards[name]
+  if existing then return existing end
+
+  local fail = function() error(hint, 2) end
+  local g = setmetatable({}, {
+    __index = fail,
+    __call = fail,
+    __newindex = fail,
+    __tostring = function() return "<" .. name .. " missing>" end,
+  })
+  guards[name] = g
+  return g
 end
 
 local function unescape(s)
@@ -674,11 +728,11 @@ local function dispatch(app, req)
     end
   end
 
-  install_watchdog(route.where)
+  local watchdog = install_watchdog(route.where)
   -- `normalize` runs INSIDE the pcall: a handler returning an invalid value
   -- must become a 500 with a clear log, not escape as an unhandled error.
   local ok, result = pcall(function() return normalize(run()) end)
-  remove_watchdog()
+  remove_watchdog(watchdog)
 
   if not ok then
     -- Response-as-error: a deep layer can signal HTTP without threading a
@@ -739,10 +793,18 @@ end
 -- across services, generated otherwise.  Not a UUID: this only has to be
 -- unique enough to correlate lines within a window, and pulling in a UUID
 -- library for that would be a dependency bought with nothing.
+-- A random prefix chosen once per process, then a counter.  Two RNG calls per
+-- request bought nothing: within a process a counter cannot collide at all,
+-- which is strictly better than hoping two 48-bit draws differ, and across
+-- processes the prefix separates them.
+local ID_PREFIX = string.format("%08x", math.random(0, 0xffffffff))
+local id_counter = 0
+
 local function request_id(headers)
   local given = headers and headers["x-request-id"]
   if given and #given > 0 and #given <= 200 then return given end
-  return string.format("%08x%04x", math.random(0, 0xffffffff), math.random(0, 0xffff))
+  id_counter = id_counter + 1
+  return ID_PREFIX .. string.format("%06x", id_counter & 0xffffff)
 end
 
 local function normalize_headers(source)
@@ -781,7 +843,12 @@ local function handle(app, input)
   -- test client hands a Lua value over directly and the two paths have to
   -- agree.  A scalar cannot be indexed by field name, so it is rejected with
   -- a message rather than blowing up inside validation.
-  local body = strip_nulls(input.body)
+  -- The wire path already stripped nulls while it had the raw text to scan.
+  -- Doing it again here walked every field of every body a second time -- on a
+  -- fifty-row body that second walk was measured at about half the cost of the
+  -- whole request.  The test client hands over a Lua value with no raw text
+  -- behind it, so that path still strips.
+  local body = input.stripped and input.body or strip_nulls(input.body)
   if body ~= nil and type(body) ~= "table" then
     input.short = input.short or
       response(400, { error = "request body must be a JSON object or array" })
@@ -897,7 +964,7 @@ local function decode_body(raw, content_type)
   if kind == "" or kind == "application/json" or kind:match "%+json$" then
     local ok, value = pcall(cjson.decode, raw)
     if not ok then return false, { status = 400, message = "invalid JSON body" } end
-    return true, strip_nulls(value)
+    return true, strip_nulls_in(raw, value)
   end
 
   if kind == "application/x-www-form-urlencoded" then
@@ -1066,7 +1133,7 @@ function App:run(config)
           method = h:get ":method", path = path, query = parse_query(qs),
           body = body, headers = h, timeout = timeout,
           capabilities = config,
-          short = short,
+          short = short, stripped = true,
         })
 
         local rh = headers.new()
