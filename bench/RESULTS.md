@@ -7,21 +7,23 @@ A number without the machine it came from is not a result.
 ## 2026-08-15 — AWS c5.2xlarge
 
 ```
-machine   : AWS c5.2xlarge, Intel Xeon Platinum 8275CL @ 3.00GHz
-cores     : 8 vCPU
-memory    : 15 GB
-os        : Ubuntu 26.04 LTS, kernel 7.0.0-1006-aws
-lua       : 5.4.8
-postgres  : 16-alpine in Docker, on the same box
-redis     : 7-alpine in Docker, on the same box
-generator : wrk 4.1.0, ALSO on the same box
-ulimit -n : 65535
+machine    : AWS c5.2xlarge, Intel Xeon Platinum 8275CL @ 3.00GHz
+topology   : 8 vCPU = 4 PHYSICAL cores x 2 threads
+memory     : 15 GB
+os         : Ubuntu 26.04 LTS, kernel 7.0.0-1006-aws
+lua        : 5.4.8
+postgres   : 16-alpine in Docker, same box, stock settings
+redis      : 7-alpine in Docker, same box
+generator  : wrk 4.1.0, same box, pinned to one whole physical core
+affinity   : servers on 3 physical cores (vcpu 1,5,2,6,3,7)
+             generator on 1 physical core (vcpu 0,4)
+ulimit -n  : 65535
 ```
 
-**Everything is co-located.** The load generator, both databases and the server
-share eight cores. That is stated up front because it is the limit in two of the
-three measurements below, and reading them without it produces the wrong
-conclusion.
+One box, so the generator is co-located. It is pinned to a **whole physical
+core** and the servers to the other three, which is what makes the numbers
+below the server's rather than the generator's. Verified during a run: server
+cores at 100% while generator cores sat at 66% and 23%.
 
 The full suite — 139 tests — passes on this machine.
 
@@ -30,60 +32,62 @@ The full suite — 139 tests — passes on this machine.
 Ten repetitions of one identical configuration:
 
 ```
-n=10  min 2388  p50 2407  p95 2450  max 2450 req/s
-spread (p95-min)/p50 = 261 basis points = 2.6%
+n=10  min 2679  p50 2688  p95 2698  max 2698 req/s
+spread = 70 basis points = 0.7%
 ```
 
-**Any difference below 2.6% on this machine is not a result.** Every comparison
-below is checked against that line.
+**Any difference below 0.7% is not a result.** Pinning brought this down from
+2.6% unpinned, and raised baseline throughput from 2,407 to 2,688 req/s — the
+contention was costing both stability and speed.
 
-For contrast, the project this methodology came from measured **±57.6%** on its
-hardware, which invalidated a comparison it had been about to base a design
-decision on. A dedicated instance earns its cost here alone.
+For contrast, the project this methodology came from measured ±57.6% on its
+hardware, which invalidated a comparison it was about to base a decision on.
 
 ---
 
-### 1. Multicore scaling, no database — `/ping`
+### 1. Scaling with no database — `/ping`
 
 ```
 processes        req/s        p50        p99   req/s/process   scaling
-1              8934.16    11.04ms    14.34ms            8934     1.00x
-2             18036.18     5.45ms     7.98ms            9018     1.01x
-4             31862.03     3.12ms     4.97ms            7966     0.89x
-8             35971.55     2.67ms     6.30ms            4496     0.50x
+1              9003.81    10.97ms    14.12ms            9004     1.00x
+2             18058.53     5.36ms     8.66ms            9029     1.00x
+3             26901.55     3.71ms     5.48ms            8967     1.00x
+6             31801.55     3.12ms     4.96ms            5300     0.59x
 ```
 
-**One to two processes is 2.02x. One to four is 3.57x.** Per-process throughput
-holds at 1.01x and 0.89x — linear within, and just outside, the noise floor.
+**Perfectly linear across physical cores: 1.00x, 1.00x, 1.00x.** Three
+processes on three physical cores deliver three times one process, with
+per-process throughput varying by 0.7% — exactly the noise floor.
 
-The fall to 0.50x at eight is **the load generator, not the server**: `wrk` runs
-four threads on the same eight cores it is measuring. Scaling is demonstrated to
-four; past that this box cannot answer, and the honest fix is a second machine.
+The drop at six is **hyperthreading, not the framework**. Six processes on the
+same three physical cores yield 31,802 against 26,902, which is **1.18x for
+twice the processes** — the usual return from a second thread on a busy core.
 
 **This is the answer to CPU-bound work.** One Lua VM is one core; capacity is
-processes, and processes scale.
+processes; processes scale linearly with real cores and give roughly another
+fifth from hyperthreads.
 
 ### 2. The realistic path — `/users/:id`, one indexed query
 
 ```
 processes        req/s        p50        p99   req/s/process   scaling
-1              2401.00    40.44ms   208.13ms            2401     1.00x
-2              2698.36    36.76ms   119.25ms            1349     0.56x
-4              2682.58    35.97ms    92.17ms             671     0.28x
-8              2642.46    35.05ms   116.03ms             330     0.14x
+1              2393.14    40.62ms   190.88ms            2393     1.00x
+2              2691.92    36.92ms   119.12ms            1346     0.56x
+3              2705.63    36.03ms    99.96ms             902     0.38x
+6              2651.42    34.98ms   107.72ms             442     0.18x
 ```
 
-Throughput gains 12% from one to two processes — above the noise floor, so real
-— then flattens at about 2,700 req/s. p99 improves markedly, 208 ms to 92 ms.
+Throughput gains 12% from one process to two — above the 0.7% floor, so real —
+then flattens at about 2,700 req/s. p99 nearly halves, 191 ms to 100 ms.
 
-**The framework is not the limit; Postgres is.** `/ping` reaches 35,972 req/s
-where `/users/:id` reaches 2,642: the framework is thirteen times faster than
-the path that touches the database, on a box where Postgres is competing for the
-same eight cores.
+**The framework is not the limit; Postgres is.** `/ping` reaches 31,802 req/s
+where `/users/:id` reaches 2,705: the framework is **twelve times faster** than
+the path that touches the database — and Postgres here is unpinned, in Docker,
+on stock settings, competing for the same box.
 
-That confirms over HTTP and under load what every measurement in this project
-has said — in a real request the database dominates and the framework is noise.
-Optimising the router would be optimising the 7%.
+This confirms over HTTP and under load what every earlier measurement in this
+project predicted: in a real request the database dominates and the framework is
+noise. Optimising the router would be optimising the 8%.
 
 ### 3. What one blocking handler costs the neighbours
 
@@ -97,63 +101,70 @@ Optimising the router would be optimising the 7%.
 | `work.yielding` | 1 | 8,625 | 5.74 ms | **8.15 ms** |
 | `work.yielding` | 8 | 34,429 | 1.23 ms | **4.28 ms** |
 
-Three findings, in order of how much they change what to do:
+1. **One blocking handler multiplies neighbour p99 by ten** — 7.69 to 74.67 ms
+   — while barely moving p50 or throughput. A tail problem, which is why this
+   project reports p99 and never a mean.
 
-1. **One blocking handler multiplies neighbour p99 by ten** — 7.69 ms to
-   74.67 ms — while barely moving p50 or throughput. It is a tail problem,
-   which is exactly why this project reports p99 and never a mean.
+2. **`work.yielding` all but erases it**: back to 8.15 ms against a 7.69 ms
+   baseline. For a Lua loop, a ninefold improvement in what everyone else feels.
 
-2. **`work.yielding` all but erases it**: 74.67 ms back to 8.15 ms against a
-   7.69 ms baseline. For a loop written in Lua, a nine-fold improvement in what
-   everyone else feels.
-
-3. **Yielding beats adding processes for this case.** One process with yielding
-   (8.15 ms) is better than eight without it (38.07 ms). Processes divide the
-   damage; yielding removes it. Both together give 4.28 ms, below the
-   single-process baseline.
+3. **Yielding beats adding processes here.** One process yielding (8.15 ms) is
+   better than eight not yielding (38.07 ms). Processes divide the damage;
+   yielding removes it.
 
 **The limit that survives all of it:** `work.yielding` needs a Lua loop. A C
-function that runs 250 ms without returning — `bcrypt` at cost 12 — offers no
-point at which Lua regains control, so only the middle row applies. Eight
-processes make one blocked worker an eighth of capacity, and that is the whole
-of the answer there.
+function that runs 250 ms without returning — `bcrypt` at cost 12 — gives Lua
+no point at which to regain control, so only the middle row applies to it.
 
 ---
 
-## The first run of this benchmark was wrong
+## Two runs of this benchmark were wrong
 
-Recorded because the failure is more instructive than the numbers.
+Recorded because the failures are more instructive than the numbers.
 
-The first scaling run reported a perfectly flat line: 2,433 req/s at one process
-and 2,424 at eight. Flat, well inside the noise floor, and entirely believable —
-the obvious reading was "Postgres is saturated".
+### The configuration was not the configuration
 
-Seven of the eight processes had died instantly with `EADDRINUSE`, because akkar
-never passed `reuseport` through to lua-http. The single survivor answered every
+The first scaling run reported a flat line: 2,433 req/s at one process, 2,424
+at eight. Flat, inside the noise floor, entirely believable — the obvious
+reading was "Postgres is saturated".
+
+Seven of the eight processes had died instantly with `EADDRINUSE`, because
+akkar never passed `reuseport` through to lua-http. The survivor answered every
 request correctly, so the run passed its own *verify every response* gate and
 produced a plausible number labelled **8 processes**.
 
-Two things came out of it:
+That found a hole in the framework, not just the harness: without
+`SO_REUSEPORT` multi-process deployment is impossible, and multi-process is
+akkar's answer to CPU-bound work. The harness now verifies the configuration
+too, and refuses to run when fewer processes are alive than were asked for.
 
-- akkar now supports `SO_REUSEPORT`. Without it multi-process deployment is not
-  possible at all — and multi-process is this framework's answer to CPU-bound
-  work, so the hole was in the thing being measured, not only in the
-  measurement.
-- The harness verifies the **configuration**, not just the responses, and
-  refuses to run when fewer processes are alive than were asked for.
+### The pinning shared physical cores
 
-The borrowed methodology already warned that a load generator being rejected
-still reports a number. The generalisation it did not make, and this run
-supplied: **a configuration that is not the configuration reports a number too,
-and that one is harder to see.**
+The second run pinned the generator to vCPU 0–1 and the servers to 2–7, and
+read per-process throughput falling to 0.67x — which looked like the framework
+scaling poorly.
+
+On this machine vCPU 4 and 5 are the sibling threads of vCPU 0 and 1. The
+servers had been handed the siblings of the generator's cores, so the
+contention survived the pinning and wore the framework's name.
+
+With whole physical cores assigned, the same measurement reads **1.00x, 1.00x,
+1.00x**. `bench/run.sh` now reads the sibling map from `/sys` and hands out
+whole physical cores.
+
+The borrowed methodology said a rejected load generator still reports a number.
+These two runs added the rest of that thought: **a configuration that is not
+the configuration reports a number too, and so does an affinity mask that only
+looks like isolation.**
 
 ---
 
 ## What this box cannot answer
 
-- **Scaling past four processes.** `wrk` shares the cores. Needs a second
-  machine before eight-process figures mean anything.
+- **Scaling past three processes as measured.** Not a framework limit — the
+  box has four physical cores and one is holding the generator. A second
+  machine would free it, but the linear result to three is already the answer.
 - **Postgres tuned.** Stock settings, in Docker, competing with the thing
-  benchmarking it. 2,700 req/s says nothing about what it can do otherwise.
-- **Sustained load.** Everything here is fifteen seconds. Connection churn,
-  memory growth and GC behaviour over hours are unmeasured.
+  benchmarking it.
+- **Sustained load.** Everything here is twelve to fifteen seconds. Connection
+  churn, memory growth and GC behaviour over hours are unmeasured.

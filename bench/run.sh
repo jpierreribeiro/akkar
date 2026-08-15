@@ -37,6 +37,54 @@ POOL="${POOL:-10}"
 REPS="${REPS:-3}"
 WARMUP="${WARMUP:-5s}"
 
+# CPU affinity, and it has to be TOPOLOGY-AWARE.
+#
+# On a single box the load generator competes with the thing it is measuring,
+# so they get pinned apart.  But pinning by vCPU number is not enough: on a
+# hyperthreaded machine vCPU 0 and vCPU 4 may be two threads of ONE physical
+# core, and splitting "0-1 for the generator, 2-7 for the servers" then hands
+# the servers the siblings of the generator's cores.  The contention survives
+# the pinning and looks exactly like the framework scaling badly.
+#
+# That is not hypothetical.  On this c5.2xlarge -- 4 physical cores, 2 threads
+# each -- that naive split had the generator and the servers sharing physical
+# cores 0 and 1, and per-process throughput read 0.67x when the real figure
+# was better.
+#
+# So: read the sibling map, hand out WHOLE physical cores, and say which went
+# where.
+CORES="${CORES:-$(nproc)}"
+PIN="${PIN:-1}"
+GEN_PHYSICAL="${GEN_PHYSICAL:-1}"     # physical cores reserved for the generator
+
+if [ "$PIN" = "1" ]; then
+  command -v taskset >/dev/null || { echo "taskset not found; set PIN=0"; exit 1; }
+
+  # physical core id -> comma-separated vcpu list
+  declare -A SIBLINGS
+  for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
+    id=${cpu##*/cpu}
+    [ -r "$cpu/topology/core_id" ] || continue
+    core=$(cat "$cpu/topology/core_id")
+    SIBLINGS[$core]="${SIBLINGS[$core]:+${SIBLINGS[$core]},}$id"
+  done
+
+  PHYSICAL_IDS=($(printf '%s\n' "${!SIBLINGS[@]}" | sort -n))
+  GEN_CORES=""; SRV_CORES=""
+  for i in "${!PHYSICAL_IDS[@]}"; do
+    core=${PHYSICAL_IDS[$i]}
+    if [ "$i" -lt "$GEN_PHYSICAL" ]; then
+      GEN_CORES="${GEN_CORES:+$GEN_CORES,}${SIBLINGS[$core]}"
+    else
+      SRV_CORES="${SRV_CORES:+$SRV_CORES,}${SIBLINGS[$core]}"
+    fi
+  done
+  SRV_PHYSICAL=$(( ${#PHYSICAL_IDS[@]} - GEN_PHYSICAL ))
+fi
+
+srv_run() { if [ "$PIN" = "1" ]; then taskset -c "$SRV_CORES" "$@"; else "$@"; fi; }
+gen_run() { if [ "$PIN" = "1" ]; then taskset -c "$GEN_CORES" "$@"; else "$@"; fi; }
+
 command -v wrk >/dev/null || { echo "wrk is not installed; see bench/README.md"; exit 1; }
 
 CONFIGS=("${@:-1 2 4 8}")
@@ -58,6 +106,14 @@ echo "  target      : $TARGET"
 echo "  wrk         : -t$THREADS -c$CONNECTIONS -d$DURATION"
 echo "  pool_size   : $POOL per process"
 echo "  repetitions : $REPS, alternating order"
+if [ "$PIN" = "1" ]; then
+echo "  topology    : ${#PHYSICAL_IDS[@]} physical cores, $CORES threads"
+echo "  affinity    : servers vcpu $SRV_CORES ($SRV_PHYSICAL physical cores)"
+echo "                generator vcpu $GEN_CORES ($GEN_PHYSICAL physical core(s))"
+echo "                whole physical cores each -- no shared siblings"
+else
+echo "  affinity    : NONE -- the generator is competing with the server"
+fi
 echo
 
 if [ "$(ulimit -n)" -lt 8192 ]; then
@@ -72,7 +128,7 @@ trap cleanup EXIT
 start_processes() {
   cleanup
   for _ in $(seq 1 "$1"); do
-    lua5.4 bench/serve.lua "$PORT" "$POOL" >/dev/null 2>&1 &
+    srv_run lua5.4 bench/serve.lua "$PORT" "$POOL" >/dev/null 2>&1 &
   done
   sleep 2
 
@@ -102,7 +158,7 @@ start_processes() {
 # Prints "rps p50 p99" or "INVALID <reason>".
 measure() {
   local out
-  out=$(wrk -t"$THREADS" -c"$CONNECTIONS" -d"$1" --latency \
+  out=$(gen_run wrk -t"$THREADS" -c"$CONNECTIONS" -d"$1" --latency \
         "http://127.0.0.1:$PORT$TARGET" 2>/dev/null)
 
   # Rule 1.  wrk prints this line ONLY when some responses were not 2xx/3xx,
@@ -133,7 +189,7 @@ FAILED=0
 for rep in $(seq 1 "$REPS"); do
   for n in "${CONFIGS[@]}"; do
     start_processes "$n"
-    [ "$rep" -eq 1 ] && wrk -t"$THREADS" -c"$CONNECTIONS" -d"$WARMUP" \
+    [ "$rep" -eq 1 ] && gen_run wrk -t"$THREADS" -c"$CONNECTIONS" -d"$WARMUP" \
       "http://127.0.0.1:$PORT$TARGET" >/dev/null 2>&1   # rule 3
 
     result=$(measure "$DURATION")
@@ -172,5 +228,11 @@ echo "  scaling near 1.00x throughout -> one process per core is the whole"
 echo "     deployment story, and CPU-bound work is capacity, not architecture"
 echo "  scaling falling off           -> something shared is the limit; check"
 echo "     Postgres max_connections against $((${CONFIGS[-1]} * POOL)) connections"
+if [ "$PIN" = "1" ]; then
+echo "  the servers hold $SRV_PHYSICAL PHYSICAL cores.  Beyond that many"
+echo "     processes the extra ones run on sibling threads, where a second"
+echo "     thread on a busy core is worth roughly a third of a core, not one --"
+echo "     so read the drop as hyperthreading before reading it as the framework"
+fi
 echo "  compare differences against the noise floor from bench/noise.sh;"
 echo "     a difference smaller than that floor is not a result"

@@ -210,8 +210,9 @@ processes. `SO_REUSEPORT` lets them share a port with no proxy in front:
 app:run { port = 8080, reuseport = true }
 ```
 
-Measured on a c5.2xlarge: 2.02x from one process to two, 3.57x to four, with
-per-process throughput holding at 1.01x and 0.89x. See `bench/RESULTS.md`.
+Measured on a c5.2xlarge: **linear across physical cores** — 1.00x, 1.00x,
+1.00x per process at one, two and three, varying by less than the 0.7% noise
+floor. Hyperthreads add about 18% more. See `bench/RESULTS.md`.
 
 **Logs that correlate without being asked to.** A request id is taken from
 `x-request-id` or generated, echoed on the response, and bound into `req.log`:

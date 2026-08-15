@@ -20,6 +20,12 @@ THREADS="${THREADS:-4}"
 TARGET="${TARGET:-/users/42}"
 POOL="${POOL:-10}"
 PROCESSES="${PROCESSES:-4}"
+CORES="${CORES:-$(nproc)}"
+GEN_CORES="${GEN_CORES:-0-1}"
+SRV_CORES="${SRV_CORES:-2-$((CORES - 1))}"
+PIN="${PIN:-1}"
+srv_run() { if [ "$PIN" = "1" ]; then taskset -c "$SRV_CORES" "$@"; else "$@"; fi; }
+gen_run() { if [ "$PIN" = "1" ]; then taskset -c "$GEN_CORES" "$@"; else "$@"; fi; }
 REPS="${1:-10}"
 
 command -v wrk >/dev/null || { echo "wrk is not installed"; exit 1; }
@@ -29,20 +35,21 @@ trap cleanup EXIT
 
 echo "# noise floor: $REPS repetitions of an identical configuration"
 echo "  processes   : $PROCESSES"
+echo "  affinity    : servers $SRV_CORES, generator $GEN_CORES"
 echo "  cpu         : $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
 echo "  date        : $(date -Is)"
 echo
 
 cleanup
 for _ in $(seq 1 "$PROCESSES"); do
-  lua5.4 bench/serve.lua "$PORT" "$POOL" >/dev/null 2>&1 &
+  srv_run lua5.4 bench/serve.lua "$PORT" "$POOL" >/dev/null 2>&1 &
 done
 sleep 2
-wrk -t"$THREADS" -c"$CONNECTIONS" -d5s "http://127.0.0.1:$PORT$TARGET" >/dev/null 2>&1
+gen_run wrk -t"$THREADS" -c"$CONNECTIONS" -d5s "http://127.0.0.1:$PORT$TARGET" >/dev/null 2>&1
 
 SAMPLES=()
 for rep in $(seq 1 "$REPS"); do
-  out=$(wrk -t"$THREADS" -c"$CONNECTIONS" -d"$DURATION" \
+  out=$(gen_run wrk -t"$THREADS" -c"$CONNECTIONS" -d"$DURATION" \
         "http://127.0.0.1:$PORT$TARGET" 2>/dev/null)
   if echo "$out" | grep -q 'Non-2xx'; then
     echo "  rep $rep: INVALID, non-2xx responses"; exit 1
