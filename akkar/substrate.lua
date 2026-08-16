@@ -119,36 +119,56 @@ function M.fix_h1_shutdown_spin()
   local original_shutdown = methods.shutdown
   local original_step     = methods.step
 
+  -- ONE guard function, built once when the patch is installed.
+  --
+  -- It used to be a closure built inside `shutdown`, which meant a closure, a
+  -- hash insert and a `table.pack` table allocated on EVERY stream -- and in
+  -- HTTP/1.1 keep-alive a stream is a request. Measured on the study machine
+  -- it cost **4.1% of /ping throughput**, 20,208 req/s against 19,383, which
+  -- is a real price for a guard that matters only when a drain is possible.
+  --
+  -- The state moves onto the stream so the function can be shared. Two field
+  -- writes are cheaper than allocating a closure with two upvalues, and they
+  -- are namespaced because this module is a guest in somebody else's table.
+  local function guarded_step(stream, timeout)
+    local advanced, err, errno = original_step(stream, timeout)
+    if not advanced then return advanced, err, errno end
+
+    local recv = stream.stats_recv or 0
+    if recv > stream.akkar_drain_recv then
+      stream.akkar_drain_recv, stream.akkar_drain_idle = recv, 0
+    else
+      local idle = stream.akkar_drain_idle + 1
+      stream.akkar_drain_idle = idle
+      if idle > IDLE_STEPS_ALLOWED then
+        -- "No progress is possible" reported as "done", which is what the
+        -- drain loop is asking about and what `step` failed to answer.
+        return false
+      end
+    end
+    return advanced, err, errno
+  end
+
   methods.shutdown = function(self, ...)
     -- The guard lives on the INSTANCE, so it shadows the metatable method for
     -- this stream only and only until this call returns.
-    local last_recv = self.stats_recv or 0
-    local idle = 0
-
-    rawset(self, "step", function(stream, timeout)
-      local advanced, err, errno = original_step(stream, timeout)
-      if not advanced then return advanced, err, errno end
-
-      local recv = stream.stats_recv or 0
-      if recv > last_recv then
-        last_recv, idle = recv, 0
-      else
-        idle = idle + 1
-        if idle > IDLE_STEPS_ALLOWED then
-          -- "No progress is possible" reported as "done", which is what the
-          -- drain loop is asking about and what `step` failed to answer.
-          return false
-        end
-      end
-      return advanced, err, errno
-    end)
+    self.akkar_drain_recv = self.stats_recv or 0
+    self.akkar_drain_idle = 0
+    rawset(self, "step", guarded_step)
 
     -- `pcall` so the instance override is always removed, even if shutdown
     -- raises. A stream left carrying a patched `step` would be a leak of this
     -- module into code that never asked for it.
-    local results = table.pack(pcall(original_shutdown, self, ...))
+    --
+    -- Three return values rather than `table.pack`, which allocated a table
+    -- per request to carry what lua-http documents as `true` or `nil, err,
+    -- errno`. The shape check above is what makes that safe to assume; if a
+    -- future lua-http returns more, the check is where it should be caught.
+    local ok, a, b, c = pcall(original_shutdown, self, ...)
     rawset(self, "step", nil)
-    if results[1] then return table.unpack(results, 2, results.n) end
+    if ok then return a, b, c end
+    -- `a` is the error pcall caught. Everything below runs only here, on the
+    -- rescue path, so nothing it costs is paid by a healthy request.
 
     -- THE SECOND FAILURE MODE, and it is not the same one.
     --
@@ -172,7 +192,7 @@ function M.fix_h1_shutdown_spin()
     -- that does not throw. Where it throws anyway, the contract its own
     -- caller assumes is what gets honoured here.
     M.rescued = M.rescued + 1
-    M.last_rescued = results[2]
+    M.last_rescued = a
 
     if self.state ~= "closed" then
       -- The same teardown `shutdown` performs on its own unhappy path, so a

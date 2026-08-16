@@ -128,8 +128,9 @@ row() {  # label, pattern
   printf "%-26s %11s %10s %10s %7s%% %7s %11s\n" "$label" $r "$us"
 }
 
-start_lua_floor cqueues && row "cqueues, no parsing"  "study/floors[.]lua"
-start_lua_floor luahttp && row "lua-http, no akkar"   "study/floors[.]lua"
+start_lua_floor cqueues && row "cqueues, no parsing"     "study/floors[.]lua"
+start_lua_floor minimal && row "minimal real HTTP server" "study/floors[.]lua"
+start_lua_floor luahttp && row "lua-http, no akkar"      "study/floors[.]lua"
 start_akkar             && row "akkar /ping"          "study/apps/serve[.]lua"
 start_gin 1             && row "gin, GOMAXPROCS=1"    "study/apps/gin-bench"
 

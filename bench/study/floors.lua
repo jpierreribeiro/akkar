@@ -20,7 +20,7 @@ Three servers, each answering the same nine bytes on the same event loop:
 
 Run one at a time, pinned identically, measured by the same wrk.
 
-  lua5.4 bench/study/floors.lua <cqueues|luahttp> [port]
+  lua5.4 bench/study/floors.lua <cqueues|minimal|luahttp> [port]
 ]]
 
 local which = arg[1] or "cqueues"
@@ -75,6 +75,80 @@ if which == "cqueues" then
   io.stderr:write(("floor=cqueues port=%d\n"):format(port))
   assert(cq:loop())
 
+elseif which == "minimal" then
+  -- A REAL HTTP/1.1 SERVER, written the way a replacement substrate would be.
+  --
+  -- The `cqueues` floor above answers without reading anything, which bounds
+  -- the event loop and nothing else. This one does the work a server cannot
+  -- skip: it parses the request line into a method and a path, walks the
+  -- headers looking for `content-length`, consumes a body if one is declared,
+  -- routes on the path, and writes a precomputed response.
+  --
+  -- It is the number that decides whether "replace lua-http" is a plan or a
+  -- wish, because it is what akkar's substrate could cost at best. Everything
+  -- akkar adds -- middleware, the request table, capabilities, the deadline,
+  -- validation, JSON -- would sit on top of this.
+  --
+  -- What it does NOT do, and a real one would: chunked encoding, HTTP/2,
+  -- pipelining, `expect: 100-continue`, TLS, header folding, or any of the
+  -- malformed-input handling that `akkar/substrate.lua` exists because of.
+  -- So this is a floor and not a proposal.
+  local BODY = '{"pong":true}'
+  local OK = table.concat {
+    "HTTP/1.1 200 OK\r\n",
+    "Content-Type: application/json\r\n",
+    "Content-Length: ", tostring(#BODY), "\r\n\r\n", BODY,
+  }
+  local NOT_FOUND = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+  local ROUTES = { ["/ping"] = OK }
+
+  local server = assert(socket.listen {
+    host = "127.0.0.1", port = port, reuseport = true,
+  })
+
+  local cq = cqueues.new()
+  cq:wrap(function()
+    for conn in server:clients() do
+      cq:wrap(function()
+        conn:setmode("bn", "bn")
+        conn:onerror(function(_, _, why) return why end)
+        while true do
+          local line = conn:read "*l"
+          if not line then break end
+
+          -- METHOD SP PATH SP VERSION. One match, no captures thrown away.
+          local _, path = line:match "^(%u+) ([^ ]+)"
+
+          local clen
+          repeat
+            local h = conn:read "*l"
+            if h then
+              -- The cheap test before the expensive one: a header matters
+              -- here only if it is content-length, and checking one byte
+              -- costs far less than running a pattern on every line.
+              local c = h:byte(1)
+              if c == 99 or c == 67 then      -- 'c' or 'C'
+                local k, v = h:match "^([^:]+):%s*(.-)%s*$"
+                if k and k:lower() == "content-length" then
+                  clen = tonumber(v)
+                end
+              end
+            end
+          until not h or h == "" or h == "\r"
+
+          -- A declared body must be consumed or it becomes the next request.
+          if clen and clen > 0 then conn:read(clen) end
+
+          if not conn:write(path and ROUTES[path] or NOT_FOUND) then break end
+          conn:flush()
+        end
+        conn:close()
+      end)
+    end
+  end)
+  io.stderr:write(("floor=minimal port=%d\n"):format(port))
+  assert(cq:loop())
+
 elseif which == "luahttp" then
   -- THE SUBSTRATE akkar IS BUILT ON, with akkar removed.
   --
@@ -119,6 +193,6 @@ elseif which == "luahttp" then
   assert(server:loop())
 
 else
-  io.stderr:write("usage: floors.lua <cqueues|luahttp> [port]\n")
+  io.stderr:write("usage: floors.lua <cqueues|minimal|luahttp> [port]\n")
   os.exit(2)
 end
