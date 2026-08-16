@@ -105,23 +105,87 @@ request and write thirteen bytes of response.
 
 ---
 
-## 3. So what can actually be done
+## 3. A real HTTP server in Lua is faster than Gin
 
-Stated with the ceilings, because a direction without a ceiling is a wish.
+The `cqueues` row above answers without reading anything, so it bounds the
+event loop and nothing else. The obvious objection is that parsing is the
+expensive part and the floor is therefore meaningless.
 
-**If every line of akkar were free**, akkar would be the lua-http floor:
-34,098 req/s, or 0.33x of Gin. That is the hard bound on optimising akkar
-alone, and akkar is currently at 19,353, so its own code is worth at most
-**1.76x** — real, and not enough on its own.
+`floors.lua minimal` answers that objection. It is a real HTTP/1.1 server: it
+parses the request line into a method and a path, walks the headers looking
+for `content-length`, consumes a declared body, routes on the path and writes
+a response. Same pinning, same generator, same bytes.
 
-**If lua-http's hot path were replaced** with something at, say, 15 µs, and
-akkar's own cost were untouched, the stack would be 11.6 + 15 + 44.6 = 71 µs →
-about 28,000 req/s. Both together, at the same optimism, land somewhere near
-40,000 — roughly **0.4x of Gin instead of 0.19x**.
+```
+layer                            req/s        p50        p99   spread   cores us/req/core
+cqueues, no parsing          169960.30   186.00us     3.31ms     1.7%    1.96        11.5
+minimal real HTTP server     171329.79   255.00us     3.32ms     0.6%    2.00        11.7
+lua-http, no akkar            34173.28     2.85ms     4.68ms     0.4%    2.00        58.5
+akkar /ping                   19408.18     5.08ms     6.13ms     2.0%    2.00       103.0
+gin, GOMAXPROCS=1            101584.35     0.98ms     2.32ms     1.2%    2.00        19.7
+```
 
-**Beating Gin on `/ping` would need the whole stack under 19.6 µs**, which is
-below what lua-http costs today for parsing alone. That is not a realistic
-target for a general framework, and saying so is more useful than implying it.
+**Parsing and routing are free.** 11.5 µs without them, 11.7 µs with them. And
+the minimal server runs at **171,330 req/s — 1.69x Gin on the same two cores.**
+
+That settles the language question in the other direction from where it is
+usually assumed. The 47 µs lua-http spends is not what HTTP costs in Lua. It
+is what lua-http's design costs: stream objects, header objects carrying a
+list and an index, an abstraction layer that also has to serve HTTP/2, and a
+connection state machine.
+
+## 4. And the collector is not the answer either
+
+Before proposing that anyone rewrite akkar's 44.6 µs, it is worth knowing how
+much of it is code rather than Lua reclaiming what the code produced. akkar
+allocates about 2,166 bytes per request; the minimal server allocates a small
+fraction of that.
+
+`bench/study/gc-cost.sh`, same route, same everything:
+
+```
+collector                    req/s        p50        p99   spread   cores     us/req peak rss
+default (shipped)         19135.49     4.33ms     7.50ms     0.7%    2.00      104.5     31MB
+generational              19622.27     5.02ms     5.66ms     1.9%    2.00      101.9     29MB
+incremental, lazy         19495.29     4.51ms    12.79ms     1.8%    2.00      102.6     42MB
+STOPPED (probe)           19814.92     5.17ms     5.51ms     0.5%    2.00      100.9  10874MB
+```
+
+**With the collector stopped entirely — ten point nine gigabytes of resident
+memory — akkar gains 3.5%.** That is the upper bound on what any collector
+tuning could ever be worth, and it means the 44.6 µs is overwhelmingly work,
+not reclamation.
+
+One free thing did fall out: the **generational** collector is 2.5% faster and
+cuts p99 from 7.50 ms to 5.66 ms on 2 MB less memory. Line of investigation 9
+asked whether generational was better here. It is, mildly, and mostly in the
+tail.
+
+## 5. So what can actually be done
+
+Stated with ceilings, because a direction without a ceiling is a wish. The
+budget is fixed and small: **Gin costs 19.7 µs, and a real Lua HTTP server
+costs 11.7 of them.** Everything a framework does has to fit in the remaining
+**8 µs** for parity.
+
+| change | akkar's µs/req | req/s | against Gin |
+|---|---:|---:|---:|
+| today | 103.0 | 19,400 | 0.19x |
+| replace lua-http's hot path only | ~56 | ~35,700 | **0.35x** |
+| that, and halve akkar's own cost | ~34 | ~59,000 | **0.58x** |
+| parity with Gin | 19.7 | ~102,000 | 1.00x |
+
+The last row is what the question really asks, so it is worth being exact
+about what it demands: akkar's own code would have to go from **44.6 µs to
+8 µs**, a 5.6x reduction, on top of a substrate that does not exist yet. The
+collector cannot supply it — section 4 puts the whole collector at 3.5%. It
+would have to come out of the router, the middleware chain, the request table,
+the capability lookups, the deadline and the JSON encoder, which is to say out
+of the things akkar exists to provide.
+
+**So: parity on `/ping` is not a realistic target, and 0.35x to 0.6x is.**
+Saying that plainly is more useful than implying otherwise, and the second
+number is a 2x to 3x improvement on what ships today.
 
 Three concrete directions, in the order their measurements justify:
 
@@ -144,9 +208,43 @@ Three concrete directions, in the order their measurements justify:
    a sizing recommendation in `docs/RUNTIME.md`, not a code change, and it is
    the cheapest item here.
 
+### But first: the direction of travel had reversed
+
+While measuring all of the above, akkar's `/ping` came back at 19,135–19,622
+across six independent runs. §2 of `RESULTS.md` published **20,648** the day
+before, on this box, with this harness. On the same runs Gin reproduced within
+**0.2%** and FastAPI within **0.1%** — the machine had not changed, akkar had.
+
+`bench/study/regression.sh` alternates two trees per repetition and bisects it.
+The 6.7% was two costs, not one, and both arrived with correctness fixes:
+
+| commit | what it fixed | cost on `/ping` |
+|---|---|---:|
+| `d1e5d45` | seven resource leaks: capabilities, sockets, pool slots | −3.3% |
+| `0ff3c80` | the two lua-http denial-of-service defects | −4.1% |
+| everything else, ~50 commits | — | ~0 |
+
+The first is a price worth paying and there is no obvious way around it: a
+leaked pool slot per dropped connection is not a trade.
+
+**The second was mostly accident.** The repair wraps `h1_stream:shutdown`, and
+in HTTP/1.1 keep-alive a stream *is* a request, so every request built a
+closure with two upvalues, inserted it into the instance table, and packed the
+results of a `pcall` into a fresh table — to arm a guard that only matters when
+there is something left to drain. Rebuilt with the guard function created once
+at patch time, its state on the stream, and no `table.pack`: **HEAD is now
+within 0.3% of the tree before the repair**, and the substrate specs and the
+framing fuzz still pass. Net against the published number: −6.7% became −4.6%.
+
+Which is the useful lesson here, and it is not about Gin. **Nothing was
+watching.** A framework can lose 4% to an allocation in a patch nobody thought
+of as hot, and the only reason this was caught is that a peer framework
+happened to reproduce to 0.2% in the same table. That belongs in CI, not in
+somebody's curiosity.
+
 ---
 
-## 4. And the framing that matters more than any of it
+## 6. And the framing that matters more than any of it
 
 `/ping` is akkar's **worst** case. It is pure framework overhead with no work
 underneath it to amortise, and it is the only route where the comparison is
@@ -162,7 +260,7 @@ request actually does, the less the framework costs relative to it.
 
 ---
 
-## 5. What these measurements do not say
+## 7. What these measurements do not say
 
 - **Three repetitions, not five.** Enough to see a 5x difference; not enough
   to claim a 5% one. The spreads are printed so nobody has to guess.
