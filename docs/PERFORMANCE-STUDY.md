@@ -59,7 +59,7 @@ went looking for.
 | 4 | What does published research say about optimising pure Lua 5.4? |
 | 5 | How do we certify a fix end-to-end rather than trusting a profile? |
 | 6 | Decomposed by stage, where does the payload degradation come from? |
-| 7 | How much of the overhead is `lua-http` and `cqueues` rather than akkar? |
+| 7 | How much of the overhead is `lua-http` and `cqueues` rather than akkar? **Answered 2026-08-16 — `bench/study/WHERE-THE-GAP-IS.md`: cqueues 11%, lua-http 46%, akkar 43%.** |
 | 8 | What do the fast frameworks do that transfers to Lua? |
 | 9 | Is the garbage collector part of the tail, and is generational better here? |
 
