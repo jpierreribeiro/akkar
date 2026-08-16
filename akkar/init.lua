@@ -1575,11 +1575,43 @@ local function handle(app, input)
     path    = normalize_path(input.path),
     query   = input.query or {},
     body    = body,
+    -- THE BYTES AS THEY ARRIVED, and without them a signed webhook cannot be
+    -- verified at all.
+    --
+    -- Every payment provider signs an HMAC over the raw request body. A digest
+    -- computed over `req.body` re-encoded is a DIFFERENT digest -- JSON key
+    -- order is not defined, whitespace is not preserved, and a number that
+    -- arrived as `1.0` comes back as `1`. So a framework that decodes and
+    -- discards cannot verify a webhook, and akkar discarded.
+    --
+    -- Found porting a service whose provider signs with
+    -- `hmac_sha256(hex(sha256(secret)), raw)` and whose own test collection
+    -- has a case asserting an unsigned delivery is refused.
+    --
+    -- It costs no allocation: the string was already built to be decoded. What
+    -- it costs is RETENTION -- the bytes stay reachable for the life of the
+    -- request instead of becoming garbage after the decode. That is bounded by
+    -- `body_limit` times the requests in flight, and it is smaller than the
+    -- decoded table it sits beside.
     headers = request_headers,
     host    = normalize_host(requested_host),
     id      = request_id(request_headers),
     user    = guard("req.user", "req.user is not set; this route is missing the authentication middleware"),
   }
+
+  -- ASSIGNED AFTER THE CONSTRUCTOR, and only when there is one.
+  --
+  -- Writing `raw_body = input.raw_body` inside the table above cost **255
+  -- bytes on every request**, including the ones with no body at all: a Lua
+  -- table constructor sizes its hash part from the number of keys written, nil
+  -- values included, and one more key crossed a power-of-two boundary.
+  -- `spec/allocation_spec.lua` refused it at 2,655 against a 2,600 ceiling,
+  -- which is exactly the regression that ceiling exists to catch.
+  --
+  -- Out here, a request that carried no body keeps the smaller table and pays
+  -- nothing. A request that did carry one pays a rehash it can afford, because
+  -- it already allocated the body.
+  if input.raw_body then req.raw_body = input.raw_body end
 
   -- Capabilities, from the closed set, acquired ON FIRST READ.
   --
@@ -2254,7 +2286,7 @@ function App:run(config)
 
         local res, request_id, trace_parent = handle(self, {
           method = h:get ":method", path = path, query = parse_query(qs),
-          body = body, headers = h, timeout = timeout,
+          body = body, raw_body = raw, headers = h, timeout = timeout,
           capabilities = config,
           peer = peer,
           short = short, stripped = true,
@@ -2462,6 +2494,13 @@ function App:test(config)
         method = method, path = p,
         query = parse_query(qs),
         body = options.body,
+        -- `raw_body` is what a signature is computed over, so a test that
+        -- exercises one has to be able to say exactly which bytes arrived.
+        -- Passing it explicitly is the honest option: encoding `options.body`
+        -- here would produce whichever key order this encoder happens to
+        -- choose, and a test asserting on a digest over that would be
+        -- asserting on cjson's iteration order.
+        raw_body = options.raw_body,
         headers = options.headers or {},
         timeout = options.timeout or config.timeout,
         capabilities = config,

@@ -249,6 +249,116 @@ describe("a client asking not to be charged twice", function()
   end)
 end)
 
+describe("the bytes a webhook was signed over", function()
+  -- WHAT HAPPENED. The service receives signed webhooks from its payment
+  -- provider, and its own test collection has a case asserting that an
+  -- UNSIGNED delivery is refused with 401. The scheme is an HMAC over the raw
+  -- request body:
+  --
+  --     signing_key = hex(sha256(secret))
+  --     expected    = hex(hmac_sha256(signing_key, RAW BODY))
+  --
+  -- akkar read the body, decoded it, and threw the bytes away. `req.body` was
+  -- all a handler ever saw, and a digest over `req.body` re-encoded is a
+  -- DIFFERENT digest -- JSON key order is undefined and whitespace is not
+  -- preserved. So signature verification was not awkward in akkar, it was
+  -- impossible, and `docs/HANDOFF.md` recorded that as an open item.
+  --
+  -- Fixed by carrying the bytes through as `req.raw_body`. It allocates
+  -- nothing new -- the string was already built in order to be decoded -- and
+  -- costs retention, bounded by `body_limit` times the requests in flight.
+  local crypto = require "akkar.crypto"
+
+  local SECRET = "whsec_test_12345"
+  local RAW = '{"event":"payment_completed","eventId":"evt_1",' ..
+              '"data":{"externalReference":"tx_1"}}'
+
+  local function sign(raw, secret)
+    local key = crypto.to_hex(crypto.sha256(secret))
+    return crypto.to_hex(crypto.hmac(key, raw, "sha256"))
+  end
+
+  local function app_with_guard()
+    local ran = { count = 0 }
+    local app = akkar.new()
+    app:post("/hook", { before = { function(req, next)
+      local raw = req.raw_body
+      local sent = req.headers["x-webhook-signature"]
+      if not raw or raw == "" or not sent then
+        return akkar.response(401, { error = "INVALID_SIGNATURE" })
+      end
+      if not crypto.equal(sign(raw, SECRET), sent) then
+        return akkar.response(401, { error = "INVALID_SIGNATURE" })
+      end
+      return next(req)
+    end } }, function()
+      ran.count = ran.count + 1
+      return { ok = true }
+    end)
+    return app, ran
+  end
+
+  local function post(app, headers)
+    return app:test():post("/hook",
+      { raw_body = RAW, body = cjson.decode(RAW), headers = headers })
+  end
+
+  it("reaches the handler as req.raw_body, byte for byte", function()
+    local seen
+    local app = akkar.new()
+    app:post("/hook", function(req) seen = req.raw_body return { ok = true } end)
+    app:test():post("/hook", { raw_body = RAW, body = cjson.decode(RAW) })
+    assert.equal(RAW, seen)
+  end)
+
+  it("lets a correctly signed delivery through", function()
+    local app, ran = app_with_guard()
+    assert.equal(200, post(app, { ["x-webhook-signature"] = sign(RAW, SECRET) }).status)
+    assert.equal(1, ran.count)
+  end)
+
+  it("refuses an unsigned delivery without running the handler", function()
+    local app, ran = app_with_guard()
+    assert.equal(401, post(app, {}).status)
+    assert.equal(0, ran.count, "the handler ran on an unsigned webhook")
+  end)
+
+  it("refuses a wrong signature without running the handler", function()
+    local app, ran = app_with_guard()
+    assert.equal(401, post(app, { ["x-webhook-signature"] = string.rep("a", 64) }).status)
+    assert.equal(0, ran.count, "the handler ran on a forged signature")
+  end)
+
+  -- The reason raw bytes are not a convenience.
+  --
+  -- The first version of this case re-encoded the same compact document and
+  -- asserted the bytes differed. It PASSED as a probe and FAILED in the suite,
+  -- because Lua's table iteration put the keys back in the original order that
+  -- time. Key order is undefined in both directions, so "the order changes" is
+  -- not a fact to assert -- it is a coin.
+  --
+  -- What is deterministic: an encoder does not reproduce the sender's
+  -- whitespace, and it does not reproduce `1.0`. Either is enough to make the
+  -- digest unreachable from the decoded value, and both are things a real
+  -- provider sends.
+  it("could not be done from the decoded body", function()
+    local spaced = '{"amount": 1.0, "ref": "tx_1"}'
+    local reencoded = cjson.encode(cjson.decode(spaced))
+    assert.are_not.equal(spaced, reencoded,
+      "re-encoding preserved the sender's bytes, which it must not be relied on to do")
+    assert.are_not.equal(sign(spaced, SECRET), sign(reencoded, SECRET))
+  end)
+
+  it("is nil when no body arrived, rather than an empty string", function()
+    local seen, called = "unset", false
+    local app = akkar.new()
+    app:get("/x", function(req) called = true seen = req.raw_body return { ok = true } end)
+    app:test():get "/x"
+    assert.is_true(called)
+    assert.is_nil(seen)
+  end)
+end)
+
 describe("an integer that arrived as JSON", function()
   -- WHAT HAPPENED. The service computes fees in integer cents and says so in
   -- its own source: "ALL arithmetic is integer-only ... eliminates IEEE 754

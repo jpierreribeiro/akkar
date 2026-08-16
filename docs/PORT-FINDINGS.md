@@ -27,7 +27,7 @@ state transition.
 The port lives outside this repository. The business logic is somebody's
 private service; what comes back here is the defects.
 
-**Time to the first defect: under an hour. Total found: six.**
+**Time to the first defect: under an hour. Seven found across two slices.**
 
 ---
 
@@ -122,7 +122,39 @@ that akkar has the module, watched the header go past, and said nothing.
 per app. The guard is read before the header is, so after it fires the cost is
 one boolean.
 
-## 5. Every UUID parameter needs an explicit cast
+## 5. A signed webhook could not be verified at all
+
+**The second slice, and it was a wall rather than a defect.**
+
+The service receives signed webhooks from its payment provider, and its own
+test collection has a case asserting an **unsigned delivery is refused with
+401**. The scheme:
+
+    signing_key = hex(sha256(secret))
+    expected    = hex(hmac_sha256(signing_key, RAW BODY))
+
+akkar read the body, decoded it, and threw the bytes away. `req.body` was all a
+handler ever saw. **A digest over `req.body` re-encoded is a different digest**
+— an encoder does not reproduce the sender's whitespace and does not reproduce
+`1.0`. So verification was not awkward in akkar, it was impossible, and
+`docs/HANDOFF.md` had this recorded as an open item without saying that it
+blocks every payment integration.
+
+**Fixed.** The bytes reach the handler as `req.raw_body`, `nil` when the request
+carried none.
+
+And the fix taught something the fix itself nearly got wrong. Written as one
+more field in the request constructor it cost **255 bytes on every request**,
+including requests with no body: a Lua table constructor sizes its hash part
+from the number of keys written, nil values included, and one more key crossed
+a power-of-two boundary. `spec/allocation_spec.lua` refused it at 2,655 against
+its 2,600 ceiling. Assigned after the constructor and only when a body exists,
+it costs nothing on the requests that do not use it.
+
+That ceiling was written for a different regression a week earlier. It caught
+this one on the first run.
+
+## 6. Every UUID parameter needs an explicit cast
 
 Postgres returns a `uuid` column as text — the only thing a Lua driver can do
 with it — and then refuses the same string as a parameter for a `uuid` column:
@@ -138,7 +170,7 @@ sends a typed `uuid.UUID` and never meets this.
 be worse. It belongs in the SQL documentation, and the error message could name
 the cast.
 
-## 6. There is no `v.uuid`, and route middleware is called `before`
+## 7. There is no `v.uuid`, and route middleware is called `before`
 
 Two small ones from the same hour. Every primary key in this service is a UUID
 and the schema had to spell the pattern out by hand. And route-scoped
@@ -182,5 +214,6 @@ Worth recording, because a findings list reads as though nothing worked.
   payment provider; the port does not. The contract was read from the Postman
   collection and the Go source rather than diffed against a running instance.
 
-The obvious next slice is the worker and one webhook, because that is where
-akkar's jobs and the raw-body gap both live.
+The webhook slice is done and closed the raw-body gap. **The worker is not**:
+the original runs a separate process consuming jobs, and akkar's `queue:consume`
+and `app:task` have never been pointed at real work. That is the next one.

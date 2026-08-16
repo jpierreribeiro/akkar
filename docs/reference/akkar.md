@@ -444,6 +444,7 @@ and only one of them is open to extension.
 | `req.params` | table | captured path segments, validated when the route declares `params` |
 | `req.query` | table | the parsed query string, validated when the route declares `query` |
 | `req.body` | table or `nil` | the decoded body. `nil` when the request carried none |
+| `req.raw_body` | string or nil | the body exactly as it arrived, before decoding. `nil` when the request carried none. This is what an HMAC in a webhook signature is computed over -- a digest over `req.body` re-encoded is a different digest |
 | `req.headers` | table | lower case header names to values |
 | `req.host` | string or `nil` | normalised, from `:authority` or `host` |
 | `req.id` | string | the request id, also sent back as `x-request-id` |

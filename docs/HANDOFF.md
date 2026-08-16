@@ -226,11 +226,20 @@ resource exhaustion at the ceiling, scale of shape, dependency movement,
 observability during an incident, adversarial security review — are unchanged.
 Items 2 and 5 closed this week, along with the clock exposure under item 3.
 
-Open items also live in `docs/BACKLOG.md` §11: a job store that fails at first
-push rather than at construction, `app:mount` not running sub-app middleware,
-`docs/DEPLOY.md` not re-run by anything, no `env` marker for the docs runner,
-and webhook signature verification being impossible because the raw body is
-discarded.
+Smaller open items, listed here rather than in `docs/BACKLOG.md`:
+
+- a job store that fails at first push rather than at construction
+- `docs/DEPLOY.md` not re-run by anything
+- no `env` marker for the documentation runner
+- ~~`app:mount` not running sub-app middleware~~ — **FIXED, and it was not the
+  ergonomic gap this list took it for: it served protected routes to anybody.**
+  `docs/PORT-FINDINGS.md` §1
+- ~~webhook signature verification impossible because the raw body is
+  discarded~~ — **FIXED**, the bytes arrive as `req.raw_body`.
+  `docs/PORT-FINDINGS.md` §5
+
+Two of the five were closed by porting a real service, and both had been sitting
+in this list wearing the wrong label.
 
 ---
 
