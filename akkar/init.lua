@@ -215,6 +215,7 @@ local CONTRACTS = {
 -- so nothing has to be configured for diagnostics to appear.
 local internal = log.new { level = "info", format = "text" }
 
+
 -- Everything else app:run{} accepts.  Listed so that a typo is an error rather
 -- than silence: `app:run { timout = 5 }` used to be ignored, leaving a server
 -- running with a 30 s deadline the author believed was 5 s.
@@ -394,9 +395,41 @@ end
 local v = {}
 akkar.v = v
 
+-- WHICH CONSTRAINTS EXIST, checked when the rule is built.
+--
+-- A misspelled constraint used to be ignored in silence, so
+-- `v.string { pattern = "@" }` -- `match` is the real name -- accepted every
+-- string, and `v.string { mn = 5 }` accepted the empty one. The schema reads
+-- as if it validates and does not, which is the worst way for a validator to
+-- be wrong.
+--
+-- `expand` already raises on an unknown schema TYPE. Being strict about the
+-- type and silent about the constraints was the inconsistency.
+--
+-- Checked here rather than in `check_one` on purpose: rules are built once at
+-- startup, so a bad schema fails at boot and costs nothing per request.
+--
+-- Found by porting a real service, where `pattern` was the first thing a hand
+-- reached for.
+local CONSTRAINTS = {
+  kind = true, optional = true, default = true,
+  min = true, max = true, match = true, one_of = true,
+}
+
 local function validator(kind)
   return function(opts)
     opts = opts or {}
+    for key in pairs(opts) do
+      if not CONSTRAINTS[key] then
+        local known = {}
+        for name in pairs(CONSTRAINTS) do
+          if name ~= "kind" then known[#known + 1] = name end
+        end
+        table.sort(known)
+        error(("unknown constraint '%s' in v.%s{}; use %s")
+              :format(tostring(key), kind, table.concat(known, ", ")), 2)
+      end
+    end
     opts.kind = kind
     return opts
   end
@@ -437,6 +470,18 @@ local function check_one(value, rule, coerce)
     if coerce and type(value) == "string" then value = tonumber(value) end
     if type(value) ~= "number" then return nil, "expected " .. kind end
     if kind == "integer" and value % 1 ~= 0 then return nil, "expected integer" end
+    -- AN INTEGER RULE PRODUCES A LUA INTEGER, not merely an integral float.
+    --
+    -- JSON has one number type, so `cjson` hands back `120000.0` -- subtype
+    -- float -- while the coercing path used for query strings produced a real
+    -- integer from `"120000"`. The same rule therefore returned two different
+    -- subtypes depending on where the value arrived, and `//`, `%`, bitwise
+    -- operators and `string.format("%d", ...)` all behave differently across
+    -- that line. `%d` on a float with no integer representation RAISES.
+    --
+    -- Found porting a service whose money arithmetic is deliberately
+    -- integer-only, with a comment in the original saying so.
+    if kind == "integer" then value = math.tointeger(value) or value end
     if rule.min and value < rule.min then return nil, "min is " .. rule.min end
     if rule.max and value > rule.max then return nil, "max is " .. rule.max end
   elseif kind == "string" then
@@ -939,8 +984,25 @@ function App:match(method, path)
     if path:sub(1, #m.prefix) == m.prefix then
       local rest = path:sub(#m.prefix + 1)
       if rest == "" then rest = "/" end
-      local route, params = m.app:match(method, rest)
-      if route then return route, params end
+      -- THE THIRD RETURN IS THE APP THAT OWNS THE ROUTE, and it exists because
+      -- without it a mounted route ran the PARENT's middleware and not its own.
+      --
+      -- That is not an ergonomic gap, it is a way to serve a protected route to
+      -- anybody: put the private routes in a sub-app, `sub:use(auth...)`,
+      -- `app:mount("/private", sub)` -- the shape every framework teaches --
+      -- and akkar answered 200 with no credential, no error and no warning.
+      --
+      -- Found within an hour of porting a real service, which is the argument
+      -- for porting one.
+      local route, params, owners = m.app:match(method, rest)
+      if route then
+        -- Outermost first, so a mount inside a mount still runs both.
+        if owners then
+          table.insert(owners, 1, m.app)
+          return route, params, owners
+        end
+        return route, params, { m.app }
+      end
     end
   end
   return nil
@@ -1097,13 +1159,13 @@ local function apply_response_schema(res, schema, where, app, req)
 end
 
 local function dispatch(app, req)
-  local route, params = app:match(req.method, req.path)
+  local route, params, owners = app:match(req.method, req.path)
 
   if not route then
     -- HEAD is served by the GET handler.  RFC 9110 requires HEAD wherever GET
     -- exists, and answering 404 to a HEAD on a live resource is a lie.
     if req.method == "HEAD" then
-      route, params = app:match("GET", req.path)
+      route, params, owners = app:match("GET", req.path)
     end
 
     if not route then
@@ -1132,6 +1194,35 @@ local function dispatch(app, req)
 
   req.params = params
   req.route = route.path
+
+  -- A CLIENT ASKING NOT TO BE CHARGED TWICE, when nothing is listening.
+  --
+  -- `Idempotency-Key` is a request saying "a retry of this must not happen
+  -- again". akkar has `akkar.idempotency` and does not install it, which is
+  -- the right default -- and it said nothing at all when the header arrived
+  -- and no middleware handled it. Porting a payments service, the same key
+  -- posted twice created two invoices with two different ids, and the only
+  -- evidence anywhere was a row count.
+  --
+  -- Once per APP -- not per process, so a process serving two apps warns for
+  -- each, and so a test can observe it. The guard is checked before the header
+  -- is, so after it has fired this costs one boolean read. An app where nobody
+  -- sends the header pays one hash lookup on POST and PATCH, a rounding error
+  -- against the ~45 us akkar spends per request, and it buys a silent double
+  -- charge becoming a log line.
+  if not app.__idempotency_warned
+     and (req.method == "POST" or req.method == "PATCH")
+     and not package.loaded["akkar.idempotency"]
+     and req.headers["idempotency-key"] then
+    app.__idempotency_warned = true
+    internal:warn("a request carried Idempotency-Key and nothing handled it", {
+      method = req.method, path = req.path,
+      detail = "The client is asking for a safe retry and this server will " ..
+               "run the request again. Install the middleware: " ..
+               "app:use(require('akkar.idempotency').new{}) -- it needs a " ..
+               "shared cache. Warned once per process.",
+    })
+  end
 
   -- Declarative validation, before the handler runs.
   local opts = route.opts
@@ -1163,6 +1254,30 @@ local function dispatch(app, req)
     for i = #opts.before, 1, -1 do
       local mw, nxt = opts.before[i], run
       run = function() return mw(req, function() return nxt() end) end
+    end
+  end
+
+  -- MIDDLEWARE OF A MOUNTED APP.
+  --
+  -- `app:mount("/private", sub)` used to discard everything `sub:use()`
+  -- registered: the route was found through the mount and then run inside the
+  -- PARENT's chain. So the shape every framework teaches -- private routes in
+  -- a sub-app, auth middleware on it, mount it -- answered 200 with no
+  -- credential. No error, no warning, and the app looks correct.
+  --
+  -- It sits outside the route-scoped middleware and inside the parent's global
+  -- chain, which is the order the nesting implies. `owners` is outermost-first
+  -- and is only built for a mounted route, so an unmounted request allocates
+  -- nothing.
+  if owners then
+    for i = #owners, 1, -1 do
+      local mws = owners[i].middleware
+      for j = #mws, 1, -1 do
+        local mw, nxt = mws[j], run
+        run = function()
+          return normalize(mw(req, function(r) if r then req = r end return nxt() end))
+        end
+      end
     end
   end
 
