@@ -17,6 +17,7 @@ inside a transaction" means something to Postgres and nothing to Redis.
 ]]
 
 local condition = require "cqueues.condition"
+local time      = require "akkar.time"
 
 local Pool = {}
 Pool.__index = Pool
@@ -38,6 +39,7 @@ function Pool.new(open, size, reusable)
     -- takes its reservation with it. See `Pool:reap`.
     opening = setmetatable({}, { __mode = "k" }),
     reaped = 0,
+    waits = 0, waited = 0, waited_max = 0,
     waiters = condition.new(),
   }, Pool)
 end
@@ -130,7 +132,19 @@ function Pool:get()
     if self:reap() == 0 then
       -- Exhausted for real.  `condition:wait` yields to the controller; it
       -- does not spin and it does not block the loop.
+      --
+      -- TIMED, because this is the number that decides pool size and akkar
+      -- could not answer it. The study measured a p99 of 191 ms at 100
+      -- connections against a pool of ten and could only infer that ninety
+      -- requests were queuing; how long each actually waited was invisible.
+      -- A p99 made of queue is a different problem from a p99 made of work,
+      -- and they are indistinguishable from the outside.
+      local started = time.monotime()
       self.waiters:wait()
+      local waited = time.monotime() - started
+      self.waits = self.waits + 1
+      self.waited = self.waited + waited
+      if waited > self.waited_max then self.waited_max = waited end
     end
   end
 end
@@ -192,6 +206,8 @@ function Pool:stats()
   return {
     size = self.size, live = self.live, idle = #self.idle,
     reserved = self:reserved(), reaped = self.reaped,
+    -- How often a request had to queue for a connection, and for how long.
+    waits = self.waits, waited = self.waited, waited_max = self.waited_max,
   }
 end
 

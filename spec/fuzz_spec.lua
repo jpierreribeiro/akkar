@@ -131,14 +131,27 @@ describe("hostile input", function()
         results[#results + 1] = attempt(case)
       end
 
-      -- A seeded mutation pass over a well-formed body. Fixed seed, so a
-      -- failure is replayable rather than a story about a Tuesday.
-      math.randomseed(20260815)
+      -- A seeded mutation pass over a well-formed body, replayable rather
+      -- than a story about a Tuesday.
+      --
+      -- Its OWN generator, and that is not fussiness. Calling
+      -- `math.randomseed` here made every later spec deterministic too, and
+      -- several of them -- `idempotency_spec`, `limit_spec`, `jobs_spec` --
+      -- depend on `math.random` for a fresh key prefix per run. With a fixed
+      -- seed those keys repeat across runs, so the second run of the day
+      -- inherits the first run's Redis state and eight tests fail. Found by
+      -- running the whole suite: the file passes alone.
+      local seed = 20260815
+      local function next_random(n)
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        return (seed % n) + 1
+      end
+
       local base = '{"name":"ada","note":"hello"}'
       for i = 1, 40 do
-        local at = math.random(1, #base)
+        local at = next_random(#base)
         local mutated = base:sub(1, at - 1) ..
-                        string.char(math.random(32, 255)) ..
+                        string.char(31 + next_random(224)) ..
                         base:sub(at + 1)
         results[#results + 1] = attempt {
           "mutation " .. i, "POST", "/users", "application/json", mutated,
