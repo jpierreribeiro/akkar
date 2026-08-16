@@ -152,6 +152,105 @@ function Store:claim_and_enqueue(key, id, ttl, encoded, run_at)
   return n
 end
 
+-- ================================================== at-least-once delivery
+--
+-- `BLMOVE` takes the job off the queue and puts it in the processing list in
+-- ONE server-side step, so there is no window where the job exists only in a
+-- worker's memory. That window is exactly what made `Queue:consume`
+-- at-most-once: a worker killed between `BRPOP` and the handler finishing
+-- lost the job with nothing anywhere recording that it existed.
+--
+-- The list is what `BLMOVE` needs; the sorted set beside it is what makes
+-- reaping possible, because a list cannot say how old its entries are. They
+-- are kept in step by scripts, never by two round trips.
+
+function Store:processing_key(key) return key .. ":processing" end
+function Store:claimed_key(key)    return key .. ":processing:at" end
+
+local ACK_SCRIPT = [[
+redis.call('LREM', KEYS[1], 1, ARGV[1])
+return redis.call('ZREM', KEYS[2], ARGV[1])
+]]
+
+-- Everything claimed before the cutoff goes back, oldest first.
+--
+-- Entries in the list with NO score are reaped too: that is a worker killed
+-- between the `BLMOVE` and the `ZADD` below, and leaving them would make a
+-- job invisible for ever -- the precise failure this whole mechanism exists
+-- to remove.
+local REAP_SCRIPT = [[
+local processing = KEYS[1]
+local claimed    = KEYS[2]
+local queue      = KEYS[3]
+local cutoff     = tonumber(ARGV[1])
+
+local moved = 0
+local stale = redis.call('ZRANGEBYSCORE', claimed, '-inf', cutoff)
+for i = 1, #stale do
+  if redis.call('LREM', processing, 1, stale[i]) > 0 then
+    redis.call('LPUSH', queue, stale[i])
+    moved = moved + 1
+  end
+  redis.call('ZREM', claimed, stale[i])
+end
+
+local held = redis.call('LRANGE', processing, 0, -1)
+for i = 1, #held do
+  if not redis.call('ZSCORE', claimed, held[i]) then
+    redis.call('LREM', processing, 1, held[i])
+    redis.call('LPUSH', queue, held[i])
+    moved = moved + 1
+  end
+end
+
+return moved
+]]
+
+--- Moves one job from the queue to the processing list and returns it.
+function Store:claim_pop(key, timeout, now)
+  local processing = self:processing_key(key)
+  local encoded
+
+  if not timeout or timeout <= 0 then
+    encoded = self.cache:command("LMOVE", key, processing, "RIGHT", "LEFT")
+  else
+    -- The connection's read bound has to outlive a command that blocks in
+    -- the server, for the same reason `dequeue` raises it around `BRPOP`.
+    local bounded = self.cache.settimeout ~= nil
+    if bounded then self.cache:settimeout(timeout + 5) end
+    local ok, reply = pcall(self.cache.command, self.cache,
+                            "BLMOVE", key, processing, "RIGHT", "LEFT", timeout)
+    if bounded then self.cache:settimeout(nil) end
+    if not ok then error(reply, 0) end
+    encoded = reply
+  end
+
+  if type(encoded) ~= "string" then return nil end
+
+  -- Timestamped after the move, and `reap` treats an entry with no timestamp
+  -- as stale precisely because a worker can die in between.
+  self.cache:command("ZADD", self:claimed_key(key), now or 0, encoded)
+  return encoded
+end
+
+function Store:ack(key, encoded)
+  local removed = eval(self.cache, ACK_SCRIPT,
+                       { self:processing_key(key), self:claimed_key(key) },
+                       { encoded })
+  return tonumber(removed) == 1
+end
+
+function Store:reap(key, cutoff)
+  local moved = eval(self.cache, REAP_SCRIPT,
+                     { self:processing_key(key), self:claimed_key(key), key },
+                     { cutoff })
+  return tonumber(moved) or 0
+end
+
+function Store:in_flight(key)
+  return tonumber(self.cache:command("LLEN", self:processing_key(key))) or 0
+end
+
 --- `SET NX EX` -- atomic across every process, which is the whole point.
 function Store:claim(key, id, ttl)
   local reply = self.cache:command("SET", key .. ":claim:" .. id, "1",

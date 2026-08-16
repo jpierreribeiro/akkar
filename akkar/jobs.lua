@@ -118,6 +118,13 @@ function M.new(store, name, options)
   return setmetatable({
     store = store,
     key = "akkar:queue:" .. (name or "default"),
+    -- The EXACT bytes each in-flight job was stored as, keyed on the decoded
+    -- job and held weakly. Acknowledging re-encodes otherwise, and a table
+    -- does not promise to serialise the same way twice -- so a job could be
+    -- acknowledged with a string that does not match the one in the
+    -- processing set, silently leaving it to be reaped and run again. Weak
+    -- keys because a job the caller drops is not our business.
+    _claimed = setmetatable({}, { __mode = "k" }),
     retries = retries,
     backoff = options.backoff or {},
     dead_letter = options.dead_letter ~= false,
@@ -187,18 +194,29 @@ function Queue:push(kind, payload, options)
 end
 
 --- Waits for one job, up to `timeout` seconds.  Returns nil on timeout.
+---
+--- Takes the RELIABLE path when the store offers one: the job moves to a
+--- processing set as it leaves the queue, in one step, and stays there until
+--- it is acknowledged. A worker that dies holding it leaves it recoverable
+--- rather than gone. See `Queue:consume` and `Queue:reap`.
 function Queue:pop(timeout)
   -- Anything whose time has come joins the queue before we look at it.
   if supports(self.store, "promote") then
     self.store:promote(self.key, time.now())
   end
 
-  local encoded = self.store:dequeue(self.key, timeout or 5)
+  local encoded
+  if supports(self.store, "claim_pop") then
+    encoded = self.store:claim_pop(self.key, timeout or 5, time.now())
+  else
+    encoded = self.store:dequeue(self.key, timeout or 5)
+  end
   if not encoded then return nil end
   local ok, job = pcall(cjson.decode, encoded)
   -- A job that cannot be decoded cannot be handled or retried, and leaving it
   -- at the head of the queue would stall every worker behind it forever.
   if not ok then return nil, "akkar.jobs: undecodable job discarded" end
+  self._claimed[job] = encoded
   return job
 end
 
@@ -251,27 +269,73 @@ function Queue:fail(job, err)
   return "buried"
 end
 
+
+--- True when this queue can survive a worker dying mid-job.
+---
+--- Worth asking rather than assuming: the answer decides whether a job that
+--- matters may go through here at all, and it depends on the store, not on
+--- the queue.
+function Queue:reliable()
+  return supports(self.store, "claim_pop") and supports(self.store, "ack")
+end
+
+--- Marks a job finished, so it stops being recoverable.
+---
+--- Called by `consume` after the handler returns AND after a failure has been
+--- retried or buried -- in both cases the job has been dealt with, and
+--- leaving it in the processing set would make `reap` run it again.
+function Queue:ack(job)
+  if not supports(self.store, "ack") then return false end
+  local encoded = self._claimed[job] or cjson.encode(job)
+  self._claimed[job] = nil
+  return self.store:ack(self.key, encoded)
+end
+
+--- Returns jobs abandoned by a worker that never came back.
+---
+--- `older_than` is in seconds and must exceed the longest a handler may
+--- legitimately take. Set it too low and a slow job is run twice while the
+--- first attempt is still going; that is the trade this method makes and it
+--- cannot be made safe from here, because only the application knows how long
+--- its work takes.
+---
+--- Returns how many were returned to the queue.
+function Queue:reap(older_than)
+  if not supports(self.store, "reap") then return 0 end
+  return self.store:reap(self.key, time.now() - (older_than or 300))
+end
+
+--- How many jobs are currently checked out by a worker.
+function Queue:in_flight()
+  if not supports(self.store, "in_flight") then return 0 end
+  return self.store:in_flight(self.key)
+end
+
 --- Consumes until `should_stop()` returns true.
 ---
---- **AT MOST ONCE. Read this before putting anything that matters through it.**
+--- **AT LEAST ONCE where the store can do it, at most once where it cannot,
+--- and `Queue:reliable()` says which one you have.**
 ---
---- `pop` is destructive: `BRPOP` removes the job from Redis and returns it,
---- and from that moment until the handler finishes the job exists only in
---- this worker's local variable. A process killed there -- an ordinary deploy,
---- an OOM kill, a machine going away -- loses it, silently and with nothing
---- anywhere recording that it existed. The retry policy does not cover this:
---- retries are for a handler that RAISED, and a worker that died raised
---- nothing.
+--- With a store that offers `claim_pop` and `ack` -- Redis and the in-memory
+--- one both do -- a job moves to a processing set as it leaves the queue, in
+--- one step, and is acknowledged only after the handler has finished or its
+--- failure has been retried or buried. A worker killed in between leaves the
+--- job recoverable: `Queue:reap(older_than)` puts it back.
 ---
---- That is a real property of this design and not a bug to be reported. It is
---- written here because nobody discovers it from the API, and because the
---- obvious assumption -- that a queue with retries, backoff and a dead-letter
---- queue also survives a worker dying -- is the opposite of the truth.
+--- Nothing reaps automatically. A timer that returned jobs on its own would
+--- have to guess how long a handler may legitimately take, and guessing that
+--- runs live jobs twice. Call `reap` from wherever your deployment knows the
+--- answer -- a periodic task, a startup hook, an operator command.
 ---
---- Use it for work that can be lost: cache warming, non-critical mail,
---- analytics. Do not use it for anything a customer paid for. At-least-once
---- delivery needs a claim on pop and an acknowledgement after the handler,
---- which changes this API and is not built.
+--- With a store that offers neither, this is AT MOST ONCE and the loss is
+--- silent: `pop` is destructive, so between it and the handler finishing the
+--- job exists only in this worker's memory, and an ordinary deploy loses it.
+--- The retry policy does not cover that -- retries are for a handler that
+--- RAISED, and a worker that died raised nothing.
+---
+--- At-least-once means a handler can run twice. That is the trade, and it is
+--- the right way round: a job run twice is visible and fixable with an
+--- idempotency key, and a job silently lost is neither.
 function Queue:consume(handlers, options)
   options = options or {}
   local log = options.log
@@ -284,6 +348,8 @@ function Queue:consume(handlers, options)
       log:warn("jobs: discarded an undecodable job")
     elseif job then
       local handler = handlers[job.kind]
+      local function done() self:ack(job) end
+
       if not handler then
         -- A job with no handler is usually a deployment in progress -- a
         -- worker running older code than the producer -- so it goes through
@@ -291,10 +357,14 @@ function Queue:consume(handlers, options)
         -- loses work that finishing the deploy would have run.
         if log then log:warn("jobs: no handler", { kind = job.kind }) end
         self:fail(job, "no handler registered for kind '" .. tostring(job.kind) .. "'")
+        done()
       else
         local ok, err = pcall(handler, job.payload, job)
         if ok then
           handled = handled + 1
+          -- AFTER the handler, never before. The whole point is that a worker
+          -- dying between the two leaves the job recoverable.
+          done()
         else
           failed = failed + 1
           local outcome, delay = self:fail(job, err)
@@ -306,6 +376,9 @@ function Queue:consume(handlers, options)
               detail = tostring(err),
             })
           end
+          -- The failure has been retried or buried, so this attempt is
+          -- finished even though the work is not.
+          done()
         end
       end
     end

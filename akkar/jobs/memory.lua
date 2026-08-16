@@ -101,6 +101,67 @@ function Store:claim_and_enqueue(key, id, ttl, encoded, run_at)
   return self:enqueue(key, encoded)
 end
 
+-- ================================================== at-least-once delivery
+--
+-- A job leaves the queue and enters the PROCESSING set in one step, and stays
+-- there until it is acknowledged. A worker that dies holding it leaves it
+-- recoverable rather than gone, which is the difference between at-most-once
+-- and at-least-once -- and `Queue:consume` was at-most-once, loudly
+-- documented, until this existed.
+--
+-- In one process the "worker died" case can only be simulated, and that is
+-- exactly what the specs do: pop without acknowledging, then reap.
+
+function Store:processing_key(key) return key .. ":processing" end
+
+--- Moves the oldest job into the processing set and returns it.
+function Store:claim_pop(key, _timeout, now)
+  local encoded = self:dequeue(key)
+  if not encoded then return nil end
+
+  local held = self.processing[key]
+  if not held then held = {} self.processing[key] = held end
+  held[#held + 1] = { encoded = encoded, at = now or time.now() }
+  return encoded
+end
+
+--- Drops a job from the processing set. Returns whether it was there.
+function Store:ack(key, encoded)
+  local held = self.processing[key]
+  if not held then return false end
+  for i, entry in ipairs(held) do
+    if entry.encoded == encoded then
+      table.remove(held, i)
+      return true
+    end
+  end
+  return false
+end
+
+--- Returns everything claimed before `cutoff` to the queue.
+---
+--- Oldest first, so a job abandoned twice does not overtake one abandoned
+--- once -- the same ordering promise `promote` makes.
+function Store:reap(key, cutoff)
+  local held = self.processing[key]
+  if not held or #held == 0 then return 0 end
+
+  local stale, fresh = {}, {}
+  for _, entry in ipairs(held) do
+    if entry.at <= cutoff then stale[#stale + 1] = entry else fresh[#fresh + 1] = entry end
+  end
+  table.sort(stale, function(a, b) return a.at < b.at end)
+
+  for _, entry in ipairs(stale) do self:enqueue(key, entry.encoded) end
+  self.processing[key] = fresh
+  return #stale
+end
+
+function Store:in_flight(key)
+  local held = self.processing[key]
+  return held and #held or 0
+end
+
 --- Reads without removing, oldest first, to match what a reader expects.
 function Store:peek(key, limit)
   local list = self.lists[key]
@@ -131,7 +192,8 @@ function Store:scheduled_depth(key)
 end
 
 function M.store()
-  return setmetatable({ lists = {}, scheduled = {}, claims = {} }, Store)
+  return setmetatable({ lists = {}, scheduled = {}, claims = {},
+                        processing = {} }, Store)
 end
 
 function M.new(name)

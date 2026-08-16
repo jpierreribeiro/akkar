@@ -121,6 +121,72 @@ local function behaves_like_a_queue(label, make)
         "the refused push still scheduled a job")
     end)
 
+    it("does not lose a job when the worker dies holding it", function()
+      -- The property `Queue:consume` did not have, and said so in its own
+      -- docstring: `pop` is destructive, so between it and the handler
+      -- finishing, the job existed only in the worker's memory. An ordinary
+      -- deploy lost it, silently, and the retry policy did not cover that --
+      -- retries are for a handler that RAISED, and a worker that died raised
+      -- nothing.
+      --
+      -- A worker dying cannot be staged in-process, so this stages what is
+      -- observationally identical: take the job and never acknowledge it.
+      assert.is_true(queue:reliable(),
+        "this store cannot survive a worker dying, and the queue says so")
+
+      queue:push("charge", { amount = 10 })
+      local job = queue:pop(0)
+      assert.equal("charge", job.kind)
+
+      assert.equal(0, queue:depth(), "the job should be out of the queue")
+      assert.equal(1, queue:in_flight(), "and accounted for as checked out")
+
+      -- `reap(n)` returns what was claimed more than n seconds ago, so a
+      -- generous window must reclaim nothing and a negative one -- everything
+      -- claimed before a moment in the future -- must reclaim this.
+      assert.equal(0, queue:reap(60), "a fresh claim must not be reclaimed")
+      assert.equal(1, queue:reap(-1), "the abandoned job was not returned")
+      assert.equal(1, queue:depth())
+      assert.equal(0, queue:in_flight())
+
+      local again = queue:pop(0)
+      assert.equal("charge", again.kind)
+      assert.equal(10, again.payload.amount)
+    end)
+
+    it("stops being recoverable once it is acknowledged", function()
+      -- The other half. A job that finished must not come back, or every
+      -- reap would replay the day.
+      queue:push("charge", { amount = 10 })
+      local job = queue:pop(0)
+      assert.is_true(queue:ack(job))
+
+      assert.equal(0, queue:in_flight())
+      assert.equal(0, queue:reap(-1), "an acknowledged job was reaped anyway")
+      assert.equal(0, queue:depth())
+    end)
+
+    it("acknowledges through consume, on success and on failure alike", function()
+      -- Both paths end with the job dealt with: handled, or failed and then
+      -- retried or buried. Leaving either checked out would make the next
+      -- reap run it again.
+      queue:push("ok", {})
+      queue:push("boom", {})
+
+      local remaining = 4
+      queue:consume({
+        ok   = function() end,
+        boom = function() error "handler exploded" end,
+      }, {
+        timeout = 0,
+        log = { warn = function() end, error = function() end },
+        should_stop = function() remaining = remaining - 1 return remaining < 0 end,
+      })
+
+      assert.equal(0, queue:in_flight(),
+        "consume left a job checked out after dealing with it")
+    end)
+
     it("warns about a job kind nobody handles", function()
       queue:push("unknown_kind", {})
       local warned = 0
@@ -159,6 +225,11 @@ if redis_reachable() then
     -- and a test that reads a depth would then be measuring history.
     cache:del "akkar:queue:spec-redis"
     cache:del "akkar:queue:spec-redis:scheduled"
+    -- And the processing set, for the same reason as the scheduled one: a
+    -- job left checked out by an earlier run is state the next run inherits,
+    -- and a test that counts in-flight jobs would be counting history.
+    cache:del "akkar:queue:spec-redis:processing"
+    cache:del "akkar:queue:spec-redis:processing:at"
     return jobs_redis.new(cache, "spec-redis")
   end)
 else
