@@ -404,5 +404,13 @@ memory or descriptors.
 - **pgmoon, not the C driver.** `akkar.pq` exists and is opt-in, and this ran
   on the default. A soak of the driver that allocates less per row is a
   different run and the interesting one to compare against.
+
+  Since measured, on this machine and through this harness: the C driver is
+  **1.27x on `/users/42` and 2.79x on a thousand rows**, with p99 under
+  saturation falling from 1.3 s to 475 ms — `bench/driver/RESULTS.md` §5. What
+  is still true is the sentence above: **the soak itself has never run on it**,
+  and section 9's whole point is what happens over eight hours rather than ten
+  seconds. The driver also turned out to be measurably less consistent than
+  pgmoon, which is exactly the property a soak exists to judge.
 - **No jobs, no cache, no TLS.** Only the HTTP and database paths.
 
