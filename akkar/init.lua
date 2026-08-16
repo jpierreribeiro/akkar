@@ -961,6 +961,26 @@ end
 --- "internal server error"}`. A Lua error carries file paths, line numbers
 --- and sometimes SQL. The detail belongs in the log beside the request id,
 --- which is already how it works and is why the response carries that id.
+-- A 500 that has not consulted `app:on_error` yet.
+--
+-- The hook must run AFTER the request's capabilities are released, and the two
+-- paths that produce a 500 sat on opposite sides of that release: a middleware
+-- raising is caught outside it, a handler raising is caught deep inside, while
+-- the connection is still checked out. Calling the hook where the error was
+-- caught therefore handed one error handler a live `req.db` and the other one
+-- a connection already back in the pool -- and possibly already handed to
+-- another request. An `on_error` that records the failure in the database,
+-- which is the obvious shape for one, would have been writing it down through
+-- somebody else's connection.
+--
+-- So the cause travels to the release point and the hook runs there, once, on
+-- both paths. Wrapped in a table because the cause may legitimately be nil.
+local function pending_error(err)
+  local res = response(500, { error = "internal server error" })
+  res.__pending = { cause = err }
+  return res
+end
+
 local function internal_error(app, err, req)
   local fallback = response(500, { error = "internal server error" })
 
@@ -1010,9 +1030,9 @@ local function apply_response_schema(res, schema, where, app, req)
     internal:error("response does not match its schema", {
       at = where, fields = table.concat(detail, "; "),
     })
-    return internal_error(app,
+    return pending_error(
       "response does not match its schema at " .. tostring(where) ..
-      ": " .. table.concat(detail, "; "), req)
+      ": " .. table.concat(detail, "; "))
   end
   return response(res.status, cleaned, res.headers)
 end
@@ -1100,7 +1120,7 @@ local function dispatch(app, req)
     internal:error("handler raised", {
       request_id = req.id, at = route.where, detail = tostring(result),
     })
-    return internal_error(app, result, req)
+    return pending_error(result)
   end
 
   if opts and opts.response then
@@ -1500,6 +1520,14 @@ local function handle(app, input)
   -- Beside the response, never on it. See the note at the stamp site above.
   local trace_parent = req.trace and req.trace.traceparent
 
+  -- HERE, AND ONLY HERE, is where `on_error` runs -- after every capability
+  -- has gone back. A 500 raised deep inside the handler travelled out as a
+  -- `pending_error` rather than consulting the hook where it was caught, so
+  -- both paths reach the application's error handler in the same state.
+  if ok and is_response(res) and rawget(res, "__pending") then
+    res = internal_error(app, res.__pending.cause, req)
+  end
+
   if not ok then
     if is_response(res) then return res, req.id, trace_parent end
     internal:error("middleware raised", { request_id = req.id, detail = tostring(res) })
@@ -1553,7 +1581,7 @@ end
 -- well, since a chunked body declares no length at all.  `get_body_as_string`
 -- has no limit of its own, so calling it on an untrusted request is how a
 -- client turns a 5 MB upload into whatever the process can allocate.
-local function read_body(stream, request_headers, limit)
+local function read_body(stream, request_headers, limit, budget)
   -- `:get` returns NO values when the header is absent, not nil, so it cannot
   -- be passed straight into tonumber() -- that call would receive zero
   -- arguments and raise.  Bind it first.
@@ -1563,8 +1591,38 @@ local function read_body(stream, request_headers, limit)
     return nil, "declared"
   end
 
+  -- READING THE BODY HAS ITS OWN BUDGET.
+  --
+  -- This runs BEFORE `with_deadline` exists -- the handler cannot be given a
+  -- body it has not been read yet -- so for as long as it was unbounded, the
+  -- request deadline covered everything except the one phase an attacker
+  -- controls completely. A client that announces a megabyte and then sends a
+  -- byte a minute held a descriptor pair and an in-flight slot for as long as
+  -- it liked, and `max_concurrent` was the only thing in its way: slowloris,
+  -- against the one part of the request akkar had left without a clock.
+  --
+  -- The budget is a DEADLINE rather than a per-chunk timeout. Passing the
+  -- same timeout to every chunk -- which is what lua-http's own
+  -- `get_body_as_string` does -- means a client that sends one byte just
+  -- inside the limit, for ever, is never refused.
+  local deadline = budget and (time.monotime() + budget)
+
   local parts, total = {}, 0
-  for chunk in stream:each_chunk() do
+  while true do
+    local remaining
+    if deadline then
+      remaining = deadline - time.monotime()
+      if remaining <= 0 then return nil, "timeout" end
+    end
+
+    local chunk, err = stream:get_next_chunk(remaining)
+    if chunk == nil then
+      -- lua-http's own convention: no chunk and no error is the end of the
+      -- body; no chunk WITH an error is a failure, and a timeout is one.
+      if err == nil then break end
+      return nil, "timeout"
+    end
+
     total = total + #chunk
     if total > limit then return nil, "streamed" end
     parts[#parts + 1] = chunk
@@ -1758,9 +1816,14 @@ function App:run(config)
         local target = h:get ":path" or "/"
         local path, qs = target:match "^([^?]*)%??(.*)$"
 
-        local raw, oversize = read_body(stream, h, body_limit)
+        local raw, oversize = read_body(stream, h, body_limit, timeout)
         local body, short
-        if oversize then
+        if oversize == "timeout" then
+          -- 408, not 503. The deadline that produces a 503 is akkar deciding
+          -- the handler took too long; this is the client never finishing the
+          -- request it started, which is what 408 is for.
+          short = response(408, { error = "timed out reading the request body" })
+        elseif oversize then
           short = response(413, { error = "request body exceeds " ..
                                           body_limit .. " bytes" })
         elseif raw and #raw > 0 then

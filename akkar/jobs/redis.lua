@@ -31,7 +31,22 @@ function Store:dequeue(key, timeout)
   if not timeout or timeout <= 0 then
     return self.cache:command("RPOP", key)
   end
-  local reply = self.cache:command("BRPOP", key, timeout)
+
+  -- The connection carries a read timeout, and this is the one command that
+  -- is legitimately slower than it: `BRPOP` waits IN THE SERVER for up to
+  -- `timeout` seconds, so leaving the socket bound at its default would abort
+  -- a wait that is doing exactly what it was asked to do. Raised for this
+  -- call and put back afterwards, on every path -- the slack is what
+  -- separates "the server is thinking" from "the server is gone".
+  local restore = self.cache.settimeout and function(seconds)
+    self.cache:settimeout(seconds)
+  end
+
+  if restore then self.cache:settimeout(timeout + 5) end
+  local ok, reply = pcall(self.cache.command, self.cache, "BRPOP", key, timeout)
+  if restore then self.cache:settimeout(nil) end
+
+  if not ok then error(reply, 0) end
   if type(reply) ~= "table" then return nil end
   return reply[2]
 end

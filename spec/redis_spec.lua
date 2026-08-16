@@ -113,6 +113,48 @@ if not reachable() then
   return
 end
 
+describe("a server that accepts and then says nothing", function()
+  -- `read_reply` had no bound at all: it waited exactly as long as the server
+  -- took, and the only thing above it was the request deadline -- which a
+  -- background worker does not have. A Redis that accepted the connection and
+  -- then stopped answering parked a `Queue:consume` worker for ever, with no
+  -- error, no log line, and nothing to distinguish it from an idle queue.
+  --
+  -- Not a fake socket: a real listener that accepts and never writes. The
+  -- property under test is what the socket layer does when a peer goes quiet,
+  -- and a double that decides to go quiet is testing the double.
+  local cqueues = require "cqueues"
+  local socket  = require "cqueues.socket"
+
+  it("gives up instead of waiting for ever", function()
+    local PORT = 8388
+    local server = socket.listen("127.0.0.1", PORT)
+
+    local failed_with, elapsed
+    local cq = cqueues.new()
+    cq:wrap(function()
+      local peer = server:accept()          -- accept, and answer nothing
+      cqueues.sleep(5)
+      peer:close()
+    end)
+    cq:wrap(function()
+      local conn = redis.connect { host = "127.0.0.1", port = PORT,
+                                   pool_size = 0, timeout = 0.3 }()
+      local started = cqueues.monotime()
+      local ok, err = pcall(function() return conn:ping() end)
+      elapsed = cqueues.monotime() - started
+      failed_with = not ok and tostring(err) or nil
+      conn:close()
+    end)
+    assert(cq:loop(15))
+    server:close()
+
+    assert.is_truthy(failed_with, "the command waited for a reply that never came")
+    assert.is_true(elapsed < 2,
+      "it waited " .. string.format("%.2f", elapsed) .. "s against a 0.3s timeout")
+  end)
+end)
+
 describe("a handshake the server refuses", function()
   -- AUTH and SELECT run on a socket that is already open. Raising out of
   -- `open` left it with nothing in this process referencing it: the pool
