@@ -40,6 +40,7 @@ that silently gets nil back from an unplanned query is a test asserting the
 wrong thing.
 ]]
 
+local time  = require "akkar.time"
 local Scope = require "akkar.scope"
 
 local Memory = {}
@@ -69,6 +70,44 @@ function Memory:fail(pattern, message)
   return self:on(pattern, function() error("db: " .. (message or "query failed"), 0) end)
 end
 
+--- Makes a query TAKE TIME, so a deadline above it can fire.
+---
+--- `:fail` raises immediately, which exercises the error path and nothing
+--- else. The defect class this project keeps finding is different: a
+--- capability acquired, a coroutine abandoned mid-yield, and a release that
+--- never runs -- and staging it needs a query that YIELDS rather than one
+--- that returns. Without this the only way to make a query slow was a real
+--- `pg_sleep`, which is why `spec/abandoned_spec.lua` is `pending` on every
+--- machine without Docker.
+---
+--- Real seconds on purpose. `akkar.time` can move a budget forward without
+--- waiting, but it deliberately does not move the event loop -- see that
+--- module's header -- and what has to happen here is a genuine yield, so
+--- that whatever is racing this query actually gets scheduled.
+function Memory:hang(pattern, seconds)
+  return self:on(pattern, function()
+    time.sleep(seconds or 60)
+    error("db: query hung and was never answered", 0)
+  end)
+end
+
+--- Makes the CONNECTION die mid-query, not merely the query fail.
+---
+--- The difference matters and it is the difference `:fail` cannot express: a
+--- failed query leaves a healthy connection that goes back to the pool, while
+--- a dropped connection must never go back -- `akkar/pool.lua` has to discard
+--- it, and a pool that recycles a dead socket hands the next request a
+--- descriptor that answers nothing.
+---
+--- Everything on this adapter fails after the drop, which is what a closed
+--- socket does. Nothing un-drops it but `reset`.
+function Memory:drop(pattern)
+  return self:on(pattern, function()
+    self.dropped = true
+    error("db: connection reset by peer", 0)
+  end)
+end
+
 local function find(self, sql)
   for _, entry in ipairs(self.responses) do
     if sql:find(entry.pattern) then return entry end
@@ -86,6 +125,14 @@ function Memory:query(sql, ...)
           "no query hides that", 0)
   end
   self.log[#self.log + 1] = { sql = sql, args = table.pack(...) }
+
+  -- A DROPPED CONNECTION STAYS DROPPED. A real socket does not recover
+  -- because the next caller asked nicely, and a fake that answers again after
+  -- a reset by peer would let a pool pass a dead connection around while the
+  -- test went green. See `Memory:drop`.
+  if self.dropped then
+    error("db: connection reset by peer", 0)
+  end
 
   -- Transaction control is answered by the adapter itself, so a test does not
   -- have to program `begin` and `commit`.
@@ -164,6 +211,7 @@ end
 
 function Memory:reset()
   self.log, self.committed, self.rolled_back = {}, nil, nil
+  self.dropped = nil
   return self
 end
 

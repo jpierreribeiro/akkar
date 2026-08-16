@@ -567,6 +567,92 @@ the milestone everything else was clearing the way for is still the milestone.
 
 ---
 
+## 7. The Postgres driver, and what measuring it corrected
+
+**Built and measured, not yet wired.** `akkar.pq` is libpq with the waiting
+done in Lua: `src/akkar_pq.c` speaks the protocol and materialises rows,
+`akkar/pq.lua` does every wait with `cqueues.poll`. `bench/driver/RESULTS.md`
+has the numbers and `spec/pq_spec.lua` pins the behaviour, including the one
+property that matters more than speed -- two concurrent 0.4 s queries finish
+in 0.4 s.
+
+**The correction is worth more than the driver.** This project had been
+quoting "32 us pgx, 82 us asyncpg, 330 us pgmoon" and reading the 330 as what
+pgmoon *adds*. `bench/driver/floor.c` -- the same query through blocking
+`PQexecParams` with no Lua at all -- costs **274.80 us on this laptop**. Those
+three figures were measured against each other on the EC2 box and are sound
+relative to one another; the inference drawn since is not. A driver cannot be
+blamed for the round trip.
+
+Driver cost, floor subtracted:
+
+| | 1 row | 1000 rows |
+|---|---:|---:|
+| pgmoon | 217 us | 12,243 us |
+| akkar.pq | 107 us | 1,686 us |
+
+**And the part that changes what to expect:** at one row the advantage does
+not clear the noise gate, and `/users/:id` -- the route in `bench/compare`, in
+the saturation study and in the soak -- is a one-row query. This will not move
+the headline throughput.
+
+### Owed on the driver
+
+- **Wire it into `akkar/db.lua`**, which still goes through pgmoon. The
+  adapter boundary is the whole reason this is one file's worth of work, and
+  that claim is now testable rather than asserted.
+- **Re-run on the study machine.** Every number above is a laptop with
+  Postgres in a container. Until it is repeated on the `c5.2xlarge`, none of
+  it may be compared with `bench/compare/RESULTS.md`.
+- **Measure the tail, not the mean.** 12,243 us of interpreter work per
+  thousand-row query is 12,243 us in which the single-threaded event loop runs
+  nothing else. That is the effect that should show up as p99 under load, and
+  it is unmeasured.
+- **A static libpq recipe for `akkar build`.** The Debian `libpq.a` drags in
+  pgcommon, pgport, curl, ssl, gssapi and ldap. Same class as the cqueues and
+  luaossl recipes; not started.
+- **Prepared statements.** Every query is an unnamed parse, exactly as pgmoon
+  does it. Named statements are where the remaining single-row gap probably
+  lives, and they bring a cache-invalidation problem with them.
+
+## 8. Astra, the competitive reference
+
+Astra (Rust + Tokio + Axum + SQLx, hosting Lua via mlua) is the closest thing
+to what akkar is trying to be, and it is treated as a reference rather than a
+threat. Three claims about it were **verified against the source** at commit
+`885586c`, v0.51.2, and all three are confirmed:
+
+- **`sql.leak()` per query.** `src/components/database.rs:251`, inside a macro
+  expanded for both Postgres and SQLite, reached by five Lua methods. The
+  `String` comes from the Lua argument on every call; there is no
+  `Box::from_raw` anywhere in the repository and no interning.
+- **Unbounded request body, with a limit knob that does not apply.**
+  `to_bytes(body, usize::MAX)` runs before any Lua. `DefaultBodyLimit` is
+  configurable and does *not* cover this path, because the handler takes the
+  raw `Request` extractor whose `from_request` is the identity; only
+  `Bytes`-based extractors read the limit. No `RequestBodyLimitLayer` exists.
+- **One global Lua VM serialises CPU work.** mlua's `ReentrantMutex` is taken
+  at the start of `poll` and held across `resume_inner`, so a handler that
+  never yields holds it for the whole request and other Tokio workers block on
+  it. `thread_pool_size` is a coroutine object pool, not parallelism.
+
+**What this does NOT license.** All three are implementation defects fixable
+in a patch, not consequences of choosing Rust. Positioning against them as
+permanent failings ages badly. What they are evidence about is process.
+
+### The experiments worth running
+
+- **Soak both runtimes side by side with RSS plotted.** The leak is the only
+  one of the three that draws itself on a graph, and the study machine exists
+  to produce that graph.
+- **Prove akkar's body limit cuts.** Astra's defect is not a missing limit; it
+  is a configurable limit that does not cover the hot path. A test that proves
+  akkar's knob actually truncates is worth more than the knob.
+- **Audit every concurrency knob akkar exposes** for the `thread_pool_size`
+  failure mode: a number that reads as parallelism and delivers a cache. If
+  the documentation does not say what a knob does *not* do, it is the same
+  trap.
+
 ## What is deliberately not being built
 
 Written down because the list keeps trying to grow.
