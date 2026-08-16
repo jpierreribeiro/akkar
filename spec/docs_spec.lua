@@ -255,13 +255,27 @@ describe("the documentation", function()
           --
           -- Trying it as an expression second keeps the real guarantee: a
           -- block with a genuine syntax error compiles as neither.
+          -- THREE SHAPES, because a documentation block is one of three
+          -- things and only the first is a program.
+          --
+          --   a chunk       `local app = akkar.new()`
+          --   a value       `{ id = 1, title = "buy milk" }`
+          --   a field       `cache = redis.connect { port = 6379 },`
+          --
+          -- The third is a line to add to an existing table, which is a
+          -- perfectly ordinary thing for a page to show and is not loadable
+          -- as either of the other two. It failed page 11 while that page was
+          -- being written, and the author would have been right to think the
+          -- checker was wrong rather than their page.
+          --
+          -- Each is wrapped in the smallest frame that makes it compilable,
+          -- so a genuine syntax error still fails all three.
           local chunk, why = load(block.code, "@" .. where)
-          if not chunk then
-            chunk = load("return " .. block.code, "@" .. where)
-          end
+          if not chunk then chunk = load("return " .. block.code, "@" .. where) end
+          if not chunk then chunk = load("return {" .. block.code .. "}", "@" .. where) end
           assert.is_truthy(chunk,
-            "a documentation example is neither a valid chunk nor a valid " ..
-            "value:\n  " .. tostring(why))
+            "a documentation example is not a valid chunk, value or table " ..
+            "field:\n  " .. tostring(why))
         end)
 
       elseif block.marker == "server" then

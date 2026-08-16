@@ -169,6 +169,33 @@ end
 
 -- Closure-scoped transaction: commit at the end, rollback on any error.
 -- There is no path where a BEGIN stays open because someone forgot.
+--
+-- RETURNING A 4xx FROM INSIDE COMMITS. This is the expensive trap in this
+-- module and it is written here because it cost somebody an afternoon to find.
+--
+--     req.db:transaction(function(tx)
+--       tx:exec("insert into ...")
+--       if bad then return akkar.bad_request "no" end   -- COMMITS the insert
+--     end)
+--
+-- The closure returned, so the transaction succeeded, so it committed -- and
+-- the 400 travels up as the handler's response. The row is written and the
+-- caller is told their request was rejected, which is the worst of both.
+-- Confirmed against a real database while writing the beginner guide: a row
+-- landed from a request that answered 400.
+--
+-- `error(akkar.bad_request "no")` is the form that rolls back, and it is the
+-- form the rest of akkar already uses -- response-as-error exists precisely so
+-- a deep layer can signal HTTP without threading a return value through every
+-- frame. It is not caught here; `pcall` sees the raise, the rollback runs, and
+-- the response is re-raised for the handler chain to answer with.
+--
+-- This is NOT changed to treat a returned 4xx as a rollback, and the reason is
+-- that the change would be a guess about intent: a closure can legitimately
+-- return a 4xx after work that should persist -- recording the rejected
+-- attempt is the ordinary example. A rule that reads the status code would
+-- silently discard those writes instead, which is the same defect pointing the
+-- other way and harder to see.
 function Db:transaction(fn)
   self:query "begin"
   self.in_transaction = true
@@ -298,8 +325,39 @@ function M.connect(config)
       password = config.password,
       socket_type = "cqueues",
     }
-    local ok, err = pg:connect()
-    if not ok then error("db: could not connect: " .. tostring(err), 0) end
+    -- THE MESSAGE BELOW NEVER APPEARED, and that was the point of writing it.
+    --
+    -- `pg:connect()` does not return `nil, err` when the server is not there.
+    -- pgmoon RAISES, from inside its cqueues socket layer, so this line was
+    -- unreachable and what a developer actually saw was a bare traceback out
+    -- of `pgmoon/cqueues.lua:18` -- no host, no port, no hint that a database
+    -- was involved at all.
+    --
+    -- Found by someone writing the beginner guide, who stopped Postgres to
+    -- show what happens and got a stack trace pointing into a dependency.
+    -- That is the worst possible first encounter with a framework: the thing
+    -- that failed is your `docker run`, and the thing on screen is somebody
+    -- else's source file.
+    --
+    -- So the call is wrapped, and both shapes -- raised and returned -- end
+    -- in the same message, which names what was being connected to.
+    local ok, err = pcall(function() return pg:connect() end)
+    if ok and err == nil then ok = false end     -- `false, reason` from pgmoon
+    if not ok then
+      local reason = tostring(err)
+      -- The connection refused case is worth naming on its own, because it is
+      -- almost always a database that is not running rather than one that is
+      -- misconfigured, and those have different fixes.
+      local hint = reason:find("refused", 1, true)
+        and "\n  Nothing is listening there. Is the database running?"
+        or ""
+      error(("db: could not connect to %s:%s (database %q, user %q) -- %s%s")
+            :format(tostring(config.host or "127.0.0.1"),
+                    tostring(config.port or 5432),
+                    tostring(config.database or "?"),
+                    tostring(config.user or "?"),
+                    reason, hint), 0)
+    end
 
     -- Override pgmoon's number serializer per connection, so this fix needs
     -- no fork of the driver.

@@ -46,12 +46,8 @@ the Postgres command from page 5:
 docker run -d --name akkar-redis -p 6379:6379 redis:7-alpine
 ```
 
-```
-Unable to find image 'redis:7-alpine' locally
-7-alpine: Pulling from library/redis
-...
-Status: Downloaded newer image for redis:7-alpine
-```
+It prints a long hexadecimal id and returns. That id is the container's, and
+you will not need it. `docker ps` should now list `akkar-redis`.
 
 ## The column that makes a job safe to repeat
 
@@ -65,12 +61,9 @@ Create `migrations/004_welcome_email_sent.sql`:
 alter table accounts add column welcome_email_sent_at timestamptz
 ```
 
-Apply it the same way you applied the first three on page 5.
-
-```
-applied this run: 1
-    004_welcome_email_sent.sql
-```
+Apply it the same way you applied the first three on page 5. It should report
+one file applied. Run it a second time and it should report none, which is the
+whole idea of a migration ledger.
 
 ## Putting a job in the queue
 
@@ -88,11 +81,18 @@ workers reading that name, so a slow email queue cannot hold up a fast one.
 
 Note the extra `()` after `redis.connect { ... }`. `redis.connect` hands back a
 function that opens connections, and the queue wants one connection rather than
-the factory. Forgetting it gives you an error that names the missing method:
+the function.
+
+Leave the `()` out and nothing complains at first. The queue is built, the
+server starts, and the mistake only surfaces on the first push:
 
 ```
-akkar.jobs: store does not satisfy the contract; missing :enqueue
+lua5.4: ./akkar/jobs/redis.lua:24: attempt to call a nil value (method 'command')
 ```
+
+That message names a file inside akkar and not the line in your code, so it
+reads like a bug in the framework. It is not. It is the missing `()`, and it is
+worth recognising once so that it costs you a minute rather than an evening.
 
 Second, inside the `/signup` handler, after the insert and before the answer:
 
@@ -426,7 +426,8 @@ end)
 
 app:get("/tasks", function(req)
   local mine = req.db:scope("user_id", signed_in(req))
-  return { tasks = mine:many(sql.select("id, title, done"):from "tasks") }
+  local rows = mine:many(sql.select("id, title, done"):from "tasks")
+  return { tasks = akkar.array(rows) }
 end)
 
 app:post("/tasks", { body = { title = "string" } }, function(req)

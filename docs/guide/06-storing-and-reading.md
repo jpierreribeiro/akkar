@@ -127,7 +127,8 @@ local open = db.connect {
 local app = akkar.new()
 
 app:get("/tasks", function(req)
-  return { tasks = req.db:many "select id, title, done from tasks order by id" }
+  local rows = req.db:many "select id, title, done from tasks order by id"
+  return { tasks = akkar.array(rows) }
 end)
 
 app:post("/tasks", { body = { title = "string" } }, function(req)
@@ -178,7 +179,7 @@ local akkar = require "akkar"
 local app = akkar.new()
 
 app:get("/tasks", function(req)
-  return { tasks = req.db:many "select id, title, done from tasks order by id" }
+  return { tasks = akkar.array(req.db:many "select id, title, done from tasks") }
 end)
 
 app:run { port = 3000 }
@@ -239,23 +240,45 @@ Without `returning` you would insert, and then have to run a second query to
 find out what id the database gave the row. With it, the insert answers with
 the finished row. One round trip instead of two, and no guessing.
 
-### One thing about empty lists
+### Why the list is wrapped in `akkar.array`
 
-An empty table in Lua becomes `{}` in JSON, not `[]`:
+That handler does not return the rows directly. It says:
 
-```sh
-curl -s http://127.0.0.1:3000/tasks
+```lua no-run
+return { tasks = akkar.array(rows) }
+```
+
+Here is what that is for. Lua has one kind of table, so an empty list and an
+empty object are the same value, and JSON has to choose. It chooses `{}`:
+
+```lua
+local akkar = require "akkar"
+local json  = require "akkar.json"
+
+print(json.encode { tasks = akkar.array {} })
+print(json.encode { tasks = {} })
+print(json.encode { tasks = akkar.array { "a", "b" } })
 ```
 
 ```
+{"tasks":[]}
 {"tasks":{}}
+{"tasks":["a","b"]}
 ```
 
-Lua has one kind of table, so an empty list and an empty object are the same
-value, and the encoder has to pick one. It picks `{}`. Nothing is wrong, and
-your own code reading `#tasks` still sees zero. Keep it in mind for the day a
-frontend calls `tasks.map(...)` on it and complains, because that code is
-expecting a list and `{}` is not one.
+Look at the middle line, and then imagine your route doing that. With rows in
+the table you answer `"tasks":[...]`, a list. With no rows you answer
+`"tasks":{}`, an object. **The type of your answer would depend on how much
+data there happens to be.**
+
+That is a bad thing to hand anybody. Whoever calls your API now needs a check
+for a case your server should never have produced, and the usual way they find
+out is that `tasks.map(...)` in a browser throws on the day a new user opens an
+empty task list.
+
+`akkar.array` marks the table as a list, so an empty one stays `[]`. Wrap every
+collection you return. It costs one call and it removes a whole class of "works
+until it does not".
 
 ## Several statements that must all happen, or none
 
@@ -277,7 +300,7 @@ app:post("/tasks/bulk", { body = { titles = "table" } }, function(req)
       created[#created + 1] = tx:one(
         "insert into tasks (title) values ($1) returning id, title, done", title)
     end
-    return akkar.created { tasks = created }
+    return akkar.created { tasks = akkar.array(created) }
   end)
 end)
 ```
@@ -398,7 +421,7 @@ hatch, because an escape hatch is where the injection goes.
 Hand the query straight to `db:many`, with no `build()` step:
 
 ```lua no-run
-return { tasks = req.db:many(query) }
+return { tasks = akkar.array(req.db:many(query)) }
 ```
 
 ### Column names are not values
@@ -492,7 +515,7 @@ app:get("/tasks", {
     query:where("done = ?", req.query.done)
   end
   query:order_by(req.query.sort, { "id", "title" })
-  return { tasks = req.db:many(query) }
+  return { tasks = akkar.array(req.db:many(query)) }
 end)
 
 app:get("/tasks/:id", { params = { id = "integer" } }, function(req)
@@ -517,7 +540,7 @@ app:post("/tasks/bulk", { body = { titles = "table" } }, function(req)
       created[#created + 1] = tx:one(
         "insert into tasks (title) values ($1) returning id, title, done", title)
     end
-    return akkar.created { tasks = created }
+    return akkar.created { tasks = akkar.array(created) }
   end)
 end)
 
@@ -541,8 +564,10 @@ curl -s http://127.0.0.1:3000/tasks
 ```
 
 ```
-{"tasks":{}}
+{"tasks":[]}
 ```
+
+An empty list, and still a list, because of `akkar.array`.
 
 **Make one:**
 

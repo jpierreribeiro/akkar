@@ -2247,6 +2247,17 @@ end
 akkar.null = cjson.null
 akkar.json = cjson          -- `cjson` is `akkar.json` here; see that module
 
+-- Marks a table as a JSON array, so an EMPTY one encodes as `[]` not `{}`.
+--
+--     return { tasks = akkar.array(rows) }
+--
+-- An empty Lua table is both an empty list and an empty object and the
+-- encoder has to guess; it guesses object, so an empty result set answered
+-- `{"tasks":{}}` and a frontend calling `.map` on it threw. See
+-- `akkar/json.lua` for why this is a marker and not a walk.
+akkar.array = cjson.array
+akkar.empty_array = cjson.empty_array
+
 -- Exposed so the startup checks can be tested without binding a socket.
 akkar.check_capabilities = check_capability_contracts
 akkar.log = log

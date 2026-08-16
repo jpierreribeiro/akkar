@@ -107,6 +107,22 @@ stack traceback:
 Measured: 0.16–0.35 µs per switch, under 2% overhead. It stays on in
 production. Go does not warn about this; neither does Node.
 
+**What it cannot see, stated because this page overpromised until somebody
+checked.** The watchdog counts Lua instructions, so it notices Lua code that
+runs too long. A single call into C is one instruction and stays one
+instruction no matter how long it takes.
+
+The example that matters is password hashing: `akkar.crypto.hash_password` is
+PBKDF2 inside OpenSSL, it took **771 ms** in a measurement taken while writing
+the beginner guide, and the watchdog said nothing at all. The whole process
+was stopped for three quarters of a second in silence.
+
+That is why `akkar.crypto` points at `akkar.work` in its own docstring, and it
+is a real limit rather than a missing feature: there is no point at which Lua
+regains control during a C call, so there is nothing for a Lua-level watchdog
+to interrupt. `akkar/work.lua` says the same thing about native work in
+general.
+
 ---
 
 ## The ladder

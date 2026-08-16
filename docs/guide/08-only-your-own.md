@@ -125,7 +125,8 @@ app:post("/login", {
 end)
 
 app:get("/tasks", { before = { require_login } }, function(req)
-  return { tasks = req.db:many "select id, title, done from tasks order by id" }
+  local rows = req.db:many "select id, title, done from tasks order by id"
+  return { tasks = akkar.array(rows) }
 end)
 
 app:post("/tasks", {
@@ -437,7 +438,7 @@ app:get("/tasks", { before = { require_login } }, function(req)
   local mine = req.db:scope("user_id", req.auth.user_id)
   local query = sql.select("id, title, done"):from "tasks"
   query:order_by("id", { "id", "title" })
-  return { tasks = mine:many(query) }
+  return { tasks = akkar.array(mine:many(query)) }
 end)
 
 app:get("/tasks/:id", {
@@ -481,6 +482,11 @@ Notice what the four task handlers have in common. Each one starts by narrowing
 the handle, and after that line there is nothing left to remember. No handler
 mentions `user_id` again. The insert does not set it and the delete does not
 check it, because the handle does both.
+
+The list route still wraps its rows in `akkar.array`, for the reason
+[page 6](06-storing-and-reading.md) gives, and scoping makes that reason
+sharper rather than weaker: an account with no tasks yet is now an ordinary,
+everyday case, and it has to answer `[]` like everybody else.
 
 Restarting the server empties the session cache, so log both accounts in again
 before trying these.

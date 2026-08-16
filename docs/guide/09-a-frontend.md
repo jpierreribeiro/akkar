@@ -88,7 +88,8 @@ end)
 
 app:get("/tasks", function(req)
   local mine = req.db:scope("user_id", signed_in(req))
-  return { tasks = mine:many(sql.select("id, title, done"):from "tasks") }
+  local rows = mine:many(sql.select("id, title, done"):from "tasks")
+  return { tasks = akkar.array(rows) }
 end)
 
 app:post("/tasks", { body = { title = "string" } }, function(req)
@@ -481,19 +482,30 @@ and not, say, `DELETE`.
 browser.** Run the `OPTIONS` above against the failing path. If it does not
 come back with your origin in it, the preflight is the failure.
 
-## One thing that will surprise your JavaScript
+## Why the task list is wrapped in `akkar.array`
 
-An empty list of tasks does not come back as `[]`.
+There is one call in `GET /tasks` that has not been explained, and the browser
+is where it earns its place.
+
+Make a second account, one with no tasks in it:
 
 ```sh
-curl -s -X POST http://127.0.0.1:3000/signup \
+curl -s -c new-cookies.txt -X POST http://127.0.0.1:3000/signup \
   -H "content-type: application/json" \
-  -d '{"email":"lovelace@example.com","password":"correct horse battery"}' \
-  -c new-cookies.txt
+  -d '{"email":"lovelace@example.com","password":"correct horse battery"}'
 ```
 
 ```
 {"email":"lovelace@example.com","id":8}
+```
+
+Now imagine the handler without that call, written the plain way:
+
+```lua no-run
+app:get("/tasks", function(req)
+  local mine = req.db:scope("user_id", signed_in(req))
+  return { tasks = mine:many(sql.select("id, title, done"):from "tasks") }
+end)
 ```
 
 ```sh
@@ -504,18 +516,7 @@ curl -s -b new-cookies.txt http://127.0.0.1:3000/tasks
 {"tasks":{}}
 ```
 
-An empty Lua table could be an empty list or an empty object, and nothing in
-the table itself says which. akkar's JSON encoder writes `{}`.
-
-In `curl` that is a curiosity. In a browser it is a crash, because
-`data.tasks.map(...)` on `{}` throws `data.tasks.map is not a function`. Guard
-it where you read it:
-
-```js
-const tasks = Array.isArray(data.tasks) ? data.tasks : [];
-```
-
-Add one task and the shape is the list you expected:
+`{}`, not `[]`. Add one task and it changes shape:
 
 ```sh
 curl -s -b new-cookies.txt -X POST http://127.0.0.1:3000/tasks \
@@ -532,6 +533,50 @@ curl -s -b new-cookies.txt http://127.0.0.1:3000/tasks
 
 ```
 {"tasks":[{"title":"buy a birthday card","done":false,"id":11}]}
+```
+
+**That is a bug, and it is yours to fix rather than the browser's to survive.**
+An endpoint whose type depends on how much data it found is an endpoint every
+caller has to write a special case for.
+
+In `curl` it looks like a curiosity. In the browser it is a crash:
+`data.tasks.map(...)` on `{}` throws `data.tasks.map is not a function`, and it
+throws only for accounts with nothing in them, which is every brand new user.
+
+The cause is a real ambiguity in Lua. An empty Lua table is both an empty list
+and an empty object, and nothing in the table says which one you meant. akkar's
+JSON encoder has to guess, and it guesses `{}`.
+
+`akkar.array` is how you say which one you meant, and it is why the handler in
+your file already reads like this:
+
+```lua no-run
+app:get("/tasks", function(req)
+  local mine = req.db:scope("user_id", signed_in(req))
+  local rows = mine:many(sql.select("id, title, done"):from "tasks")
+  return { tasks = akkar.array(rows) }
+end)
+```
+
+```sh
+curl -s -b new-cookies.txt http://127.0.0.1:3000/tasks
+```
+
+```
+{"tasks":[]}
+```
+
+Only the empty case ever changed. A list with rows in it was already an array.
+
+**Wrap every list you return.** It costs one call and it removes a whole class
+of frontend bug that only appears for the emptiest, newest accounts, which are
+exactly the ones you test with last.
+
+If you are consuming an API somebody else wrote and it does this, the guard on
+your side is one line:
+
+```js
+const tasks = Array.isArray(data.tasks) ? data.tasks : [];
 ```
 
 ## The whole application
@@ -603,7 +648,8 @@ end)
 
 app:get("/tasks", function(req)
   local mine = req.db:scope("user_id", signed_in(req))
-  return { tasks = mine:many(sql.select("id, title, done"):from "tasks") }
+  local rows = mine:many(sql.select("id, title, done"):from "tasks")
+  return { tasks = akkar.array(rows) }
 end)
 
 app:post("/tasks", { body = { title = "string" } }, function(req)

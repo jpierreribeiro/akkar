@@ -77,18 +77,19 @@ into the `akkar` folder you cloned and run `lua5.4 app.lua` from there.
 **`Address already in use`**
 
 ```
-lua5.4: ...akkar/init.lua:2051: Address already in use
-stack traceback:
-	[C]: in function 'assert'
-	...akkar/init.lua:2051: in method 'run'
-	app.lua:9: in main chunk
-	[C]: in ?
+lua5.4: akkar: port 3000 on 127.0.0.1 is already in use.
+  Something else is listening there -- most often a server from a previous run
+  that is still going.
+  Stop it, or start this one on another port with app:run { port = 3001 }
 ```
 
 Something is already listening on port 3000, usually a copy of this server you
 forgot to stop. Stop it with `Ctrl-C`, or change `port = 3000` to another
-number such as `3001`. The file path in that message will look different on
-your machine.
+number such as `3001`.
+
+This message used to be a stack trace pointing inside akkar's own source, with
+no port in it. It was rewritten because this page existed: writing down what a
+beginner sees is what made it obvious that the message was useless to one.
 
 ---
 

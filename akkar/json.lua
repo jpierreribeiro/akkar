@@ -76,4 +76,27 @@ function M.implementation() return impl end
 
 M.null = impl.null
 
+
+--- Marks a table as a JSON ARRAY, so an empty one encodes as `[]` and not `{}`.
+---
+--- THE AMBIGUITY IS LUA'S AND SOMEBODY HAS TO RESOLVE IT. An empty Lua table
+--- is both an empty list and an empty object, and every JSON encoder has to
+--- guess. cjson guesses `{}`, so a handler returning `{ tasks = rows }` with
+--- no rows answered `{"tasks":{}}` -- and a frontend doing `tasks.map(...)`
+--- gets a TypeError on a response that looked fine to whoever wrote it.
+---
+--- Found by someone writing the guide's frontend page, who could not paste an
+--- honest example: the browser code they were teaching would have crashed on
+--- an empty list, and there was no way at akkar's level to say "array".
+---
+--- Only the EMPTY case is ambiguous -- a table with elements encodes as an
+--- array already -- so this costs nothing on the path that has data, which is
+--- why it is a marker rather than a walk over every response.
+function M.array(value)
+  return setmetatable(value or {}, impl.array_mt)
+end
+
+--- An empty array, ready to return.
+M.empty_array = M.array {}
+
 return M

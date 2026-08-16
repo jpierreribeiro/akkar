@@ -172,31 +172,31 @@ lua5.4 check-db.lua
 ```
 
 ```
-lua5.4: /home/jp/.luarocks/share/lua/5.4/pgmoon/cqueues.lua:18: socket:connect: Connection refused
+lua5.4: db: could not connect to 127.0.0.1:55432 (database "akkar", user "postgres") -- /home/jp/.luarocks/share/lua/5.4/pgmoon/cqueues.lua:18: socket:connect: Connection refused
+  Nothing is listening there. Is the database running?
 stack traceback:
 	[C]: in function 'error'
-	/home/jp/.luarocks/share/lua/5.4/cqueues/socket.lua:90: in function </home/jp/.luarocks/share/lua/5.4/cqueues/socket.lua:75>
-	(...tail calls...)
-	/home/jp/.luarocks/share/lua/5.4/cqueues/socket.lua:271: in method 'connect'
-	/home/jp/.luarocks/share/lua/5.4/pgmoon/cqueues.lua:18: in method 'connect'
-	/home/jp/.luarocks/share/lua/5.4/pgmoon/init.lua:300: in method 'connect'
-	./akkar/db.lua:301: in local 'open'
+	...akkar/db.lua:354: in local 'open'
 	check-db.lua:12: in main chunk
 	[C]: in ?
 ```
 
-Those paths are from the machine this guide was written on. Yours will say
-something else, and the last two lines are the ones that matter: `akkar/db.lua`
-tried to connect, and `check-db.lua:12` is your `open()` call.
+Read the first line from the left. akkar tells you the exact address it tried,
+`127.0.0.1:55432`, and the exact database and user it tried them with. Compare
+those four things against your `docker run` command and against the settings in
+your file. One of them will be different.
 
-This one message is uglier than akkar's usual. Nothing in it names your
-settings or tells you what to check, because the failure happens inside the
-Postgres driver before akkar sees it.
+The middle part, up to `Connection refused`, is the message from the Postgres
+driver underneath. `Connection refused` has a precise meaning: something
+answered at that address and said no, or rather nothing was there to answer at
+all. That is what the second line says in plain words.
 
-`Connection refused` means nothing was listening at that address. Almost always
-one of three things: the container is stopped, the port in your file does not
-match the port in the `docker run` command, or you never ran `docker run` at
-all.
+`check-db.lua:12` is the line in your file that opened the connection. The
+`akkar/db.lua` path will look different on your machine.
+
+Almost always one of three things: the container is stopped, the port in your
+file does not match the port in the `docker run` command, or you never ran
+`docker run` at all.
 
 Start it again before moving on:
 
