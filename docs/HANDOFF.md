@@ -1,295 +1,213 @@
 # Handoff — 16 August 2026
 
-Written at the end of the session that measured the C driver end to end. It
-covers what changed, what is waiting for you, and what the next person should
-point an instrument at.
+For whoever picks this up next, including you in a week. It says what is
+waiting, what changed, what was learned, and what to do — in that order,
+because the first one has a deadline and the rest do not.
+
+Rewritten rather than appended to. The previous version had grown four layers
+of correction blocks over sections that were no longer true, which is
+archaeology and not a handoff. The corrections live in the documents that carry
+the measurements, where somebody reading a number will meet them.
 
 ---
 
-## Do these three things first
+## Waiting on you
 
-1. **Sync your local checkout.** It sits on `main` at `d1e5d45`, one position
-   behind `origin/main` (`48772cc`, your merge of PR #1). Clean fast-forward:
+**1. Merge PR #3** — https://github.com/jpierreribeiro/akkar/pull/3 — twelve
+commits, MERGEABLE, 1,696 tests passing. This session does not merge to `main`.
 
-   ```sh
-   cd ~/Desktop/akkar && git pull --ff-only origin main
-   ```
+**2. Sync your checkout.** It is on `main` at `d1e5d45`; `origin/main` is at
+`f15d6fa`.
 
-2. **Merge PR #2** — https://github.com/jpierreribeiro/akkar/pull/2 —
-   three commits, MERGEABLE, 1,661 tests passing. It carries the driver
-   measurement, a real 408 defect it uncovered, and the framework comparison
-   redone. Merging is yours to do; this session does not merge to `main`.
+```sh
+cd ~/Desktop/akkar && git pull --ff-only origin main
+```
 
-3. **The EC2 is running and billing.** `100.48.219.220`, quiet, fully
-   provisioned. Stop it if you are done, or leave it up — the memory says you
-   want it up, so it was left up.
-
-Also still live: the Railway service `akkar-deploy-test`, from an earlier
-session, still costing money.
+**3. Two things are billing.** The `c5.2xlarge` at `100.48.219.220` has been up
+27 hours and is idle. The Railway service `akkar-deploy-test` is still live from
+an earlier session. Neither is in use.
 
 ---
 
-## What this session established
+## Where the project stands
 
-### The question that started it
+**1,696 tests, 0 failures, 0 pending**, verified on a shell with `LUA_PATH` and
+`LUA_CPATH` unset — the shape that catches path assumptions.
 
-*"Our performance, comparison and benchmark tests never measured with the new
-driver, right?"* — correct, and wider than the question. `driver = "pq"` is
-opt-in, and **no benchmark server in this repository ever passed it.** The
-comparison against Gin and FastAPI, the saturation sweep and the eight-hour
-soak all ran pgmoon. The one measurement that used the C driver ran it in
-isolation — one connection, one query at a time — and on a laptop rather than
-the study machine, so it was not comparable with anything else either.
+`main` is `0.1.0`. The framework works; what the last two days changed is how
+much of it is *known* rather than believed.
 
-Both gaps were already written down, in `bench/driver/RESULTS.md` §4 and in the
-study's "What this does NOT prove". Writing a gap down is not closing it.
+### The runtime has a first minute
 
-### The driver, measured end to end
-
-`bench/driver/RESULTS.md` §5, on the study `c5.2xlarge`:
-
-| route | pgmoon | akkar.pq | ratio |
-|---|---:|---:|---:|
-| `/ping` @100 | 19,241 | 19,392 | 1.01x — the control |
-| `/users/42` @16 | 7,040 | 8,969 | 1.27x |
-| `/rows/100` @16 | 2,392 | 5,031 | 2.10x |
-| `/rows/1000` @16 | 333 | 928 | 2.79x |
-| `/rows/1000` @100 | 322 | 861 | 2.68x |
-
-p99 under saturation: **1.3 s → 475 ms**.
-
-A published prediction failed. §3 of that page said the driver would not move
-`/users/:id`, because one row was OVERLAPPING in isolation. It moves 1.27x and
-separates. §3 is kept as written, with a pointer to the score.
-
-The direction is the interesting part: the advantage is **larger** through a
-whole request (1.27x) than over a bare query (1.09x), which is backwards from
-dilution. The hypothesis on offer — labelled as one, because nothing here
-isolates it — is that one thread per process means driver CPU is not paid by
-the request that spends it. Concurrency multiplies driver cost instead of
-diluting it.
-
-### The comparison, with the driver in the table
-
-`bench/study/RESULTS.md` §2.1. `/rows/200` at 16 connections:
-
-```
-gin              7206.08     1.99ms     7.04ms     1.00x
-fastapi           880.59    17.92ms    23.94ms     0.12x
-akkar            1425.37    10.72ms    18.56ms     0.20x
-akkar-pq         3482.56     4.57ms     6.53ms     0.48x
+```sh
+akkar new my-api
+cd my-api
+akkar run
+curl localhost:8080/health     # {"ok":true}
 ```
 
-A fifth of Gin becomes about half of it; 1.6x FastAPI becomes 3.95x. The p99
-lands under Gin's own — the first row in the study where akkar's tail is not
-the worse one. `/ping` does not move, which is what says the driver variable is
-not leaking into the framework path.
+`new`, `run` and `test` joined `doctor`, `watch`, `build`, `archive` and
+`version`. All of them read one shape: a file that **returns** the app,
+optionally with its config. `spec/cli_spec.lua` spawns the real CLI, because
+the value of a scaffold is entirely in whether the thing it emits runs.
 
-The pgmoon rows also **reproduced section 2 a day later** on the same box: Gin
-7,194 → 7,206, FastAPI 880 → 881, akkar 1,450 → 1,425. That agreement is worth
-as much as the new row.
+### The C driver has no objection left against it
 
-### Defects found, all with running proofs
+`akkar.pq` is **1.27x on a single row, 2.79x on a thousand**, with p99 under
+saturation falling from 1.3 s to 475 ms. It returns byte-identical rows.
+
+The consistency objection that kept it off has been **withdrawn** — see
+"What was wrong" below. The default is still pgmoon, for a packaging reason
+nobody had stated: the C half is a separate rock, so a default of `pq` would
+fail at the first query for anyone who installed only `akkar`.
+
+```sh
+luarocks install akkar-pq PQ_INCDIR=$(pg_config --includedir)
+```
+
+Install it, pass `driver = "pq"`, and use it.
+
+### The gap against Gin is attributed, not quoted
+
+All at two cores, same 13 bytes:
+
+| layer | req/s | µs of CPU per request |
+|---|---:|---:|
+| cqueues, no parsing | 169,960 | 11.5 |
+| **a real HTTP server in pure Lua** | **171,330** | **11.7** |
+| lua-http | 34,173 | 58.5 |
+| akkar `/ping` | 19,408 | 103.0 |
+| Gin, same CPU | 101,584 | 19.7 |
+
+**It is not the language.** A hand-written HTTP server in PUC Lua 5.4 runs at
+1.69x Gin. akkar's 103 µs is cqueues 11%, **lua-http 46%**, akkar's own code
+43% — and the collector is at most 3.5% of it.
+
+`bench/study/WHERE-THE-GAP-IS.md`.
+
+---
+
+## What was wrong, and is not any more
+
+Nine defects, and the ones that matter were not found by reading.
 
 | what | how it was found |
 |---|---|
-| `timeout = 0` answered **408 to every request**, including a GET with no body | the comparison harness refusing to publish a number for a server answering errors |
-| Two specs spawned a child `lua5.4` and trusted `LUA_PATH`, producing ten false failures that blamed the code under test | running the suite on a shell where luarocks is per-user |
-| `bench/study/apps/serve.lua` could not select a driver, and did not set `package.cpath` for the C module | building the measurement |
-| The `timeout` reference never documented that `0` disables the deadline | checking a claim before publishing it |
+| **`app:mount` discarded the mounted app's middleware** — a protected route answered 200 with no credential | porting a real service |
+| **Webhook signatures were impossible** — the raw body was decoded and thrown away | porting a real service |
+| `timeout = 0` answered **408 to every request**, including a GET with no body | a benchmark gate refusing to publish a number |
+| A misspelled schema constraint validated **nothing**, silently | porting a real service |
+| `v.integer` returned a float from JSON and an integer from a query string | porting a real service |
+| The retry schedule every webhook system uses could not be expressed | porting a real service |
+| Sub-second retry delays did not exist, quantising the jitter that prevents a thundering herd | a probe misbehaving |
+| A 4% throughput regression, from three allocations added to a hot path | a peer framework reproducing to 0.2% in the same table |
+| Invalid UTF-8 echoed into JSON responses | pointing hostile bytes at it |
 
-The 408 is the one to remember. `spec/slow_body_spec.lua` is the file that
-introduced the body-read budget and tests it carefully — with `0.5` and with
-`2`. **The value that turns the feature off was never sent through the
-feature.** In Lua `0` is true, so `budget and (...)` turned "no deadline" into
-"a deadline of right now".
+Two of those are security defects and both were sitting in the open-items list
+wearing the label "ergonomic".
 
----
+### And two things this session believed and had to withdraw
 
-## The state of things
+**The C driver is less consistent than pgmoon.** It is not. Re-measured at the
+configuration the claim came from, it is 1.8% spread with zero anomalous
+windows against a published 21.4% and two. The raggedness that does reproduce
+is `SO_REUSEPORT` splitting few connections across processes, and it hits
+**pgmoon harder**. `bench/driver/ANOMALY.md` carries all four experiments,
+including the checkpoint hypothesis that looked decisive at n=1 and died when
+it was forced.
 
-- **1,661 tests passing**, 0 failures, 0 pending, verified on a shell with
-  `LUA_PATH`/`LUA_CPATH` unset.
-- `main` is `0.1.0`. PR #2 is the next merge.
-- The default driver is **still pgmoon**, deliberately — see below.
-
-### Why the default did not move
-
-> **CORRECTED.** The reasoning below was investigated and did not survive:
-> `akkar.pq` is **not** less consistent than pgmoon. Re-measured at the same
-> configuration it comes back at 1.8% spread with zero anomalous windows, and
-> the one raggedness that does reproduce is the harness splitting connections
-> across processes — which hits pgmoon harder. `bench/driver/ANOMALY.md`.
->
-> The default still does not move, for a reason nobody had stated: the C half
-> is a **separate rock**, so a default of `pq` would fail at the first query for
-> anyone who installed only `akkar`. Packaging, not judgement.
-
-The C driver is faster **and less consistent**. Across thirty ten-second
-windows, pgmoon held 0.9%–3.5% spread on every route and produced zero
-anomalous windows. `akkar.pq` produced two, on routes whose spread was 21.4%
-and 14.2%. In a slow window p50 rose along with p99, so the whole window was
-slower rather than one request hanging in it.
-
-No explanation has been measured. It is not row-count dependent — `/rows/10`
-sits between the two affected routes and is clean. It never happened to pgmoon
-on the same box in the same alternating runs.
-
-A driver becomes the default by proving itself, and an unexplained
-intermittent loss of its entire advantage is not proof.
+**A run was discarded for being taken on a busy machine.** It was not busy.
+`/proc/loadavg` on that box reads 2.3 while `vmstat` reports the CPU 100% idle;
+the load average does not decay there. The gate now asks `vmstat`.
 
 ---
 
-## What to do next, and what not to
+## What to do next
 
-> **Superseded in part by `docs/RUNTIME-1.0.md`**, which reframes the project
-> as a backend runtime rather than a framework chasing Gin, prices a LuaJIT
-> spike at about a week, and sets the bar a component must clear to earn a C
-> implementation. The ordering below survives with one change: the LuaJIT
-> experiment moves up, because 91.6 of akkar's 103 µs per request is
-> interpreted Lua and a JIT is the only single change that touches all of it.
+The direction is `docs/RUNTIME-1.0.md`: a small, predictable backend runtime
+whose application language is Lua, not a framework chasing Gin. Ordered by risk
+removed rather than by architectural appeal.
 
+**1. The platform, which is the next piece of work.** `akkar new/run/test` is
+the first mile. What is missing between that and a distribution: automatic
+recipes for native dependencies, cross-compilation and a platform matrix, and
+an `akkar version` that prints the whole lock — Lua, cqueues commit, OpenSSL,
+cjson, driver, target. The product is "Akkar Runtime 1.3 is the supported
+platform", which moves an entire class of issue from the user to release
+engineering.
 
-Asked directly what we should do, after measuring the gap against Gin. The
-answer the measurements support is **not** "chase Gin".
+**2. The LuaJIT spike — one week, decision rule already written.** 91.6 of
+akkar's 103 µs per request is interpreted Lua, and a JIT is the only single
+change that touches all of it while requiring nobody to own anything. The
+port cost is audited: `<close>` in four places, `//` in twelve, `math.type` in
+nine, `table.pack` in ten, `utf8` in three. It comes **before** writing an HTTP
+parser, because its answer decides whether that parser is worth owning.
 
-### Do not rewrite lua-http for speed
+**3. Keep porting.** Three slices done — invoice API, inbound webhook, outbound
+dispatcher — and they produced six of the nine defects above. Untouched: the
+reconciliation cron, disputes, KYC, the IP-allowlisted admin surface. And the
+dispatcher ran against a **fake** HTTP client, so the queue and the retry
+schedule are proved and the transport is not.
 
-It is the largest single line in the `/ping` budget — 47 µs of 103 — and
-replacing it would take akkar from 0.19x of Gin to about 0.35x. That is real,
-and it is the wrong reason to do it, because **`/ping` is the route where
-applications spend the least time.**
-
-On `/rows/200` a request occupies roughly 570 µs of server time. Removing 47 µs
-of substrate is worth at most 8% there. The 2.79x that actually moved
-application performance came from the C driver, not from the framework path.
-
-Rewrite the substrate when there is a reason other than a benchmark: lua-http
-has had no release since September 2024, akkar already carries two
-denial-of-service repairs for it, and `docs/substrate/RESULT.md` plus the
-executable contract exist to make that move a measured step. Speed is the
-bonus, not the case.
-
-### 1. ~~Explain the pq inconsistency, then make it the default~~ — DONE
-
-**There was no inconsistency.** At the exact configuration the claim was
-measured in, `akkar.pq` comes back at 1.8% spread with zero anomalous windows
-against the published 21.4% and two. The one raggedness that reproduces is
-`SO_REUSEPORT` splitting six connections over two processes, and it hits
-**pgmoon harder than pq**. A Postgres checkpoint was the first hypothesis and
-was refuted by forcing it.
-
-The default still does not move, for an unrelated reason: `akkar.pq_native` is
-a separate rock, so a default of `pq` would fail at the first query for anyone
-who installed only `akkar`. What changed is the recommendation — install
-`akkar-pq` and use it.
-
-`bench/driver/ANOMALY.md`. The superseded reasoning follows.
-
-### 1b. The original item
-
-This is the highest return available and most of the work is done. `akkar.pq`
-is **2.79x on a thousand rows** with p99 under saturation falling from 1.3 s to
-475 ms, and it is switched off by default for one unexplained reason: two
-anomalous windows in thirty, where a whole ten-second window ran at pgmoon's
-speed. pgmoon produced zero such windows in the same alternating runs.
-
-Per-request timing over a long run, not per-window throughput — that is the
-only instrument that says whether the window holds one long stall or a hundred
-thousand slightly slower requests. Everything needed is provisioned on the box.
-
-### 2. ~~Put a gate on the hot path~~ — DONE
-
-The allocation ceiling existed and was watching `app:test()`, which never calls
-`app:run` and therefore never touches lua-http, the socket, or the substrate
-repair. It is now also measured over a real socket against a real server, and
-calibrated by proving it fails on the commit it exists for: the old repair
-costs 511 bytes per request, the rewritten one costs zero, and the measurement
-repeats to within two bytes.
-
-### 3. Port a real application
-
-Unchanged as the largest gap, and `docs/UNKNOWNS.md` §10 still says so. Every
-defect this week was found by engineering an exposure — including the 408,
-which a benchmark gate caught, and the 4% regression, which surfaced only
-because a peer framework reproduced to 0.2% in the same table. **None was found
-by anybody using akkar to build something.**
-
-### Cheap things sitting on the table
-
-- **Generational collector**: 2.5% faster, p99 from 7.50 ms to 5.66 ms, 2 MB
-  less memory. Do not flip the default on ten seconds of evidence — the soak
-  that justifies it is the same soak the C driver needs, so run them together.
-- **`PROCS` sizing**: defaulting to physical cores leaves about 15% on the
-  table on any box with SMT. A paragraph in `docs/RUNTIME.md`, not a code
-  change.
+**4. Do not rewrite lua-http for speed.** It is 46% of `/ping` and replacing it
+would take akkar from 0.19x of Gin to about 0.35x — but on a route that touches
+a database a request already costs ~570 µs, so the whole substrate saving is
+worth at most 8%. Rewrite it when the reason is maintenance and
+denial-of-service surface: no release since September 2024, and akkar already
+carries two repairs for it. Speed is the bonus, not the case.
 
 ---
 
-## Instruments still unpointed
+## Instruments nobody has pointed yet
 
-Ranked by what they would actually tell you.
+From `docs/UNKNOWNS.md`, and the list is shorter than it was:
 
-1. **Explain the pq inconsistency.** This is the blocker on the default and the
-   only open question with a clear shape. Per-request timing over a long run,
-   not per-window throughput — that is the only thing that can say whether the
-   window contains one long stall or a hundred thousand slightly slower
-   requests. Everything needed is provisioned on the box.
+- **Platform.** CI is `ubuntu-24.04` and nothing else. This matters more now
+  that the project calls itself a runtime: the promise of a runtime *is* the
+  combination that works, and akkar cannot yet say where it works.
+- **Adversarial security review.** Of the nine defects, two were security
+  failures found by accident. Somebody trying would find more.
+- Infrastructure failure injection, resource exhaustion at the ceiling, scale
+  of *shape* (ten thousand routes, a one-megabyte header), dependency movement,
+  and observability during an incident.
 
-2. **Soak the C driver.** Section 9 of the study is eight hours of pgmoon. The
-   C driver has never run for more than ten seconds at a stretch, and it is the
-   one that allocates less per row — the interesting comparison. `soak.sh` now
-   checks correctness byte-for-byte every sample, so it would catch drift as
-   well as leaks.
-
-3. **Port a real application.** Still the largest gap, and `docs/UNKNOWNS.md`
-   §10 still says so. Every defect this session found was found by engineering
-   an exposure. None was found by use — including the 408, which was found by a
-   benchmark gate, not by anyone running an app.
-
-The remaining lenses in `docs/UNKNOWNS.md` — infrastructure failure injection,
-resource exhaustion at the ceiling, scale of shape, dependency movement,
-observability during an incident, adversarial security review — are unchanged.
-Items 2 and 5 closed this week, along with the clock exposure under item 3.
-
-Smaller open items, listed here rather than in `docs/BACKLOG.md`:
-
-- a job store that fails at first push rather than at construction
-- `docs/DEPLOY.md` not re-run by anything
-- no `env` marker for the documentation runner
-- ~~`app:mount` not running sub-app middleware~~ — **FIXED, and it was not the
-  ergonomic gap this list took it for: it served protected routes to anybody.**
-  `docs/PORT-FINDINGS.md` §1
-- ~~webhook signature verification impossible because the raw body is
-  discarded~~ — **FIXED**, the bytes arrive as `req.raw_body`.
-  `docs/PORT-FINDINGS.md` §5
-
-Two of the five were closed by porting a real service, and both had been sitting
-in this list wearing the wrong label.
+Closed since it was written: correctness over time, hostile encodings, the
+clock, and — started — porting a real application.
 
 ---
 
-## Reproducing the measurements
+## Reproducing anything here
 
-The box has everything: rocks for Lua 5.4, the compiled `pq_native.so`, `wrk`,
-Postgres seeded with 10,000 users and 2,000 bench rows, Gin built and a FastAPI
-venv.
+The `c5.2xlarge` has everything: rocks for Lua 5.4, the compiled
+`pq_native.so`, `wrk`, Postgres seeded with 10,000 users and 2,000 bench rows,
+Gin built and a FastAPI venv.
 
 ```sh
 ssh -i ~/Downloads/colossus.pem ubuntu@100.48.219.220
 eval "$(luarocks --local --lua-version 5.4 path)"
 cd ~/akkar
 
-bash bench/driver/end-to-end.sh                       # driver, both, six targets
-TARGETS="/users/42:16:4" REPS=8 bash bench/driver/end-to-end.sh   # one route, deeper
-bash bench/study/run.sh compare                       # five-way, three targets
+bash bench/study/floors.sh          # where the Gin gap is
+bash bench/study/run.sh compare     # akkar, Gin, FastAPI, both drivers
+bash bench/driver/end-to-end.sh     # pgmoon against akkar.pq
+bash bench/driver/distribution.sh   # why the "inconsistency" was the harness
+bash bench/study/regression.sh <ref> HEAD   # did akkar get slower?
 ```
 
-Two things that are easy to get wrong and cost a run each:
+Three ways to waste a run, each of which cost one:
 
 - **`luarocks` on Ubuntu defaults to Lua 5.1.** Rocks installed without
   `--lua-version 5.4` build against 5.1 and die on `luaL_register`.
-- **Never measure on the laptop.** It ran at load 4 from an ordinary browser
-  session. A contaminated benchmark does not fail, it produces a clean curve of
-  wrong numbers — which is what the CORRECTION block at the top of
-  `bench/driver/RESULTS.md` is about.
+- **Never measure on the laptop.** It runs at load 4 from an ordinary browser
+  session, and a contaminated benchmark does not fail — it produces a clean
+  curve of wrong numbers.
+- **`/proc/loadavg` is not an instrument on the study box.** Ask `vmstat`.
+
+---
+
+## The port lives outside this repository
+
+`~/Desktop/escrow-akkar/` — three slices of a private escrow service, ported to
+akkar. It stays out of the public repo because the business logic is somebody's
+and akkar is public. What comes back here is the defects, in
+`docs/PORT-FINDINGS.md` and `spec/port_findings_spec.lua`.
