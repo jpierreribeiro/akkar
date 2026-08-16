@@ -33,8 +33,52 @@ function Pool.new(open, size, reusable)
     reusable = reusable,
     idle = {},
     live = 0,
+    -- Slots taken by a coroutine that is still inside `open`. Weak keys: an
+    -- abandoned coroutine is unreferenced by anything else, so a collection
+    -- takes its reservation with it. See `Pool:reap`.
+    opening = setmetatable({}, { __mode = "k" }),
+    reaped = 0,
     waiters = condition.new(),
   }, Pool)
+end
+
+--- How many slots are held by opens still in flight.
+function Pool:reserved()
+  local n = 0
+  for _ in pairs(self.opening) do n = n + 1 end
+  return n
+end
+
+--- Recovers slots reserved by coroutines nobody will ever resume.
+---
+--- An abandoned coroutine is SUSPENDED, not dead, so `coroutine.status` says
+--- nothing useful about it. What distinguishes it is that nothing references
+--- it any more -- the deadline dropped it -- so it is exactly what a
+--- collection removes, and the weak table is what turns that into an answer.
+---
+--- Called on demand, when the pool looks full, rather than left to whenever
+--- the collector happens to run. That distinction is not theoretical here:
+--- this project has already measured a case where descriptors came back only
+--- with the collector, which tied a hard operating-system limit to the pace of
+--- the garbage collector.
+function Pool:reap()
+  local before = self:reserved()
+  if before == 0 then return 0 end
+
+  -- TWICE, and the number is measured rather than defensive. An abandoned
+  -- handler is held by its `cqueues` controller, and the controller has a
+  -- finalizer: the first collection runs that finalizer, which is what
+  -- finally drops the coroutine, and only the second collects it. Counted
+  -- directly -- one collection left the weak entry in place, two removed it.
+  collectgarbage()
+  collectgarbage()
+
+  local freed = before - self:reserved()
+  if freed > 0 then
+    self.reaped = self.reaped + freed
+    self.waiters:signal()
+  end
+  return freed
 end
 
 function Pool:get()
@@ -46,24 +90,48 @@ function Pool:get()
       return resource
     end
 
-    if self.live < self.size then
-      self.live = self.live + 1
+    -- THE SLOT IS RESERVED, NOT SPENT, WHILE `open` RUNS.
+    --
+    -- `open` yields: it connects a socket, and on Postgres it authenticates
+    -- and sets `statement_timeout` besides. A deadline landing anywhere in
+    -- there abandons the coroutine, and `live` was already incremented -- so
+    -- the slot was gone for the life of the process. The recovery below the
+    -- old `pcall` only ever covered an error that was RAISED, and an
+    -- abandoned coroutine raises nothing; it simply never comes back.
+    --
+    -- Counting reservations separately means a slot in that state is
+    -- recoverable rather than lost, and `live` goes back to meaning what it
+    -- says: resources that exist.
+    if self.live + self:reserved() < self.size then
+      local co = coroutine.running()
+      if co then self.opening[co] = true end
+
       local ok, resource_or_err = pcall(self.open)
+
+      -- Not reached if the coroutine was abandoned inside `open`, which is
+      -- precisely the state `reap` exists to find.
+      if co then self.opening[co] = nil end
+
       if not ok then
-        -- Give the slot back.  A pool that leaks a slot per failed connection
-        -- wedges permanently once the backend has been down for a moment.
-        self.live = self.live - 1
+        -- A pool that leaks a slot per failed connection wedges permanently
+        -- once the backend has been down for a moment.
         self.waiters:signal(1)
         error(resource_or_err, 0)
       end
+
+      self.live = self.live + 1
       resource_or_err.pool = self
       resource_or_err.pooled = nil
       return resource_or_err
     end
 
-    -- Exhausted.  `condition:wait` yields to the controller; it does not spin
-    -- and it does not block the loop.
-    self.waiters:wait()
+    -- Full. If part of that is a reservation nobody will ever come back for,
+    -- this is where it is found -- before parking, not after a timeout.
+    if self:reap() == 0 then
+      -- Exhausted for real.  `condition:wait` yields to the controller; it
+      -- does not spin and it does not block the loop.
+      self.waiters:wait()
+    end
   end
 end
 
@@ -114,10 +182,17 @@ function Pool:close()
     pcall(function() resource:close() end)
   end
   self.idle, self.live = {}, 0
+  self.opening = setmetatable({}, { __mode = "k" })
 end
 
+--- `live` is resources that EXIST; `reserved` is slots held by an open still
+--- in flight. Two numbers because a pool reporting one total cannot say
+--- whether it is busy or stuck.
 function Pool:stats()
-  return { size = self.size, live = self.live, idle = #self.idle }
+  return {
+    size = self.size, live = self.live, idle = #self.idle,
+    reserved = self:reserved(), reaped = self.reaped,
+  }
 end
 
 return Pool

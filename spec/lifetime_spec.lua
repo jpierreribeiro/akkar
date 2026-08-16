@@ -141,6 +141,78 @@ describe("a streamed response", function()
   end)
 end)
 
+describe("a slot reserved by an open that never finished", function()
+  -- `open` yields: it connects a socket, and on Postgres it authenticates and
+  -- sets `statement_timeout` besides. `live` used to be incremented BEFORE
+  -- that call, and the recovery underneath it only ran when the open RAISED.
+  -- An abandoned coroutine raises nothing -- it simply never comes back -- so
+  -- a deadline landing inside `open` took a slot out of the pool for the life
+  -- of the process. A pool of ten dies after ten such events.
+
+  local function parked_pool()
+    -- An `open` that never returns within the test.
+    return Pool.new(function()
+      cqueues.sleep(60)
+      return { close = function() end }
+    end, 1)
+  end
+
+  it("reserves the slot rather than spending it", function()
+    local pool = parked_pool()
+    local cq = cqueues.new()
+    cq:wrap(function() pool:get() end)
+    cq:step(0.05)
+
+    local stats = pool:stats()
+    assert.equal(1, stats.reserved, "an open in flight did not reserve a slot")
+    assert.equal(0, stats.live, "`live` counted a resource that does not exist yet")
+  end)
+
+  it("gives the slot back once nobody can come back for it", function()
+    local pool = parked_pool()
+
+    -- The controller and its coroutine go out of scope here, which is exactly
+    -- what a fired deadline does: it stops referencing the handler and moves
+    -- on. Nothing else holds the coroutine afterwards.
+    do
+      local cq = cqueues.new()
+      cq:wrap(function() pool:get() end)
+      cq:step(0.05)
+      assert.equal(1, pool:stats().reserved)
+    end
+
+    assert.equal(1, pool:reap(), "the abandoned reservation was not recovered")
+    assert.equal(0, pool:stats().reserved)
+    assert.equal(1, pool:stats().reaped, "the recovery was not counted")
+  end)
+
+  it("lets a later request through instead of parking for ever", function()
+    -- The point of the whole thing: after the abandonment, the pool of one
+    -- must still be able to serve somebody.
+    local opened = 0
+    local pool
+    pool = Pool.new(function()
+      opened = opened + 1
+      if opened == 1 then cqueues.sleep(60) end     -- the abandoned one
+      return { close = function() end }
+    end, 1)
+
+    do
+      local cq = cqueues.new()
+      cq:wrap(function() pool:get() end)
+      cq:step(0.05)
+    end
+
+    local served
+    local cq = cqueues.new()
+    cq:wrap(function() served = pool:get() ~= nil end)
+    assert(cq:loop(5))
+
+    assert.is_true(served, "the pool never recovered the abandoned slot")
+    assert.equal(1, pool:stats().live)
+  end)
+end)
+
 describe("a response the handler reuses", function()
   it("is never stamped with the request that happened to return it", function()
     -- `x-request-id` and the traceparent were written onto whatever table the
