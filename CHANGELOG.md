@@ -1,13 +1,12 @@
 # Changelog
 
-akkar has not been released yet. Everything below is `Unreleased`, and the
-version number is deliberately not chosen here — see **Choosing the first
-number** at the bottom.
+The first release is `0.1.0`, tagged 16 August 2026. The reasoning for that
+number rather than `1.0.0` is at the bottom and has not changed.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/). Dates are
 the day the work landed on `main`.
 
-## Unreleased
+## 0.1.0 — 2026-08-16
 
 ### Added
 
@@ -86,6 +85,28 @@ as data.
 that did not say which port, and `req.body` being nil producing only "attempt
 to index a nil value". Both found by writing documentation for beginners.
 
+**Five defects found by people reading the source to document it**, none of
+which a test had caught:
+
+- **The idempotency fingerprint differed between processes.** It hashed
+  `cjson.encode(body)`, and cjson walks a Lua table in hash order with a
+  per-process seed — twelve processes produced twelve fingerprints for one
+  body. In a fleet sharing one Redis, a retry landing on another worker was
+  answered 422 "already used for a different request": the module refusing the
+  honest retry it exists to make safe. Canonical now, and whole floats are
+  normalised so `7` and `7.0` are the same request.
+- **`Queue:consume` spun instead of waiting** when the store was told not to
+  block. Against Redis it never showed, because `BRPOP` waits server-side and
+  yields; against the in-memory store the loop had nothing to yield to and took
+  a whole core, and the server sharing the process stopped answering.
+- **The job stores dropped every option.** `memory.new("emails", { retries = 3 })`
+  produced a queue with `retries = 0` in silence, because the constructors
+  never forwarded options to `jobs.new`.
+- **`Registry:gauge` raised on every labelled call**, so the metrics renderer
+  carried complete label support that could not be reached.
+- **`akkar.limit.rate` throttled health checks**, so twelve probes answered 429
+  and an orchestrator restarted a healthy process.
+
 **Jobs, pools and capabilities**, from an earlier audit: a capability leaked on
 write failure, a Redis socket leak, job destruction from a non-atomic
 `ZREM`/`LPUSH`, a pool whose `live` count could go negative, and an
@@ -136,15 +157,14 @@ Stated rather than discovered:
 - **`akkar.pq` is opt-in**; pgmoon remains the default until a soak says
   otherwise.
 
-## Choosing the first number
-
-This is the one decision in this file that is not mine to make, so it is
-written as a recommendation rather than as an entry.
+## Why 0.1.0 and not 1.0.0
 
 **`0.1.0` is the honest number.** Not `1.0.0`: that promises the API will not
 break, and several things here are two days old and have never been used by
 anybody outside this repository. Not `0.0.1` either — that reads as a sketch,
-and 874 tests, a soak and a measured deployment are past a sketch.
+and 1,619 passing tests -- 603 of them documentation examples that are
+executed rather than read -- an eight-hour soak and a measured deployment
+are past a sketch.
 
 What `0.1.0` commits to, and what it should say in the release notes:
 
@@ -153,6 +173,30 @@ What `0.1.0` commits to, and what it should say in the release notes:
 - the substrate repairs are carried until upstream moves.
 
 `1.0.0` is worth waiting for one thing in particular: **a real application
-built on this by somebody who did not write it.** Every gap found this session
-was found by engineering exposure rather than by use, and the ones use finds
-are the ones nobody plans for.
+built on this by somebody who did not write it.** Every gap found so far was
+found by engineering exposure rather than by use, and the ones use finds are
+the ones nobody plans for.
+
+The evidence for that is a few hours old. Four people were sent to write
+documentation by reading the source, and they found **five defects in code
+carrying a thousand passing tests** — an idempotency fingerprint that differed
+between processes, a job consumer that spun instead of waiting, job stores
+that dropped every option they were given, a metrics gauge that raised on
+every labelled call, and a rate limiter that throttled health checks into a
+restart loop. None of those was found by a test. All of them were found by
+somebody trying to use the thing and write down what happened.
+
+`docs/UNKNOWNS.md` lists the instruments that have not been pointed at akkar
+yet. A version number promising stability, published before those, would be
+promising something nobody has checked.
+
+### What 0.1.0 does and does not promise
+
+- **Does:** everything in this file is measured or corrected, never asserted.
+  1,619 tests pass, 603 of them documentation examples that are executed. Eight hours of
+  soak show no memory drift. It builds and passes on Linux x86-64 and on
+  aarch64/musl.
+- **Does not:** promise a stable API. It will change, and changes will be
+  listed here.
+- **Untested, and named rather than implied:** macOS, Windows, 32-bit, and
+  every platform outside Linux. See `docs/UNKNOWNS.md`.

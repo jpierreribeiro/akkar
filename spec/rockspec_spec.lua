@@ -18,7 +18,19 @@ a rock that silently does not contain it.
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
-local ROCKSPEC = "akkar-dev-1.rockspec"
+-- BOTH ROCKSPECS, and the release one is why.
+--
+-- `akkar-dev-1.rockspec` tracks the branch and is what a contributor installs
+-- dependencies from. `akkar-0.1.0-1.rockspec` pins a tag and is what a user
+-- installs. They declare the same modules, and a module added to one and not
+-- the other means `luarocks install akkar` ships a package missing a file
+-- while the development install works perfectly -- which nobody here would
+-- ever notice.
+--
+-- So every check in this file runs against both, and one more check compares
+-- them to each other.
+local ROCKSPECS = { "akkar-dev-1.rockspec", "akkar-0.1.0-1.rockspec" }
+local ROCKSPEC = ROCKSPECS[1]
 
 local function read(path)
   local file = assert(io.open(path, "r"), "cannot read " .. path)
@@ -114,5 +126,56 @@ describe("the rockspec", function()
     -- on Homebrew, and under 5.5 it is simply not there.
     local shebang = read("bin/akkar"):match "^[^\n]*"
     assert.equal("#!/usr/bin/env lua", shebang)
+  end)
+end)
+
+describe("the release rockspec", function()
+  local function load_one(path)
+    local env = {}
+    local ok = pcall(function()
+      local f = load(io.open(path):read "a", "@" .. path, "t", env)
+      f()
+    end)
+    assert(ok, "could not load " .. path)
+    return env
+  end
+
+  it("declares exactly the same modules as the development one", function()
+    -- A module in one and not the other means `luarocks install akkar` ships
+    -- a package missing a file while the development install is fine. The
+    -- person who finds that is a stranger, and they find it as a require
+    -- error.
+    local dev = load_one "akkar-dev-1.rockspec"
+    local rel = load_one "akkar-0.1.0-1.rockspec"
+
+    local missing, extra = {}, {}
+    for name in pairs(dev.build.modules) do
+      if not rel.build.modules[name] then missing[#missing + 1] = name end
+    end
+    for name in pairs(rel.build.modules) do
+      if not dev.build.modules[name] then extra[#extra + 1] = name end
+    end
+    table.sort(missing) table.sort(extra)
+
+    assert.equal(0, #missing,
+      "in the development rockspec and not the release: " ..
+      table.concat(missing, ", "))
+    assert.equal(0, #extra,
+      "in the release rockspec and not the development one: " ..
+      table.concat(extra, ", "))
+  end)
+
+  it("pins a tag, because a release must not track a branch", function()
+    -- `luarocks install` from a moving branch gives two people different code
+    -- under one version number.
+    local rel = load_one "akkar-0.1.0-1.rockspec"
+    assert.is_string(rel.source.tag, "the release rockspec has no tag")
+    assert.equal("v" .. rel.version:match "^([^-]+)", rel.source.tag)
+  end)
+
+  it("carries a version that is not `dev`", function()
+    local rel = load_one "akkar-0.1.0-1.rockspec"
+    assert.is_truthy(rel.version:match "^%d+%.%d+%.%d+%-%d+$",
+      "unexpected version string: " .. tostring(rel.version))
   end)
 end)
