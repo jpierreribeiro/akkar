@@ -1,0 +1,41 @@
+# What the build context does NOT need.
+#
+# The Dockerfile does `COPY . /build/app` for the application's own modules,
+# so everything not excluded here is uploaded to the daemon on every build.
+# The measured effect of this file is in `docs/DEPLOY.md`: the context drops
+# from megabytes to kilobytes, which is most of the difference between a
+# `docker build` that starts instantly and one that pauses first.
+
+.git
+.github
+
+# Build outputs and anything already compiled for THIS machine. `pq_native.so`
+# is the sharp one: it is a glibc x86-64 shared object built by src/build.sh,
+# and copying it into a musl builder would put a silently unloadable .so where
+# something might later look for it.
+*.so
+*.o
+*.a
+akkar-app
+
+# Test and benchmark machinery. `bench/` is deliberately Linux-only shell that
+# expects docker, sudo and a reserved machine -- the rockspec already drops it
+# from an installed rock for the same reason.
+spec
+bench
+.busted
+
+# Documentation. `docs/DEPLOY.md` describes this image; it does not belong
+# inside it.
+docs
+README.md
+LICENSE
+types
+
+# Scratch files from verification runs.
+.dbtest.lua
+.migtest.lua
+
+# Local editor and OS noise.
+.DS_Store
+*.swp

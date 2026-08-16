@@ -32,10 +32,24 @@ describe("akkar.crypto", function()
       -- The failure this catches: someone swapping `openssl.rand` for
       -- `math.random` because it was simpler. A seeded `math.random` produces
       -- the same sequence twice, and a session id from it is guessable.
+      --
+      -- THE SEED IS PUT BACK, and the first version of this test did not do
+      -- that. `math.randomseed` is process-global, so leaving it fixed at 42
+      -- made every later spec deterministic -- and `spec/jobs_spec.lua` draws
+      -- its idempotency keys with `math.random`, so on the next run it drew
+      -- the SAME key, the second push was refused as a duplicate of the first
+      -- run's job, and a passing test went red for a reason that had nothing
+      -- to do with it.
+      --
+      -- This project has paid for this exact mistake before: `fuzz_spec`
+      -- seeded the global generator and poisoned key isolation in three later
+      -- specs. Reintroducing it here is why the note is this long.
       math.randomseed(42)
       local first = crypto.token(16)
       math.randomseed(42)
       local second = crypto.token(16)
+      math.randomseed()          -- back to an OS-derived seed, for everyone else
+
       assert.are_not.equal(first, second,
         "tokens repeat when Lua's PRNG is reseeded, so they come from it")
     end)

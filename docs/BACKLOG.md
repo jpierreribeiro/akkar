@@ -746,7 +746,7 @@ Written down because the list keeps trying to grow.
 
 | Not building | Why |
 |---|---|
-| ORM, migrations, templating, HTML, admin, scaffolding | Out of scope in `PLAN.md` §1, permanently. |
+| ORM, ~~migrations~~, templating, HTML, admin, scaffolding | Out of scope in `PLAN.md` §1, permanently — **except migrations, and that exclusion is retracted.** It was grouped with the ORM and it does not belong there: an ORM is an opinion about modelling, which akkar refuses, while a migration runner is a ledger of applied files and a lock, with no opinion about a schema at all. And `akkar build` produces a binary whose whole promise is "copy it to a server" — a binary that cannot bring its own schema forward has an incomplete promise. Built as `akkar/migrate.lua`; see `docs/ROADMAP.md` §2.1. |
 | Adapters for payments, storage, mail | Past "JSON API framework". Own the contract, let libraries implement. |
 | ~~`akkar build` producing a self-contained binary~~ | **Retracted — the reason was wrong.** It read "Redbean is a *different substrate*, and `cqueues` is a C module. That is a substrate change, not a packaging step." True of Redbean, and it does not follow for a C module: static linking changes no substrate. Measured since — cqueues runs an event loop inside a single 1.5 MB binary. See `docs/RUNTIME.md`. |
 | ~~CI, docs site, semantic versioning, compatibility policy, ADRs~~ | **Retracted with the audience.** These were excluded because "the audience is my own use". The audience changed; see `docs/PLAN.md` §1. |
