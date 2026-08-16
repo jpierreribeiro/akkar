@@ -262,9 +262,16 @@ function M.new(options)
     local binding = options.bind and options.bind(req)
                     or cookies[settings.session_cookie] or ""
 
-    local applies = options.applies and options.applies(req)
-                    or (options.applies == nil and
-                        cookie_authenticated(req, cookies, settings))
+    -- Written as an `if` rather than as an `and`/`or` chain because the chain
+    -- gets this wrong: `options.applies(req)` returning false would fall
+    -- through to the `or` and re-enable the built-in test, so an application
+    -- that carefully exempted a route would find it protected anyway.
+    local applies
+    if options.applies then
+      applies = options.applies(req) and true or false
+    else
+      applies = cookie_authenticated(req, cookies, settings)
+    end
 
     if not SAFE[req.method] and applies then
       local from_cookie = cookies[settings.cookie]
