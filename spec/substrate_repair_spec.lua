@@ -101,6 +101,25 @@ describe("substrate repair", function()
       -- The control. Without it, the four tests above prove only that the
       -- server survives today, not that this module is why.
       local stop, port = raw.start(8420, "repair_substrate = false,")
+
+      -- CLEANUP IN `finally`, AND THE FIRST VERSION PUT IT ON THE LAST LINE.
+      --
+      -- This test deliberately wedges a server -- that is the whole point of
+      -- it -- and a wedged lua-http server does not sit idle, it SPINS. So a
+      -- `stop()` at the bottom of the function is cleanup that never runs
+      -- whenever an assertion above it fails, and each such run leaves a
+      -- process burning a core for ever.
+      --
+      -- Found by looking at the machine, not by looking at the code:
+      -- twenty-two of them, five hours old, load average 23. They had been
+      -- running underneath the driver benchmark, which is why
+      -- `bench/driver/RESULTS.md` had to be re-measured.
+      --
+      -- A test that leaks is bad. A test that leaks a spinning process while
+      -- benchmarks run on the same machine corrupts other people's numbers,
+      -- which is worse and much harder to trace back.
+      finally(function() if stop then stop() end end)
+
       assert.is_truthy(stop, "the server did not start: " .. tostring(port))
 
       local ok_before = raw.send(port, WELL_FORMED, 3)
@@ -113,8 +132,6 @@ describe("substrate repair", function()
         "the unrepaired server answered, so this spec is no longer testing " ..
         "anything -- check whether lua-http has fixed it upstream, and if it " ..
         "has, retire akkar.substrate rather than editing this line")
-
-      stop()
     end)
   end)
 end)

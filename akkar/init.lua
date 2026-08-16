@@ -1124,8 +1124,33 @@ local function dispatch(app, req)
     -- Response-as-error: a deep layer can signal HTTP without threading a
     -- return value back through every frame.
     if is_response(result) then return result end
+    -- THE ONE ERROR THAT DID NOT NAME ITS FIX.
+    --
+    -- Writing the beginner guide surfaced it. A handler doing `req.body.title`
+    -- on a request that carried no body raises `attempt to index a nil value
+    -- (field 'body')` -- true, useless, and the first thing anybody hits.
+    -- Every other message in this project names the mistake and the remedy
+    -- (`req.db is not configured; pass db = ... to app:run{}`); this one named
+    -- neither.
+    --
+    -- The hint is added HERE rather than by making `req.body` a guard object,
+    -- and the reason is worth recording so nobody 'improves' it later: a guard
+    -- is a table, tables are truthy, and `if req.body then` would start taking
+    -- the branch it exists to avoid -- then raising inside it. Worse, a route
+    -- that DOES declare a body schema passes `req.body` to `validate`, which
+    -- would receive a guard instead of nil and raise where it should answer
+    -- 422. Improving the message costs nothing and changes no semantics.
+    local detail = tostring(result)
+    if detail:find("index a nil value (field 'body')", 1, true) then
+      detail = detail ..
+        "\n  req.body is nil because this request carried no body." ..
+        "\n  Declare one on the route -- app:post(path, { body = { ... } }, " ..
+        "handler) -- and akkar will answer 422 before your handler runs, " ..
+        "instead of raising here."
+    end
+
     internal:error("handler raised", {
-      request_id = req.id, at = route.where, detail = tostring(result),
+      request_id = req.id, at = route.where, detail = detail,
     })
     return pending_error(result)
   end
@@ -2048,7 +2073,31 @@ function App:run(config)
     onerror = function(_, _, op, e) internal:warn("transport", { op = op, detail = tostring(e) }) end,
   })
 
-  assert(s:listen())
+  -- THE PORT IS IN THE MESSAGE, because this is the first error a beginner
+  -- meets and the bare assert did not name it.
+  --
+  -- Writing the beginner guide found this: forgetting to stop the previous
+  -- server is the most common mistake anybody makes learning this, and what
+  -- akkar answered was `init.lua:2051: Address already in use` plus a
+  -- traceback -- no port, no suggestion, and a file and line pointing inside
+  -- the framework rather than at anything the reader wrote.
+  --
+  -- Every other error in this project names the mistake and the fix
+  -- (`req.db is not configured; pass db = ... to app:run{}`). This one did
+  -- not, and it is the one most likely to be somebody's first.
+  local listening, listen_error = s:listen()
+  if not listening then
+    local reason = tostring(listen_error)
+    if reason:find("Address already in use", 1, true) then
+      error(("akkar: port %s on %s is already in use.\n  Something else is " ..
+             "listening there -- most often a server from a previous run " ..
+             "that is still going.\n  Stop it, or start this one on another " ..
+             "port with app:run { port = %d }")
+            :format(tostring(port), tostring(host), tonumber(port) + 1), 0)
+    end
+    error(("akkar: could not listen on %s:%s -- %s")
+          :format(tostring(host), tostring(port), reason), 0)
+  end
   local _, bh, bp = s:localname()
   internal:info("listening", {
     url = string.format("%s://%s:%s", config.tls and "https" or "http",

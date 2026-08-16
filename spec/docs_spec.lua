@@ -24,6 +24,10 @@ comment on the line before the fence:
     <!-- docs: server -->     started, expected to keep running, then killed
     <!-- docs: skip -->       neither, and the page must say why in prose
 
+A block that calls `app:run` is treated as `server` without being marked,
+because that is the shape of nearly every example in the guide and a marker
+required on the common case is a marker that gets forgotten.
+
 `no-run` still COMPILES. A snippet that cannot be loaded is a snippet with a
 syntax error in it, and there is no reason to publish one of those whatever it
 demonstrates. `skip` is the only true escape hatch and it should be rare --
@@ -95,7 +99,21 @@ local function lua_blocks(text, path)
         current[#current + 1] = line
       end
     elseif line:match "^%s*```lua" then
+      -- THE MARKER MAY RIDE ON THE FENCE, and that is the preferred spelling.
+      --
+      -- ```lua no-run
+      --
+      -- It sits with the block instead of on the line above it, so it cannot
+      -- drift away from what it describes when somebody inserts a sentence,
+      -- and a reader of the raw markdown sees it without knowing this
+      -- convention exists. GitHub renders the extra word away.
+      --
+      -- The HTML-comment form still works and came first; the guide's authors
+      -- reached for the fence spelling without being told to, which is the
+      -- usual sign of which one is natural.
+      local fence_marker = line:match "^%s*```lua%s+([%w%-]+)"
       current, start_line = {}, line_no
+      if fence_marker then marker = fence_marker end
     else
       local found = line:match "^%s*<!%-%-%s*docs:%s*([%w%-]+)%s*%-%->%s*$"
       if found then marker = found
@@ -147,6 +165,22 @@ describe("the documentation", function()
       total = total + 1
       local where = ("%s:%d"):format(path, block.line)
 
+      -- A BLOCK THAT STARTS A SERVER IS DETECTED, not declared.
+      --
+      -- Requiring `<!-- docs: server -->` above every example that calls
+      -- `app:run` looked tidy and was a trap: the guide's first five pages
+      -- contain sixteen such blocks, every one of them the whole point of its
+      -- page, and forgetting the marker fails the suite with "example did not
+      -- exit" -- which reads like the example is broken when it is correct.
+      --
+      -- A marker that must be remembered on the common case is a marker that
+      -- will be forgotten. So `app:run` means server, and the marker stays as
+      -- an override for the rare block that calls it and is still expected to
+      -- return.
+      if not block.marker and block.code:find("app:run", 1, true) then
+        block.marker = "server"
+      end
+
       if block.marker == "skip" then
         -- Deliberately not executed and deliberately not compiled. The page
         -- has to explain why in its own prose; nothing here can check that.
@@ -156,9 +190,24 @@ describe("the documentation", function()
 
       elseif block.marker == "no-run" then
         it("compiles " .. where, function()
+          -- AS A CHUNK OR AS A VALUE, because `no-run` is used for both.
+          --
+          -- The guide shows `{ id = 1, title = "buy milk" }` on its own to
+          -- explain what a Lua table looks like next to the JSON it becomes.
+          -- That is a VALUE, not a statement, and `load` rejects it -- so the
+          -- first version of this check failed three correct blocks and would
+          -- have pushed whoever hit it into deleting the marker rather than
+          -- the page.
+          --
+          -- Trying it as an expression second keeps the real guarantee: a
+          -- block with a genuine syntax error compiles as neither.
           local chunk, why = load(block.code, "@" .. where)
+          if not chunk then
+            chunk = load("return " .. block.code, "@" .. where)
+          end
           assert.is_truthy(chunk,
-            "a documentation example does not compile:\n  " .. tostring(why))
+            "a documentation example is neither a valid chunk nor a valid " ..
+            "value:\n  " .. tostring(why))
         end)
 
       elseif block.marker == "server" then

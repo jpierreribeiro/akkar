@@ -231,6 +231,24 @@ local function sql_files(dir)
   return found
 end
 
+--- The id at the front of a migration name, as a number.
+---
+--- ORDERING BY STRING WAS A REAL DEFECT, and it is the kind that waits.
+--- Sorting `2_users.sql`, `9_add_index.sql` and `10_add_column.sql` as text
+--- produces **10, 2, 9** -- the tenth migration first -- because `"1" < "2"`.
+--- It stays invisible until the tenth file, which is weeks after anybody
+--- would think to check ordering, and by then the failure looks like a broken
+--- migration rather than a broken sort.
+---
+--- Found by comparing this module against Druse's, which parses the integer.
+--- Zero-padding the names would also work and is worse: it is a convention
+--- nothing enforces, so it holds until the first person writes `10_` instead
+--- of `010_`, and that person is right to expect it to work.
+local function id_of(name)
+  local digits = name:match "^(%d+)[_%-]"
+  return digits and tonumber(digits) or nil
+end
+
 local function read_file(path)
   local file, why = io.open(path, "rb")
   if not file then
@@ -302,6 +320,7 @@ function M.new(db, options)
     db = db,
     dir = options.files and nil or (options.dir or "migrations"),
     literal = literal,
+    lock_timeout = options.lock_timeout or 30,
     ledger = ledger_name(options.table or "akkar_migrations"),
   }, Migrate)
 end
@@ -341,8 +360,7 @@ function Migrate:files()
         checksum = checksum_of(entry.sql),
       }
     end
-    table.sort(out, function(a, b) return a.name < b.name end)
-    return out
+    return M._ordered(out)
   end
 
   for _, path in ipairs(sql_files(self.dir)) do
@@ -354,8 +372,62 @@ function Migrate:files()
       checksum = checksum_of(sql),
     }
   end
-  table.sort(out, function(a, b) return a.name < b.name end)
-  return out
+  return M._ordered(out)
+end
+
+--- Sorts by numeric id and refuses anything ambiguous.
+---
+--- Two refusals, both because the alternative is silence:
+---
+--- A file with no leading id cannot be placed. Falling back to string order
+--- for it would mean the ordering rule changes depending on what is in the
+--- directory, which is worse than either rule alone.
+---
+--- Two files with the SAME id are two migrations that both claim to be third,
+--- and which one runs first is then decided by the filesystem. This is the
+--- single most common way a migration set breaks in a team: two people branch
+--- from the same commit and both write `007_`. Druse's documentation says the
+--- fix out loud -- use a timestamp, not a counter, because two timestamps
+--- cannot collide -- and that advice is repeated in this module's header.
+--- Detecting the collision is what makes the advice actionable rather than
+--- something you read after the incident.
+function M._ordered(entries)
+  local by_id, missing, duplicates = {}, {}, {}
+
+  for _, entry in ipairs(entries) do
+    local id = id_of(entry.name)
+    if not id then
+      missing[#missing + 1] = entry.name
+    else
+      entry.id = id
+      if by_id[id] then
+        duplicates[#duplicates + 1] = ("%d (%s and %s)")
+          :format(id, by_id[id], entry.name)
+      else
+        by_id[id] = entry.name
+      end
+    end
+  end
+
+  if #missing > 0 then
+    table.sort(missing)
+    error("akkar.migrate: these files have no leading id, so there is no " ..
+          "order to run them in: " .. table.concat(missing, ", ") ..
+          "\n  name them like `20260816120000_add_users.sql` -- a timestamp " ..
+          "rather than a counter, because two people branching from the same " ..
+          "commit both pick 007 and two timestamps cannot collide", 0)
+  end
+
+  if #duplicates > 0 then
+    table.sort(duplicates)
+    error("akkar.migrate: two migrations share an id, so which runs first is " ..
+          "up to the filesystem: " .. table.concat(duplicates, "; ") ..
+          "\n  this is what happens when two branches both pick the next " ..
+          "counter; renaming one to a timestamp fixes it for good", 0)
+  end
+
+  table.sort(entries, function(a, b) return a.id < b.id end)
+  return entries
 end
 
 --- What the ledger says has run, oldest name first.
@@ -418,7 +490,47 @@ function Migrate:apply()
   -- configured with a request-sized timeout will cancel this wait -- and will
   -- cancel a long migration too. Hand `migrate` a connection opened without
   -- one.
-  self.db:one("select pg_advisory_lock($1)", LOCK_KEY)
+  -- A BOUNDED WAIT, which is neither of the two obvious answers.
+  --
+  -- Blocking for ever is what this did first, and it is wrong in the way that
+  -- only shows up at 3am: a lock left held by a crashed runner, or a
+  -- migration that is genuinely taking twenty minutes, turns every subsequent
+  -- deploy into a process that hangs with no output. Nothing times out,
+  -- nothing logs, and the orchestrator eventually kills a container that
+  -- looked healthy the whole time.
+  --
+  -- Druse takes the other answer -- `pg_try_advisory_lock`, refuse
+  -- immediately -- with the argument that multiple deploys should not queue
+  -- silently. That is right about the silence and wrong about the queueing:
+  -- a rolling deploy starts several instances ON PURPOSE, and all but one of
+  -- them finding the lock busy is the NORMAL case, not an incident. Failing
+  -- them means a healthy deploy needs a retry loop somewhere else.
+  --
+  -- So: wait, but not for ever, and say so when the wait runs out.
+  -- `lock_timeout` rather than `statement_timeout` because it bounds only the
+  -- wait for a lock and leaves a long migration alone once it starts -- which
+  -- is exactly the split wanted here, and is why `statement_timeout` is the
+  -- wrong knob and is documented above as something to keep off this
+  -- connection entirely.
+  local wait = self.lock_timeout or 30
+  self.db:exec("set lock_timeout = " .. math.floor(wait * 1000))
+
+  local got = pcall(function()
+    return self.db:one("select pg_advisory_lock($1)", LOCK_KEY)
+  end)
+
+  -- Back off the bound before running anything: a migration that legitimately
+  -- waits on a lock of its own -- `alter table` behind a long read -- must not
+  -- inherit the deploy's patience budget.
+  pcall(function() self.db:exec "set lock_timeout = 0" end)
+
+  if not got then
+    error(("akkar.migrate: another runner has held the migration lock for " ..
+           "more than %d seconds.\n  That is normal for a slow migration and " ..
+           "not normal for a fast one -- check whether a previous deploy died " ..
+           "holding it. `select * from pg_locks where locktype = " ..
+           "'advisory'` names the session."):format(wait), 0)
+  end
 
   local ok, result = pcall(function()
     -- Under the lock, both of them. Creating the ledger here is what keeps two

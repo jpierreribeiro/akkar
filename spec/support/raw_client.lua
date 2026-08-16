@@ -121,7 +121,20 @@ function M.start_on(port, extra)
 
     if ready then
       return function()
+        -- TERM, THEN KILL, and the escalation is not belt-and-braces.
+        --
+        -- A wedged akkar server cannot answer a signal. `app:handle_signals`
+        -- installs the handler as a cqueues coroutine, and the whole nature of
+        -- the wedge this suite provokes is that one coroutine spins and the
+        -- scheduler never runs another -- so the handler that would exit
+        -- politely is exactly the thing that is starved. `pkill -TERM` on it
+        -- is a signal nobody is listening for.
+        --
+        -- Twenty-two of these accumulated across a night of test runs, each
+        -- spinning on a core, five hours old, load average 23 -- underneath a
+        -- benchmark that was measuring something else at the time.
         os.execute(("pkill -f %q >/dev/null 2>&1"):format(path))
+        os.execute(("pkill -9 -f %q >/dev/null 2>&1"):format(path))
         os.remove(path)
       end
     end
@@ -132,6 +145,7 @@ function M.start_on(port, extra)
   end
 
   os.execute(("pkill -f %q >/dev/null 2>&1"):format(path))
+  os.execute(("pkill -9 -f %q >/dev/null 2>&1"):format(path))
 
   local file = io.open(log, "r")
   local said = file and file:read "a" or ""

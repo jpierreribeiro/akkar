@@ -318,11 +318,14 @@ describe("akkar.migrate", function()
         name text primary key,
         checksum text not null,
         applied_at timestamptz not null default now(),
-        constraint refuse_one check (name <> 'zz_forbidden.sql')
+        constraint refuse_one check (name <> '002_forbidden.sql')
       )]])
 
       write(dir, "001_notes.sql", "create table akkar_migrate_spec_notes (id int)")
-      write(dir, "zz_forbidden.sql", "create table akkar_migrate_spec_ghost (id int)")
+      -- `002_`, not `zz_`: every migration needs a leading id now, because
+      -- string order runs the tenth file first. The fixture obeys the rule
+      -- it is not testing.
+      write(dir, "002_forbidden.sql", "create table akkar_migrate_spec_ghost (id int)")
 
       assert.is_false(pcall(function() return runner:apply() end))
 
@@ -504,5 +507,68 @@ describe("migrations as data, for an image with no shell", function()
       end)
       assert.is_false(ok, "a malformed migration entry was accepted")
     end
+  end)
+end)
+
+describe("ordering, which was wrong by default", function()
+  -- Found by comparing this module against Druse's, which parses the id as an
+  -- integer. Ours sorted the names as text, and text order puts the tenth
+  -- migration first: 2, 9, 10 sorts as 10, 2, 9, because "1" < "2".
+  --
+  -- It is the kind of defect that waits. Nothing is wrong until the tenth
+  -- file, which is weeks after anybody would think to check ordering, and by
+  -- then it looks like a broken migration rather than a broken sort.
+  local migrate = require "akkar.migrate"
+
+  local function names_of(entries)
+    local out = {}
+    for _, entry in ipairs(entries) do out[#out + 1] = entry.name end
+    return out
+  end
+
+  it("orders by the id as a number, not as text", function()
+    local entries = migrate._ordered {
+      { name = "10_add_column.sql" },
+      { name = "2_users.sql" },
+      { name = "9_add_index.sql" },
+    }
+    assert.same({ "2_users.sql", "9_add_index.sql", "10_add_column.sql" },
+                names_of(entries))
+  end)
+
+  it("handles zero-padded and timestamp ids the same way", function()
+    local entries = migrate._ordered {
+      { name = "20260816120000_late.sql" },
+      { name = "007_early.sql" },
+      { name = "0008_middle.sql" },
+    }
+    assert.same({ "007_early.sql", "0008_middle.sql", "20260816120000_late.sql" },
+                names_of(entries))
+  end)
+
+  it("refuses two migrations claiming the same id", function()
+    -- The single most common way a migration set breaks in a team: two people
+    -- branch from the same commit and both write 007_. Which one runs first
+    -- is then up to the filesystem.
+    local ok, why = pcall(migrate._ordered, {
+      { name = "007_alice.sql" }, { name = "007_bob.sql" },
+    })
+    assert.is_false(ok)
+    assert.is_truthy(tostring(why):find("share an id", 1, true))
+    assert.is_truthy(tostring(why):find("007_alice.sql", 1, true))
+    -- And it says what to do about it, because the advice is only useful
+    -- before the incident.
+    assert.is_truthy(tostring(why):find("timestamp", 1, true))
+  end)
+
+  it("refuses a file with no id rather than guessing where it goes", function()
+    -- Falling back to text order for it would mean the ordering rule changes
+    -- depending on what is in the directory, which is worse than either rule.
+    local ok, why = pcall(migrate._ordered, {
+      { name = "001_fine.sql" }, { name = "add_users.sql" },
+    })
+    assert.is_false(ok)
+    assert.is_truthy(tostring(why):find("no leading id", 1, true))
+    assert.is_truthy(tostring(why):find("add_users.sql", 1, true))
   end)
 end)
