@@ -1587,6 +1587,20 @@ local function read_body(stream, request_headers, limit, budget)
   -- arguments and raise.  Bind it first.
   local length = request_headers:get "content-length"
   local declared = length and tonumber(length)
+
+  -- A NEGATIVE LENGTH IS MALFORMED, and saying so here is the difference
+  -- between blaming the client and blaming the server. Without this, `-5`
+  -- passed the size check, reached the chunk reader, failed somewhere inside
+  -- lua-http and came back to the caller as a 503 -- akkar reporting its own
+  -- unavailability for a header the client typed wrong.
+  --
+  -- It does not save the server: `docs/substrate/lua-http-wedge.md` records
+  -- that lua-http stops accepting connections after this request whatever
+  -- akkar answers. What it fixes is the answer.
+  if declared and declared < 0 then
+    return nil, "malformed"
+  end
+
   if declared and declared > limit then
     return nil, "declared"
   end
@@ -1850,8 +1864,46 @@ function App:run(config)
       -- client releases on both paths where the server did not.
       local pending_release
 
+      -- A REQUEST WHOSE FRAMING lua-http REFUSES TO PARSE.
+      --
+      -- `get_headers` raises for a `Content-Length` that is not a number, or
+      -- is negative, and letting that raise travel on took the whole SERVER
+      -- down: the process stayed alive and the listening socket stayed open,
+      -- but nothing accepted again. Measured with one request --
+      -- `Content-Length: banana` -- after which `ss` showed a connection
+      -- sitting unaccepted in the queue for ever and every later client timed
+      -- out. One malformed header, one line, and the server is gone.
+      --
+      -- Found by `spec/framing_spec.lua`, which exists because the fuzzer
+      -- that goes through an HTTP client cannot express a request this wrong.
+      --
+      -- Answered 400 and closed HERE, before the raise can reach lua-http's
+      -- accept loop. The client is told its request was malformed, which is
+      -- true and is the whole of what akkar knows about it.
+      local got_headers, headers_or_why = pcall(function()
+        return assert(stream:get_headers())
+      end)
+
+      if not got_headers then
+        internal:warn("refusing a request akkar could not frame", {
+          detail = tostring(headers_or_why),
+        })
+        pcall(function()
+          local rh = headers.new()
+          rh:append(":status", "400")
+          rh:append("content-type", "application/json")
+          local body = cjson.encode { error = "malformed request" }
+          rh:append("content-length", tostring(#body))
+          stream:write_headers(rh, false)
+          stream:write_chunk(body, true)
+        end)
+        pcall(stream.shutdown, stream)
+        self.in_flight = self.in_flight - 1
+        return
+      end
+
       local ok, err = pcall(function()
-        local h = assert(stream:get_headers())
+        local h = headers_or_why
         -- The socket's own idea of who connected. Everything else about the
         -- client's identity is something the client typed.
         local peer
@@ -1864,7 +1916,9 @@ function App:run(config)
 
         local raw, oversize = read_body(stream, h, body_limit, timeout)
         local body, short
-        if oversize == "timeout" then
+        if oversize == "malformed" then
+          short = response(400, { error = "malformed request" })
+        elseif oversize == "timeout" then
           -- 408, not 503. The deadline that produces a 503 is akkar deciding
           -- the handler took too long; this is the client never finishing the
           -- request it started, which is what 408 is for.
