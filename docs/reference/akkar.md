@@ -804,7 +804,7 @@ Binds a socket and serves. This call does not return until the server stops.
 | `tls` | table | none | `{ certificate = ..., key = ..., protocol = ... }`, each a PEM string or a path |
 | `ctx` | userdata | none | a luaossl context, the escape hatch past `tls` |
 | `body_limit` | number | `1048576` | bytes, above which the answer is 413 |
-| `timeout` | number | `30` | seconds of wall clock per request, above which the answer is 503 |
+| `timeout` | number | `30` | seconds of wall clock per request, above which the answer is 503. **`0` turns the deadline off** |
 | `shutdown_grace` | number | `10` | seconds to drain on stop |
 | `check_capabilities` | boolean | `true` | acquire each capability once at boot and check its contract |
 | `reuseport` | boolean | none | let several processes share the port |

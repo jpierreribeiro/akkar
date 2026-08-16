@@ -1713,7 +1713,13 @@ local function read_body(stream, request_headers, limit, budget)
   -- same timeout to every chunk -- which is what lua-http's own
   -- `get_body_as_string` does -- means a client that sends one byte just
   -- inside the limit, for ever, is never refused.
-  local deadline = budget and (time.monotime() + budget)
+  -- `> 0` and not merely truthy, because ZERO MEANS OFF here as it does
+  -- everywhere else in akkar -- `with_deadline` opens with `if not seconds or
+  -- seconds <= 0`. In Lua `0` is true, so `budget and ...` turned "no
+  -- deadline" into "a deadline of right now" and answered 408 to every
+  -- request, including a GET carrying no body to read. An app configured the
+  -- documented way served nothing at all.
+  local deadline = budget and budget > 0 and (time.monotime() + budget) or nil
 
   local parts, total = {}, 0
   while true do
