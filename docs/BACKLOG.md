@@ -740,6 +740,80 @@ one file.
 2. **`akkar.crypto`** — password hashing and JWT over the already-linked OpenSSL.
 3. The rest when a real need appears.
 
+## 11. What writing the guide found, and what is still open
+
+Nine defects came out of writing beginner documentation, and none of them was
+caught by a thousand tests. The reason is structural and worth keeping: **a
+test never has to READ an error message, and never uses the API as somebody
+who has not seen it before.** Every one of these was found by an author who
+could not write an honest sentence about what the reader would see.
+
+Six are fixed: the bind error that did not name its port, `req.body` being nil
+with no explanation, `akkar.log` printing an id as `7.0`, the connection
+failure whose message was unreachable code, an empty list encoding as `{}`,
+and the README promising a watchdog that cannot see a C call.
+
+### Still open
+
+- **A job store fails at first push, not at construction.**
+  `jobs.new(redis.connect{...}, "email")` — note the missing call parentheses
+  — builds happily. The server starts, and the error arrives at the first
+  `push` as `attempt to call a nil value (method 'command')`, pointing inside
+  `akkar/jobs/redis.lua` rather than at the line that was wrong. akkar already
+  checks capability contracts at boot for this exact reason; the job store
+  does not get the same treatment.
+
+- **A global rate limiter throttles the health checks into a restart loop.**
+  Twelve requests to `/health/live` answer 429, an orchestrator reads that as
+  a failed probe, and it restarts a process that was healthy. The framework
+  has no built-in exemption, and this is the failure mode where a protective
+  feature causes the outage. Guide page 11 shows the 429 first and then the
+  four lines that fix it, which is a workaround in documentation for something
+  that should probably be a default.
+
+- **No supported way to run a background loop in the same process as
+  `app:run`.** It ends in `assert(s:loop())`, or -- when `handle_signals` was
+  called -- in a controller wrapping exactly two tasks, the server loop and
+  the signal task. Neither is reachable from outside, and `SETTINGS` has no
+  key for one, so there is nothing an application can pass.
+
+  The cost showed up as a documentation cost, which is how it was found. The
+  smallest honest example of "the request should not wait for the email" is
+  one process, an in-memory queue, and a consumer sharing the event loop.
+  That is not expressible, so the guide's first working example needs Redis
+  and a second process -- a `docker run` and a third terminal before a
+  beginner has seen one job run. Redis is right for anything real and heavy
+  for the idea.
+
+  Two things for whoever takes it. The workaround that exists today is
+  `cqueues.running():wrap(fn)` from inside a handler, which attaches to the
+  server's own controller; it works, and it stayed out of the guide because
+  "start your worker from inside a request" teaches a beginner something they
+  should unlearn. And `akkar.jobs.memory` already implements `claim_pop`,
+  `ack` and `reap`, so `Queue:reliable()` is true for it -- the store half is
+  not the gap, the place to run the consumer is.
+
+  Deliberately not designed here: a task-registration hook has real questions
+  in it about shutdown ordering and about whether a failing task should take
+  the server down, and those deserve a decision rather than a guess.
+
+- **`docs/DEPLOY.md` is not re-run by anything.** Its Dockerfile numbers and
+  its Railway transcript are true of a tree from one afternoon that has since
+  moved. `spec/docs_spec.lua` covers `docs/guide/` only, deliberately, and
+  this file is the one page outside it that makes measured claims.
+
+- **An `env` marker for the docs runner.** Page 12's application is `no-run`
+  because it refuses to start without `SESSION_SECRET`, `FRONTEND_ORIGIN` and
+  the `PG*` variables, and the runner has none to give it. It is verified by
+  being containerised instead, which the page says.
+
+  Two halves, and the second is the one that would be skipped: the block runs
+  with a supplied environment and stays up, AND the same block with one
+  variable removed exits non-zero and names that variable. A runner proving
+  only the first would leave the refusal untested while looking thorough —
+  the same shape as the skip guard this project once shipped that never
+  checked anything.
+
 ## What is deliberately not being built
 
 Written down because the list keeps trying to grow.
