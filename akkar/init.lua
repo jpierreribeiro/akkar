@@ -142,7 +142,8 @@ akkar.defaults = {
 -- every entry becomes permanent: moving `req.db` to `ctx.db` later would force
 -- an edit to every handler ever written, which is exactly what the complexity
 -- ladder forbids.
-local CAPABILITIES = { db = true, cache = true, log = true, clock = true }
+local CAPABILITIES = { db = true, cache = true, log = true, clock = true,
+                       http = true }
 
 -- What each capability must be able to do.  Checked once at startup, so a
 -- misconfigured adapter fails at boot the way a duplicate route already does,
@@ -151,6 +152,11 @@ local CONTRACTS = {
   db    = { "one", "many", "exec", "transaction" },
   cache = { "get", "set", "del" },
   log   = { "debug", "info", "warn", "error", "with" },
+  -- The outbound half. `request` is the whole contract -- the verb helpers are
+  -- conveniences over it -- so an adapter answering only `request` is a valid
+  -- one, which is what makes a fake possible without reimplementing six
+  -- methods that all do the same thing.
+  http  = { "request", "get", "post" },
 }
 
 -- The framework's own voice.  Replaced by `app:run { log = ... }`, but present

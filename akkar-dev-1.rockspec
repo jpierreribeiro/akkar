@@ -83,6 +83,7 @@ build = {
     ["akkar.jobs"] = "akkar/jobs.lua",
     ["akkar.jobs.redis"] = "akkar/jobs/redis.lua",
     ["akkar.jobs.memory"] = "akkar/jobs/memory.lua",
+    ["akkar.http"] = "akkar/http.lua",
     ["akkar.json"] = "akkar/json.lua",
     ["akkar.log"] = "akkar/log.lua",
     ["akkar.metrics"] = "akkar/metrics.lua",
