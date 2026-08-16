@@ -27,7 +27,7 @@ state transition.
 The port lives outside this repository. The business logic is somebody's
 private service; what comes back here is the defects.
 
-**Time to the first defect: under an hour. Seven found across two slices.**
+**Time to the first defect: under an hour. Nine found across three slices.**
 
 ---
 
@@ -154,7 +154,56 @@ it costs nothing on the requests that do not use it.
 That ceiling was written for a different regression a week earlier. It caught
 this one on the first run.
 
-## 6. Every UUID parameter needs an explicit cast
+## 6. The retry schedule every webhook system uses could not be expressed
+
+**The third slice: the outbound dispatcher**, the worker that POSTs an event to
+whatever endpoint a seller registered and retries when it fails.
+
+The original's schedule is the ordinary one — `BaseBackoff * 2^(attempt-1)`
+capped at `MaxBackoff`: one minute, doubling, four hours, twenty attempts.
+
+akkar computed `base ^ attempt`, and the two things that could say were both
+wrong. `base = 2` retries a customer's dead endpoint after two seconds and
+hammers it. `base = 60` goes 60 seconds, then an hour, then two and a half days.
+
+**Fixed**, and without moving anything. The window is now
+`first * factor ^ (attempt - 1)`, and `base` sets both, so for every existing
+value the old formula and the new one agree exactly — checked for `base` of 2,
+3, 5 and 10 across five attempts rather than argued.
+
+```lua
+{ first = 60, factor = 2, max = 4 * 60 * 60 }   --> 60, 120, 240, 480, ... 4h
+```
+
+## 7. A delay shorter than a second did not exist
+
+Found by a probe misbehaving rather than by reading anything. A dispatcher test
+with a 10 ms backoff reported that an endpoint failing every time was tried
+**once and then vanished** — not retried, not dead-lettered, gone.
+
+It had been rescheduled correctly. `Store:schedule` computed
+`time.now() + delay`, and `time.now()` is `os.time`, which counts whole seconds.
+`run_at` was `N + 0.01` and `promote` compared it against `N` until the second
+ticked. **Every sub-second delay meant "the next second boundary".**
+
+The consequence is not about tests. `jobs.delay_for` returns a fractional delay
+on purpose — full jitter, a uniform draw across the window, which exists so a
+hundred jobs failing against a database that has just come back do not all
+retry on the same second. With one-second resolution and a two-second default
+window, they retried on one of two.
+
+**Fixed in both stores.** The memory store schedules against `monotime`, which
+is sub-second and immune to a wall clock being stepped — the same argument
+deadlines already won here a day earlier. The Redis store reads the
+microseconds from `redis.call('TIME')` that it was already fetching and
+discarding.
+
+With that, the dispatcher behaves: three attempts to deliver through two
+failures, four attempts and a dead letter when the endpoint never recovers, and
+**one** attempt with no retry when it answers 410 — and the receiver verified
+our signature on every one.
+
+## 8. Every UUID parameter needs an explicit cast
 
 Postgres returns a `uuid` column as text — the only thing a Lua driver can do
 with it — and then refuses the same string as a parameter for a `uuid` column:
@@ -170,7 +219,7 @@ sends a typed `uuid.UUID` and never meets this.
 be worse. It belongs in the SQL documentation, and the error message could name
 the cast.
 
-## 7. There is no `v.uuid`, and route middleware is called `before`
+## 9. There is no `v.uuid`, and route middleware is called `before`
 
 Two small ones from the same hour. Every primary key in this service is a UUID
 and the schema had to spell the pattern out by hand. And route-scoped
@@ -214,6 +263,9 @@ Worth recording, because a findings list reads as though nothing worked.
   payment provider; the port does not. The contract was read from the Postman
   collection and the Go source rather than diffed against a running instance.
 
-The webhook slice is done and closed the raw-body gap. **The worker is not**:
-the original runs a separate process consuming jobs, and akkar's `queue:consume`
-and `app:task` have never been pointed at real work. That is the next one.
+Three slices done: the invoice API, the inbound webhook, the outbound
+dispatcher. What is still untouched is the reconciliation cron, the dispute and
+KYC surfaces, the IP-allowlisted admin routes, and anything under real load or
+TLS. The dispatcher was exercised against a fake HTTP client rather than a real
+socket, so the queue and the retry schedule are proved and the transport is
+not.

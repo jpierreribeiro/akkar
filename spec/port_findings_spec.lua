@@ -359,6 +359,117 @@ describe("the bytes a webhook was signed over", function()
   end)
 end)
 
+describe("a retry schedule a webhook dispatcher can use", function()
+  -- WHAT HAPPENED. The third slice was the outbound dispatcher: the worker
+  -- that POSTs an event to whatever endpoint a seller registered and retries
+  -- when it fails. The original's schedule is the one every retrying system
+  -- uses -- a first delay, doubling, capped:
+  --
+  --     BaseBackoff * 2^(attempt-1), capped at MaxBackoff
+  --     one minute -> four hours, twenty attempts
+  --
+  -- akkar computed `base ^ attempt`, which cannot say that. The two things it
+  -- could say were both wrong: `base = 2` retries a customer's dead endpoint
+  -- after two seconds, and `base = 60` goes 60s, then an hour, then two and a
+  -- half days.
+  local jobs = require "akkar.jobs"
+
+  local function schedule(opts, n)
+    local out = {}
+    for attempt = 1, n do
+      opts.jitter = false
+      out[attempt] = jobs.delay_for(attempt, opts)
+    end
+    return out
+  end
+
+  it("can express a first delay that doubles", function()
+    assert.same({ 60, 120, 240, 480, 960 },
+      schedule({ first = 60, factor = 2, max = 4 * 60 * 60 }, 5))
+  end)
+
+  it("caps where it is told to", function()
+    local s = schedule({ first = 60, factor = 2, max = 300 }, 6)
+    assert.same({ 60, 120, 240, 300, 300, 300 }, s)
+  end)
+
+  -- The compatibility claim, checked rather than asserted in a comment: for
+  -- any `base`, the old formula and the new one agree exactly.
+  it("moves no existing configuration by a microsecond", function()
+    for _, base in ipairs { 2, 3, 5, 10 } do
+      local got = schedule({ base = base, max = math.huge }, 5)
+      for attempt = 1, 5 do
+        assert.equal(base ^ attempt, got[attempt],
+          ("base = %d, attempt %d"):format(base, attempt))
+      end
+    end
+  end)
+end)
+
+describe("a delay shorter than a second", function()
+  -- WHAT HAPPENED, and it was found by a probe misbehaving rather than by
+  -- reading anything. A dispatcher test with a 10ms backoff reported that an
+  -- endpoint failing every time was tried ONCE and then vanished -- not
+  -- retried, not dead-lettered, gone.
+  --
+  -- It had been rescheduled correctly. `Store:schedule` computed
+  -- `time.now() + delay`, and `time.now()` is `os.time`, which counts whole
+  -- seconds. `run_at` was `N + 0.01`; `promote` compared it against `N` until
+  -- the second ticked over. Every sub-second delay meant "the next second
+  -- boundary".
+  --
+  -- The consequence in production is not about tests. `jobs.delay_for` returns
+  -- a FRACTIONAL delay on purpose -- full jitter, a uniform draw across the
+  -- window, which exists so that a hundred jobs failing against a database
+  -- that has just come back do not all retry on the same second. With
+  -- one-second resolution and a two-second default window, they retried on one
+  -- of two.
+  --
+  -- The memory store now schedules against `monotime`, which is sub-second and
+  -- immune to a wall clock being stepped -- the same argument deadlines
+  -- already won. The Redis store reads the microseconds from `TIME` that it
+  -- was already fetching and throwing away.
+  local jobs   = require "akkar.jobs"
+  local memory = require "akkar.jobs.memory"
+  local time   = require "akkar.time"
+
+  it("comes due before the next whole second", function()
+    local queue = jobs.new(memory.store(), "port_subsecond", {
+      retries = 3,
+      backoff = { first = 0.02, factor = 2, max = 0.05, jitter = false },
+    })
+    queue:push("work", { n = 1 })
+
+    local job = queue:pop(0)
+    assert.is_truthy(job, "nothing to pop")
+    queue:fail(job, "boom")
+
+    -- Nothing yet: the backoff has not elapsed.
+    assert.is_nil(queue:pop(0), "the job came back before its backoff")
+
+    -- Wait past 20ms of WALL time without relying on the second boundary.
+    local started = time.monotime()
+    while time.monotime() - started < 0.08 do end
+
+    assert.is_truthy(queue:pop(0),
+      "a sub-second backoff did not come due; scheduling is quantised to seconds")
+  end)
+
+  it("keeps the fraction the jitter produced", function()
+    -- `delay_for` returning fractions is only meaningful if the store can
+    -- store them. Two delays 30ms apart must not land on the same instant.
+    local store = memory.store()
+    store:schedule("k", "a", 0.01)
+    store:schedule("k", "b", 0.04)
+    assert.equal(0, store:promote "k", "both were due immediately")
+
+    local started = time.monotime()
+    while time.monotime() - started < 0.02 do end
+    assert.equal(1, store:promote "k",
+      "the two delays were indistinguishable, so the jitter did nothing")
+  end)
+end)
+
 describe("an integer that arrived as JSON", function()
   -- WHAT HAPPENED. The service computes fees in integer cents and says so in
   -- its own source: "ALL arithmetic is integer-only ... eliminates IEEE 754

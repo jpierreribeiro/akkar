@@ -82,10 +82,29 @@ local M = {}
 -- jitter -- a uniform draw across the whole interval rather than a wobble
 -- around its end -- is the variant that measured best among the simple
 -- strategies, and it costs one line.
+-- THE SHAPE, and why there are three names for two numbers.
+--
+-- This used to compute `base ^ attempt`, which cannot express the schedule
+-- almost every retrying system actually uses: a FIRST delay, doubling. Porting
+-- a webhook dispatcher whose original is "one minute, doubling, capped at four
+-- hours" left two choices, and both were wrong -- `base = 2` retries a
+-- customer's dead endpoint after two seconds, and `base = 60` goes 60s, then
+-- an hour, then two and a half days.
+--
+-- The general form is `first * factor ^ (attempt - 1)`, and `base` still means
+-- exactly what it meant: defaulting both `first` and `factor` to it reproduces
+-- `base ^ attempt` for every value, so no existing configuration moves by a
+-- microsecond.
+--
+--     {}                        -> 2, 4, 8, 16      (unchanged)
+--     { base = 3 }              -> 3, 9, 27         (unchanged)
+--     { first = 60, factor = 2 } -> 60, 120, 240    (the one that was missing)
 local function delay_for(attempt, backoff)
-  local base = backoff.base or 2
-  local max  = backoff.max or 300
-  local window = math.min(max, base ^ attempt)
+  local base   = backoff.base or 2
+  local first  = backoff.first or base
+  local factor = backoff.factor or base
+  local max    = backoff.max or 300
+  local window = math.min(max, first * factor ^ (attempt - 1))
   if backoff.jitter == false then return window end
   return math.random() * window
 end

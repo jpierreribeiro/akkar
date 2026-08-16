@@ -53,8 +53,18 @@ end
 --- there is only one process, so its own clock IS the shared one. A step of
 --- this process's clock moves everything in it together, which is the
 --- consistent -- if not always convenient -- answer.
+-- `monotime`, not `now`, and for two reasons that arrived a day apart.
+--
+-- RESOLUTION: `time.now()` is `os.time`, which counts whole seconds, so a
+-- sub-second delay became "the next second boundary" and the fractional jitter
+-- `jobs.delay_for` computes was discarded. A retry schedule whose first window
+-- is two seconds spread its jobs across two values.
+--
+-- AND THE SAME ARGUMENT DEADLINES ALREADY WON: a wall clock stepped by NTP
+-- moves scheduled work with it. Everything in this process schedules and
+-- promotes against one monotonic clock, so a step moves nothing.
 function Store:schedule(key, encoded, delay)
-  local run_at = time.now() + (delay or 0)
+  local run_at = time.monotime() + (delay or 0)
   local pending = self.scheduled[key]
   if not pending then pending = {} self.scheduled[key] = pending end
   pending[#pending + 1] = { run_at = run_at, encoded = encoded }
@@ -65,7 +75,7 @@ end
 --- many moved.  Ordering by `run_at` matters: two jobs that came due while
 --- nobody was looking should run in the order they were meant to.
 function Store:promote(key)
-  local now = time.now()
+  local now = time.monotime()
   local pending = self.scheduled[key]
   if not pending or #pending == 0 then return 0 end
 
