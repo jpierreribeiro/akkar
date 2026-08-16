@@ -336,3 +336,73 @@ trusted: the process count is verified after every start, each server proves
 which tree it loaded, a run whose body says `"error"` is refused, the
 concurrency for database routes is derived from the pool rather than chosen,
 and one physical core is reserved so the kernel is never starved.
+
+---
+
+## 9. Eight hours, which is what the backlog meant by a soak
+
+Section 7 ran forty-five minutes. That proves a server starts and keeps
+answering; it does not prove anything about a leak, because a leak of a
+kilobyte a request is invisible in forty-five minutes and fatal in a week.
+
+    480 minutes, 2 processes, pool 10 each, 16 connections, /users/42
+    AWS c5.2xlarge, Xeon Platinum 8124M @ 3.00GHz
+    started 2026-08-16T01:45:03Z, 96 samples at five-minute intervals
+
+```
+                first hour     last hour       min        max
+throughput      7181 req/s     7179 req/s      5334       7244
+p50             2.25 ms        2.23 ms         2.16       3.86
+p99             3.36 ms        3.22 ms         2.99       6.17
+rss             28 MB          28 MB           28         28
+fds             68             84              59         84
+pg connections  19             21              16         21
+
+errors: 0
+```
+
+### What it answers
+
+**No memory drift.** 28 MB at minute 5 and 28 MB at minute 480, and 28 MB at
+every one of the 96 samples between. Not "roughly flat" -- the same integer,
+every time. This is the measurement the whole run existed to take.
+
+**Descriptors settle, they do not climb.** 59 to 84 over the first four hours,
+and then **not one change from minute 235 to minute 480**. That shape is a
+warm-up: two processes filling pools of ten as concurrency reaches them.  A
+leak does not stop, and this one stopped and stayed stopped for four hours.
+
+**Throughput does not decay.** The first hour's median and the last hour's
+differ by 2 req/s, which is 0.03%. Eight hours of continuous load moved
+nothing.
+
+**Zero errors**, across roughly 200 million requests at that rate.
+
+### The one anomaly, named rather than smoothed
+
+Minute 50 records 5334 req/s against a median of 7179 -- a 26% dip, in one
+sample, with p99 at 6.17 ms instead of the usual 3.2 ms. Nothing else in the
+run resembles it and every sample after it is normal. It is the single reason
+the min/max spread reads 26.6%; without it the spread is under 3%.
+
+It is reported and not explained. A single five-minute sample on a shared
+cloud instance has too many candidate causes -- a noisy neighbour, a host
+migration, a background task on the box -- and picking one would be a story
+rather than a finding. What can be said is what it is not: it did not recur in
+the following seven hours, it produced no errors, and it left no trace in
+memory or descriptors.
+
+### What this does NOT prove
+
+- **One route, one shape.** `/users/42` is a single indexed row, and the
+  driver comparison in `bench/driver/RESULTS.md` shows single-row queries are
+  exactly where the least work happens. A soak on a list endpoint would
+  exercise the allocator far harder and has not been run.
+- **Sixteen connections against a capacity of twenty**, so nothing ever
+  queued. This is the same limitation section 7 had and section 8 was written
+  to address; the saturation curve is where queueing appears, not here.
+- **pgmoon, not the C driver.** `akkar.pq` exists and is opt-in, and this ran
+  on the default. A soak of the driver that allocates less per row is a
+  different run and the interesting one to compare against.
+- **No jobs, no cache, no TLS.** Only the HTTP and database paths.
+
