@@ -76,6 +76,7 @@ build = {
   type = "builtin",
   modules = {
     ["akkar"]    = "akkar/init.lua",
+    ["akkar.build"] = "akkar/build.lua",
     ["akkar.db"] = "akkar/db.lua",
     ["akkar.db.memory"] = "akkar/db/memory.lua",
     ["akkar.cache.memory"] = "akkar/cache/memory.lua",

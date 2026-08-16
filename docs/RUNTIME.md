@@ -1,7 +1,24 @@
 # akkar as a runtime
 
-> **Status.** Open, and it starts with a retraction. The feasibility question
-> is **answered**; the design question is not.
+> **Status.** `akkar build` exists and **serves requests**. The feasibility
+> question is answered twice over; the design question below is still open.
+>
+> ```
+> $ akkar build serve-app.lua -o myapp --root ... --archive ...
+> akkar build: 369 Lua modules, 46 native modules -> myapp
+>
+> $ ./myapp 8375 &
+> $ curl -i http://127.0.0.1:8375/users/7
+> HTTP/1.1 200 OK
+> x-request-id: 3824249f000001
+> content-type: application/json
+>
+> {"id":7}
+> ```
+>
+> 5.08 MB. Routing, parameter validation (`/users/abc` answers 422), JSON,
+> the request id, the whole cqueues and lua-http stack. `ldd` shows OpenSSL,
+> libm and libc: no Lua, no LuaRocks, no shared modules.
 
 ## What this changes, and why it is a reversal
 
@@ -66,19 +83,56 @@ executable itself, which fails with *cannot dynamically load executable*.
 from their `luaopen_` symbols, which is verifiably done in the generated
 source.
 
-**That is a `luastatic` naming problem, not an akkar one, and it is the
+**That is a `luastatic` naming problem, not an akkar one, and it was the
 argument for `akkar build` emitting its OWN host** rather than leaning on a
-general-purpose bundler. A host akkar generates knows exactly which
-`luaopen_` belongs to which module name, because it wrote both.
+general-purpose bundler. That host is now `akkar/build.lua`, and the section
+below is what it took.
+
+## What the host had to know that a bundler could not
+
+**Reversing the C naming convention is ambiguous.**
+`luaopen__openssl_x509_verify_param` reads equally well as
+`_openssl.x509.verify.param` and as `_openssl.x509.verify_param`. The module
+is the second. No rule over symbols can tell, and a bundler that guesses
+produces a binary that dies with "module not found" for a module demonstrably
+linked into it.
+
+akkar does not guess. The code that requires the module is going into the same
+binary and names it exactly, so `akkar.build` reads every literal `require`
+out of the sources it is about to embed and maps FORWARD -- name to symbol,
+dots to underscores, which is unambiguous in that direction -- then checks
+whether the archive defines it. The guess becomes a lookup. The symbol rule
+survives only as a fallback for a module nothing requires by a literal name.
+
+**The second obstacle was not naming at all**, and it took reading luaossl's C
+to find. `dl_anchor()` does `dladdr` on its own entry point and then `dlopen`s
+the file it lands in, to stop the loader unlinking the module while OpenSSL
+holds a callback into it. Statically linked, that concern cannot arise -- the
+code is in the executable and can never be unloaded -- but `dladdr` returns
+the executable's path and `dlopen` on an executable fails by definition. The
+error surfaces as `openssl.init: cannot dynamically load executable`, from a
+module nobody mentioned, and `openssl.init` turns out to be an error label in
+C rather than a module at all.
+
+luaossl's own `#else` branch already does the right thing, so a static build
+compiles it with `-DHAVE_DLADDR=0`. **A native module written for dynamic
+loading may hold assumptions that only static linking violates**, and that is
+the general lesson worth carrying into the next one.
 
 ## What this does NOT prove
 
-Written here rather than left to be discovered, because a feasibility probe
-that oversells is worse than none.
+Written here rather than left to be discovered, because a probe that oversells
+is worse than none.
 
-- **No request has been served from the binary.** It loads, and it stops at
-  the module above. The event loop probe is the strongest positive result;
-  the full stack is "links and starts", not "serves".
+- **One platform, one libc.** Linux, glibc, x86-64. Nothing here says anything
+  about musl, macOS or the BSDs, and `dl_anchor` is exactly the kind of thing
+  that differs.
+- **Not fully static.** OpenSSL is still linked dynamically. `libssl.a` and
+  `libcrypto.a` exist on this machine, so it is reachable; untried.
+- **The archives are built by hand.** `akkar build` consumes `.a` files and
+  does not produce them: turning a rock into an archive is still a manual
+  `make` and `ar`. That is the next piece of work, not a footnote.
+- **No cross-compilation.** It builds for the machine it runs on.
 - **The binary is not fully static.** It still links `libssl.so` and
   `libcrypto.so` dynamically. `libssl.a` and `libcrypto.a` exist on this
   machine, so a fully static link is reachable — untried.

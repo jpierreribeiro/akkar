@@ -24,7 +24,7 @@ must not block a service that speaks plain HTTP.
 ]]
 
 local USAGE = [[
-akkar — a microframework for JSON APIs on cqueues and lua-http
+akkar — an application runtime for backend services in Lua
 
 usage:
   akkar doctor [app.lua] [--json] [--no-probe]
@@ -36,6 +36,23 @@ usage:
     app.lua      a file returning `app` or `app, config`
     --json       machine-readable output
     --no-probe   skip anything that touches the network
+
+  akkar build app.lua [options]
+
+    Emits a C host embedding the Lua VM, every module the application needs
+    and every native module, and links it into ONE EXECUTABLE. Deployment
+    then needs no Lua, no LuaRocks and no shared objects.
+
+    -o NAME         output binary          (default: the entry file's name)
+    --root DIR      a directory of Lua modules to embed; repeatable.
+                    The first root wins, so an application can shadow a
+                    library module by listing its own directory first
+    --archive A.a   a static archive of native modules; repeatable
+    --lua-lib PATH  liblua.a
+    --lua-inc DIR   the directory holding lua.h
+    --libs "..."    extra linker flags     (default: -lm -ldl -lpthread)
+    --cc NAME       the compiler           (default: $CC, or cc)
+    --c-only        write the C and stop, without compiling
 
   akkar version
   akkar help
@@ -72,11 +89,68 @@ local function doctor(args)
   require("akkar.doctor").cli(options)
 end
 
+local function build(args)
+  local options = {
+    roots = {}, archives = {},
+    libs = "-lm -ldl -lpthread",
+  }
+
+  local i = 1
+  local function value(flag)
+    i = i + 1
+    if not args[i] then fail(flag .. " needs a value") end
+    return args[i]
+  end
+
+  while i <= #args do
+    local a = args[i]
+    if     a == "-o"        then options.output = value(a)
+    elseif a == "--root"    then options.roots[#options.roots + 1] = value(a)
+    elseif a == "--archive" then options.archives[#options.archives + 1] = value(a)
+    elseif a == "--lua-lib" then options.lua_library = value(a)
+    elseif a == "--lua-inc" then options.lua_include = value(a)
+    elseif a == "--libs"    then options.libs = value(a)
+    elseif a == "--cc"      then options.cc = value(a)
+    elseif a == "--c-only"  then options.compile = false
+    elseif a:sub(1, 1) == "-" then fail("unknown option " .. a)
+    else options.entry = a end
+    i = i + 1
+  end
+
+  if not options.entry then fail("build needs an entry file: akkar build app.lua") end
+  if not options.output then
+    options.output = (options.entry:gsub("^.*/", ""):gsub("%.lua$", ""))
+  end
+
+  -- akkar embeds ITSELF without being told to. Anything else the application
+  -- needs is a root the caller names, because guessing at a dependency tree
+  -- is how a build silently omits a module and fails on the target.
+  local own = package.searchpath("akkar", package.path)
+  if own then
+    options.roots[#options.roots + 1] = own:gsub("/akkar/init%.lua$", "")
+                                           :gsub("/akkar%.lua$", "")
+  end
+
+  if options.compile ~= false then
+    if not options.lua_library then fail("build needs --lua-lib (the path to liblua.a)") end
+    if not options.lua_include then fail("build needs --lua-inc (where lua.h lives)") end
+  end
+
+  local result, why = require("akkar.build").run(options)
+  if not result then fail(why) end
+
+  io.write(("akkar build: %d Lua modules, %d native modules -> %s\n")
+           :format(result.modules.lua, result.modules.native,
+                   result.binary or result.c))
+end
+
 local command = arg[1]
 local rest = { table.unpack(arg, 2) }
 
 if command == "doctor" then
   doctor(rest)
+elseif command == "build" then
+  build(rest)
 elseif command == "version" then
   print("akkar dev-1 on " .. _VERSION)
 elseif command == nil or command == "help" or command == "--help" or command == "-h" then
