@@ -189,7 +189,19 @@ static int pq_send_query(lua_State *L) {
 
   if (!lua_isnoneornil(L, 3)) {
     luaL_checktype(L, 3, LUA_TTABLE);
-    n = (int)lua_rawlen(L, 3);
+    /* `n` WINS OVER THE LENGTH OPERATOR, and the reason is the only value
+     * that cannot be counted: nil.
+     *
+     * `table.pack(nil)` produces `{n = 1}` with no element at index 1, so
+     * `lua_rawlen` answers 0 and the parameter vanishes -- which is exactly
+     * the case where a caller means SQL NULL. Postgres then rejects the bind
+     * with "supplies 0 parameters, but prepared statement requires 1", which
+     * is the polite version; the impolite version is a trailing nil silently
+     * dropped from a longer list and a query that binds the wrong columns. */
+    lua_getfield(L, 3, "n");
+    if (lua_isinteger(L, -1)) n = (int)lua_tointeger(L, -1);
+    else n = (int)lua_rawlen(L, 3);
+    lua_pop(L, 1);
   }
   if (n > 65535) return luaL_error(L, "akkar.pq: too many parameters");
 
@@ -366,6 +378,13 @@ static int push_result(lua_State *L, akkar_conn *c, PGresult *res) {
 
   if (status == PGRES_TUPLES_OK || status == PGRES_SINGLE_TUPLE) {
     int rows = PQntuples(res), cols = PQnfields(res);
+    /* `affected_rows` is set for a write that also returned rows -- INSERT
+     * ... RETURNING -- and NOT for a SELECT, which is precisely what pgmoon
+     * does (pgmoon/init.lua:853). The shape has to match or swapping the
+     * driver becomes a rewrite of every caller that reads it, and the whole
+     * claim being tested is that swapping changes one file. */
+    const char *tag = PQcmdStatus(res);
+    int is_select = tag && strncmp(tag, "SELECT", 6) == 0;
 
     /* Field names once, not once per row: a thousand rows of five columns is
      * five thousand strings interned for no reason otherwise. */
@@ -388,15 +407,28 @@ static int push_result(lua_State *L, akkar_conn *c, PGresult *res) {
       lua_rawseti(L, -2, row + 1);
     }
     lua_remove(L, names);
+    if (!is_select) {
+      const char *n = PQcmdTuples(res);
+      if (n && *n) {
+        lua_pushinteger(L, (lua_Integer)strtoll(n, NULL, 10));
+        lua_setfield(L, -2, "affected_rows");
+      }
+    }
     PQclear(res);
     return 1;
   }
 
   if (status == PGRES_COMMAND_OK) {
+    /* A write with nothing to return. pgmoon answers `{affected_rows = n}`
+     * and so does this; a `begin` or a `set` answers an empty table, because
+     * `PQcmdTuples` is empty for them and inventing a zero would make
+     * "changed nothing" indistinguishable from "not a write". */
     lua_newtable(L);
-    const char *tag = PQcmdTuples(res);
-    lua_pushstring(L, tag ? tag : "0");
-    lua_setfield(L, -2, "affected");
+    const char *n = PQcmdTuples(res);
+    if (n && *n) {
+      lua_pushinteger(L, (lua_Integer)strtoll(n, NULL, 10));
+      lua_setfield(L, -2, "affected_rows");
+    }
     PQclear(res);
     return 1;
   }

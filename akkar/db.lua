@@ -144,6 +144,10 @@ function Db:query(sql, ...)
     self.broken = true
     error("db: " .. tostring(res), 0)
   end
+  -- A driver that knows its connection is unusable is believed. The C driver
+  -- sets this when a query timed out with its result still in flight; pgmoon
+  -- has no equivalent and the flag is simply absent there.
+  if self.pg and self.pg.spoiled then self.broken = true end
   if not res then error("db: " .. tostring(err), 0) end
   return res
 end
@@ -206,6 +210,70 @@ function Db:release()
   if self.pool then self.pool:put(self) else self:close() end
 end
 
+-- ================================================================ the C driver
+--
+-- `akkar.pq` presents a different surface from pgmoon -- `query(sql, params,
+-- deadline)` against `query(sql, ...)` -- so it enters through a shim that
+-- speaks pgmoon's shape. Everything above this line is then untouched: `Db`,
+-- the transaction, the scope wrapper and the pool never learn which driver is
+-- underneath, which is the claim `docs/PLAN.md` makes about the adapter
+-- boundary and the first chance to check it rather than assert it.
+--
+-- OPT-IN, and the default stays pgmoon on purpose. A driver becomes the
+-- default by proving itself, not by being newer, and the proof is
+-- `spec/db_spec.lua` running the same contract against both. Flipping the
+-- default is a separate commit with that evidence behind it.
+local function pq_open(config)
+  local ok, pq = pcall(require, "akkar.pq")
+  if not ok then
+    error("db: driver 'pq' needs akkar/pq_native.so -- build it with " ..
+          "src/build.sh, or use the default pgmoon driver.\n  " ..
+          tostring(pq), 0)
+  end
+
+  local conn, why = pq.connect(config)
+  if not conn then error("db: could not connect: " .. tostring(why), 0) end
+
+  -- `statement_timeout` for the same reason the pgmoon path sets it: closing
+  -- a connection frees akkar's slot but does not stop the query, so without
+  -- this a timeout makes the database busier rather than quieter.
+  if config.statement_timeout then
+    local ms = math.floor(config.statement_timeout * 1000)
+    local set, set_err = conn:query("set statement_timeout = " .. ms)
+    if not set then
+      -- Close before raising, exactly as the pgmoon path learned to: the
+      -- connection is authenticated by now, so raising out of `open` would
+      -- leave a live Postgres backend that nothing references while the pool
+      -- restored its slot.
+      pcall(function() conn:close() end)
+      error("db: could not set statement_timeout: " ..
+            tostring(set_err and set_err.message or set_err), 0)
+    end
+  end
+
+  return {
+    conn = conn,
+    --- pgmoon's signature: rows, or nil plus a message.
+    query = function(self, sql, ...)
+      -- `table.pack` and its `n` kept intact: a lone nil parameter is a SQL
+      -- NULL, and `#` cannot count it. See the note in `pq_send_query`.
+      local params
+      if select("#", ...) > 0 then params = table.pack(...) end
+      local rows, err = self.conn:query(sql, params)
+      if rows then return rows end
+
+      -- A TIMED-OUT QUERY POISONS ITS CONNECTION and the driver says so. The
+      -- result is still coming, so the next borrower would read this query's
+      -- rows as its own -- the identical defect `in_flight` was added to
+      -- catch on the pgmoon path, where an unread result set left the
+      -- connection refusing everything for the rest of its life.
+      if self.conn.spoiled then self.spoiled = true end
+      return nil, err and err.message or "query failed"
+    end,
+    disconnect = function(self) self.conn:close() end,
+  }
+end
+
 local M = {}
 
 -- ==================================================================== connect
@@ -214,6 +282,14 @@ local M = {}
 -- measured and what a one-off script wants.
 function M.connect(config)
   local function open()
+    if config.driver == "pq" then
+      return setmetatable({ pg = pq_open(config) }, Db)
+    end
+    if config.driver ~= nil and config.driver ~= "pgmoon" then
+      error("db: unknown driver '" .. tostring(config.driver) ..
+            "'; expected 'pgmoon' or 'pq'", 0)
+    end
+
     local pg = pgmoon.new {
       host = config.host or "127.0.0.1",
       port = config.port or 5432,

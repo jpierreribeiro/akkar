@@ -8,6 +8,62 @@
 > The order stands: the Postgres driver first. This is a study to make the
 > decision cheap when it arrives, not a proposal to start building.
 
+## THE QUESTION THAT ACTUALLY GATES THIS, and it is not technical
+
+Everything below is engineering. This part is not, and it decides whether any
+of it matters:
+
+> **Is akkar a framework, where the owner writes every route — or a platform,
+> where somebody else publishes code that runs in your process?**
+
+If the first, there is no untrusted code in the process, and Wasm is six times
+the binary solving a problem akkar does not have. `akkar/vm.lua` is already
+enough for hooks that are untrusted but not hostile, which is what it says it
+is for.
+
+If the second — real multi-tenancy, customer plugins, the `akkar cloud` shape
+that keeps appearing in the design notes — then the gap `vm.lua` admits to is
+a hole in the product, and nothing else fills it inside one process.
+
+**The size spike only matters under the second answer.** Running it first
+would be measuring the cost of a decision nobody has made.
+
+## Why the sandbox distinction is a change of kind, not of degree
+
+Worth stating once, because "Lua already has a sandbox" is the objection that
+makes this look optional.
+
+`akkar/vm.lua` is an **allowlist**. An allowlist has holes you have not found
+yet — `debug`, metatables, `string.dump`, coroutines, and whatever is next —
+and every hole is a total escape, because whoever leaves the sandbox has the
+whole process. That is why the module's own header says it is not a boundary
+against hostile code. That sentence is accurate, not modest.
+
+A Wasm module is an **address space**. It has no instruction that addresses
+memory outside its own; this is not a prohibition, it is an absence from the
+instruction set. And it cannot *name* a capability that was not declared as an
+import — there is no global table to rummage through, no `require`, no
+environment. If the request did not carry `db`, the function is not in that
+instance's linker.
+
+The same argument covers the fear that made this project cautious about C in
+the first place. A `.so` can corrupt the heap and cannot be interrupted; a
+Wasm guest can do neither. **On both axes where owning C is frightening —
+taking the process down, and locking the event loop — Wasm is better than C.**
+
+## What it honestly does not fix
+
+The ecosystem argument is half true and the missing half is the expensive one.
+
+Wasm carries **pure computation**: bcrypt, image processing, compression,
+parsers, codecs. It does not carry **systems software**, which needs sockets,
+TLS and an async runtime that a component does not bring with it. "Compile
+sqlx to Wasm" does not work, and akkar's actual bottleneck was a database
+driver — which is exactly the category that does not cross.
+
+So Wasm would not have solved the problem the C driver just solved, and saying
+otherwise would be selling it.
+
 ## The problem Wasm is a candidate for
 
 Not performance. akkar owns its hot path deliberately — HTTP parsing, router,

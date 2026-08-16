@@ -17,23 +17,47 @@ package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local db = require "akkar.db"
 
-local CONFIG = {
-  host = "127.0.0.1", port = 55432, database = "akkar",
-  user = "postgres", password = "akkar", pool_size = 0,
-}
+package.cpath = "./?.so;" .. package.cpath
 
-local function reachable()
-  local ok, conn = pcall(db.connect(CONFIG))
-  if ok then conn:close() end
+local function config_for(driver)
+  return {
+    host = "127.0.0.1", port = 55432, database = "akkar",
+    user = "postgres", password = "akkar", pool_size = 0,
+    driver = driver,
+  }
+end
+
+local function reachable(driver)
+  local ok, conn = pcall(function() return db.connect(config_for(driver))() end)
+  if ok and conn then conn:close() end
   return ok
 end
 
-if not reachable() then
+if not reachable "pgmoon" then
   describe("akkar.db (integration)", function()
     pending("Postgres is not reachable on 127.0.0.1:55432; skipping")
   end)
   return
 end
+
+-- THE SAME CONTRACT, RUN AGAINST EVERY DRIVER.
+--
+-- The claim `docs/PLAN.md` makes about the adapter boundary is that swapping
+-- the driver rewrites `akkar/db.lua` and nothing else. Until there were two
+-- drivers that was an assertion; running one suite against both is what turns
+-- it into a check, and it is the same shape `spec/jobs_spec.lua` uses to hold
+-- the memory and Redis stores to one set of semantics.
+--
+-- It is also the gate for promoting `pq` to the default. A driver earns that
+-- by answering the contract, not by being newer.
+local DRIVERS = { "pgmoon" }
+if pcall(require, "akkar.pq_native") and reachable "pq" then
+  DRIVERS[#DRIVERS + 1] = "pq"
+end
+
+for _, DRIVER in ipairs(DRIVERS) do
+local CONFIG = config_for(DRIVER)
+describe("driver " .. DRIVER, function()
 
 describe("akkar.db parameter binding", function()
   local conn
@@ -324,3 +348,6 @@ describe("the boot-time warning about unbounded statements", function()
     assert.is_truthy(boot(nil):find("WARN", 1, true))
   end)
 end)
+
+end)
+end
