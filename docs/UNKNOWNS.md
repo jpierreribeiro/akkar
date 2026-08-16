@@ -53,7 +53,11 @@ What that leaves unknown, in rough order of likelihood to bite:
 - **Windows.** Almost certainly not, and saying so is better than leaving it
   ambiguous.
 
-## 2. Correctness over time, as opposed to resources over time
+## 2. ~~Correctness over time~~ — CLOSED
+
+The soak now captures the answer at startup and compares it byte for byte
+every sample, printing both bodies on a divergence. Proven to fire against a
+server rigged to drift. What follows is the original statement.
 
 The 8-hour soak measured RSS, descriptors and throughput. **It never checked
 that the answers were still right.** A server that starts returning the wrong
@@ -71,9 +75,10 @@ misbehaving. Nothing covers the layer below:
 - a Redis failover, or a replica promoted mid-request
 - DNS failing, or resolving to something new
 - the disk filling while logs are being written
-- **the clock jumping** — NTP stepping backwards, which every deadline in the
-  framework is exposed to and which `akkar.time` was built to make testable
-  and has never been tested against
+- ~~**the clock jumping**~~ — **CLOSED.** Measured, and it was worse than
+  feared: one worker's clock stepping forward reaped the whole fleet's live
+  claims. The Redis store now reads the server's clock, so the caller's is
+  never consulted. Deadlines were always immune, being monotonic.
 
 ## 4. Resource exhaustion at the ceiling
 
@@ -85,7 +90,13 @@ Postgres will accept.
 The saturation study went to 4× capacity and stopped, and it stopped because
 that was the interesting part of the curve, not because the rest was checked.
 
-## 5. Encoding, locale and time zone
+## 5. Encoding — CLOSED for encoding, still open for locale and time zone
+
+Ten hostile byte sequences now go through paths, headers and bodies
+(`spec/encoding_spec.lua`). It found sixteen real failures: akkar echoed
+non-UTF-8 bytes into JSON responses. Fixed at the request boundary rather
+than on every response, because validating output measured at 20.8% and 59.9%
+overhead. Locale and time zone remain untested. Original statement follows.
 
 No test sends a non-UTF-8 byte sequence in a header, a path, or a JSON string.
 No test runs under a non-UTF-8 locale or a non-UTC timezone. `os.date`,
