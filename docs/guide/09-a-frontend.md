@@ -358,11 +358,11 @@ Restart the server. Press **Log in**, then **Load my tasks**. The grey box
 under the buttons shows, in turn:
 
 ```
-200 {"email":"grace@example.com","id":5}
+200 {"id":5,"email":"grace@example.com"}
 ```
 
 ```
-200 {"tasks":[{"title":"call the bank","done":false,"id":9}]}
+200 {"tasks":[{"id":9,"title":"call the bank","done":false}]}
 ```
 
 That is a browser, on one origin, logged in to your API on another origin,
@@ -403,7 +403,7 @@ const res = await fetch(API + "/tasks");
 Reload the page and press the two buttons in order. The grey box shows:
 
 ```
-200 {"email":"grace@example.com","id":5}
+200 {"id":5,"email":"grace@example.com"}
 ```
 
 ```
@@ -487,16 +487,16 @@ come back with your origin in it, the preflight is the failure.
 There is one call in `GET /tasks` that has not been explained, and the browser
 is where it earns its place.
 
-Make a second account, one with no tasks in it:
+Make a second account, one with no tasks in it at all:
 
 ```sh
 curl -s -c new-cookies.txt -X POST http://127.0.0.1:3000/signup \
   -H "content-type: application/json" \
-  -d '{"email":"lovelace@example.com","password":"correct horse battery"}'
+  -d '{"email":"hamilton@example.com","password":"correct horse battery"}'
 ```
 
 ```
-{"email":"lovelace@example.com","id":8}
+{"id":12,"email":"hamilton@example.com"}
 ```
 
 Now imagine the handler without that call, written the plain way:
@@ -516,24 +516,7 @@ curl -s -b new-cookies.txt http://127.0.0.1:3000/tasks
 {"tasks":{}}
 ```
 
-`{}`, not `[]`. Add one task and it changes shape:
-
-```sh
-curl -s -b new-cookies.txt -X POST http://127.0.0.1:3000/tasks \
-  -H "content-type: application/json" -d '{"title":"buy a birthday card"}'
-```
-
-```
-{"title":"buy a birthday card","done":false,"id":11}
-```
-
-```sh
-curl -s -b new-cookies.txt http://127.0.0.1:3000/tasks
-```
-
-```
-{"tasks":[{"title":"buy a birthday card","done":false,"id":11}]}
-```
+`{}`, not `[]`.
 
 **That is a bug, and it is yours to fix rather than the browser's to survive.**
 An endpoint whose type depends on how much data it found is an endpoint every
@@ -548,7 +531,7 @@ and an empty object, and nothing in the table says which one you meant. akkar's
 JSON encoder has to guess, and it guesses `{}`.
 
 `akkar.array` is how you say which one you meant, and it is why the handler in
-your file already reads like this:
+your file reads like this instead:
 
 ```lua no-run
 app:get("/tasks", function(req)
@@ -566,10 +549,28 @@ curl -s -b new-cookies.txt http://127.0.0.1:3000/tasks
 {"tasks":[]}
 ```
 
-Only the empty case ever changed. A list with rows in it was already an array.
+Only the empty case ever changed. Add a task and the answer is the same either
+way, because a list with rows in it was already an array:
+
+```sh
+curl -s -b new-cookies.txt -X POST http://127.0.0.1:3000/tasks \
+  -H "content-type: application/json" -d '{"title":"buy a birthday card"}'
+```
+
+```
+{"id":12,"title":"buy a birthday card","done":false}
+```
+
+```sh
+curl -s -b new-cookies.txt http://127.0.0.1:3000/tasks
+```
+
+```
+{"tasks":[{"id":12,"title":"buy a birthday card","done":false}]}
+```
 
 **Wrap every list you return.** It costs one call and it removes a whole class
-of frontend bug that only appears for the emptiest, newest accounts, which are
+of frontend bug that appears only for the emptiest, newest accounts, which are
 exactly the ones you test with last.
 
 If you are consuming an API somebody else wrote and it does this, the guard on

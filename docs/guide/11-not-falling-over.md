@@ -93,7 +93,7 @@ Install it as middleware and it applies to everything:
 app:use(limiter)
 ```
 
-Try eleven requests quickly and the eleventh is refused:
+Send eleven requests quickly and the eleventh is refused:
 
 ```sh
 curl -s -i http://127.0.0.1:3000/tasks
@@ -101,13 +101,13 @@ curl -s -i http://127.0.0.1:3000/tasks
 
 ```
 HTTP/1.1 429 Too Many Requests
-ratelimit-limit: 10
 access-control-allow-credentials: true
-retry-after: 1
-ratelimit-remaining: 0
 access-control-allow-origin: http://127.0.0.1:5173
 ratelimit-reset: 2
-x-request-id: 5127e20500001b
+ratelimit-limit: 10
+retry-after: 1
+ratelimit-remaining: 0
+x-request-id: 35e8f1a2000026
 content-type: application/json
 content-length: 45
 
@@ -143,7 +143,7 @@ done
 ```
 
 ```
-200 200 200 200 200 200 200 200 200 200 200 429
+200 200 200 200 200 200 200 200 200 200 429 429
 ```
 
 Read what that means. Your host asks "are you alive?", your server answers
@@ -182,7 +182,7 @@ done
 ```
 
 ```
-401 401 401 401 401 401 401 401 401 401 401 429
+401 401 401 401 401 401 401 401 401 401 429 429
 ```
 
 ### The limiter needs a shared place to count
@@ -196,11 +196,16 @@ whether you have a real limit:
 - **Redis** counts in one place that every process shares. That is a real
   limit.
 
-You already started Redis on page 10 for the job queue, so switching costs one
-line in `app:run`:
+You already started Redis on page 10 for the job queue, so switching means
+changing the `cache` line of `app:run` and nothing else:
 
 ```lua no-run
-cache = redis.connect { port = 6379 },
+app:run {
+  port = 3000,
+  timeout = 5,
+  db = connect,
+  cache = redis.connect { port = 6379 },
+}
 ```
 
 This has a second effect you will like: sessions live in `req.cache` too, so
@@ -259,7 +264,7 @@ curl -s http://127.0.0.1:3000/health/live
 ```
 
 ```
-{"status":"pass","uptime":8.9354297539976,"checks":{}}
+{"status":"pass","uptime":9.7806364339995,"checks":{}}
 ```
 
 ```sh
@@ -267,7 +272,7 @@ curl -s http://127.0.0.1:3000/health/ready
 ```
 
 ```
-{"status":"pass","uptime":8.957531592001,"cached":false,"checks":{"db":{"status":"pass","took_ms":2}}}
+{"status":"pass","uptime":9.7931252540002,"cached":false,"checks":{"db":{"status":"pass","took_ms":1}}}
 ```
 
 Notice `"checks":{}` on the liveness answer. It ran nothing, and that is the
@@ -347,16 +352,13 @@ curl -s -i http://127.0.0.1:3000/health/live
 
 ```
 HTTP/1.1 200 OK
-access-control-allow-origin: http://127.0.0.1:5173
-ratelimit-limit: 10
-ratelimit-reset: 1
-ratelimit-remaining: 9
 access-control-allow-credentials: true
-x-request-id: 1e50dd00000001
+access-control-allow-origin: http://127.0.0.1:5173
+x-request-id: db2ef11b000001
 content-type: application/json
 content-length: 54
 
-{"status":"pass","checks":{},"uptime":7.7372604460033}
+{"checks":{},"status":"pass","uptime":8.5785176360005}
 ```
 
 Readiness, same server, same moment:
@@ -367,16 +369,13 @@ curl -s -i http://127.0.0.1:3000/health/ready
 
 ```
 HTTP/1.1 503 Service Unavailable
-access-control-allow-origin: http://127.0.0.1:5173
-ratelimit-limit: 10
-ratelimit-reset: 2
-ratelimit-remaining: 8
 access-control-allow-credentials: true
-x-request-id: 1e50dd00000002
+access-control-allow-origin: http://127.0.0.1:5173
+x-request-id: db2ef11b000002
 content-type: application/json
-content-length: 222
+content-length: 307
 
-{"error":{"status":"fail","cached":false,"checks":{"db":{"status":"fail","took_ms":0,"reason":"\/home\/jp\/.luarocks\/share\/lua\/5.4\/pgmoon\/cqueues.lua:18: socket:connect: Connection refused"}},"uptime":7.747202161001}}
+{"error":{"uptime":8.5937886770043,"checks":{"db":{"took_ms":1,"status":"fail","reason":"db: could not connect to 127.0.0.1:55499 (database \"akkar\", user \"postgres\") -- \/home\/jp\/.luarocks\/share\/lua\/5.4\/pgmoon\/cqueues.lua:18: socket:connect: Connection refused"}},"status":"fail","cached":false}}
 ```
 
 `200` and `503`, from one process, at the same instant, and both are correct.

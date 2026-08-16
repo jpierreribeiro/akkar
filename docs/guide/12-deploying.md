@@ -1,6 +1,6 @@
 # 12. Putting it on the internet
 
-By the end of this page your task list will be a 6.6 MB container image that
+By the end of this page your task list will be a 6.58 MB container image that
 runs its own migrations when it starts, reads every secret from the
 environment, and stops cleanly when the host asks it to.
 
@@ -30,8 +30,11 @@ are already next to your `app.lua`.
 
 | target | contains | size |
 |---|---|---|
-| default | your binary and a CA bundle | 6.6 MB |
-| `slim` | the same binary, plus busybox | 14.5 MB |
+| default | your binary and a CA bundle | 6.58 MB for this application |
+| `slim` | the same binary, plus busybox | about 8 MB more |
+
+Sizes move a little with what your application pulls in. `docs/DEPLOY.md`
+measured 6.4 MB for a smaller example and 14.5 MB for its `slim` build.
 
 The default has no shell in it. That is a feature most days and a trap on one
 specific day, which has its own section below.
@@ -167,8 +170,9 @@ tables, and it has to happen on every deploy, before the new code serves a
 request.
 
 The obvious approach is to ship the `migrations/` folder and let
-`akkar.migrate` read it. **From this image, that does not work**, and the
-failure is worth showing because nothing about it is guessable:
+`akkar.migrate` read it. **From this image, that does not work.** Somebody hit
+it before you and wrote it down in `docs/DEPLOY.md`, with the directory
+mounted and readable:
 
 ```
 akkar.migrate: could not list /migrations:
@@ -176,7 +180,7 @@ find "/migrations" -maxdepth 1 -type f -name '*.sql': No such file or directory
 ```
 
 Read that carefully. It says "No such file or directory" about a directory that
-is mounted and readable. The missing file is not `/migrations`. It is
+was there the whole time. The missing file is not `/migrations`. It is
 **`/bin/sh`**.
 
 `akkar.migrate` lists a directory by running `find`, because Lua has no way to
@@ -185,7 +189,7 @@ Running `find` needs a shell. This image has no shell. Prove it on your own
 machine once the image is built:
 
 ```sh
-docker exec mytasks-run /bin/sh -c 'echo hi'
+docker exec tasklist-api /bin/sh -c 'echo hi'
 ```
 
 ```
@@ -307,9 +311,9 @@ involved. `--network host` lets the container reach `127.0.0.1` services on
 your machine; on a real deploy the host names are real.
 
 ```sh
-docker run -d --name mytasks-run --network host \
+docker run -d --name tasklist-api --network host \
   -e PORT=3003 -e HOST=0.0.0.0 \
-  -e PGHOST=127.0.0.1 -e PGPORT=55432 -e PGDATABASE=akkar_container \
+  -e PGHOST=127.0.0.1 -e PGPORT=55432 -e PGDATABASE=tasklist_deploy \
   -e PGUSER=postgres -e PGPASSWORD=akkar \
   -e REDIS_HOST=127.0.0.1 -e REDIS_PORT=6379 \
   -e SESSION_SECRET=this-is-thirty-two-bytes-long-ok \
@@ -318,15 +322,16 @@ docker run -d --name mytasks-run --network host \
   mytasks
 ```
 
-`akkar_container` is a new, empty database. Create it first with
-`createdb`, or with whatever your Postgres container gives you.
+`tasklist_deploy` is a new, empty database, with nothing in it at all.
+Create it first with `createdb tasklist_deploy`, or with whatever your Postgres
+container gives you.
 
 `INSECURE_COOKIES=1` is only for this local test. Session cookies are marked
 `Secure` by default, which means the browser will not send them over plain
 `http`. In production you have HTTPS and you leave this unset.
 
 ```sh
-docker logs mytasks-run
+docker logs tasklist-api
 ```
 
 ```
@@ -345,7 +350,7 @@ curl -s http://127.0.0.1:3003/health/ready
 ```
 
 ```
-{"uptime":7.0617773690028,"cached":false,"status":"pass","checks":{"db":{"status":"pass","took_ms":1}}}
+{"cached":false,"status":"pass","uptime":3.8247107550051,"checks":{"db":{"status":"pass","took_ms":1}}}
 ```
 
 ```sh
@@ -380,8 +385,8 @@ It is fast, because everything except the last two layers is already cached.
 from the environment rather than from the file.
 
 ```sh
-docker run -d --name mytasks-worker-run --network host \
-  -e PGHOST=127.0.0.1 -e PGPORT=55432 -e PGDATABASE=akkar_container \
+docker run -d --name tasklist-worker --network host \
+  -e PGHOST=127.0.0.1 -e PGPORT=55432 -e PGDATABASE=tasklist_deploy \
   -e PGUSER=postgres -e PGPASSWORD=akkar \
   -e REDIS_HOST=127.0.0.1 -e REDIS_PORT=6379 \
   mytasks-worker
@@ -396,17 +401,23 @@ curl -s -X POST http://127.0.0.1:3003/signup \
 ```
 
 ```
-{"email":"grace@example.com","id":2}
+{"id":2,"email":"grace@example.com"}
 ```
 
 ```sh
-docker logs mytasks-worker-run
+docker logs tasklist-worker
 ```
 
 ```
 INFO  worker waiting for jobs
+INFO  welcome email sent to=ada@example.com
 INFO  welcome email sent to=grace@example.com
 ```
+
+Two emails, and only one signup happened just now. The other is ada's, queued
+before there was any worker to take it, and waiting in Redis the whole time.
+That is page 10's "if nobody is listening, the job waits", seen from the other
+side.
 
 Two containers, one Redis between them, and neither knows the other exists.
 
@@ -426,7 +437,7 @@ app:handle_signals()
 Watch it:
 
 ```sh
-docker stop mytasks-run
+docker stop tasklist-api
 ```
 
 ```
@@ -473,9 +484,12 @@ production even though your container never sees a certificate.
 `app.lua`. It is longer than page 11's, and every extra line is one of the five
 things on this page.
 
-It is not run by the documentation's own test suite, and the reason is the
-point of the file: it refuses to start without its environment, and the suite
-has none to give it.
+It is the one file in this guide the documentation's own test suite does not
+execute, and the reason is the point of the file: it refuses to start without
+its environment, and the suite has none to give it. It was verified the way
+this page describes instead, by being built into the image above and run
+against a real Postgres and a real Redis, which is a better test than the
+runner could have given it.
 
 ```lua no-run
 local akkar   = require "akkar"
@@ -740,7 +754,7 @@ queue:consume(handlers, { log = log, timeout = 1 })
 
 You have this if:
 
-- `docker build` produces an image of about 6.6 MB
+- `docker build` produces an image of about six and a half megabytes
 - `docker logs` shows four migrations applied on the first run and none on the
   second
 - the container answers `/health/ready` and accepts a signup

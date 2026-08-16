@@ -193,21 +193,21 @@ And a terminal for `curl`:
 ```sh
 time curl -s -i -X POST http://127.0.0.1:3000/signup \
   -H "content-type: application/json" \
-  -d '{"email":"turing@example.com","password":"correct horse battery"}'
+  -d '{"email":"noether@example.com","password":"correct horse battery"}'
 ```
 
 ```
 HTTP/1.1 201 Created
 access-control-allow-origin: http://127.0.0.1:5173
-set-cookie: akkar_session=1395e2e93c7d10f7351ec03b243e02aa67df927fc028066b0d653e5de6db4585.eefb438389bed5ff916cb23702fb04c56930fc63ff75858838bfcf8e2e1e92d0; Path=/; Max-Age=1209600; HttpOnly; SameSite=Lax
+set-cookie: akkar_session=d621d5985219d60fb67a9e8cb0c81ac7c9be544a13d2c626dc259743d2ee72da.ad449163adb6b63484c8aac280c1c093a97eac1624e6379f65708cf35a5f072c; Path=/; Max-Age=1209600; HttpOnly; SameSite=Lax
 access-control-allow-credentials: true
-x-request-id: bda1226e000001
+x-request-id: d34903c6000001
 content-type: application/json
-content-length: 37
+content-length: 39
 
-{"email":"turing@example.com","id":9}
+{"id":13,"email":"noether@example.com"}
 
-real	0m0,759s
+real	0m0,777s
 ```
 
 Under a second, and most of that second is hashing the password, not the email.
@@ -216,7 +216,7 @@ Look at the worker's terminal:
 
 ```
 INFO  worker waiting for jobs
-INFO  welcome email sent to=turing@example.com
+INFO  welcome email sent to=noether@example.com
 ```
 
 That line appeared about three seconds after the `curl` finished. **The caller
@@ -243,11 +243,18 @@ and Redis does. Here is what that means in practice.
 
 When a worker takes a job, the job is not deleted. It moves to a "being worked
 on" list, and it is only removed once the handler has finished. If the worker
-is killed halfway through, the job is still there, and it can be put back and
-run again.
+is killed halfway through, the job is still sitting in that list rather than
+gone.
 
-The alternative would be to delete the job the moment it is handed out. Then a
-worker that dies loses the job silently and forever, and nobody finds out.
+Nothing puts it back on its own. `queue:reap(older_than)` is the call that
+returns abandoned jobs to the queue, and it is yours to make, from a timer or
+at startup, because only you know how long one of your handlers may
+legitimately take. Set `older_than` too low and you will hand a live job to a
+second worker while the first is still working on it.
+
+The alternative design would be to delete the job the moment it is handed out.
+Then a worker that dies loses the job silently and forever, and nobody finds
+out.
 
 **So the trade is deliberate: a job that runs twice is better than a job that
 vanishes.** One is visible and fixable. The other is invisible.
@@ -292,7 +299,7 @@ local jobs  = require "akkar.jobs.redis"
 
 local queue = jobs.new(redis.connect { port = 6379 }(), "email")
 
-queue:push("welcome_email", { account_id = 10, email = "babbage@example.com" })
+queue:push("welcome_email", { account_id = 14, email = "lamarr@example.com" })
 
 print("jobs waiting: " .. queue:depth())
 ```
@@ -315,8 +322,8 @@ lua5.4 worker.lua
 
 ```
 INFO  worker waiting for jobs
-INFO  welcome email sent to=babbage@example.com
-INFO  this welcome email was already sent, doing nothing account_id=10
+INFO  welcome email sent to=lamarr@example.com
+INFO  this welcome email was already sent, doing nothing account_id=14
 ```
 
 Two jobs, one email. That is what "safe to run twice" looks like, and it is
