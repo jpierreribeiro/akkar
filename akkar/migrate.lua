@@ -173,12 +173,44 @@ end
 -- would pick up a backup directory, an editor's `.sql~`, or a subdirectory
 -- somebody made to "archive" old migrations -- and applying an archive is a
 -- worse failure than not finding it.
+--- THE SHELL IS NOT ALWAYS THERE, and a deploy found it the hard way.
+---
+--- `io.popen` needs `/bin/sh`. The single-file binary `akkar build` produces
+--- runs happily in a `scratch` container -- two files, no libc, no shell --
+--- which is the whole point of the runtime, and in that image this function
+--- fails with:
+---
+---     could not list /migrations: ... No such file or directory
+---
+--- where the missing file is the SHELL, not the directory. Proven rather than
+--- guessed: the same binary against the same mount and the same database
+--- applied both migrations from an Alpine image and neither from scratch.
+---
+--- The fix is not to find another way to read a directory -- there is none in
+--- plain Lua, and adding a C dependency to list files would trade the whole
+--- point of the small binary for a convenience. The fix is that a deployment
+--- which cannot list files should not have to: `migrate.new(db, { files =
+--- {...} })` takes the migrations as data, which is what `akkar build` should
+--- embed alongside the modules. A directory stays the default because it is
+--- what development wants, and development has a shell.
+local function shell_available()
+  local pipe = io.popen "exit 0"
+  if not pipe then return false end
+  local ok = pipe:close()
+  return ok and true or false
+end
+
 local function sql_files(dir)
   local found = {}
   local pipe, why = io.popen(
     ("find %q -maxdepth 1 -type f -name '*.sql' 2>/dev/null"):format(dir))
   if not pipe then
-    error("akkar.migrate: could not list " .. dir .. ": " .. tostring(why), 0)
+    error("akkar.migrate: could not list " .. dir .. ": " .. tostring(why) ..
+          (shell_available() and ""
+           or "\n  there is no shell in this image, which is normal for a " ..
+              "binary built by `akkar build` and running in a scratch " ..
+              "container.\n  pass the migrations as data instead: " ..
+              "migrate.new(db, { files = { { name = ..., sql = ... } } })"), 0)
   end
   for path in pipe:lines() do found[#found + 1] = path end
   -- `find` exits non-zero when the directory is not there, and that has to be
@@ -190,7 +222,11 @@ local function sql_files(dir)
   if not ok then
     error("akkar.migrate: cannot read the migration directory '" .. dir ..
           "' -- it does not exist, or is not readable from " ..
-          "the working directory", 0)
+          "the working directory" ..
+          (shell_available() and ""
+           or ".\n  Or -- more likely, since there is no shell here -- this " ..
+              "is a scratch container. Pass the migrations as data: " ..
+              "migrate.new(db, { files = { { name = ..., sql = ... } } })"), 0)
   end
   return found
 end
@@ -228,9 +264,44 @@ function M.new(db, options)
   end
 
   options = options or {}
+
+  -- MIGRATIONS AS DATA, for a deployment that cannot list files.
+  --
+  -- `{ files = { { name = "001_users.sql", sql = "create table ..." } } }`
+  -- is the same input a directory produces, handed over directly. It exists
+  -- because the binary `akkar build` emits runs in a scratch container with
+  -- no shell, where listing a directory is impossible -- see `sql_files`. It
+  -- is also the honest shape for a single artefact: a deploy whose schema
+  -- travels inside the binary cannot fall out of step with the code, which is
+  -- a class of incident a separate migrations directory invites.
+  --
+  -- Validated here rather than at first use, because the failure otherwise
+  -- lands during `apply`, holding a lock, halfway through a deploy.
+  local literal
+  if options.files ~= nil then
+    if type(options.files) ~= "table" then
+      error("akkar.migrate: `files` must be a list of { name, sql }, got " ..
+            type(options.files), 2)
+    end
+    if options.dir ~= nil then
+      error("akkar.migrate: pass `dir` or `files`, not both -- two sources " ..
+            "of migrations is two answers to what has been applied", 2)
+    end
+    literal = {}
+    for index, entry in ipairs(options.files) do
+      if type(entry) ~= "table" or type(entry.name) ~= "string"
+         or type(entry.sql) ~= "string" then
+        error(("akkar.migrate: files[%d] must be { name = string, sql = " ..
+               "string }"):format(index), 2)
+      end
+      literal[#literal + 1] = { name = entry.name, sql = entry.sql }
+    end
+  end
+
   return setmetatable({
     db = db,
-    dir = options.dir or "migrations",
+    dir = options.files and nil or (options.dir or "migrations"),
+    literal = literal,
     ledger = ledger_name(options.table or "akkar_migrations"),
   }, Migrate)
 end
@@ -258,6 +329,22 @@ end
 --- Each entry is `{ name, path, sql, checksum }`.
 function Migrate:files()
   local out = {}
+
+  -- The data path. Checksummed identically, so a migration embedded in a
+  -- binary and the same migration read from disk produce the same ledger row
+  -- -- otherwise moving from a directory to an embedded list would look like
+  -- every migration had been edited.
+  if self.literal then
+    for _, entry in ipairs(self.literal) do
+      out[#out + 1] = {
+        name = entry.name, path = nil, sql = entry.sql,
+        checksum = checksum_of(entry.sql),
+      }
+    end
+    table.sort(out, function(a, b) return a.name < b.name end)
+    return out
+  end
+
   for _, path in ipairs(sql_files(self.dir)) do
     local sql = read_file(path)
     out[#out + 1] = {

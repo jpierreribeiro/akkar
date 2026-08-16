@@ -402,3 +402,107 @@ describe("akkar.migrate", function()
     end)
   end)
 end)
+
+describe("migrations as data, for an image with no shell", function()
+  -- The deploy that found this ran the same binary from a scratch container:
+  -- two files, no libc, no `/bin/sh`. `io.popen` needs a shell, so listing a
+  -- directory is not merely awkward there, it is impossible -- and the error
+  -- said "No such file or directory" about the SHELL while naming the
+  -- directory, which is as misleading as an error gets.
+  --
+  -- Adding a C dependency to list files would trade the small binary for a
+  -- convenience. Handing the migrations over as data costs nothing and is the
+  -- honest shape for a single artefact anyway: a schema that travels inside
+  -- the binary cannot fall out of step with the code that expects it.
+  local db_module = require "akkar.db"
+
+  local CONFIG = {
+    host = "127.0.0.1", port = 55432, database = "akkar",
+    user = "postgres", password = "akkar", pool_size = 0,
+  }
+
+  local function reachable()
+    local ok, conn = pcall(function() return db_module.connect(CONFIG)() end)
+    if ok and conn then conn:close() end
+    return ok
+  end
+
+  if not reachable() then
+    pending "Postgres is not reachable on 127.0.0.1:55432; skipping"
+    return
+  end
+
+  local db, runner
+
+  before_each(function()
+    db = db_module.connect(CONFIG)()
+    db:exec "drop table if exists akkar_data_spec"
+    db:exec "drop table if exists akkar_data_ledger"
+    runner = require("akkar.migrate").new(db, {
+      table = "akkar_data_ledger",
+      files = {
+        { name = "002_second.sql", sql = "alter table akkar_data_spec add column note text" },
+        { name = "001_first.sql",  sql = "create table akkar_data_spec (id serial primary key)" },
+      },
+    })
+  end)
+
+  after_each(function()
+    if db then
+      db:exec "drop table if exists akkar_data_spec"
+      db:exec "drop table if exists akkar_data_ledger"
+      db:close()
+    end
+  end)
+
+  it("applies them in name order, not the order they were listed", function()
+    -- Deliberately given second-then-first: without the sort, 002 alters a
+    -- table 001 has not created yet.
+    local applied = runner:apply()
+    assert.same({ "001_first.sql", "002_second.sql" }, applied)
+    local row = db:one "select to_regclass('akkar_data_spec') is not null as present"
+    assert.is_true(row.present)
+  end)
+
+  it("is idempotent, exactly as the directory path is", function()
+    runner:apply()
+    assert.same({}, runner:apply())
+  end)
+
+  it("refuses an edited migration, exactly as the directory path does", function()
+    runner:apply()
+
+    local tampered = require("akkar.migrate").new(db, {
+      table = "akkar_data_ledger",
+      files = {
+        { name = "001_first.sql", sql = "create table akkar_data_spec (id serial primary key) -- edited" },
+        { name = "002_second.sql", sql = "alter table akkar_data_spec add column note text" },
+      },
+    })
+    local ok, why = pcall(function() return tampered:pending() end)
+    assert.is_false(ok)
+    assert.is_truthy(tostring(why):find("001_first.sql", 1, true))
+  end)
+
+  it("refuses both sources at once", function()
+    -- Two sources of migrations is two answers to what has been applied.
+    local ok, why = pcall(function()
+      return require("akkar.migrate").new(db, { dir = "x", files = {} })
+    end)
+    assert.is_false(ok)
+    assert.is_truthy(tostring(why):find("not both", 1, true))
+  end)
+
+  it("refuses a malformed entry rather than skipping it", function()
+    for _, bad in ipairs {
+      { { name = "a.sql" } },                 -- no sql
+      { { sql = "select 1" } },               -- no name
+      { "not a table" },
+    } do
+      local ok = pcall(function()
+        return require("akkar.migrate").new(db, { files = bad })
+      end)
+      assert.is_false(ok, "a malformed migration entry was accepted")
+    end
+  end)
+end)
