@@ -88,6 +88,15 @@ build = {
     ["akkar.metrics"] = "akkar/metrics.lua",
     ["akkar.multipart"] = "akkar/multipart.lua",
     ["akkar.pool"] = "akkar/pool.lua",
+
+    -- The Lua half of the Postgres driver. Its C half, `akkar.pq_native`, is
+    -- DELIBERATELY NOT HERE: declaring it would make libpq a hard dependency
+    -- of `luarocks install akkar` and break the install for everyone who does
+    -- not use Postgres. It is built by `src/build.sh` and required only by
+    -- this module, which nothing else requires yet -- `akkar/db.lua` still
+    -- goes through pgmoon. See `bench/driver/RESULTS.md` for why that wiring
+    -- is a separate decision.
+    ["akkar.pq"] = "akkar/pq.lua",
     ["akkar.redis"] = "akkar/redis.lua",
     ["akkar.sql"] = "akkar/sql.lua",
     ["akkar.substrate"] = "akkar/substrate.lua",
