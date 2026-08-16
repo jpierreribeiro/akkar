@@ -17,28 +17,30 @@ server.
 The practical consequence is worth stating plainly: **akkar does not yet serve
 a service that calls another service**, which is most real backends.
 
-## The fork in the road, which has to be decided before Tier 5
+## Scope, decided rather than left open
 
-"A complete web framework" has two readings and they lead to different
-projects:
+**akkar is complete when it is complete for JSON APIs.** Tiers 0-4 below are
+that, and there is no Tier 5.
 
-| | scope | what it adds |
-|---|---|---|
-| **A. Complete for JSON APIs** | what `PLAN.md` §1 already says akkar is | outbound path, auth, migrations, ops surface |
-| **B. Complete like Rails/Django** | reverses `PLAN.md` §1 | templates, HTML forms, CSRF, static assets, flash, admin |
+The other reading of "a complete web framework" -- templates, HTML forms,
+CSRF on form posts, flash messages, an asset pipeline, scaffolding -- was
+considered on 16 Aug 2026 and **rejected**, which confirms what `PLAN.md` §1
+has said from the beginning rather than reversing it.
 
-**Recommendation: A, and stop there.** Not from timidity — from the fact that
-every structural property akkar has earned is stated in terms of JSON. The
-handler *returns* a response instead of mutating a context, so writing twice
-is structurally impossible; that invariant is what makes the response
-serialisable and validatable, and template rendering is exactly the feature
-that erodes it. OpenAPI derives from the schemas because the schemas describe
-JSON. Tenant scope works because every read goes through a builder.
+The reason is not scope timidity. It is that reading is not an increment; it
+is a **second product sharing a runtime**, and the thing it changes is the
+invariant every other property rests on. akkar's handler *returns* a response
+instead of mutating a context, and that single fact is what makes writing the
+response twice structurally impossible, what makes OpenAPI derivable from the
+schemas, and what keeps tenant scope enforceable because every read goes
+through a builder. Template rendering erodes all three at once -- a renderer
+wants to stream into a response that is still being assembled, which is
+precisely the mutation the design refuses.
 
-Reading B is not wrong, but it is a **second product** sharing a runtime, and
-it should be decided as one rather than arrived at by adding a template
-engine. Tiers 0–4 below are common to both; Tier 5 is where B forks off and it
-is written separately.
+So a server-rendered akkar would not be akkar with more features. It would be
+a different framework that happened to share the event loop, and it should be
+decided as one -- with its own name and its own invariants -- rather than
+arrived at by adding a template engine to this one.
 
 ## The rules every module below obeys
 
@@ -226,31 +228,13 @@ Each of these is independently useful and none blocks the others.
 
 | | notes |
 |---|---|
-| **Static files** | Range requests, ETag, `sendfile` if cheap. Small, and needed by Tier 5. |
+| **Static files** | Range requests, ETag, `sendfile` if cheap. Small. Not a step toward server-rendered HTML -- serving a file and rendering a page are unrelated jobs. |
 | **WebSocket** | lua-http has an implementation. Real question is lifecycle: a long-lived connection outside the request/response model needs its own capability and shutdown story. **Not small.** |
 | **Email** | Over 0.1, to an HTTP API. SMTP is a protocol implementation and a different-sized job; `BACKLOG` currently excludes mail adapters and that exclusion is about *vendor* adapters, not about the capability. |
 | **Object storage** | S3 over 0.1 plus SigV4 from 0.2. Mostly signing. |
 
 *Size: static half a session; storage half; email half; WebSocket a full one on
 its own.*
-
----
-
-# Tier 5 — Where reading B forks off
-
-**Only if the answer to the fork above is B.** Listed so the size is visible
-before the decision, not after.
-
-- Template engine, or a binding to one
-- HTML form parsing beyond multipart, and form validation errors as HTML
-- CSRF for form posts (partly covered by 1.2)
-- Flash messages, which require sessions
-- Asset pipeline, or an explicit refusal to have one
-- `akkar new` scaffolding, which only becomes valuable with a conventional
-  layout to scaffold
-
-**This is not an increment; it is a second product.** It changes what a handler
-returns, which is the invariant the whole framework is built on.
 
 ---
 
@@ -275,8 +259,9 @@ returns, which is the invariant the whole framework is built on.
 `0.1` and `0.2` are the two roots and neither blocks the other. Everything
 worth having is within two steps of them.
 
-**Rough total for Tiers 0–4: eight to ten focused sessions**, WebSocket being
-the one item that could double on its own. Tier 5 is comparable again.
+**Rough total: eight to ten focused sessions**, WebSocket being the one item
+that could double on its own. That is the whole of it -- there is nothing
+after Tier 4, by decision rather than by omission.
 
 # Risks, stated before they are discovered
 
