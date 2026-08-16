@@ -115,6 +115,16 @@ feature.** In Lua `0` is true, so `budget and (...)` turned "no deadline" into
 
 ### Why the default did not move
 
+> **CORRECTED.** The reasoning below was investigated and did not survive:
+> `akkar.pq` is **not** less consistent than pgmoon. Re-measured at the same
+> configuration it comes back at 1.8% spread with zero anomalous windows, and
+> the one raggedness that does reproduce is the harness splitting connections
+> across processes — which hits pgmoon harder. `bench/driver/ANOMALY.md`.
+>
+> The default still does not move, for a reason nobody had stated: the C half
+> is a **separate rock**, so a default of `pq` would fail at the first query for
+> anyone who installed only `akkar`. Packaging, not judgement.
+
 The C driver is faster **and less consistent**. Across thirty ten-second
 windows, pgmoon held 0.9%–3.5% spread on every route and produced zero
 anomalous windows. `akkar.pq` produced two, on routes whose spread was 21.4%
@@ -160,7 +170,23 @@ denial-of-service repairs for it, and `docs/substrate/RESULT.md` plus the
 executable contract exist to make that move a measured step. Speed is the
 bonus, not the case.
 
-### 1. Explain the pq inconsistency, then make it the default
+### 1. ~~Explain the pq inconsistency, then make it the default~~ — DONE
+
+**There was no inconsistency.** At the exact configuration the claim was
+measured in, `akkar.pq` comes back at 1.8% spread with zero anomalous windows
+against the published 21.4% and two. The one raggedness that reproduces is
+`SO_REUSEPORT` splitting six connections over two processes, and it hits
+**pgmoon harder than pq**. A Postgres checkpoint was the first hypothesis and
+was refuted by forcing it.
+
+The default still does not move, for an unrelated reason: `akkar.pq_native` is
+a separate rock, so a default of `pq` would fail at the first query for anyone
+who installed only `akkar`. What changed is the recommendation — install
+`akkar-pq` and use it.
+
+`bench/driver/ANOMALY.md`. The superseded reasoning follows.
+
+### 1b. The original item
 
 This is the highest return available and most of the work is done. `akkar.pq`
 is **2.79x on a thousand rows** with p99 under saturation falling from 1.3 s to

@@ -443,14 +443,20 @@ Measured end to end over HTTP on a reserved machine, against pgmoon:
 | a thousand rows | 333 | **928** (2.79x) |
 | p99, a thousand rows, saturated | 1300 ms | **475 ms** |
 
-**pgmoon is still the default**, and the reason is measured rather than
-cautious: the C driver is faster and less consistent. Across thirty
-ten-second windows pgmoon produced no anomalous ones and `akkar.pq` produced
-two, where a whole window ran at pgmoon's speed for reasons nobody has
-explained yet. A driver becomes the default by proving itself against the same
-contract, not by being faster on average.
+**pgmoon is still the default, and not because of any doubt about `akkar.pq`.**
+The C half is a separate rock, so a default of `pq` would fail at the first
+query for everyone who installed only `akkar`. That is packaging, not judgement.
 
-Both numbers and the open question are in `bench/driver/RESULTS.md` §5.
+An earlier consistency objection has been **withdrawn**. It reported that
+`akkar.pq` lost two windows in thirty where pgmoon lost none; investigated, the
+number does not reproduce — 1.8% spread and zero anomalous windows at the same
+configuration — and the one raggedness that does reproduce is the harness
+splitting a small number of connections across processes, which hits pgmoon
+harder. `bench/driver/ANOMALY.md` has the four experiments, two of which
+refuted a hypothesis.
+
+So: **if you install `akkar-pq`, use it.** Both numbers and the correction are
+in `bench/driver/RESULTS.md` §5.
 
 Everything on this page behaves the same either way: the shim gives `akkar.pq`
 pgmoon's shape, and `Connection`, the transaction, the scope wrapper and the
