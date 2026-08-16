@@ -385,6 +385,173 @@ function M.emit(plan)
   return table.concat(out, "\n")
 end
 
+-- ============================================================== archives
+--
+-- WHY THIS IS RECIPES AND NOT ONE ALGORITHM.
+--
+-- `akkar build` consumes `.a` files. Producing them from a rock's source is
+-- the step that was left as "run `make` and `ar` by hand", and the honest
+-- reason it stayed there is that there is no general procedure. Every C rock
+-- builds differently:
+--
+--   cqueues    a GNUmakefile with a target per Lua API, and a build that
+--              already emits `libnonlua.a` beside per-API objects whose
+--              basenames COLLIDE with it
+--   luaossl    the same shape, and it must be told `-DHAVE_DLADDR=0` or the
+--              binary dies at startup on a `dlopen` of itself
+--   lua-cjson  no build system worth using, and it compiles EITHER fpconv.c
+--              OR dtoa.c -- archiving both is a duplicate symbol
+--   lpeg       six named sources and nothing else
+--
+-- A generic "compile every .c and archive it" gets three of those wrong. So:
+-- a small mechanism, plus named recipes for the libraries akkar itself needs,
+-- and a loud failure for anything else rather than a plausible archive that
+-- fails at link time.
+
+--- What each library needs. Anything not here can still be archived by
+--- passing the same fields explicitly.
+M.recipes = {
+  cqueues = {
+    make = "all%s",
+    -- `src/lib` and `src/%s` both define socket.o, dns.o and notify.o.
+    objects = { "src/%s/*.o", "src/lib/*.o" },
+    prefix_collisions = true,
+  },
+  luaossl = {
+    make = "all%s",
+    -- `dl_anchor` dlopens the file its own symbol lives in, to stop the
+    -- loader unlinking the module while OpenSSL holds a callback. Statically
+    -- linked that cannot happen, and `dlopen` on an executable fails by
+    -- definition -- see `docs/RUNTIME.md`.
+    cppflags = "-DHAVE_DLADDR=0",
+    objects = { "src/%s/*.o" },
+  },
+  ["lua-cjson"] = {
+    -- fpconv OR dtoa, never both: they each define `fpconv_strtod`.
+    sources = { "lua_cjson.c", "fpconv.c", "strbuf.c" },
+  },
+  lpeg = {
+    sources = { "lpcap.c", "lpcode.c", "lpcset.c", "lpprint.c", "lptree.c",
+                "lpvm.c" },
+  },
+}
+
+--- Runs a command and KEEPS WHAT IT SAID.
+---
+--- Discarding it costs an afternoon every time: a build step that fails with
+--- "exit 1" and nothing else forces the next person to reconstruct the
+--- command by hand before they can even start reading the error.
+local function shell(command)
+  local pipe = io.popen(command .. " 2>&1")
+  if not pipe then return false, "could not run: " .. command end
+  local said = pipe:read "a" or ""
+  local ok, kind, code = pipe:close()
+  if ok then return true, said end
+  return false, ("%s (%s %s)\n%s"):format(command, tostring(kind), tostring(code),
+                                          said:gsub("%s+$", ""))
+end
+
+local function glob(pattern)
+  local found = {}
+  local pipe = io.popen("ls -1 " .. pattern .. " 2>/dev/null")
+  if not pipe then return found end
+  for path in pipe:lines() do found[#found + 1] = path end
+  pipe:close()
+  return found
+end
+
+--- Builds a static archive from a library's source tree.
+---
+--- @param options.source      the unpacked source directory
+--- @param options.recipe      a name from `M.recipes`, or a table of its own
+--- @param options.lua_include where lua.h lives
+--- @param options.lua_api     "5.4" by default -- the makefile target suffix
+--- @param options.output      the .a to write
+function M.archive(options)
+  local source = assert(options.source, "akkar.build: no source directory")
+  local include = assert(options.lua_include, "akkar.build: no lua_include")
+  local api = options.lua_api or "5.4"
+  local output = assert(options.output, "akkar.build: no output")
+
+  local recipe = options.recipe
+  if type(recipe) == "string" then
+    recipe = M.recipes[recipe] or
+      error("akkar.build: no recipe for '" .. recipe ..
+            "'; pass `sources` or `make` explicitly", 2)
+  end
+  recipe = recipe or {}
+
+  local cc = options.cc or os.getenv "CC" or "cc"
+  local cppflags = ("-I%q %s"):format(include, recipe.cppflags or "")
+
+  local objects = {}
+
+  if recipe.make then
+    local target = recipe.make:format(api)
+    local ok, why = shell(("cd %q && make %s CPPFLAGS=%q")
+                          :format(source, target, cppflags))
+    if not ok then
+      return nil, ("`make %s` failed in %s (%s)"):format(target, source, why)
+    end
+
+    -- Basenames collide across the directories a project builds into, and
+    -- `ar` keeps only the last member with a given name -- silently, which is
+    -- how a binary ends up missing half a library.
+    local seen, staged = {}, options.stage or (source .. "/.akkar-archive")
+    shell(("rm -rf %q && mkdir -p %q"):format(staged, staged))
+
+    for _, pattern in ipairs(recipe.objects or { "src/*.o" }) do
+      for _, path in ipairs(glob(("%s/%s"):format(source, pattern:format(api)))) do
+        local base = path:match "([^/]+)$"
+        local name = base
+        if seen[name] and recipe.prefix_collisions then
+          local n = 1
+          repeat name = ("dup%d_%s"):format(n, base) n = n + 1 until not seen[name]
+        end
+        if seen[name] then
+          return nil, ("two objects are both called %q and the recipe does " ..
+                       "not say which wins"):format(base)
+        end
+        seen[name] = true
+        shell(("cp %q %q"):format(path, staged .. "/" .. name))
+        objects[#objects + 1] = staged .. "/" .. name
+      end
+    end
+
+  else
+    local sources = recipe.sources or options.sources
+    if not sources then
+      return nil, "no `make` and no `sources`: akkar will not guess which " ..
+                  "files a library compiles, because guessing wrong produces " ..
+                  "an archive that only fails at link time"
+    end
+    for _, file in ipairs(sources) do
+      -- The output is named RELATIVE to the source directory, because the
+      -- command has already changed into it. Building it from `source` too
+      -- applies the prefix twice, and the assembler's complaint about a
+      -- directory that does not exist is the only clue.
+      local object = file:gsub("%.c$", ".o")
+      local ok, why = shell(("cd %q && %s -c -O2 -fPIC %s %q -o %q")
+                            :format(source, cc, cppflags, file, object))
+      if not ok then
+        return nil, ("compiling %s failed: %s"):format(file, why)
+      end
+      objects[#objects + 1] = ("%s/%s"):format(source, object)
+    end
+  end
+
+  if #objects == 0 then
+    return nil, "the build produced no object files"
+  end
+
+  local quoted = {}
+  for i, path in ipairs(objects) do quoted[i] = string.format("%q", path) end
+  local ok, why = shell(("ar rcs %q %s"):format(output, table.concat(quoted, " ")))
+  if not ok then return nil, "ar failed (" .. why .. ")" end
+
+  return { archive = output, objects = #objects }
+end
+
 -- ================================================================ the plan
 --- Builds a plan from roots, archives and an entry file.
 function M.plan(options)

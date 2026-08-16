@@ -144,6 +144,43 @@ local function build(args)
                    result.binary or result.c))
 end
 
+local function archive(args)
+  local options = { lua_api = "5.4" }
+
+  local i = 1
+  local function value(flag)
+    i = i + 1
+    if not args[i] then fail(flag .. " needs a value") end
+    return args[i]
+  end
+
+  while i <= #args do
+    local a = args[i]
+    if     a == "--source"  then options.source = value(a)
+    elseif a == "--lua-inc" then options.lua_include = value(a)
+    elseif a == "--lua-api" then options.lua_api = value(a)
+    elseif a == "-o"        then options.output = value(a)
+    elseif a == "--cc"      then options.cc = value(a)
+    elseif a:sub(1, 1) == "-" then fail("unknown option " .. a)
+    else options.recipe = a end
+    i = i + 1
+  end
+
+  if not options.recipe then
+    fail("archive needs a library: akkar archive cqueues --source DIR\n" ..
+         "  known: cqueues, luaossl, lua-cjson, lpeg")
+  end
+  if not options.source then fail("archive needs --source (the unpacked source)") end
+  if not options.lua_include then fail("archive needs --lua-inc (where lua.h lives)") end
+  options.output = options.output or (options.recipe .. ".a")
+
+  local result, why = require("akkar.build").archive(options)
+  if not result then fail(why) end
+
+  io.write(("akkar archive: %d objects -> %s\n")
+           :format(result.objects, result.archive))
+end
+
 local command = arg[1]
 local rest = { table.unpack(arg, 2) }
 
@@ -151,6 +188,8 @@ if command == "doctor" then
   doctor(rest)
 elseif command == "build" then
   build(rest)
+elseif command == "archive" then
+  archive(rest)
 elseif command == "version" then
   print("akkar dev-1 on " .. _VERSION)
 elseif command == nil or command == "help" or command == "--help" or command == "-h" then

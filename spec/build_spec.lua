@@ -189,6 +189,53 @@ describe("the emitted host", function()
   end)
 end)
 
+describe("producing the archives", function()
+  it("knows the libraries akkar itself needs", function()
+    -- Recipes rather than one algorithm, and the module says why: every C
+    -- rock builds differently, and a generic "compile every .c" gets three of
+    -- these four wrong.
+    for _, name in ipairs { "cqueues", "luaossl", "lua-cjson", "lpeg" } do
+      assert.is_truthy(build.recipes[name], "no recipe for " .. name)
+    end
+  end)
+
+  it("compiles cjson without the file that would collide", function()
+    -- `fpconv.c` and `dtoa.c` each define `fpconv_strtod`; archiving both is
+    -- a duplicate symbol at link time and nowhere else.
+    local sources = build.recipes["lua-cjson"].sources
+    local named = {}
+    for _, file in ipairs(sources) do named[file] = true end
+
+    assert.is_true(named["fpconv.c"])
+    assert.is_nil(named["dtoa.c"], "dtoa.c and fpconv.c cannot both be archived")
+  end)
+
+  it("tells luaossl not to look itself up dynamically", function()
+    -- Without this the built binary dies at startup on a `dlopen` of its own
+    -- executable -- see docs/RUNTIME.md.
+    assert.is_truthy(build.recipes.luaossl.cppflags:find("HAVE_DLADDR=0", 1, true))
+  end)
+
+  it("refuses to guess which files a library compiles", function()
+    local ok, why = build.archive {
+      source = "/tmp", lua_include = "/usr/include", output = "/tmp/x.a",
+      recipe = {},
+    }
+    assert.is_nil(ok)
+    assert.is_truthy(tostring(why):find("will not guess", 1, true),
+      "expected a refusal that explains itself, got: " .. tostring(why))
+  end)
+
+  it("names a library it has no recipe for, rather than failing vaguely", function()
+    local ok, why = pcall(build.archive, {
+      source = "/tmp", lua_include = "/usr/include", output = "/tmp/x.a",
+      recipe = "some-library-nobody-taught-it",
+    })
+    assert.is_false(ok)
+    assert.is_truthy(tostring(why):find("no recipe for", 1, true))
+  end)
+end)
+
 -- ---------------------------------------------------------------------------
 local function toolchain()
   local cc = io.popen "cc --version 2>/dev/null"
