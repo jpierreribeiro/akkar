@@ -87,7 +87,7 @@ at shutdown.
   reason mentions a refused connection
 - `db: could not set statement_timeout: <reason>`, after disconnecting
 - `db: unknown driver '<name>'; expected 'pgmoon' or 'pq'`
-- `db: driver 'pq' needs akkar/pq_native.so -- build it with src/build.sh, or use the default pgmoon driver.`
+- `db: driver 'pq' needs the C module akkar.pq_native, which is a separate rock: luarocks install akkar-pq ...`
 
 ```lua
 local db = require "akkar.db"
@@ -413,12 +413,44 @@ open.pool:close()
 
 ## The pq driver
 
-`driver = "pq"` uses `akkar.pq`, a driver over libpq that waits in Lua. It
-needs `akkar/pq_native.so`, built by `src/build.sh`. Without that file the
-factory raises and names the script.
+`driver = "pq"` uses `akkar.pq`, a driver over libpq that waits in Lua.
 
-pgmoon is the default and stays the default. A driver becomes the default by
-proving itself against the same contract, not by being newer.
+### Installing it
+
+The C half is a **separate rock**, because linking libpq into `akkar` itself
+would break `luarocks install akkar` for everyone who does not use Postgres:
+
+```sh
+luarocks install akkar-pq PQ_INCDIR=$(pg_config --includedir)
+```
+
+`PQ_INCDIR` is needed on Debian and Ubuntu, where `libpq-fe.h` lives in
+`/usr/include/postgresql` rather than anywhere LuaRocks looks by default. On a
+system that puts it somewhere standard, plain `luarocks install akkar-pq`
+works. From a checkout, `src/build.sh` does the same thing.
+
+Without the C module the factory raises and names the install line — the
+option fails loudly at connect time, not quietly at the first query.
+
+### What it buys, and why it is not the default
+
+Measured end to end over HTTP on a reserved machine, against pgmoon:
+
+| route | pgmoon | akkar.pq |
+|---|---:|---:|
+| one row | 7,040 req/s | **8,969** (1.27x) |
+| a hundred rows | 2,392 | **5,031** (2.10x) |
+| a thousand rows | 333 | **928** (2.79x) |
+| p99, a thousand rows, saturated | 1300 ms | **475 ms** |
+
+**pgmoon is still the default**, and the reason is measured rather than
+cautious: the C driver is faster and less consistent. Across thirty
+ten-second windows pgmoon produced no anomalous ones and `akkar.pq` produced
+two, where a whole window ran at pgmoon's speed for reasons nobody has
+explained yet. A driver becomes the default by proving itself against the same
+contract, not by being faster on average.
+
+Both numbers and the open question are in `bench/driver/RESULTS.md` §5.
 
 Everything on this page behaves the same either way: the shim gives `akkar.pq`
 pgmoon's shape, and `Connection`, the transaction, the scope wrapper and the
