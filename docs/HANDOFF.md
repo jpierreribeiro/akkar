@@ -132,6 +132,14 @@ intermittent loss of its entire advantage is not proof.
 
 ## What to do next, and what not to
 
+> **Superseded in part by `docs/RUNTIME-1.0.md`**, which reframes the project
+> as a backend runtime rather than a framework chasing Gin, prices a LuaJIT
+> spike at about a week, and sets the bar a component must clear to earn a C
+> implementation. The ordering below survives with one change: the LuaJIT
+> experiment moves up, because 91.6 of akkar's 103 µs per request is
+> interpreted Lua and a JIT is the only single change that touches all of it.
+
+
 Asked directly what we should do, after measuring the gap against Gin. The
 answer the measurements support is **not** "chase Gin".
 
