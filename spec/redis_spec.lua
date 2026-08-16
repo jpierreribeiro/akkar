@@ -101,9 +101,17 @@ end)
 -- ---------------------------------------------------------------------------
 
 local function reachable()
+  -- PING, not merely connect. `cqueues.socket.connect` builds the socket
+  -- lazily and touches the network on first use, so `pcall` around the
+  -- factory returns TRUE with nothing listening -- every Redis skip guard in
+  -- this suite was decorative, and only looked correct because a developer's
+  -- machine always had Redis running. CI's no-services job found it on its
+  -- first run.
   local ok, conn = pcall(redis.connect { pool_size = 0 })
-  if ok then conn:close() end
-  return ok
+  if not ok then return false end
+  local alive = pcall(function() return conn:ping() end)
+  conn:close()
+  return alive
 end
 
 if not reachable() then

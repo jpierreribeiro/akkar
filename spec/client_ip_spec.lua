@@ -113,8 +113,13 @@ describe("the rate limiter's identity", function()
     -- Before the fix, each of these three requests minted its own bucket and
     -- all three were allowed.
     local redis = require "akkar.redis"
-    local ok = pcall(redis.connect { pool_size = 0 })
+    -- PING, not merely connect: `cqueues.socket.connect` builds the socket
+    -- lazily, so the factory succeeds with nothing listening.
+    local ok, conn = pcall(redis.connect { pool_size = 0 })
     if not ok then return end
+    local alive = pcall(function() return conn:ping() end)
+    conn:close()
+    if not alive then return end
 
     local cqueues = require "cqueues"
     local cq = cqueues.new()
