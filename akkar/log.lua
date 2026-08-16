@@ -43,6 +43,34 @@ local function merge(into, from)
   return into
 end
 
+--- Renders one field value for the text format.
+---
+--- AN ID IS NOT `7.0`, and this is the framework's own line doing it.
+---
+--- A job payload round-trips through JSON, and a JSON number comes back as a
+--- Lua float. So `account_id = 7` in a handler became `account_id=7.0` in
+--- akkar's own log, which reads like a bug to anybody grepping for an id and
+--- is not one. Reported by someone writing the guide, who found it because
+--- they pasted real output into a page and it looked wrong on the screen.
+---
+--- A float whose value is whole is printed without the fractional part. That
+--- loses the distinction between `7` and `7.0`, which is a distinction a LOG
+--- reader has never once wanted: a duration of two seconds reads better as
+--- `2` than as `2.0`, and an id reads correctly only as `7`.
+---
+--- The bound matters. Beyond 2^53 a float can no longer represent every
+--- integer, so `%d` on one would print a number that was never the value;
+--- those keep their float rendering, where the exponent at least admits the
+--- imprecision.
+local function render(value)
+  if type(value) == "table" then return cjson.encode(value) end
+  if math.type(value) == "float" and value == math.floor(value)
+     and math.abs(value) < 2 ^ 53 then
+    return string.format("%d", value)
+  end
+  return tostring(value)
+end
+
 local function format_text(entry)
   local parts = { string.format("%-5s %s", entry.level:upper(), entry.message) }
   local keys = {}
@@ -52,8 +80,7 @@ local function format_text(entry)
   table.sort(keys)
   for _, key in ipairs(keys) do
     local value = entry[key]
-    parts[#parts + 1] = key .. "=" ..
-      (type(value) == "table" and cjson.encode(value) or tostring(value))
+    parts[#parts + 1] = key .. "=" .. render(value)
   end
   return table.concat(parts, " ")
 end

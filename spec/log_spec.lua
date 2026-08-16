@@ -133,3 +133,51 @@ describe("request correlation", function()
     assert.equal("trace-error", res.headers["x-request-id"])
   end)
 end)
+
+describe("numbers that came back from JSON", function()
+  -- A job payload round-trips through JSON, and a JSON number returns as a Lua
+  -- float. So `account_id = 7` in a handler became `account_id=7.0` in akkar's
+  -- OWN log line, which reads like a bug to anybody grepping for an id and is
+  -- not one.
+  --
+  -- Reported by someone writing the beginner guide, who found it by pasting
+  -- real output into a page and seeing that it looked wrong on the screen --
+  -- which is the third defect that writing documentation has surfaced.
+  local log = require "akkar.log"
+
+  local function line_for(fields)
+    local seen
+    local l = log.new {
+      level = "info", format = "text",
+      sink = function(text) seen = text end,
+    }
+    l:info("m", fields)
+    return seen
+  end
+
+  it("prints a whole float as an integer", function()
+    assert.is_truthy(line_for { account_id = 7.0 }:find("account_id=7", 1, true))
+    assert.is_falsy(line_for { account_id = 7.0 }:find("7.0", 1, true))
+    assert.is_truthy(line_for { delta = -3.0 }:find("delta=-3", 1, true))
+  end)
+
+  it("leaves a real fraction alone", function()
+    -- The rendering must not round. A duration is still a duration.
+    assert.is_truthy(line_for { seconds = 2.5 }:find("seconds=2.5", 1, true))
+    assert.is_truthy(line_for { seconds = 0.001 }:find("0.001", 1, true))
+  end)
+
+  it("does not pretend a huge float is an exact integer", function()
+    -- Past 2^53 a float cannot represent every integer, so `%d` would print a
+    -- number that was never the value. The float rendering at least admits
+    -- the imprecision.
+    local line = line_for { huge = 2 ^ 60 }
+    assert.is_truthy(line:find("e+", 1, true),
+      "a float too large to be exact was printed as though it were: " .. line)
+  end)
+
+  it("leaves integers and strings as they were", function()
+    assert.is_truthy(line_for { n = 7 }:find("n=7", 1, true))
+    assert.is_truthy(line_for { s = "7.0" }:find("s=7.0", 1, true))
+  end)
+end)
