@@ -771,8 +771,10 @@ and the README promising a watchdog that cannot see a C call.
   four lines that fix it, which is a workaround in documentation for something
   that should probably be a default.
 
-- **No supported way to run a background loop in the same process as
-  `app:run`.** It ends in `assert(s:loop())`, or -- when `handle_signals` was
+- ~~**No supported way to run a background loop in the same process as
+  `app:run`.**~~ **Built** as `app:task(name, fn)`; the decisions it was
+  waiting on are in the commit and in the module docstring. Original
+  statement kept below, because the reasoning for the shape came from it. It ends in `assert(s:loop())`, or -- when `handle_signals` was
   called -- in a controller wrapping exactly two tasks, the server loop and
   the signal task. Neither is reachable from outside, and `SETTINGS` has no
   key for one, so there is nothing an application can pass.

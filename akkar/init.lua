@@ -1691,6 +1691,61 @@ end
 -- mid-write and corrupts what the client already received.  This was learned
 -- on an earlier project, where the drain that never finished was one of two
 -- defects that killed it.
+--- Runs `fn` in the server's own event loop, for the life of the process.
+---
+--- WHY THIS EXISTS. Until it did, there was no supported way to run a
+--- background loop in the same process as `app:run`: the call ends in
+--- `s:loop()`, or in a controller wrapping exactly two tasks, and neither is
+--- reachable from outside. The cost showed up as a documentation cost, which
+--- is how it was found -- the smallest honest example of "the request should
+--- not wait for the email" is one process, an in-memory queue and a consumer
+--- sharing the loop, and that was not expressible. The guide's first working
+--- example needed Redis and a second process: a `docker run` and a third
+--- terminal before a beginner sees one job run.
+---
+---     app:task("emails", function(task)
+---       queue:consume(handlers, { should_stop = task.stopping })
+---     end)
+---
+--- `task.stopping` is a function, not a flag, so it can be handed straight to
+--- `Queue:consume`, which already takes `should_stop` in exactly that shape.
+--- The two were designed apart and fit, which is usually a sign the shape is
+--- the right one.
+---
+--- THIS IS NOT PARALLELISM. One Lua state runs one coroutine at a time, so a
+--- task that computes without yielding stops the server for exactly as long
+--- as it computes -- the same rule handlers live under, and the blocking
+--- watchdog will say so. Tasks are for work that WAITS: a queue, a timer, a
+--- poll. Work that burns CPU still belongs in another process.
+function App:task(name, fn)
+  if type(name) ~= "string" then
+    error("akkar: app:task needs a name first -- it is what the logs and the " ..
+          "restart counter call this task", 2)
+  end
+  if type(fn) ~= "function" then
+    error("akkar: app:task('" .. name .. "') needs a function", 2)
+  end
+  self.tasks = self.tasks or {}
+  for _, existing in ipairs(self.tasks) do
+    if existing.name == name then
+      error("akkar: a task named '" .. name .. "' is already registered; " ..
+            "two tasks with one name make a log line ambiguous", 2)
+    end
+  end
+  self.tasks[#self.tasks + 1] = { name = name, fn = fn }
+  return self
+end
+
+--- True once the server has drained and tasks are being asked to finish.
+---
+--- Deliberately NOT true during draining. A request still in flight may queue
+--- work, so a consumer that stopped at STOP_ACCEPTING would leave that work
+--- unconsumed and the shutdown would look clean while losing a job. See
+--- `App:stop`.
+function App:stopping()
+  return self.tasks_stopping == true
+end
+
 function App:stop(grace)
   if self.state ~= "RUNNING" then return self.state end
   grace = grace or self.shutdown_grace or 10
@@ -1712,6 +1767,40 @@ function App:stop(grace)
     cqueues.poll(0.02)
   end
   if warned then internal:info("shutdown: drain completed") end
+
+  -- TASKS STOP AFTER THE DRAIN, NOT BEFORE IT, and the order is the whole
+  -- decision.
+  --
+  -- A request still in flight can enqueue work -- that is what a background
+  -- task is usually FOR -- so a consumer told to stop at STOP_ACCEPTING would
+  -- leave that work sitting there while the shutdown reported itself clean.
+  -- Draining first means nothing new can be enqueued by the time the
+  -- consumer is asked to finish, so the queue it leaves behind is only what
+  -- was already unfinished.
+  --
+  -- The wait is bounded by the same grace period, and expiring it is a
+  -- warning rather than a kill: `akkar.jobs` is at-least-once with a store
+  -- that supports it, so an unacknowledged job comes back on the next
+  -- `reap`. Forcing a task mid-item would trade a delay for a duplicate.
+  if self.tasks_running and self.tasks_running > 0 then
+    self.tasks_stopping = true
+    internal:info("shutdown: asking tasks to finish",
+                  { tasks = self.tasks_running })
+    local task_deadline = time.monotime() + grace
+    local said = false
+    while self.tasks_running > 0 do
+      if time.monotime() > task_deadline and not said then
+        said = true
+        internal:warn("shutdown: a task is still running and is not being " ..
+                      "forced; unacknowledged work returns on the next reap",
+                      { tasks = self.tasks_running, grace_s = grace })
+        break
+      end
+      cqueues.poll(0.02)
+    end
+    if not said then internal:info "shutdown: tasks finished" end
+  end
+  self.tasks_stopping = true
 
   self.state = "CLOSING"
   for _, closer in ipairs(self.closers) do pcall(closer) end
@@ -2105,12 +2194,68 @@ function App:run(config)
   })
   self.server = s
 
+  -- A TASK THAT RAISES MUST NOT TAKE THE SERVER DOWN, and must not die
+  -- quietly either.
+  --
+  -- Those pull in opposite directions and the second is the one people get
+  -- wrong. A supervisor that swallows the error keeps the process up while
+  -- the queue behind the dead consumer grows, and nothing says so until
+  -- somebody notices the backlog hours later. So: log at error, count it,
+  -- and restart with a backoff that caps -- a task failing instantly in a
+  -- loop must not become a busy loop that starves the server it was supposed
+  -- to run beside.
+  --
+  -- A task that RETURNS without being asked to stop is also restarted, and is
+  -- also a warning. `Queue:consume` returns when its `should_stop` says so,
+  -- so a consumer coming back early means its stop condition is wrong, and
+  -- silently never running it again would hide that.
+  local function supervise(app, task)
+    return function()
+      app.tasks_running = (app.tasks_running or 0) + 1
+      local failures = 0
+      while not app.tasks_stopping do
+        local ok, err = pcall(task.fn, {
+          name = task.name,
+          stopping = function() return app.tasks_stopping == true end,
+          app = app,
+        })
+        if app.tasks_stopping then break end
+
+        if ok then
+          internal:warn("task returned before shutdown; restarting", {
+            task = task.name,
+          })
+        else
+          failures = failures + 1
+          app.task_failures = (app.task_failures or 0) + 1
+          internal:error("task raised; restarting", {
+            task = task.name, detail = tostring(err), failures = failures,
+          })
+        end
+
+        -- Doubling from 100 ms, capped at 30 s. The cap matters more than the
+        -- curve: an unreachable Redis should cost one line every half minute,
+        -- not a core.
+        local wait = math.min(30, 0.1 * 2 ^ math.min(failures, 8))
+        local until_ = time.monotime() + wait
+        while time.monotime() < until_ and not app.tasks_stopping do
+          cqueues.poll(math.min(0.2, until_ - time.monotime()))
+        end
+      end
+      app.tasks_running = app.tasks_running - 1
+    end
+  end
+
   -- The signal task, if one was installed, runs alongside the server rather
-  -- than instead of it.
-  if self.signal_task then
+  -- than instead of it -- and so does every registered task.
+  if self.signal_task or (self.tasks and #self.tasks > 0) then
     local cq = cqueues.new()
     cq:wrap(function() s:loop() end)
-    cq:wrap(self.signal_task)
+    if self.signal_task then cq:wrap(self.signal_task) end
+    for _, task in ipairs(self.tasks or {}) do
+      internal:info("task started", { task = task.name })
+      cq:wrap(supervise(self, task))
+    end
     return assert(cq:loop())
   end
   return assert(s:loop())
