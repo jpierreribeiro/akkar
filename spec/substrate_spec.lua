@@ -180,6 +180,66 @@ describe("lua-http: the server", function()
     assert.equal(1, select("#", h:get "content-length"))
   end)
 
+  it("drops an over-long request line before akkar ever sees it", function()
+    -- Found by `spec/fuzz_spec.lua` and then measured: a request line up to
+    -- 4000 bytes reaches akkar and is answered 404; at 8000 bytes lua-http
+    -- closes the connection with no response, and a middleware counter proves
+    -- akkar was never called.
+    --
+    -- The consequence is a limit akkar does not own and cannot report. It
+    -- cannot answer 414, it cannot log the attempt, and `max_concurrent` is
+    -- the only thing that ever counted it. A substitute HTTP layer with a
+    -- different cutoff -- or none -- changes what this framework is exposed
+    -- to without changing a line of it.
+    --
+    -- Not asserted as an exact number: the boundary is lua-http's business
+    -- and may move. What is asserted is that the boundary EXISTS, so that a
+    -- replacement without one is noticed here rather than in production.
+    local akkar_saw = 0
+    local PORT = 8380
+    local app = akkar.new()
+    app:use(function(req, next) akkar_saw = akkar_saw + 1 return next(req) end)
+    app:get("/x", function() return { ok = true } end)
+
+    local short_status, long_status
+    local cq = cqueues.new()
+    cq:wrap(function()
+      pcall(function()
+        app:run { port = PORT, check_capabilities = false,
+                  log = akkar.log.new { level = "error", sink = function() end } }
+      end)
+    end)
+    cq:wrap(function()
+      cqueues.sleep(0.25)
+      local request = require "http.request"
+
+      local function try(length)
+        local status
+        pcall(function()
+          local req = request.new_from_uri(
+            "http://127.0.0.1:" .. PORT .. "/x/" .. string.rep("a", length))
+          local headers, stream = req:go(5)
+          if headers then
+            status = tonumber(headers:get ":status")
+            stream:get_body_as_string(2)
+          end
+        end)
+        return status
+      end
+
+      short_status = try(1000)
+      local before = akkar_saw
+      long_status = try(16000)
+      akkar_saw = akkar_saw - before      -- reused as "did the long one arrive"
+      app:stop(2)
+    end)
+    assert(cq:loop(30))
+
+    assert.equal(404, short_status, "a 1000-byte request line no longer reaches akkar")
+    assert.is_nil(long_status, "lua-http now answers an over-long request line")
+    assert.equal(0, akkar_saw, "the over-long request reached akkar after all")
+  end)
+
   it("keeps header names lowercase, which req.headers relies on", function()
     -- `normalize_headers` hands handlers a plain lowercase table so no
     -- application ever writes `req.headers:get "X-Thing"`.
