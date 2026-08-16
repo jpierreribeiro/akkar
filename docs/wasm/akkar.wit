@@ -1,0 +1,152 @@
+// The akkar plugin world — a DESIGN ARTEFACT, not a shipped interface.
+//
+// Nothing loads this yet. It exists because the shape of the interface is
+// decided by constraints akkar already has, and writing it down is how those
+// constraints get checked against a concrete thing rather than discussed.
+// `docs/wasm/DECISION.md` says what is measured, what is open, and what has
+// to be true before any of this is built.
+//
+// TWO RULES THIS FILE OBEYS, both inherited rather than invented.
+//
+// 1. THE CAPABILITY SET IS CLOSED. akkar has four capabilities -- db, cache,
+//    log, clock -- reached through the request object, and a handler cannot
+//    invent a fifth. A plugin must not be able to either. So this world
+//    imports exactly those and nothing else: no filesystem, no sockets, no
+//    environment, no clock beyond the one akkar hands out. A component that
+//    imports anything else fails to instantiate rather than getting a stub,
+//    which is what `define_unknown_imports_as_traps` is for.
+//
+// 2. THERE IS NO `query(string)`, AND THERE CANNOT BE. `akkar/scope.lua:15`
+//    refuses raw SQL outright, and states the reason: "a string cannot be
+//    scoped without parsing it". Tenant scope is the invariant that makes a
+//    multi-tenant application safe by construction, and an interface that
+//    accepts a SQL string hands a plugin the one thing that can escape it.
+//
+//    So the database interface is BUILDER-SHAPED. The plugin describes what
+//    it wants; the host applies the scope and builds the SQL. This is not a
+//    convenience -- it is the only shape in which a plugin cannot bypass the
+//    property the framework exists to guarantee.
+
+package akkar:runtime@0.1.0;
+
+/// Structured logging, at the levels `akkar.log` already has.
+interface log {
+    enum level { debug, info, warn, error }
+
+    /// Fields travel as pairs rather than as a JSON string: a plugin that
+    /// formats its own JSON produces a second log format inside a process
+    /// that already has one, and the host is what knows the request id.
+    record field {
+        key: string,
+        value: string,
+    }
+
+    emit: func(at: level, message: string, fields: list<field>);
+}
+
+/// The clock, so a plugin does not read one of its own.
+///
+/// A component with no import for time has no way to get it, which is the
+/// point: `akkar.time` exists so the framework's sense of time is one thing
+/// that a test can move, and a plugin reading a wall clock behind akkar's
+/// back would be the same defect `req.clock` was introduced to remove.
+interface clock {
+    /// Wall-clock seconds, for stamping.
+    now: func() -> u64;
+    /// Monotonic seconds, for budgets. Never for timestamps.
+    monotime: func() -> f64;
+}
+
+interface cache {
+    get: func(key: string) -> option<list<u8>>;
+    set: func(key: string, value: list<u8>, ttl-seconds: option<u32>) -> bool;
+    incr: func(key: string) -> s64;
+    del: func(keys: list<string>) -> u32;
+}
+
+/// The database, in the only shape that keeps tenant scope enforceable.
+interface database {
+    /// A Postgres value crossing the boundary.
+    ///
+    /// `null-value` is a case rather than an absent field, because on the way
+    /// IN a plugin must be able to say "set this column to NULL", which is a
+    /// different statement from "do not touch this column". On the way OUT
+    /// akkar's own convention is the opposite -- a SQL NULL leaves the key
+    /// absent -- and the host is what reconciles the two.
+    variant value {
+        null-value,
+        boolean(bool),
+        integer(s64),
+        float-value(f64),
+        text(string),
+        blob(list<u8>),
+    }
+
+    record column { name: string, val: value }
+    record row { columns: list<column> }
+
+    /// A comparison. The column is a NAME, never an expression: an expression
+    /// is a string, and a string is the thing that cannot be scoped.
+    enum operator { eq, neq, lt, lte, gt, gte, like, in-list }
+
+    record condition {
+        column: string,
+        op: operator,
+        val: value,
+        /// Only meaningful for `in-list`.
+        values: list<value>,
+    }
+
+    record ordering { column: string, descending: bool }
+
+    record select-query {
+        table: string,
+        columns: list<string>,
+        conditions: list<condition>,
+        order: list<ordering>,
+        limit: option<u32>,
+        offset: option<u32>,
+    }
+
+    record write-query {
+        table: string,
+        values: list<column>,
+        conditions: list<condition>,
+    }
+
+    /// THE SCOPE IS NOT A PARAMETER ANYWHERE ABOVE, deliberately.
+    ///
+    /// If a plugin could name its tenant it could name someone else's. The
+    /// host takes the scope from the request that is running and applies it
+    /// on this side of the boundary, so a plugin has no vocabulary for the
+    /// question. That is the same reason `akkar/scope.lua` wraps the adapter
+    /// rather than asking handlers to remember a where-clause.
+    select: func(q: select-query) -> result<list<row>, string>;
+    insert: func(q: write-query) -> result<list<row>, string>;
+    update: func(q: write-query) -> result<u32, string>;
+    delete: func(q: write-query) -> result<u32, string>;
+}
+
+/// What a plugin is.
+///
+/// Bytes in, bytes out, plus a content type -- NOT an HTTP request. A plugin
+/// that received a request would need routing, headers and a body limit, and
+/// every one of those is a boundary akkar already owns and does not intend to
+/// hand over. The narrow shape is what keeps the hot path akkar's.
+world plugin {
+    import log;
+    import clock;
+    import cache;
+    import database;
+
+    record payload {
+        content-type: string,
+        body: list<u8>,
+    }
+
+    /// One call, one answer. Synchronous in the WIT because the async
+    /// Component Model does not reach a C host yet -- see DECISION.md. The
+    /// host still preempts a plugin that runs too long, via epoch deadlines,
+    /// which is strictly more than it can do to a C function.
+    export handle: func(input: payload) -> result<payload, string>;
+}

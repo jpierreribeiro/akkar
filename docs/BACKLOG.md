@@ -653,6 +653,41 @@ permanent failings ages badly. What they are evidence about is process.
   the documentation does not say what a knob does *not* do, it is the same
   trap.
 
+## 9. WebAssembly components — studied, measured, not decided
+
+`docs/wasm/DECISION.md` has the full study and `docs/wasm/akkar.wit` the world
+it produced. **The decision is blocked on one number, not on an argument**, and
+the order stands: the Postgres driver first.
+
+The premises broke in both directions. WASI 0.3 is real (11 June 2026,
+ratified). A C host **can** instantiate components today — Wasmtime's C API
+has 154 `wasmtime_component_*` symbols and a minimal C host was compiled and
+run to confirm it. But **WASI 0.3 does not reach the C API** (zero `wasip3`
+symbols; issue #13705 open and unanswered), and `wit-bindgen` is guest-side
+only, so host marshalling is hand-written against a 23-case union.
+
+**The number: 5.08 MB today against a 24.8 MB stripped C host that merely
+touches the component API.** Six times, in the dimension `docs/RUNTIME.md`
+sells. WAMR and wasm3 are small and have no Component Model at all; without
+components the story shrinks to "a plugin in C or Rust with an integer ABI".
+
+**The single experiment**, on the study machine: build `wasmtime-c-api` from
+source with the minimum set that still runs components, link a trivial C host,
+and ask whether it comes in under ~10 MB. Under 10, the rest is engineering.
+Still 25, akkar keeps `vm.lua` for untrusted-but-not-hostile hooks and puts
+hostile code in another process.
+
+**Two things worth keeping whatever the answer is.** First, `epoch_deadline_
+async_yield_and_update` **preempts a Wasm guest**, which is strictly more than
+akkar can do to a C function — `akkar/work.lua` documents that impossibility —
+so Wasm beats C on the very axis where C is feared. Second, and this holds
+even if Wasm is never adopted: **the plugin database interface cannot take a
+SQL string.** `akkar/scope.lua:15` refuses raw SQL because "a string cannot be
+scoped without parsing it", so the interface is builder-shaped and the scope
+is not a parameter anywhere in it — the host takes it from the running
+request. Any extension mechanism akkar grows, in any technology, has to be
+builder-shaped for that reason.
+
 ## What is deliberately not being built
 
 Written down because the list keeps trying to grow.
