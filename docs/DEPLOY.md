@@ -14,8 +14,9 @@ Where something was only reasoned about it says so.
 ## What was measured
 
 One machine, one afternoon: Linux 6.8 x86-64, Docker 28.2.2, an 8-core
-laptop. Nothing here was measured on Railway itself — see
-[What is verified and what is not](#what-is-verified-and-what-is-not).
+laptop. **The Railway half was then deployed for real** — see
+[Railway](#railway) — so the numbers below are local and the platform
+behaviour is observed rather than quoted.
 
 | | |
 |---|---|
@@ -142,8 +143,37 @@ first database call. Two objects and one `ar` invocation is the whole fix.
 
 ## Railway
 
-What Railway needs was checked against its documentation and its live JSON
-schema, not assumed.
+**This was deployed.** Not modelled, not inferred from the documentation —
+`railway up` against a real project, with a real public URL answering real
+requests:
+
+```
+$ curl -i https://akkar-deploy-test-production.up.railway.app/
+HTTP/2 200
+content-type: application/json
+server: railway-hikari
+x-railway-edge: mia1
+x-request-id: d841186c000002
+
+{"service":"akkar","ok":true}
+```
+
+`x-request-id` is akkar's; `x-railway-request-id` and `x-railway-edge` are the
+platform's. Every route behaved as it did locally, including validation:
+
+| | |
+|---|---|
+| `/` | `200` `{"service":"akkar","ok":true}` |
+| `/health/live` | `200` `{"status":"pass","uptime":124.3,...}` |
+| `/health/ready` | `200` `{"status":"pass","cached":false,...}` |
+| `/echo/7` | `200` `{"n":7}` |
+| `/echo/abc` | **`422`** |
+
+A 6.4 MB `scratch` image, built by Railway from this `Dockerfile`, running in
+`sfo`, serving HTTP/2 over a TLS certificate it did not have to manage.
+
+What follows separates what the documentation says from what the deploy
+actually did, because on two points they differ in ways worth knowing.
 
 ### The three things that matter
 
@@ -173,6 +203,44 @@ schema, not assumed.
    Note `PORT` is injected at **run** time, not build time. A `Dockerfile`
    that bakes `$PORT` into a build-stage command finds it empty.
 
+### What the port actually did, which is not quite what the docs say
+
+The deploy resolved a question the documentation leaves ambiguous, and the
+answer is better than the docs imply.
+
+`railway variable list` on the service showed **no `PORT`** — before or after
+deploying. The application nonetheless came up on the image's own default:
+
+```
+INFO  listening url=http://0.0.0.0:8080
+```
+
+and Railway's edge routed to it with the domain's **target port unset**. So
+the operative rule is not "Railway hands you a port and you must use it" but:
+
+> **Railway routes to whatever port your app listens on**, when the domain has
+> no target port configured. `PORT` is how you *tell* it, not something you
+> must wait to receive.
+
+Proved by changing it. Setting a service variable `PORT=7777` and redeploying:
+
+```
+INFO  listening url=http://0.0.0.0:7777
+
+$ curl https://akkar-deploy-test-production.up.railway.app/echo/99
+{"n":99}
+```
+
+The edge followed, with no configuration change. Two things fall out, and
+both matter more than the default value:
+
+- **A Railway service variable overrides the image's `ENV PORT`.** The
+  `ENV PORT=8080` in the `Dockerfile` is a floor, not a ceiling — which is
+  exactly what you want, and why reading `os.getenv "PORT"` in the app is not
+  optional even though the image sets a default.
+- **`0.0.0.0` is doing real work here.** This is the requirement that has no
+  fallback: no environment variable rescues an app bound to loopback.
+
 ### Deploying
 
 ```sh
@@ -181,11 +249,13 @@ railway login
 railway link          # or: create the project from the GitHub repo in the UI
 
 # every time
-git push
+git push              # with the repo connected, or:
+railway up            # to push the working directory straight up
 ```
 
 Railway sees `Dockerfile` and `railway.json`, builds the image and runs it.
-There is no start command to configure: the image has an `ENTRYPOINT`.
+**There is no start command to configure** — the image has an `ENTRYPOINT`,
+and leaving `startCommand` unset was verified to work rather than assumed.
 
 ### `railway.json`
 
@@ -206,6 +276,15 @@ Committed at the repository root. Every key was validated against
     "overlapSeconds": 15
   }
 }
+```
+
+**The file is read, and it took effect.** An empty Railway service runs no
+healthcheck at all; this one did, which is only possible if `railway.json`
+was picked up:
+
+```
+Starting Healthcheck
+[1/1] Healthcheck succeeded!
 ```
 
 `healthcheckPath` is **`/health/ready`, not `/health/live`**, and the
@@ -539,16 +618,28 @@ Because a deployment document that oversells is worse than none.
 - Idle resident memory of 6.7 MiB (`docker stats`).
 - Every key in `railway.json` checked against Railway's live JSON schema.
 
+### Run on Railway itself
+
+- `railway up` building this `Dockerfile` and deploying the `scratch` image,
+  with no start command configured.
+- The public URL answering `/`, `/health/live`, `/health/ready`, `/echo/7`
+  over HTTP/2, and `422` on `/echo/abc`.
+- `railway.json` being honoured — `Starting Healthcheck` /
+  `[1/1] Healthcheck succeeded!` on a service that would otherwise run none.
+- The edge routing to the app's port with no target port set, and following
+  it to 7777 when a `PORT` service variable was added.
+- A service variable overriding the image's `ENV PORT`.
+
 ### Read in documentation, not run
 
-- Everything Railway does. **Nothing here was deployed to Railway.** That
-  `PORT` is injected, that `0.0.0.0` is required, that SIGTERM comes with a
-  zero-second default budget, that a root `Dockerfile` is detected — all of
-  it is from Railway's own documentation, and all of it is unconfirmed
-  against a running Railway service.
+- **SIGTERM's zero-second default budget, and `drainingSeconds`.** The
+  handler was verified locally against `docker stop`; that Railway's default
+  grace is 0 s and that `drainingSeconds` extends it is Railway's own
+  documentation. No rolling deploy under load was observed.
 - `preDeployCommand` needing a shell. Consistent with the `scratch`
   migration failure, and not tested on Railway.
-- The `DATABASE_URL`/`PG*` variable names of Railway's Postgres plugin.
+- The `DATABASE_URL`/`PG*` variable names of Railway's Postgres plugin. No
+  Railway database was attached; the Postgres verification was local.
 
 ### Not attempted at all
 

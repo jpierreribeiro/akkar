@@ -176,6 +176,8 @@ and should be written first and slowest.
 
 Written down now, while it is cheap to avoid:
 
+Please write in simple English , NO "—" or AI traces.
+
 - **Writing reference first.** It is the easiest to write and the least
   useful, and finishing it creates the feeling of being done.
 - **Letting the tutorial become a feature tour.** The application decides

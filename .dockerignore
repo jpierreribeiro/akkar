@@ -32,10 +32,6 @@ README.md
 LICENSE
 types
 
-# Scratch files from verification runs.
-.dbtest.lua
-.migtest.lua
-
 # Local editor and OS noise.
 .DS_Store
 *.swp
