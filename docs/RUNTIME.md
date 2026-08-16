@@ -141,7 +141,54 @@ is worse than none.
 - **Nothing about the size or startup cost of the real thing.** 1.5 MB is
   cqueues; akkar, lua-http and pgmoon are on top of that.
 
-## The design question, which is the hard one
+## The design question, answered
+
+Three shapes were on the table. The recommendation, and the reasoning, because
+the reasoning is what will still be useful when the recommendation is wrong.
+
+**1. `akkar build` — the application compiled in. SHIPPED, and it is the
+default.** One binary per application; changing the app means rebuilding.
+Deployment stops needing Lua, LuaRocks or a shared object, which was the whole
+problem. Nothing about it needs a compatibility promise, because the framework
+and the application are compiled together and ship as one artefact — which
+matters, since this project has decided not to make one yet.
+
+**2. `akkar run app.lua` — the binary hosts an app it reads at startup.
+NEXT, and small.** The host already embeds akkar; running an app from a file
+instead of from the bundle is a handful of lines. It is worth having because
+it makes the edit-and-restart loop possible without a compiler, which is how
+anyone actually develops.
+
+Its real cost is not code. It creates a SECOND versioned interface -- between
+the runtime binary and the application source -- at a moment when the project
+has deliberately promised nothing. So `akkar run` states which akkar built the
+binary and leaves it at that. No compatibility checking theatre for a contract
+nobody has agreed to.
+
+**3. The supervising runtime, apps as data. NOT NOW, and the reason is
+concrete rather than a matter of taste.** Its whole appeal is running code
+somebody else wrote -- several tenants, hot-swapped, in one process. akkar
+has the loading half of that already (`akkar.from_spec`, `App:swap_host`) and
+does not have the isolation half. `akkar/vm.lua` says so in its own header:
+it is a sandbox inside one Lua state, not a boundary against hostile code, and
+**if the code is hostile rather than merely untrusted, run it in a separate
+process with an OS-level sandbox.**
+
+Building the supervising runtime now would mean offering, as a product, the
+guarantee the code explicitly disclaims.
+
+### What actually unblocks the third one
+
+Not more code in akkar. A process per tenant, which the binary above makes
+cheap: a 5 MB self-contained executable with no interpreter to install is a
+very different proposition from "provision a Lua environment per customer".
+The isolation story becomes the operating system's, which is the only place it
+has ever been true.
+
+That is why the order is 1, then 2, then 3 -- and why 3 is a decision to make
+after 2 exists, not before.
+
+## The design question as it was posed
 
 Feasibility was the cheap half. What `akkar build` should *mean* is not
 settled, and these are different products:

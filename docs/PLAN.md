@@ -26,9 +26,27 @@ Three decisions are settled:
 
 | Decision | Choice | Consequence |
 |---|---|---|
-| Audience | **Public, and my own services first** | Semantic versioning, a compatibility policy, and docs that answer someone who did not write it. Still aggressively opinionated; opinions are now promises. |
+| Audience | **Public, and my own services first** | Docs that answer someone who did not write it. Still aggressively opinionated. **No version and no compatibility promise until 1.0** — see below. |
 | Substrate | **Lua 5.4 + cqueues / lua-http, behind a contract** | No nginx, native coroutines. The substrate is a *detail*: what akkar promises is `app:get`, `req.db`, `akkar.stream` — never that cqueues is underneath. The contract in `spec/` is what makes that true rather than aspirational. |
 | Shape | **One artefact** | `akkar run app.lua`, and eventually a binary. Proved feasible in `docs/RUNTIME.md`; not yet designed. |
+
+### What "public" does and does not promise, yet
+
+Public audience, and **no version number, no CHANGELOG and no compatibility
+promise until 1.0.** The rockspec stays at `dev-1`.
+
+That is not indecision, it is the honest state. A version number is a promise,
+and there are two things this project cannot promise today. The substrate
+depends on a commit of cqueues that upstream has never released, so what
+`luarocks install` gets and what CI proves are not the same build. And the
+API is still moving under measurement — `akkar.jobs` gained acknowledgement
+and reaping this week because the queue was losing work on a deploy, which is
+exactly the kind of change a compatibility promise would have made expensive
+at the moment it was most needed.
+
+So: depend on it by pinning a commit, and expect it to change. Anyone who
+wants a stable surface should wait for 1.0, and 1.0 waits for the substrate
+pin to survive one upstream bump.
 
 ### The rule that follows from calling it a runtime
 

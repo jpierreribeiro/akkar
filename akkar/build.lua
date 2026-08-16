@@ -202,6 +202,42 @@ typedef struct {
 
 ]]
 
+-- `akkar run <file>` — host an application this binary did not embed.
+--
+-- The runtime is already in here; only the application is outside. That makes
+-- the edit-and-restart loop possible without a compiler, which is how anyone
+-- actually develops, and it is why this is worth the twenty lines.
+--
+-- It creates a second versioned interface -- between the binary and the
+-- source it runs -- and this project has deliberately promised no
+-- compatibility yet. So the binary SAYS which akkar it is and stops there.
+-- Checking a contract nobody has agreed to would be theatre.
+local HOST_RUN = [[
+
+static int akkar_run_file(lua_State *L, const char *path, int argc, char **argv) {
+  int i;
+
+  lua_createtable(L, argc - 2, 1);
+  for (i = 2; i < argc; i++) {
+    lua_pushstring(L, argv[i]);
+    lua_rawseti(L, -2, i - 2);
+  }
+  lua_pushstring(L, path);
+  lua_rawseti(L, -2, 0);
+  lua_setglobal(L, "arg");
+
+  if (luaL_loadfile(L, path) != LUA_OK) {
+    fprintf(stderr, "akkar: %s\n", lua_tostring(L, -1));
+    return 1;
+  }
+  if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+    fprintf(stderr, "akkar: %s\n", lua_tostring(L, -1));
+    return 1;
+  }
+  return 0;
+}
+]]
+
 local HOST_LOADER = [[
 
 /* `require` calls a preload entry with (modname, ":preload:"), so one shared
@@ -261,6 +297,20 @@ int main(int argc, char **argv) {
   }
   lua_setglobal(L, "arg");
 
+  /* `run <file>` hosts an application this binary did not embed; anything
+   * else runs the one it did. */
+  if (argc > 2 && strcmp(argv[1], "run") == 0) {
+    int status = akkar_run_file(L, argv[2], argc, argv);
+    lua_close(L);
+    return status;
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--akkar-version") == 0) {
+    printf("%s\n", AKKAR_BUILT_WITH);
+    lua_close(L);
+    return 0;
+  }
+
   lua_getglobal(L, "require");
   lua_pushstring(L, AKKAR_ENTRY);
   if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
@@ -282,7 +332,9 @@ int main(int argc, char **argv) {
 function M.emit(plan)
   local out = { HOST_PREAMBLE }
 
-  out[#out + 1] = ('#include <stdio.h>\n#define AKKAR_ENTRY %q\n\n'):format(plan.entry)
+  out[#out + 1] = ('#include <stdio.h>\n#define AKKAR_ENTRY %q\n' ..
+                   '#define AKKAR_BUILT_WITH %q\n\n')
+                  :format(plan.entry, plan.built_with or "akkar dev-1")
 
   -- The Lua half, embedded as source.
   local names = {}
@@ -328,6 +380,7 @@ function M.emit(plan)
   end
   out[#out + 1] = "}\n"
 
+  out[#out + 1] = HOST_RUN
   out[#out + 1] = HOST_LOADER
   return table.concat(out, "\n")
 end
