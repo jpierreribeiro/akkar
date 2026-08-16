@@ -279,8 +279,12 @@ one long stall or a hundred thousand slightly slower requests.
 - **Ten seconds is not a soak.** `docs/UNKNOWNS.md` asks for correctness over
   time, and the soak that answers it ran pgmoon. The C driver has never run
   for eight hours.
-- **The comparison against Gin and FastAPI still stands on pgmoon.** These
-  numbers say what the driver would do to it, they do not restate it.
+- ~~**The comparison against Gin and FastAPI still stands on pgmoon.**~~
+  **CLOSED the same day** — `bench/study/RESULTS.md` §2.1 re-runs the
+  three-way comparison with `akkar-pq` as a fifth variant. On two hundred rows
+  it moves akkar from 0.20x of Gin to **0.48x**, and from 1.6x FastAPI to
+  **3.95x**, with a p99 of 6.53 ms against Gin's own 7.04 ms. The framework
+  path does not move, which is what says the driver variable is not leaking.
 
 ## 6. Reproducing it
 

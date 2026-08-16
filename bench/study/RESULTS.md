@@ -84,6 +84,113 @@ that means something.
 
 ---
 
+## 2.1 The same comparison with the C driver, which changes the database half
+
+Everything above ran **pgmoon**, akkar's pure-Lua Postgres driver, against
+Gin's `pgx` and FastAPI's `asyncpg` — both of which are C underneath. That was
+not a decision, it was a default: `driver = "pq"` is opt-in and no benchmark
+server in this repository ever passed it. So the table above compared a
+pure-Lua database path against two compiled ones and reported the difference
+as a framework result.
+
+Re-run the next day with a fifth variant, `akkar-pq`, which is the same tree
+and the same routes on `akkar.pq`. Same harness, same gates, same machine, all
+five proved to return byte-identical JSON on every target before timing.
+
+```
+machine   : the same c5.2xlarge, load 0.11 at start
+processes : 2 each, VERIFIED after every restart, and the akkar servers now
+            also prove WHICH DRIVER they loaded before the run is allowed
+date      : 2026-08-16
+```
+
+### Framework alone — `/ping`, 100 connections
+
+```
+framework          req/s        p50        p99   spread   relative
+gin            116389.66   644.00us     8.74ms     0.7%      1.00x
+fastapi         21910.30     3.58ms     7.38ms     0.9%      0.19x
+akkar           19453.95     5.11ms     6.09ms     1.1%      0.17x
+akkar-lean      21414.96     4.58ms     7.24ms     1.8%      0.18x
+akkar-pq        19281.72     5.05ms     6.39ms     1.2%      0.17x
+```
+
+`/ping` touches no database and the two akkar rows are 0.9% apart, which is
+inside their own spread. That is the control: it says the driver variable is
+not leaking into the framework path, and without it every row below would be
+suspect.
+
+### One indexed query — `/users/42`, 16 connections
+
+```
+gin             26466.47   558.00us     1.57ms     0.3%      1.00x
+fastapi          5654.53     2.91ms     4.36ms     4.0%      0.21x
+akkar            7090.59     2.30ms     3.60ms     2.2%      0.27x
+akkar-lean       7755.48     2.01ms     3.41ms     2.3%      0.29x
+akkar-pq         9030.65     1.73ms     2.86ms     1.4%      0.34x
+```
+
+### Two hundred rows — `/rows/200`, 16 connections
+
+```
+gin              7206.08     1.99ms     7.04ms     1.1%      1.00x
+fastapi           880.59    17.92ms    23.94ms     1.9%      0.12x
+akkar            1425.37    10.72ms    18.56ms     3.8%      0.20x
+akkar-lean       1453.89     9.32ms    23.98ms     0.6%      0.20x
+akkar-pq         3482.56     4.57ms     6.53ms     2.0%      0.48x
+```
+
+### What it moves
+
+| | pgmoon | akkar.pq |
+|---|---:|---:|
+| `/users/42` against Gin | 0.27x | **0.34x** |
+| `/users/42` against FastAPI | 1.25x | **1.60x** |
+| `/rows/200` against Gin | 0.20x | **0.48x** |
+| `/rows/200` against FastAPI | 1.62x | **3.95x** |
+
+**On a list endpoint the driver takes akkar from a fifth of Gin to about half
+of it, and from 1.6x FastAPI to nearly 4x.** The p99 on that route falls from
+18.56 ms to 6.53 ms — below Gin's own 7.04 ms, which is the first row in this
+study where akkar's tail is not the worse one.
+
+The framework path does not move, and should not: `/ping` is 0.17x either way.
+Whatever separates akkar from Gin on the HTTP path is still there, unchanged,
+and no driver was ever going to touch it.
+
+### Two things this does not say
+
+- **It is not a new default.** pgmoon remains the default driver.
+  `bench/driver/RESULTS.md` §5.4 has the reason, and it is a measured one: the
+  C driver is faster and measurably *less consistent*, with two anomalous
+  windows in thirty against pgmoon's zero, unexplained.
+- **The `akkar` and `akkar-lean` rows reproduce section 2 rather than replace
+  it.** Run a day apart on the same box: Gin 7,194 → 7,206 and FastAPI 880 →
+  881 on `/rows/200`, akkar 1,450 → 1,425. That agreement is worth as much as
+  the new row, because it says the harness — not the weather — is what these
+  numbers come from.
+
+### The defect this run found before it produced a number
+
+The first attempt **refused to run**:
+
+```
+REFUSING on /ping (akkar-lean): HTTP-408:{"error":"timed out reading the request body"}
+```
+
+`akkar-lean` sets `timeout = 0`, which means "no deadline" everywhere in akkar
+except in the body-read budget, which wrote `budget and (...)` — and `0` is
+true in Lua. Every request got 408, including a GET with no body. Fixed, and
+pinned by a third case in `spec/slow_body_spec.lua`; the numbers above are
+from the re-run.
+
+It is worth naming what caught it. `lib.sh` refuses to measure a response
+whose body contains `"error"`, a gate added after an earlier run measured two
+frameworks agreeing on a 404. A benchmark that only measured speed would have
+reported `akkar-lean` as the fastest variant on the page.
+
+---
+
 ## 3. Does capacity follow cores?
 
 ```
