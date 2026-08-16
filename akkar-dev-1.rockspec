@@ -93,6 +93,7 @@ build = {
     ["akkar.scope"] = "akkar/scope.lua",
     ["akkar.time"] = "akkar/time.lua",
     ["akkar.vm"] = "akkar/vm.lua",
+    ["akkar.watch"] = "akkar/watch.lua",
     ["akkar.doctor"] = "akkar/doctor.lua",
     ["akkar.limit"] = "akkar/limit.lua",
     ["akkar.idempotency"] = "akkar/idempotency.lua",

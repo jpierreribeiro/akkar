@@ -181,11 +181,56 @@ local function archive(args)
            :format(result.objects, result.archive))
 end
 
+local function watch(args)
+  local roots, run_command = {}, nil
+  local options = {}
+
+  local i = 1
+  local function value(flag)
+    i = i + 1
+    if not args[i] then fail(flag .. " needs a value") end
+    return args[i]
+  end
+
+  while i <= #args do
+    local a = args[i]
+    if     a == "--root"     then roots[#roots + 1] = value(a)
+    elseif a == "--interval" then options.interval = tonumber(value(a))
+    elseif a == "--pattern"  then options.pattern = value(a)
+    elseif a == "--" then
+      run_command = table.concat({ table.unpack(args, i + 1) }, " ")
+      break
+    elseif a:sub(1, 1) == "-" then fail("unknown option " .. a)
+    else fail("watch takes options and then `-- <command>`") end
+    i = i + 1
+  end
+
+  if not run_command or run_command == "" then
+    fail("watch needs a command after `--`:\n" ..
+         "  akkar watch --root . -- ./myapp run app.lua")
+  end
+  if #roots == 0 then roots = { "." } end
+
+  io.write(("akkar watch: %s\n  roots: %s\n")
+           :format(run_command, table.concat(roots, ", ")))
+
+  require("akkar.watch").run(run_command, roots, {
+    interval = options.interval,
+    pattern = options.pattern,
+    on_restart = function(changes)
+      io.write(("akkar watch: %d file(s) changed, restarting -- %s\n")
+               :format(#changes, changes[1]))
+    end,
+  })
+end
+
 local command = arg[1]
 local rest = { table.unpack(arg, 2) }
 
 if command == "doctor" then
   doctor(rest)
+elseif command == "watch" then
+  watch(rest)
 elseif command == "build" then
   build(rest)
 elseif command == "archive" then
