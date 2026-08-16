@@ -37,6 +37,7 @@ app:post("/users", { body = { name = "string" } },
 
 app:handle_signals()
 app:run { port = %d, check_capabilities = false, timeout = 1,
+          %s
           log = akkar.log.new { level = "error", sink = function() end } }
 ]==]
 
@@ -63,9 +64,13 @@ end
 --- corpus leaves listening sockets behind that nothing will reclaim. A fixed
 --- port would make the spec fail on its second run for a reason that has
 --- nothing to do with what it tests.
-function M.start(first_port)
+--- `extra` is pasted into the server's `app:run{}` call, so a spec can start
+--- a server configured differently -- `repair_substrate = false`, say, which
+--- is how `spec/substrate_repair_spec.lua` shows that the repair is what
+--- keeps the server alive rather than something else in the stack.
+function M.start(first_port, extra)
   for attempt = 0, 40 do
-    local stop, why = M.start_on((first_port or 8300) + attempt)
+    local stop, why = M.start_on((first_port or 8300) + attempt, extra)
     if stop then return stop, (first_port or 8300) + attempt end
     if not tostring(why):find("Address already in use", 1, true) then
       return nil, why
@@ -74,11 +79,12 @@ function M.start(first_port)
   return nil, "no free port in forty tries"
 end
 
-function M.start_on(port)
+function M.start_on(port, extra)
   local path = os.tmpname() .. ".lua"
   local file = assert(io.open(path, "w"))
   file:write(SERVER:format(package.path:gsub("%%", "%%%%"),
-                           package.cpath:gsub("%%", "%%%%"), port))
+                           package.cpath:gsub("%%", "%%%%"), port,
+                           extra or ""))
   file:close()
 
   -- Backgrounded with `&` rather than `io.popen`, which would block this

@@ -165,6 +165,7 @@ local SETTINGS = {
   body_limit = true, timeout = true, shutdown_grace = true,
   check_capabilities = true, reuseport = true, strict = true,
   max_concurrent = true, trusted_proxies = true,
+  repair_substrate = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -1594,9 +1595,12 @@ local function read_body(stream, request_headers, limit, budget)
   -- lua-http and came back to the caller as a 503 -- akkar reporting its own
   -- unavailability for a header the client typed wrong.
   --
-  -- It does not save the server: `docs/substrate/lua-http-wedge.md` records
-  -- that lua-http stops accepting connections after this request whatever
-  -- akkar answers. What it fixes is the answer.
+  -- This fixes the ANSWER. The server is saved separately and was not, when
+  -- this comment was first written: `akkar.substrate` repairs the two ways a
+  -- malformed length takes a lua-http server down -- an unbounded spin in
+  -- `shutdown` for a length that is not a number, and an uncaught raise that
+  -- exits the process for one that is negative. See that module and
+  -- `docs/substrate/lua-http-wedge.md`.
   if declared and declared < 0 then
     return nil, "malformed"
   end
@@ -1710,6 +1714,22 @@ function App:run(config)
   -- live server is worse than the bug it was looking for.  Development and
   -- the test suite should turn it on; see `akkar.strict`.
   if config.strict then require("akkar.strict").on() end
+
+  -- REPAIR THE SUBSTRATE BEFORE BINDING A PORT.
+  --
+  -- One malformed header stops a lua-http server accepting for ever, and a
+  -- second one kills the process outright. Both are repaired by
+  -- `akkar.substrate`, which explains itself at length and carries the
+  -- measurements. Here rather than at require time: importing akkar should
+  -- not mutate a third-party library as a side effect, and the substrate
+  -- tests need the unpatched behaviour available to compare against.
+  --
+  -- Opt out with `repair_substrate = false` -- for anyone who would rather
+  -- carry the defect than a patched dependency, and so the specs can prove
+  -- what happens without it.
+  if config.repair_substrate ~= false then
+    require("akkar.substrate").apply()
+  end
 
   local port = config.port or 8080
   local host = config.host or "127.0.0.1"

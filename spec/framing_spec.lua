@@ -104,30 +104,54 @@ describe("framing", function()
   local results = {}
 
   setup(function()
-    -- A FRESH SERVER PER CASE, and the reason is the finding this file made:
-    -- `Content-Length: banana` stops lua-http accepting connections for ever
-    -- (`docs/substrate/lua-http-wedge.md`). A single server would die on the
-    -- fourth input and every later verdict would be about a corpse.
+    -- ONE SERVER FOR THE WHOLE CORPUS, restarted only when a case kills it.
     --
-    -- One process per case is slow and it is the only honest way to ask
-    -- twenty-two independent questions of a server that one of them kills.
-    for i, case in ipairs(corpus()) do
-      local stop, port = raw.start(8300 + i * 3)
-      local why = port
+    -- It used to be a fresh process per case, and the reason was the finding
+    -- this file made: `Content-Length: banana` stopped lua-http accepting
+    -- connections for ever, so a single server died on the fourth input and
+    -- every later verdict was about a corpse. That cost twenty-two process
+    -- starts and about ten minutes a run.
+    --
+    -- `akkar.substrate` repairs the wedge, so the corpus can share a server
+    -- -- and sharing one is a STRONGER test, not merely a faster one. Each
+    -- case now runs against a server that has already survived every case
+    -- before it, which is the property a corpus of hostile inputs should be
+    -- asserting and could not while one input was fatal.
+    --
+    -- The restart is kept for attribution rather than for survival. If some
+    -- future input does kill the server, `killed_the_server` names the exact
+    -- case instead of leaving every later result to be read as a consequence.
+    local stop, port = raw.start(8300)
+    local probe = "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n"
+
+    for _, case in ipairs(corpus()) do
+      if not stop then
+        stop, port = raw.start(8300)
+      end
+
       if not stop then
         results[#results + 1] = { label = case[1], outcome = "server-failed",
-                                  waiting = case[3] == "wait", why = why }
+                                  waiting = case[3] == "wait", why = port }
       else
         local waiting = case[3] == "wait"
         local outcome = raw.send(port, case[2], waiting and 1 or 2)
         -- Does the server still answer afterwards? That is the property the
         -- corpus is really testing.
-        local after = raw.send(port, "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n", 2)
+        local after = raw.send(port, probe, 2)
         results[#results + 1] = { label = case[1], outcome = outcome,
-                                  waiting = waiting, after = after }
-        stop()
+                                  waiting = waiting, after = after,
+                                  killed_the_server = after ~= "status=200" }
+        if after ~= "status=200" then
+          -- Dead or wedged: retire this one and let the next case start a
+          -- fresh process, so one fatal input does not silently condemn the
+          -- twenty that follow it.
+          stop()
+          stop, port = nil, nil
+        end
       end
     end
+
+    if stop then stop() end
   end)
 
   it("started a server for every case", function()
@@ -182,30 +206,35 @@ describe("framing", function()
   -- what this file can prove is that the server keeps answering, which is
   -- the observable consequence of the same property.
 
-  it("STILL dies on a malformed content-length, which is lua-http's bug", function()
-    -- Pinned as currently TRUE, not as acceptable. `Content-Length: banana`
-    -- and `Content-Length: -5` stop the server accepting connections for
-    -- ever: the process lives, the listening socket stays open, and `ss`
-    -- shows connections piling up unaccepted, so a port check calls it
-    -- healthy. Reproduced in `docs/substrate/lua-http-wedge.lua` with
-    -- twenty-five lines containing no akkar, which is how it was attributed.
+  it("survives a malformed content-length, which it did not used to", function()
+    -- THE SENTINEL FIRED, AND THIS IS ITS REPLACEMENT.
     --
-    -- akkar answers 400 for both now, rather than the 503 that blamed the
-    -- server for a header the client typed. It cannot prevent the wedge: the
-    -- failure is above anything a handler reaches.
+    -- What stood here asserted the opposite: that `Content-Length: banana`
+    -- and `Content-Length: -5` still took the server down, pinned as
+    -- currently TRUE rather than as acceptable. Its message said the day it
+    -- went red was the day to retract `docs/substrate/lua-http-wedge.md`.
     --
-    -- THIS TEST FAILS WHEN UPSTREAM FIXES IT, which is the point. The day it
-    -- goes red is the day `docs/substrate/lua-http-wedge.md` gets retracted
-    -- and this file can stop starting one server per case.
-    local wedged = 0
+    -- It went red because AKKAR fixed it, not upstream -- `akkar.substrate`,
+    -- with the measurements and the two corrections the old writeup needed.
+    -- The assertion is therefore inverted rather than deleted: the property
+    -- worth pinning was never "lua-http is broken", it was "we know exactly
+    -- what this input does", and now what it does is survive.
+    --
+    -- `spec/substrate_repair_spec.lua` proves the repair is the reason, by
+    -- starting a server without it and requiring that one to die. This test
+    -- covers the same ground through the full framing corpus, where the
+    -- malformed lengths sit alongside every other hostile input.
+    local wedged = {}
     for _, result in ipairs(results) do
       local malformed = result.label:find("not a number", 1, true)
                      or result.label:find("negative", 1, true)
-      if malformed and result.after ~= "status=200" then wedged = wedged + 1 end
+      if malformed and result.after ~= "status=200" then
+        wedged[#wedged + 1] = result.label .. " -> " .. tostring(result.after)
+      end
     end
-    assert.is_true(wedged > 0,
-      "lua-http no longer wedges on a malformed content-length -- retract " ..
-      "docs/substrate/lua-http-wedge.md and simplify this spec")
+    assert.equal(0, #wedged,
+      "a malformed content-length still stops the server answering: " ..
+      table.concat(wedged, "; "))
   end)
 
   it("did not smuggle a second request past the router", function()

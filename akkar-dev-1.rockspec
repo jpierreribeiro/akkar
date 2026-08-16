@@ -90,6 +90,7 @@ build = {
     ["akkar.pool"] = "akkar/pool.lua",
     ["akkar.redis"] = "akkar/redis.lua",
     ["akkar.sql"] = "akkar/sql.lua",
+    ["akkar.substrate"] = "akkar/substrate.lua",
     ["akkar.scope"] = "akkar/scope.lua",
     ["akkar.time"] = "akkar/time.lua",
     ["akkar.vm"] = "akkar/vm.lua",
