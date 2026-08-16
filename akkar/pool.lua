@@ -158,7 +158,17 @@ function Pool:put(resource)
   --
   -- It is reachable whenever a release runs on two paths, and one such path
   -- shipped in the streaming code.
-  if resource.pooled then return end
+  -- `pooled` covers a resource that went back to the idle set. `discarded`
+  -- covers one the predicate REJECTED -- and it had to be added, because the
+  -- guard used to cover only the first case while the second decremented
+  -- `live` every single time it was called.
+  --
+  -- Returning a broken resource twice therefore drove `live` NEGATIVE, and a
+  -- negative `live` is worse than a wrong number: capacity is
+  -- `live + reserved < size`, so the pool then opens more connections than it
+  -- was allowed. Found by `spec/properties_spec.lua` on its first run, at
+  -- seed 7919 step 61, which is a schedule nobody would have written by hand.
+  if resource.pooled or resource.discarded then return end
 
   resource.pool = nil
   local keep = true
@@ -171,6 +181,7 @@ function Pool:put(resource)
     resource.pooled = true
     self.idle[#self.idle + 1] = resource
   else
+    resource.discarded = true
     pcall(function() resource:close() end)
     self.live = self.live - 1
   end

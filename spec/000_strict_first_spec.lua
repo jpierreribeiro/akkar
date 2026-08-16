@@ -27,4 +27,24 @@ describe("the suite itself", function()
   it("runs under strict mode", function()
     assert.is_true(require("akkar.strict").active())
   end)
+
+  it("still sorts before every other spec, which is the whole mechanism", function()
+    -- The `000_` prefix is load-bearing and nothing checked it. Add a spec
+    -- that sorts earlier -- `0_helpers_spec.lua` would do it, and so would
+    -- anything starting with a digit below zero's ASCII -- and strict mode
+    -- gets installed AFTER that file has already run. Nothing fails; the
+    -- guarantee simply stops covering one file, silently, and akkar's ninth
+    -- invariant is checked against slightly less than the suite.
+    --
+    -- This is the cheapest possible tripwire: ask the filesystem.
+    local names = {}
+    local pipe = assert(io.popen "ls spec/*_spec.lua 2>/dev/null")
+    for path in pipe:lines() do names[#names + 1] = path:match "([^/]+)$" end
+    pipe:close()
+    table.sort(names)
+
+    assert.is_true(#names > 1, "no spec files found; is the working directory wrong?")
+    assert.equal("000_strict_first_spec.lua", names[1],
+      "'" .. tostring(names[1]) .. "' now loads before strict mode is installed")
+  end)
 end)
