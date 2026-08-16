@@ -43,16 +43,30 @@ stop_all() {
 }
 trap stop_all EXIT
 
-start_akkar() {   # tree, processes, cores, [lean]
-  local tree=$1 n=$2 cores=$3 lean=${4:-0}
+start_akkar() {   # tree, processes, cores, [lean], [driver]
+  local tree=$1 n=$2 cores=$3 lean=${4:-0} driver=${5:-pgmoon}
   stop_all
+  local log=/tmp/akkar-boot-$driver.log; : > "$log"
   for _ in $(seq 1 "$n"); do
-    AKKAR_ROOT="$tree" AKKAR_LEAN="$lean" setsid taskset -c "$cores" \
-      lua5.4 "$APPS/serve.lua" "$PORT" "$POOL" </dev/null >/dev/null 2>&1 &
+    AKKAR_ROOT="$tree" AKKAR_LEAN="$lean" AKKAR_DRIVER="$driver" \
+      setsid taskset -c "$cores" \
+      lua5.4 "$APPS/serve.lua" "$PORT" "$POOL" </dev/null >/dev/null 2>>"$log" &
     disown
   done
   sleep 4
   verify_running "study/apps/serve[.]lua" "$n" "akkar" || exit 1
+
+  # WHICH DRIVER, read back rather than assumed. `db.connect` returns a factory
+  # and opens on first use, so a server asked for `pq` on a box without
+  # `pq_native.so` would pass the process-count gate and then answer 500s in
+  # the middle of a timed run. serve.lua loads it at boot and prints the name.
+  local seen; seen=$(grep -c "^driver=$driver$" "$log" 2>/dev/null); seen=${seen:-0}
+  if [ "$seen" -ne "$n" ]; then
+    echo "REFUSING: $seen of $n akkar servers reported driver=$driver."
+    echo "  A run that does not know which driver it measured measures nothing."
+    sed -n '1,10p' "$log"
+    exit 1
+  fi
 }
 
 start_gin() {
@@ -221,12 +235,17 @@ part_compare() {
     local target=$1 conns=$2
     declare -A got bodies
     for rep in $(seq 1 "$REPS"); do
-      for fw in gin fastapi akkar akkar-lean; do
+      # `akkar-pq` is the same tree and the same routes on the C driver.
+      # Without it this table compared akkar's pure-Lua database path against
+      # Gin's pgx and FastAPI's asyncpg -- both of which are C underneath --
+      # and reported the difference as a framework result.
+      for fw in gin fastapi akkar akkar-lean akkar-pq; do
         case $fw in
           gin)        start_gin "$PROCS" "$SERVERS" ;;
           fastapi)    start_fastapi "$PROCS" "$SERVERS" ;;
           akkar)      start_akkar "$HEAD_TREE" "$PROCS" "$SERVERS" 0 ;;
           akkar-lean) start_akkar "$HEAD_TREE" "$PROCS" "$SERVERS" 1 ;;
+          akkar-pq)   start_akkar "$HEAD_TREE" "$PROCS" "$SERVERS" 0 pq ;;
         esac
         [ "$rep" -eq 1 ] && {
           local body; body=$(probe_body "http://127.0.0.1:$PORT$target") || {
@@ -241,7 +260,7 @@ part_compare() {
     # Semantic equivalence before any timing.  Compared canonically, because
     # JSON key order is not defined and varies between runs, not between
     # frameworks.
-    for fw in fastapi akkar akkar-lean; do
+    for fw in fastapi akkar akkar-lean akkar-pq; do
       if [ "${bodies[$fw]}" != "${bodies[gin]}" ]; then
         echo "REFUSING on $target: $fw and gin return different data."
         echo "  gin : ${bodies[gin]:0:180}"
@@ -250,10 +269,10 @@ part_compare() {
       fi
     done
 
-    echo "$target at $conns connections  (all four return byte-identical JSON)"
+    echo "$target at $conns connections  (all five return byte-identical JSON)"
     printf "  %-12s %12s %10s %10s %8s %9s\n" framework req/s p50 p99 spread relative
     local base=""
-    for fw in gin fastapi akkar akkar-lean; do
+    for fw in gin fastapi akkar akkar-lean akkar-pq; do
       local r; r=$(echo "${got[$fw]}" | grep -v '^$' | summarise)
       local rps; rps=$(echo $r | cut -d' ' -f1)
       [ -z "$base" ] && base=$rps
