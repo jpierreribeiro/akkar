@@ -40,16 +40,45 @@ Two build facts came out of it, both mechanical:
   module beginning with an underscore hits this. A real `akkar build` emits
   its own host and never meets it.
 
+## The whole stack links, and stops one plumbing detail short of serving
+
+The second attempt went further: **every C dependency and all 102 Lua modules
+a running akkar app loads**, in one 2.9 MB executable.
+
+| | |
+|---|---|
+| `_cqueues.a` | 2.1 MB, all entry points |
+| `_openssl.a` | 26 entry points |
+| `cjson.a`, `lpeg.a` | |
+| Lua modules | 102 — akkar, lua-http, cqueues, lpeg_patterns, openssl wrappers, basexx, fifo, binaryheap |
+| Result | **links, and runs** |
+
+The module list was not guessed. A script starts an app, serves one request to
+itself and dumps `package.loaded`, so what gets bundled is what a real request
+touches.
+
+It stops here, precisely: the binary loads akkar, reaches `http.server`, which
+requires `http.h2_connection`, which requires `openssl.rand`, whose one-line
+Lua wrapper does `require "_openssl.rand"` -- and that does not resolve to the
+statically linked C module. The searcher falls through to `dlopen` on the
+executable itself, which fails with *cannot dynamically load executable*.
+`-no-pie` does not fix it; nor does rewriting all 49 C-module registrations
+from their `luaopen_` symbols, which is verifiably done in the generated
+source.
+
+**That is a `luastatic` naming problem, not an akkar one, and it is the
+argument for `akkar build` emitting its OWN host** rather than leaning on a
+general-purpose bundler. A host akkar generates knows exactly which
+`luaopen_` belongs to which module name, because it wrote both.
+
 ## What this does NOT prove
 
 Written here rather than left to be discovered, because a feasibility probe
 that oversells is worse than none.
 
-- **luaossl was not linked.** TLS is the remaining C dependency and it is the
-  same shape as cqueues, but "same shape" is a prediction, not a result.
-- **Nothing was served over HTTP.** The probe ran an event loop, not a
-  request. `lua-http` and `pgmoon` are pure Lua and bundle trivially, but that
-  is reasoning, not a measurement.
+- **No request has been served from the binary.** It loads, and it stops at
+  the module above. The event loop probe is the strongest positive result;
+  the full stack is "links and starts", not "serves".
 - **The binary is not fully static.** It still links `libssl.so` and
   `libcrypto.so` dynamically. `libssl.a` and `libcrypto.a` exist on this
   machine, so a fully static link is reachable — untried.

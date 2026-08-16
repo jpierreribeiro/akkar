@@ -1,0 +1,15 @@
+# saturation: 2 processes, pool 10 each, capacity 20 connections
+# route /users/42, answering: {"email":"u42@example.com","id":42,"name":"user42"}
+# 2026-08-16T01:29:10Z  Intel(R) Xeon(R) Platinum 8124M CPU @ 3.00GHz
+
+mult   conns         req/s       p50       p99   errors
+0.5x   10          7138.36    1.17ms    1.98ms        0
+0.75x  15          7198.57    1.68ms    2.63ms        0
+1x     20          7315.41    2.71ms    3.74ms        0
+1.25x  25          7349.19    3.24ms    4.35ms        0
+1.5x   30          7420.54    3.73ms    4.69ms        0
+2x     40          7768.32    5.18ms    6.22ms        0
+3x     60          7181.37    6.65ms   37.70ms        0
+4x     80          6941.36    9.28ms   82.38ms        0
+
+# pool waits, summed across the server processes:

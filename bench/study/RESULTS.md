@@ -211,6 +211,68 @@ one.
 
 ---
 
+## 8. Above capacity, which is the run the backlog owed
+
+Section 7 sustained 45 minutes at 16 connections against a capacity of 20, so
+nothing ever queued. It proved the absence of a leak and said nothing about
+the regime an incident happens in. This holds the pool fixed and sweeps
+offered concurrency from half capacity to four times it.
+
+Two processes, `pool_size = 10` each, capacity **20 connections**, 30 s per
+point, three repetitions, `/users/42`. Script: `bench/study/saturation.sh`.
+
+```
+mult   conns         req/s       p50       p99   errors
+0.5x   10          7138.36    1.17ms    1.98ms        0
+0.75x  15          7198.57    1.68ms    2.63ms        0
+1x     20          7315.41    2.71ms    3.74ms        0
+1.25x  25          7349.19    3.24ms    4.35ms        0
+1.5x   30          7420.54    3.73ms    4.69ms        0
+2x     40          7768.32    5.18ms    6.22ms        0
+3x     60          7181.37    6.65ms   37.70ms        0
+4x     80          6941.36    9.28ms   82.38ms        0
+```
+
+### The predictions, scored
+
+Recorded in the script before the run, per `bench/compare/METHOD.md`. **One of
+four was right.**
+
+| | Predicted | Measured |
+|---|---|---|
+| 1 | Throughput flat from 1.0x onward | **Wrong.** It rises to a peak at 2x (+6% over 1x) and then falls, down 11% from that peak by 4x. There is an optimum, not a plateau |
+| 2 | p99 grows roughly linearly past capacity | **Wrong.** It is nearly flat through 2x and then breaks: 6.22 ms → 37.70 ms → 82.38 ms. A knee between 2x and 3x, not a line |
+| 3 | Pool wait becomes the majority of p99 above 2x | **Not measured.** The benchmark app does not mount `/metrics`, so the counters added to `Pool:get` for exactly this were never read. Owed |
+| 4 | Errors stay at zero | **Right.** Zero at every point |
+
+### The sizing rule, which is what the run was for
+
+> **Offered concurrency up to twice the pool is free. Past that it is paid for
+> in the tail, and it buys nothing.**
+
+Below 2x, every extra connection is absorbed: throughput improves slightly and
+p99 stays under 7 ms. Above 2x the server does *less* work and answers *worse*
+— 3x offers half again the load for 7.5% less throughput and six times the
+tail.
+
+So: **size the pool at about half the peak concurrency you intend to accept**,
+and use `akkar.limit.concurrent` to refuse the rest rather than queue it. That
+is the same conclusion the limiter's own docstring reached from the earlier
+numbers, now with the knee located.
+
+### The honest limits
+
+- **One route, one shape.** `/users/42` is a single indexed row. A query
+  costing ten times as much moves the knee, and this says nothing about where.
+- **Errors stayed at zero because the deadline was never reached.** At 4x, p99
+  is 82 ms against a 30-second default. A tighter deadline would convert the
+  tail into 503s, which is the intended behaviour and is not measured here.
+- **Prediction 3 is still owed**, and the instrumentation to answer it now
+  exists — `stats().waits`, `.waited`, `.waited_max`. What is missing is a
+  benchmark app that exposes it.
+
+---
+
 ## What this study is not
 
 - **Not a claim about developer velocity, ecosystem or maintenance**, which

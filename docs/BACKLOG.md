@@ -511,13 +511,20 @@ the milestone everything else was clearing the way for is still the milestone.
   descriptors or of database connections — which is the one thing this
   project's ten-second measurements were never able to assert.
 
-  **The specific question it was supposed to answer is still open.**
-  `/users/:id` p99 was 191 ms at one process with 100 concurrent connections
-  against `pool_size = 10`, so ninety requests were queuing for a connection.
-  The soak ran 16 connections against a capacity of 20, so nothing queued: it
-  proves the absence of a leak and says nothing about a saturated pool. Pool
-  sizing against concurrency remains undocumented, and the run that produces
-  the guidance has to push past capacity.
+  **The question it was supposed to answer is now answered**, by a second run
+  above capacity — `bench/study/saturation.sh`, written up as section 8 of
+  `bench/study/RESULTS.md`. The rule:
+
+  > Offered concurrency up to **twice** the pool is free. Past that it is paid
+  > for in the tail, and it buys nothing.
+
+  Throughput peaks at 2x capacity and *falls* beyond it, while p99 goes from
+  6.22 ms to 37.70 ms to 82.38 ms. So size the pool at about half the peak
+  concurrency you intend to accept, and refuse the rest with
+  `akkar.limit.concurrent` rather than queue it.
+
+  Three of the four predictions recorded before that run were wrong, and they
+  are scored in the results rather than quietly dropped.
 
   Forty-five minutes also is not a night. The slope is flat enough to rule out
   a leak at this timescale and not long enough to speak about a weekly one.
