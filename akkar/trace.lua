@@ -552,6 +552,10 @@ end
 --- to write.
 function Exporter:middleware(options)
   options = options or {}
+  -- Lazily, once, at construction rather than per request: `akkar` does not
+  -- require this module, and keeping the edge one-directional at load time
+  -- means nobody has to reason about the order later.
+  local akkar = require "akkar"
   local name_of = options.name or function(req)
     -- The ROUTE, not the path, when akkar knows it. `/users/42` and
     -- `/users/43` are the same operation, and a backend that groups by raw
@@ -601,9 +605,22 @@ function Exporter:middleware(options)
     span.name = name_of(req)
 
     if not ok then
+      -- A THROWN RESPONSE IS NOT AN ERROR, and telling them apart is exactly
+      -- what `akkar.is_response` is exported for -- `akkar/init.lua` says so:
+      -- "middleware has to tell a thrown response from a raised error, and the
+      -- alternative was comparing metatables".
+      --
+      -- A handler that throws a 404 to unwind has answered the request
+      -- correctly. Recording that as a failed span would make the error rate
+      -- on every dashboard equal to the rate at which people mistype URLs,
+      -- which is the same reason a returned 4xx is UNSET below.
+      local thrown = akkar.is_response(res) and res or nil
       span:finish {
-        status = "error",
-        message = type(res) == "string" and res or "handler raised",
+        status = (not thrown or (thrown.status or 500) >= 500) and "error" or nil,
+        message = (not thrown) and
+                  (type(res) == "string" and res or "handler raised") or nil,
+        attributes = thrown and
+                     { ["http.response.status_code"] = thrown.status } or nil,
       }
       -- Rethrown with level 0 so the value is preserved unchanged: akkar
       -- dispatches on a THROWN RESPONSE as well as on an error string, and

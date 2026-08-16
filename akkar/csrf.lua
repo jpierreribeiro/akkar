@@ -327,14 +327,26 @@ function M.new(options)
     -- only on a safe method -- see the header comment for why this file does
     -- not contend for `set-cookie` with `akkar.session`.
     if SAFE[req.method] and fresh ~= current then
-      -- NORMALISED FIRST, BECAUSE MIDDLEWARE SITS ABOVE NORMALISATION.
+      -- NORMALISED FIRST, AND THE COMMENT THAT SENT ME HERE IS NOW STALE.
       --
-      -- What comes back from `next` is whatever the handler literally
-      -- returned: a bare `{ ok = true }` with no `status`, no `body` and no
-      -- `headers`. `akkar.auth` records the debugging session this cost --
-      -- copying those fields off a bare table produced three nils carrying a
-      -- cookie, akkar normalised THAT into a 200 whose body was the copy, and
-      -- the body and the header both vanished silently.
+      -- `akkar/auth.lua` says at length that "a middleware sits ABOVE
+      -- normalisation, so what comes back from `next` is whatever the handler
+      -- literally returned" -- a bare `{ ok = true }` with no `status`, no
+      -- `body` and no `headers` -- and records the debugging session that
+      -- cost: copying those fields off a bare table produced three nils
+      -- carrying a cookie, akkar normalised THAT into a 200 whose body was the
+      -- copy, and the body and the header both vanished silently.
+      --
+      -- MEASURED RATHER THAN BELIEVED, because a comment is a claim: today
+      -- akkar normalises at EVERY hop. A middleware's `next` returns a real
+      -- response even when the handler returned a bare table, and even when
+      -- the middleware BELOW returned one. So this branch cannot fire on the
+      -- current framework.
+      --
+      -- It stays, because it costs one comparison and the alternative is a
+      -- module whose correctness depends on where normalisation happens to sit
+      -- this month. What does NOT stay is the false statement -- `akkar/auth.lua`
+      -- still carries it, and it should be corrected there.
       local normalised = res
       if type(res) ~= "table" or res.__response ~= true then
         normalised = akkar.response(res == nil and 204 or 200, res)

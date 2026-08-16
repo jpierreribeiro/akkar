@@ -223,13 +223,24 @@ function M.middleware(options)
     -- was merely confusing; a stray `Set-Cookie` is one user's session handed
     -- to another.
     --
-    -- So a copy. And the copy has to be a RESPONSE, which cost a debugging
-    -- session to learn: a middleware sits ABOVE normalisation, so what comes
-    -- back from `next` is whatever the handler literally returned -- a bare
-    -- `{ ok = true }`, with no `status`, no `body` and no `headers`. Copying
-    -- those fields off it produced a table of three nils carrying a cookie,
-    -- and akkar then normalised THAT into a 200 whose body was the copy. The
+    -- So a copy. And the copy has to be a RESPONSE.
+    --
+    -- CORRECTION, because the first version of this comment explained the bug
+    -- wrongly while fixing it correctly. It said a middleware sits ABOVE
+    -- normalisation and receives whatever the handler literally returned.
+    -- That is false: akkar normalises at every hop, and a middleware is handed
+    -- a real response -- `__response = true`, `status = 200`, `body` filled in
+    -- -- even when the handler returned a bare table. Measured, after another
+    -- agent reading this file said the claim did not match what they saw.
+    --
+    -- The actual defect was on the other side of the copy. `res` was fine;
+    -- the COPY was a plain table with no `__response`, so akkar treated it as
+    -- a JSON body and normalised it into a 200 whose body was the copy. The
     -- body vanished and the header with it, silently.
+    --
+    -- Worth keeping the correction rather than editing the sentence: a
+    -- comment that explains a real bug with a wrong mechanism is how the next
+    -- person builds on a false model of the framework.
     --
     -- `akkar.response` is the constructor that marks a table as already
     -- normalised (`__response`), so building one here is how a middleware adds
