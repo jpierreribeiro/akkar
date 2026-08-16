@@ -79,8 +79,14 @@ end
 local function run_program(source, seconds)
   local path = os.tmpname() .. ".lua"
   local file = assert(io.open(path, "w"))
-  file:write(('package.path = "%s/?.lua;%s/?/init.lua;" .. package.path\n')
-             :format(".", "."))
+  -- The parent's resolved search paths, written in rather than appended to.
+  -- A fresh `lua5.4` inherits only the environment, so appending depends on
+  -- `LUA_PATH` being exported -- and where it is not, every case in this file
+  -- fails with "the consumer never ran the job" when the real answer is that
+  -- cqueues was never found. `package.cpath` matters as much as `package.path`
+  -- here: cqueues is a C module.
+  file:write(("package.path = %q\n"):format("./?.lua;./?/init.lua;" .. package.path))
+  file:write(("package.cpath = %q\n"):format("./?.so;" .. package.cpath))
   file:write(source)
   file:close()
 

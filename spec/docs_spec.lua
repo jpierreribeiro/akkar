@@ -197,9 +197,18 @@ local function write_temp(code, index)
   -- reading the docs runs `lua app.lua` from their own project, where akkar is
   -- installed, and making every example carry a `package.path` line would put
   -- noise in front of the thing being taught.
-  file:write(('package.path = "%s/?.lua;%s/?/init.lua;" .. package.path\n')
-             :format(".", "."))
-  file:write('package.cpath = "./?.so;" .. package.cpath\n')
+  -- THE CHILD IS A FRESH INTERPRETER and inherits nothing but the environment.
+  -- Appending to *its* `package.path` only works if `LUA_PATH` happens to be
+  -- exported, which is true when luarocks is wired through the shell and false
+  -- when it is wired through a wrapper script on PATH. On the second kind of
+  -- shell this file reported six documentation examples as broken when the
+  -- truth was "the child could not find cqueues" -- a failure that blames the
+  -- docs for the harness.
+  --
+  -- So the parent's own resolved paths are written in, not appended to. This
+  -- process already found akkar and its dependencies; the child is told where.
+  file:write(("package.path = %q\n"):format("./?.lua;./?/init.lua;" .. package.path))
+  file:write(("package.cpath = %q\n"):format("./?.so;" .. package.cpath))
   file:write(code)
   file:close()
   return path
