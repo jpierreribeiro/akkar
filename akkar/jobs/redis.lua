@@ -161,8 +161,19 @@ end
 -- lost the job with nothing anywhere recording that it existed.
 --
 -- The list is what `BLMOVE` needs; the sorted set beside it is what makes
--- reaping possible, because a list cannot say how old its entries are. They
--- are kept in step by scripts, never by two round trips.
+-- reaping possible, because a list cannot say how old its entries are.
+--
+-- ONE PAIR CANNOT BE A SCRIPT, and this comment used to claim they all were:
+-- "kept in step by scripts, never by two round trips". Redis refuses blocking
+-- commands inside a script, so the WAITING claim is `BLMOVE` and then `ZADD`,
+-- two round trips with a gap between them. Everything else here is a script,
+-- including the non-blocking claim, which was two round trips only because
+-- nobody had noticed it did not have to be.
+--
+-- What that surviving gap costs is bounded on purpose: an entry in the list
+-- with no score is a claim in flight, so `reap` STAMPS it rather than
+-- reclaiming it, and only the ordinary staleness rule can take a job away
+-- from a worker. See `REAP_SCRIPT`.
 
 function Store:processing_key(key) return key .. ":processing" end
 function Store:claimed_key(key)    return key .. ":processing:at" end
@@ -183,6 +194,7 @@ local processing = KEYS[1]
 local claimed    = KEYS[2]
 local queue      = KEYS[3]
 local cutoff     = tonumber(ARGV[1])
+local now        = tonumber(ARGV[2]) or cutoff
 
 local moved = 0
 local stale = redis.call('ZRANGEBYSCORE', claimed, '-inf', cutoff)
@@ -197,13 +209,36 @@ end
 local held = redis.call('LRANGE', processing, 0, -1)
 for i = 1, #held do
   if not redis.call('ZSCORE', claimed, held[i]) then
-    redis.call('LREM', processing, 1, held[i])
-    redis.call('LPUSH', queue, held[i])
-    moved = moved + 1
+    -- STAMPED, NOT SNATCHED. This branch used to move an unscored entry
+    -- straight back to the queue, and the only way to be unscored is to be
+    -- inside the window between `BLMOVE` and `ZADD` in `claim_pop` -- which
+    -- a LIVE worker passes through on every single job. A reap landing in
+    -- that window handed a running job to somebody else, and at-least-once
+    -- quietly became at-least-twice under nothing worse than ordinary
+    -- timing.
+    --
+    -- So it adopts instead: give it a timestamp now, and let the ordinary
+    -- stale path reclaim it one window later if nobody acknowledges it. A
+    -- worker that really died between the two commands loses `cutoff`
+    -- seconds, once. A worker that is alive loses nothing.
+    redis.call('ZADD', claimed, now, held[i])
   end
 end
 
 return moved
+]]
+
+-- The non-blocking claim, as one step.
+--
+-- `LMOVE` then `ZADD` from the client is two round trips with a gap, and the
+-- gap is what made `reap` capable of stealing a live worker's job. The
+-- comment at the top of this file claims these pairs are "kept in step by
+-- scripts, never by two round trips"; for this one pair it was not true.
+local CLAIM_POP_SCRIPT = [[
+local job = redis.call('RPOPLPUSH', KEYS[1], KEYS[2])
+if not job then return false end
+redis.call('ZADD', KEYS[3], tonumber(ARGV[1]), job)
+return job
 ]]
 
 --- Moves one job from the queue to the processing list and returns it.
@@ -212,7 +247,15 @@ function Store:claim_pop(key, timeout, now)
   local encoded
 
   if not timeout or timeout <= 0 then
-    encoded = self.cache:command("LMOVE", key, processing, "RIGHT", "LEFT")
+    -- One script, so the move and the timestamp cannot be separated. The
+    -- blocking branch below cannot do this -- Redis refuses blocking commands
+    -- inside a script -- which is why `reap` had to learn to adopt an
+    -- unscored entry rather than reclaim it.
+    encoded = eval(self.cache, CLAIM_POP_SCRIPT,
+                   { key, processing, self:claimed_key(key) },
+                   { tostring(now or 0) })
+    if type(encoded) ~= "string" then return nil end
+    return encoded
   else
     -- The connection's read bound has to outlive a command that blocks in
     -- the server, for the same reason `dequeue` raises it around `BRPOP`.
@@ -240,10 +283,10 @@ function Store:ack(key, encoded)
   return tonumber(removed) == 1
 end
 
-function Store:reap(key, cutoff)
+function Store:reap(key, cutoff, now)
   local moved = eval(self.cache, REAP_SCRIPT,
                      { self:processing_key(key), self:claimed_key(key), key },
-                     { cutoff })
+                     { cutoff, now or cutoff })
   return tonumber(moved) or 0
 end
 

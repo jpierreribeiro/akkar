@@ -213,9 +213,29 @@ function Queue:pop(timeout)
   end
   if not encoded then return nil end
   local ok, job = pcall(cjson.decode, encoded)
-  -- A job that cannot be decoded cannot be handled or retried, and leaving it
-  -- at the head of the queue would stall every worker behind it forever.
-  if not ok then return nil, "akkar.jobs: undecodable job discarded" end
+  if not ok then
+    -- DISCARDED MEANS DISCARDED, and for one commit it did not.
+    --
+    -- On the reliable path `claim_pop` has already moved these bytes into the
+    -- processing set, so returning here without removing them left the entry
+    -- checked out with nobody holding it: `ack` needs a decoded job to find
+    -- the bytes, and `reap` pushes stale entries BACK to the queue. The result
+    -- was a poison cycle -- queue, processing, reap, queue -- with a log line
+    -- claiming the thing had been discarded.
+    --
+    -- Worse than the old behaviour, which at least lost it once. A message
+    -- that describes what the code used to do is how a defect hides.
+    if supports(self.store, "ack") then
+      pcall(function() return self.store:ack(self.key, encoded) end)
+    end
+    if self.dead_letter then
+      -- Kept rather than dropped: bytes nobody can decode are exactly what
+      -- somebody will need to look at, and a dead-letter queue is where this
+      -- module already puts work it cannot finish.
+      pcall(function() return self.store:enqueue(self:dead_key(), encoded) end)
+    end
+    return nil, "akkar.jobs: undecodable job discarded"
+  end
   self._claimed[job] = encoded
   return job
 end
@@ -302,7 +322,11 @@ end
 --- Returns how many were returned to the queue.
 function Queue:reap(older_than)
   if not supports(self.store, "reap") then return 0 end
-  return self.store:reap(self.key, time.now() - (older_than or 300))
+  local now = time.now()
+  -- `now` as well as the cutoff: a store that keeps claim times separately
+  -- from the jobs themselves needs to be able to stamp an entry it finds
+  -- unstamped, rather than assume nobody holds it.
+  return self.store:reap(self.key, now - (older_than or 300), now)
 end
 
 --- How many jobs are currently checked out by a worker.

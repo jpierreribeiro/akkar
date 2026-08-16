@@ -213,7 +213,19 @@ function Memory:eval(script, numkeys, ...)
       LOG_WARNING  = 3,
     },
   }
-  env.redis.pcall = env.redis.call
+  -- `pcall` RETURNS the error; `call` raises it. That is the entire
+  -- difference between them, and this line used to make them the same
+  -- function -- so a script written to inspect `result.err` and carry on
+  -- aborted here instead, and the only place it did so was the fake. A test
+  -- double whose failure mode differs from the real thing is worse than no
+  -- double: it certifies scripts that Redis will run differently.
+  env.redis.pcall = function(command, ...)
+    local ok, result = pcall(self.command, self, command, ...)
+    if not ok then
+      return { err = type(result) == "table" and result.err or tostring(result) }
+    end
+    return result == nil and false or result
+  end
 
   local chunk, why = load(script, "=redis-script", "t", env)
   if not chunk then

@@ -58,23 +58,34 @@ for mult in 0.5 0.75 1 1.25 1.5 2 3 4; do
   conns=$(awk -v c="$CAPACITY" -v m="$mult" 'BEGIN { printf "%d", c * m }')
   [ "$conns" -lt "$THREADS" ] && conns=$THREADS
 
-  best_rps=""; best_p50=""; best_p99=""; errors=0
+  # MEDIAN, AND IT WAS NOT ONE. This loop kept the run with the HIGHEST
+  # throughput while the comment above it said "median", so every published
+  # figure was a best-of-three dressed as a middle-of-three -- optimistic by
+  # construction, and worst precisely where the variance is highest, which on
+  # a saturation curve is past the knee. `bench/study/RESULTS.md` section 8
+  # carries the retraction.
+  #
+  # The rows are collected and sorted now, and the middle one is taken whole
+  # so that the three numbers on a line still come from ONE run rather than
+  # from three different ones.
+  runs=""; errors=0
   for _ in $(seq 1 "$REPS"); do
     # `run_wrk url duration conns threads` -- the order matters and getting it
     # wrong reports INVALID for every row, which looks like a saturated server
     # rather than a mistyped call.
     read -r rps p50 p99 < <(run_wrk "http://127.0.0.1:$PORT/users/42" \
       "$DURATION" "$conns" "$THREADS") || { errors=$((errors + 1)); continue; }
-    # Nearest-rank median over three is just the middle one; take the run with
-    # the median throughput and report ITS latencies, so the three numbers on
-    # a line come from one run rather than from three different ones.
-    if [ -z "$best_rps" ] || awk -v a="$rps" -v b="$best_rps" 'BEGIN{exit !(a>b)}'; then
-      best_rps=$rps; best_p50=$p50; best_p99=$p99
-    fi
+    runs="${runs}${rps} ${p50} ${p99}"$'\n'
   done
 
+  # Nearest-rank median: sort by throughput, take row ceil(n/2).
+  read -r med_rps med_p50 med_p99 < <(
+    printf '%s' "$runs" | grep -v '^$' | sort -g -k1,1 |
+    awk '{ row[NR] = $0 } END { if (NR) print row[int((NR + 1) / 2)] }'
+  )
+
   printf "%-6s %-8s %10s %9s %9s %8s\n" \
-    "${mult}x" "$conns" "${best_rps:-INVALID}" "${best_p50:--}" "${best_p99:--}" "$errors"
+    "${mult}x" "$conns" "${med_rps:-INVALID}" "${med_p50:--}" "${med_p99:--}" "$errors"
 done
 
 echo

@@ -105,6 +105,30 @@ describe("akkar.cache.memory", function()
     assert.same({ 1, 42 }, reply)
   end)
 
+  it("lets redis.pcall return the error that redis.call raises", function()
+    -- The one thing that distinguishes them, and this fake had `pcall` set to
+    -- the very same function as `call`. A script that inspects `.err` and
+    -- carries on -- the only reason to reach for `pcall` in the first place --
+    -- would pass here and abort against a real Redis.
+    local c = cache.new()
+
+    local reply = c:command("EVAL", [[
+      local bad = redis.pcall('NOSUCHCOMMAND', KEYS[1])
+      if type(bad) == 'table' and bad.err then return 'handled' end
+      return 'no error was reported'
+    ]], 1, "k")
+    assert.equal("handled", reply)
+
+    -- And the other half: `call` must still stop the script.
+    local ok = pcall(function()
+      return c:command("EVAL", [[
+        redis.call('NOSUCHCOMMAND', KEYS[1])
+        return 'kept going'
+      ]], 1, "k")
+    end)
+    assert.is_false(ok, "redis.call let the script continue past a failure")
+  end)
+
   it("answers TIME from its own clock, so a script can be moved through time", function()
     local at = 1755000000
     local c = cache.new { now = function() return at end }

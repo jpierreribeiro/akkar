@@ -260,6 +260,42 @@ and use `akkar.limit.concurrent` to refuse the rest rather than queue it. That
 is the same conclusion the limiter's own docstring reached from the earlier
 numbers, now with the knee located.
 
+### RETRACTION: these numbers are best-of-three, not median-of-three
+
+Written after the fact, in the same voice as the retractions in
+`bench/compare/RESULTS.md` and `docs/PERFORMANCE-STUDY.md`, because a number
+that overstates itself is worth more as a correction than as a deletion.
+
+The table above says "three repetitions" and this document's header says
+"nearest-rank median". `saturation.sh` did neither: the loop that collected the
+repetitions kept the run with the HIGHEST throughput, under a comment that said
+it was taking the median. Every `req/s` in the table is therefore a **best of
+three**, and each `p50`/`p99` is the latency of that best run.
+
+What that does to the conclusions, stated rather than guessed:
+
+- **The bias is upward everywhere, and unequal across rows.** It is largest
+  where run-to-run variance is largest, and on a saturation curve that is past
+  the knee. So the tail figures at 3x and 4x are the ones least to be trusted,
+  and they are optimistic — the real p99 there is worse than 37.70 ms and
+  82.38 ms, not better.
+- **The knee survives.** A five-fold jump between 2x and 3x is far outside the
+  spread that picking a maximum can produce; taking the best of three cannot
+  manufacture a break of that size, only soften it.
+- **The 2x peak does not survive as a measurement.** It is +6% over 1x, which
+  is the same order as the difference between a maximum and a median over
+  three runs. Prediction 1 is scored "wrong" on the strength of that peak, and
+  that score should be read as unproven rather than as established.
+- **The sizing rule is unaffected in direction**, since it rests on the knee,
+  and the bias makes it if anything conservative: the tail past 2x is worse
+  than published, so refusing that load rather than queueing it is the better
+  call, not the worse one.
+
+The script is fixed — it sorts the runs and takes row ceil(n/2) whole, so the
+three numbers on a line still come from one run. **The table has not been
+re-measured**, because the machine it needs is not currently up; when it is,
+this section gets new numbers and this retraction stays.
+
 ### The honest limits
 
 - **One route, one shape.** `/users/42` is a single indexed row. A query
@@ -267,6 +303,8 @@ numbers, now with the knee located.
 - **Errors stayed at zero because the deadline was never reached.** At 4x, p99
   is 82 ms against a 30-second default. A tighter deadline would convert the
   tail into 503s, which is the intended behaviour and is not measured here.
+- **The numbers are biased upward.** See the retraction above; the table is a
+  best-of-three that was labelled a median.
 - **Prediction 3 is still owed**, and the instrumentation to answer it now
   exists — `stats().waits`, `.waited`, `.waited_max`. What is missing is a
   benchmark app that exposes it.
