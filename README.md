@@ -656,7 +656,7 @@ JSON API has today, which is nothing.
 | `akkar.cache.memory` is per-process | two processes have two caches, and akkar's answer to more CPU is more processes |
 | Teal does not check schemas against handler output | schemas are runtime values; validation is what checks those |
 | Linear scan for dynamic routes | measured: 33 µs worst case at 50 routes against ~4000 µs for one query. Revisit past ~500 dynamic routes |
-| Pinned to Lua 5.4 | `cqueues` pins `lua == 5.4` and has had no release since 2020 — not `lua-http`, which accepts `>= 5.1` |
+| Runs on Lua 5.4, not yet 5.5 | The blocker is **`luaossl`**, whose makefile has no 5.5 target. `cqueues` master builds and runs an event loop under 5.5 once its vendored `lua-compat-5.3` is updated from v0.9; the published rock is what pins 5.4. Measured by `docs/runtime/lua55-probe.sh` |
 | `akkar.vm` is a sandbox, not an isolated VM | Lua 5.4 cannot make a separate state from Lua. Real within its stated limits; against hostile code, use a separate process |
 | Streaming holds its capabilities open | a slow client reading a streamed export keeps a pool slot for as long as it reads |
 | The database path is pgmoon in pure Lua | decoding rows into tables is 55% of a thousand-row query and needs a C driver to move |
