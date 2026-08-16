@@ -67,7 +67,7 @@ door, which is a different thing from an idempotent handler and does not
 pretend to replace one.
 ]]
 
-local cjson = require "cjson"
+local cjson = require "akkar.json"
 
 local Queue = {}
 Queue.__index = Queue

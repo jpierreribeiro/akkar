@@ -17,7 +17,7 @@ local cqueues = require "cqueues"
 local time    = require "akkar.time"
 local server  = require "http.server"
 local headers = require "http.headers"
-local cjson   = require "cjson"
+local cjson   = require "akkar.json"
 local log     = require "akkar.log"
 local multipart = require "akkar.multipart"
 
@@ -1787,8 +1787,54 @@ function App:run(config)
   -- the server enforces and nothing else can read is half a ceiling.
   self.max_concurrent = max_concurrent
 
+  -- TLS WITHOUT MAKING THE APPLICATION IMPORT luaossl.
+  --
+  -- `ctx` was a whitelisted option passed straight through to lua-http, so
+  -- serving HTTPS meant an application constructed a luaossl context by hand
+  -- -- and two substrate libraries appeared in its configuration. That is the
+  -- boundary this project says it keeps, breached in the one place where
+  -- getting it wrong is a security problem rather than an inconvenience.
+  --
+  -- `tls = { certificate = ..., key = ... }` is answered here instead. `ctx`
+  -- stays as the escape hatch for anyone who needs to configure ciphers,
+  -- client certificates or anything else akkar has no opinion about -- named
+  -- explicitly, so `grep ctx` is the complete list of applications reaching
+  -- past the boundary.
+  local tls_ctx = config.ctx
+  local tls_on  = config.tls and true or false
+  if type(config.tls) == "table" and not tls_ctx then
+    local ok, context = pcall(function()
+      local openssl_ctx = require "openssl.ssl.context"
+      local x509 = require "openssl.x509"
+      local pkey = require "openssl.pkey"
+
+      local certificate = config.tls.certificate
+        or error("akkar: tls needs `certificate` -- a PEM string or a path", 0)
+      local key = config.tls.key
+        or error("akkar: tls needs `key` -- a PEM string or a path", 0)
+
+      local function pem(value)
+        if value:find "-----BEGIN" then return value end
+        local file = assert(io.open(value, "r"),
+          "akkar: cannot read " .. tostring(value))
+        local contents = file:read "a"
+        file:close()
+        return contents
+      end
+
+      local ctx = openssl_ctx.new(config.tls.protocol or "TLS", true)
+      ctx:setCertificate(x509.new(pem(certificate)))
+      ctx:setPrivateKey(pkey.new(pem(key)))
+      return ctx
+    end)
+    if not ok then
+      error("akkar: could not build the TLS context: " .. tostring(context), 0)
+    end
+    tls_ctx = context
+  end
+
   local s = assert(server.listen {
-    host = host, port = port, tls = config.tls or false, ctx = config.ctx,
+    host = host, port = port, tls = tls_on, ctx = tls_ctx,
     reuseport = config.reuseport,
     max_concurrent = max_concurrent,
     onstream = function(_, stream)
@@ -2064,7 +2110,13 @@ function App:handle_signals(signals)
 end
 
 -- Exposed so tests can express a JSON null without going through the wire.
+-- The serializer's sentinel, reached through the contract rather than lifted
+-- out of a dependency. It used to read `cjson.null` -- a C userdata from a
+-- library nothing in akkar's API mentions, handed to users as akkar's own
+-- value and compared by identity in dispatch. Swapping the JSON library would
+-- have changed the identity of a value people were holding.
 akkar.null = cjson.null
+akkar.json = cjson          -- `cjson` is `akkar.json` here; see that module
 
 -- Exposed so the startup checks can be tested without binding a socket.
 akkar.check_capabilities = check_capability_contracts

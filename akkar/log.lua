@@ -14,7 +14,7 @@ nobody has to follow is worth more than a rule everybody has to.
 Output goes to stderr by default, so nothing needs configuring to work.
 ]]
 
-local cjson = require "cjson"
+local cjson = require "akkar.json"
 local time  = require "akkar.time"
 
 local LEVELS = { debug = 10, info = 20, warn = 30, error = 40 }

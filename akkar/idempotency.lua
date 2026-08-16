@@ -63,7 +63,7 @@ a repeat re-runs the handler. Refusing to store is better than an unbounded
 write into a shared cache, and it is stated rather than discovered.
 ]]
 
-local cjson = require "cjson"
+local cjson = require "akkar.json"
 
 local M = {}
 

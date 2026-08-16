@@ -52,7 +52,7 @@ transport half, correct and free, and it is a great deal better than nothing --
 which is what almost every JSON API has today.
 ]]
 
-local cjson = require "cjson"
+local cjson = require "akkar.json"
 
 local M = {}
 
