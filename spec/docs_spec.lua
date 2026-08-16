@@ -14,8 +14,9 @@ without a running proof -- applied to the documentation.
 
 ## How a block is treated
 
-Every fenced ```lua block under `docs/guide/` is extracted and executed in
-its own process, with the repository on the path. A block that raises fails this spec.
+Every fenced ```lua block under `docs/guide/`, `docs/recipes/`,
+`docs/reference/` and `docs/why/` is extracted and executed in its own
+process, with the repository on the path. A block that raises fails this spec.
 
 Three markers change that, and each has to be written deliberately as an HTML
 comment on the line before the fence:
@@ -47,7 +48,7 @@ package.path = "./?.lua;./?/init.lua;" .. package.path
 local TMP = os.getenv "CLAUDE_JOB_DIR"
 TMP = (TMP and TMP .. "/tmp") or "/tmp"
 
--- SCOPED TO THE GUIDE, and the boundary is deliberate.
+-- SCOPED TO THE GUIDE AND THE REFERENCE, and the boundary is deliberate.
 --
 -- `docs/` also holds the design documents -- RUNTIME.md, ROADMAP.md,
 -- PERFORMANCE-STUDY.md and the rest -- and those are full of fragments on
@@ -63,16 +64,57 @@ TMP = (TMP and TMP .. "/tmp") or "/tmp"
 -- Running this against `docs/` at large was tried first, and it immediately
 -- flagged fragments in the design documents -- correctly, by its own rule, and
 -- uselessly.
-local GUIDE = "docs/guide"
+--
+-- The reference joined the guide for the same reason, not by extension of the
+-- rule. A reference page is looked up by somebody who copies one function's
+-- example, pastes it, and expects it to work -- so its examples are
+-- instructions too, and the signature above an example that no longer runs is
+-- a signature nobody should trust either. Reference is also the part of any
+-- documentation that rots first, because it tracks the code line by line.
+--
+-- `docs/why/` is in for a narrower reason, and it is NOT the design-document
+-- rule being reversed. Those pages are arguments and most of their blocks are
+-- fragments, marked `no-run` and only compiled. But a handful of them exist to
+-- EXECUTE the argument -- the page on sessions ends by destroying one and
+-- reading the store back, and that print is the claim it spent a screen
+-- making. A demonstration that has stopped demonstrating is worse than a
+-- fragment, because it looks like evidence. So the fragments are marked and
+-- the demonstrations run.
+--
+-- `docs/recipes/` is in for the plainest reason of the four. A recipe is one
+-- page, one problem, and one complete file the reader copies whole and runs
+-- without reading anything else -- so a recipe that has rotted is not a
+-- misleading paragraph, it is a file that does not work, pasted by somebody
+-- who has no page before it to compare against. Nearly every block there is a
+-- whole server, which this already knows how to start and kill. The two
+-- exceptions are marked: a busted spec, which `busted` runs and `lua5.4` does
+-- not, and the configuration page, whose file deliberately refuses to start
+-- when the environment is missing a required setting.
+--
+-- `docs/sql/` is a tutorial track, so it is in for the guide's reason rather
+-- than a new one: a reader follows it literally and types from it. It earns a
+-- line of its own only because of what its blocks DO. Nearly every one of them
+-- prints the SQL a builder produced, or the row a real Postgres answered with,
+-- and the page shows that output as the thing being taught. An example whose
+-- printed statement no longer matches the module is not a stale paragraph, it
+-- is a lesson teaching the wrong text, and nothing but running it can tell.
+-- Its database examples create their own `sqlguide_`-prefixed tables and drop
+-- them again, so the track leaves the shared database as it found it.
+local DOC_DIRS = { "docs/guide", "docs/recipes", "docs/reference", "docs/sql",
+                   "docs/why" }
 
---- Every markdown file under the guide, sorted so failures are reported in a
---- stable order rather than in whatever order the filesystem answers.
+--- Every markdown file under the documented directories, sorted so failures
+--- are reported in a stable order rather than in whatever order the
+--- filesystem answers.
 local function doc_files()
   local found = {}
-  local pipe = io.popen(("find %s -name '*.md' -type f 2>/dev/null"):format(GUIDE))
-  if not pipe then return found end
-  for path in pipe:lines() do found[#found + 1] = path end
-  pipe:close()
+  for _, dir in ipairs(DOC_DIRS) do
+    local pipe = io.popen(("find %s -name '*.md' -type f 2>/dev/null"):format(dir))
+    if pipe then
+      for path in pipe:lines() do found[#found + 1] = path end
+      pipe:close()
+    end
+  end
   table.sort(found)
   return found
 end
@@ -124,8 +166,32 @@ local function lua_blocks(text, path)
   return blocks
 end
 
+-- A TOKEN UNIQUE TO THIS PROCESS, and it is not decoration.
+--
+-- The temp file used to be named `docs-example-<os.time()>-<index>`, which is
+-- unique within one run and NOT unique across two. Two suites running at the
+-- same second -- two people, two agents, a watch loop and a terminal -- pick
+-- the same path for the same block index, and each then executes whatever the
+-- other wrote there.
+--
+-- That failure does not look like a collision. It was found as
+-- `docs/reference/vm.md` failing with `INFO listening url=http://127.0.0.1:3000`
+-- in its output: a page about sandboxing that binds no port, reported as
+-- starting a web server, because the other run's guide example had landed in
+-- the file a moment before it was read. Whoever hits that goes looking for a
+-- server in a page that has none.
+--
+-- `os.tmpname` is the unique part, taken once. It creates the file on POSIX,
+-- so it is removed again immediately; only the name is wanted.
+local RUN_TOKEN
+do
+  local probe = os.tmpname()
+  os.remove(probe)
+  RUN_TOKEN = probe:gsub("%W", "")
+end
+
 local function write_temp(code, index)
-  local path = ("%s/docs-example-%d-%d.lua"):format(TMP, os.time(), index)
+  local path = ("%s/docs-example-%s-%d.lua"):format(TMP, RUN_TOKEN, index)
   local file = assert(io.open(path, "w"))
   -- The path prelude is added rather than required of every page: a beginner
   -- reading the docs runs `lua app.lua` from their own project, where akkar is
@@ -178,7 +244,7 @@ local files = doc_files()
 
 describe("the documentation", function()
   if #files == 0 then
-    pending "docs/guide does not exist yet"
+    pending "neither docs/guide nor docs/reference exists yet"
     return
   end
 
@@ -316,8 +382,9 @@ describe("the documentation", function()
     -- broke and matched nothing. A documentation suite that tests zero
     -- examples is the same failure as a skip guard that never checks.
     assert.is_true(total > 0,
-      "no Lua examples were extracted from " .. #files .. " guide pages -- " ..
+      "no Lua examples were extracted from " .. #files .. " pages -- " ..
       "the extractor is broken, since a guide page with no runnable example " ..
-      "in it is not teaching anybody to write code")
+      "in it is not teaching anybody to write code, and a reference page " ..
+      "with none is not showing anybody how to call the function")
   end)
 end)

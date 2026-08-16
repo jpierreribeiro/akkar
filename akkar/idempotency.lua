@@ -150,15 +150,79 @@ end
 --- an honest client's mistake, and it is not a defence against an attacker who
 --- can already choose the key. Method and path are included because the same
 --- key on a different route is the same class of error.
+--- Serialises a value the same way in every process, for ever.
+---
+--- CJSON'S KEY ORDER IS NOT STABLE ACROSS PROCESSES, and the fingerprint was
+--- built on it.
+---
+--- Lua tables are hashes, `cjson.encode` walks them in hash order, and the
+--- hash seed differs per process. Measured: twelve processes, one identical
+--- body, **twelve different fingerprints**.
+---
+--- What that does in production is precise and bad. A fleet shares one Redis.
+--- A client retries -- which is the entire reason this module exists -- the
+--- retry lands on a different worker, the fingerprint does not match the
+--- stored one, and the module answers **422 "already used for a different
+--- request"**. It refuses the honest retry it was written to make safe, and
+--- it does so only in a fleet, only sometimes, and never on the developer's
+--- single-process machine.
+---
+--- Found by an agent writing reference documentation who read the encoder and
+--- asked whether it was ordered. It was not; the first check ran twelve
+--- processes rather than twelve loops, because a single process cannot show
+--- this at all.
+---
+--- Keys are sorted, and sorted by TYPE first so that a table with both
+--- numeric and string keys cannot compare a number against a string and
+--- raise. Depth is bounded because a fingerprint is not a serialiser and a
+--- cyclic body should cost a refusal rather than a stack.
+local function canonical(value, depth)
+  depth = depth or 0
+  if depth > 12 then return '"..."' end
+
+  local kind = type(value)
+  if kind == "table" then
+    local keys = {}
+    for key in pairs(value) do keys[#keys + 1] = key end
+    table.sort(keys, function(a, b)
+      local ta, tb = type(a), type(b)
+      if ta ~= tb then return ta < tb end
+      if ta == "number" or ta == "string" then return a < b end
+      return tostring(a) < tostring(b)
+    end)
+
+    local parts = {}
+    for _, key in ipairs(keys) do
+      parts[#parts + 1] = string.format("%q", tostring(key)) .. ":" ..
+                          canonical(value[key], depth + 1)
+    end
+    return "{" .. table.concat(parts, ",") .. "}"
+  end
+
+  if kind == "string" then return string.format("%q", value) end
+  if kind == "number" then
+    -- `7` and `7.0` are the same request. A body that round-trips through
+    -- JSON returns whole numbers as floats, so without this a retry could
+    -- fail to match itself for that reason alone.
+    if value == math.floor(value) and math.abs(value) < 2 ^ 53 then
+      return string.format("%d", value)
+    end
+    return tostring(value)
+  end
+  return tostring(value)
+end
+
 local function fingerprint_of(req)
   local body = ""
   if req.body ~= nil then
-    local ok, encoded = pcall(cjson.encode, req.body)
+    local ok, encoded = pcall(canonical, req.body)
     body = ok and encoded or tostring(req.body)
   end
   return req.method .. " " .. req.path .. " " .. #body .. ":" ..
          tostring(body:sub(1, 512))
 end
+
+M.canonical = canonical
 
 M.fingerprint_of = fingerprint_of
 

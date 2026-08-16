@@ -58,8 +58,34 @@ end
 
 --- Sets a gauge, for things that are read rather than counted: pool
 --- occupancy, queue depth, in-flight requests.
+--- Records a gauge, optionally with labels.
+---
+--- `labels` is a LIST OF PAIRS -- `{ { "queue", "emails" }, { "state", "due" } }`
+--- -- because Prometheus labels are ordered in the rendered line and a Lua map
+--- would render in a different order on every process.
+---
+--- THE LABELLED PATH RAISED ON EVERY CALL, and nothing noticed for as long as
+--- this module has existed. The map key was built with `table.concat{ name,
+--- labels }`, which is `invalid value (at index 2) in table for 'concat'` the
+--- moment `labels` is a table. So `render` had complete, correct label
+--- support that could not be reached, and the spec only ever called this with
+--- two arguments -- which is how a whole branch stays dead in a tested module.
+---
+--- Found by an agent writing reference documentation, who called every public
+--- function with every documented argument rather than the arguments the
+--- tests happened to use. That is the difference between a test suite and a
+--- reader.
 function Registry:gauge(name, value, labels)
-  self.gauges[key(name, labels or "")] = { name = name, labels = labels, value = value }
+  local label_key = ""
+  if labels then
+    local parts = {}
+    for _, pair in ipairs(labels) do
+      parts[#parts + 1] = tostring(pair[1]) .. "=" .. tostring(pair[2])
+    end
+    label_key = table.concat(parts, ",")
+  end
+  self.gauges[key(name, label_key)] =
+    { name = name, labels = labels, value = value }
 end
 
 -- A label value may contain a quote or a backslash; Prometheus needs both

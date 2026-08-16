@@ -321,8 +321,26 @@ function Store:scheduled_depth(key)
 end
 
 --- Returns a ready-to-use queue, which is what a caller almost always wants.
-function M.new(cache, name)
-  return jobs.new(setmetatable({ cache = cache }, Store), name)
+--- Builds a queue on this store.
+---
+--- OPTIONS ARE FORWARDED, AND FOR A WHILE THEY WERE NOT.
+---
+--- `jobs.new(store, name, options)` has always accepted a retry policy, a
+--- backoff and a dead-letter setting -- and this constructor took only the
+--- name, so every one of them was dropped on the floor between the caller and
+--- the queue. `memory.new("emails", { retries = 3 })` produced a queue with
+--- `retries = 0` and said nothing.
+---
+--- The irony is the part worth recording: `akkar/jobs.lua` REFUSES a retry
+--- policy it cannot honour, and calls that refusal "the silent degradation
+--- this module exists to avoid". The policy never reached the check.
+---
+--- Found by an agent writing the reference documentation, who read the
+--- signature rather than the docstring -- and it had already been taught in
+--- `docs/guide/10-background-work.md`, whose retries section was configuring
+--- nothing at all.
+function M.new(cache, name, options)
+  return jobs.new(setmetatable({ cache = cache }, Store), name, options)
 end
 
 M.Store = Store

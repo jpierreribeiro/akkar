@@ -366,8 +366,38 @@ function Queue:consume(handlers, options)
   local should_stop = options.should_stop or function() return false end
   local handled, failed, retried, buried = 0, 0, 0, 0
 
+  -- AN EMPTY POLL THAT DID NOT WAIT MUST WAIT HERE, or this loop is a spin.
+  --
+  -- `timeout = 0` tells the STORE not to block. Against Redis that never
+  -- mattered: `BRPOP` waits server-side and yields the coroutine while it
+  -- does, so the loop was paced by the store. Against the in-memory store
+  -- `pop(0)` returns immediately, and the loop had nothing to yield to --
+  -- 99.9% of a core, and the server it shares a process with stops answering
+  -- entirely.
+  --
+  -- Measured: a probe designed to finish in one second did not finish in
+  -- sixty, because the spinning consumer starved even the controller's own
+  -- timeout.
+  --
+  -- Found by an agent writing a recipe for an in-process worker, and it is
+  -- the exact shape `App:task`'s docstring suggests -- so the framework was
+  -- recommending it. `spec/task_spec.lua` used it too and passed, because a
+  -- test that exits as soon as its job is consumed never notices a spin.
+  --
+  -- The wait belongs here rather than in the store: a store honouring
+  -- `timeout = 0` is behaving correctly, and the caller who asked for it
+  -- wants a poll loop, not a busy loop. `idle` is how long an empty turn
+  -- costs, and only an EMPTY turn pays it -- a queue with work in it runs
+  -- flat out.
+  local idle = options.idle or 0.05
+  local store_waits = (options.timeout or 1) > 0
+
   while not should_stop() do
     local job, decode_error = self:pop(options.timeout or 1)
+
+    if not job and not decode_error and not store_waits and not should_stop() then
+      time.sleep(idle)
+    end
     if decode_error and log then
       log:warn("jobs: discarded an undecodable job")
     elseif job then
