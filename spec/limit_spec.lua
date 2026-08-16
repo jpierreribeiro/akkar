@@ -683,3 +683,101 @@ describe("what the store can honour", function()
     end)
   end)
 end)
+
+describe("health checks and the limiter", function()
+  -- THE FAILURE MODE WHERE THE PROTECTIVE FEATURE CAUSES THE OUTAGE.
+  --
+  -- A global rate limiter counts the orchestrator's probes as traffic.
+  -- Twelve requests to /health/live inside the window answer 429, Kubernetes
+  -- reads a 429 as a failed probe, and it restarts a healthy process -- then
+  -- restarts the replacement, because the limiter is shared between them.
+  --
+  -- Found by someone writing the guide's resilience page, who had to show the
+  -- 429 first and then four lines of exemption. A page teaching a workaround
+  -- for a default is the default being wrong.
+  local akkar  = require "akkar"
+  local limit  = require "akkar.limit"
+  local memory = require "akkar.cache.memory"
+
+  local function app_with(options)
+    local app = akkar.new()
+    app:use(limit.rate(options))
+    app:get("/health/live", function() return { ok = true } end)
+    app:get("/work", function() return { ok = true } end)
+    return app
+  end
+
+  it("does not throttle a probe into a restart loop", function()
+    local shared = memory.new()
+    local client = app_with { per_second = 1, burst = 1,
+                              cache = shared }:test()
+
+    -- Far more than the burst. Every one must answer 200.
+    for i = 1, 20 do
+      local res = client:get "/health/live"
+      assert.equal(200, res.status,
+        ("probe %d answered %d; an orchestrator reads that as a dead process")
+        :format(i, res.status))
+    end
+  end)
+
+  it("still throttles everything else", function()
+    -- The exemption must be narrow. A limiter that stopped limiting would be
+    -- a worse bug than the one being fixed.
+    local shared = memory.new()
+    local client = app_with { per_second = 1, burst = 1,
+                              cache = shared }:test()
+
+    assert.equal(200, client:get("/work").status)
+    local throttled = false
+    for _ = 1, 10 do
+      if client:get("/work").status == 429 then throttled = true break end
+    end
+    assert.is_true(throttled, "the limiter stopped limiting ordinary traffic")
+  end)
+
+  it("covers the spellings that are actually in the wild", function()
+    -- Nobody should have to discover which spelling this module happened to
+    -- pick.
+    local shared = memory.new()
+    local app = akkar.new()
+    app:use(limit.rate { per_second = 1, burst = 1, cache = shared })
+    for _, path in ipairs { "/health", "/healthz", "/livez", "/readyz" } do
+      app:get(path, function() return { ok = true } end)
+    end
+    local client = app:test()
+
+    for _, path in ipairs { "/health", "/healthz", "/livez", "/readyz" } do
+      for _ = 1, 5 do
+        assert.equal(200, client:get(path).status, path .. " was throttled")
+      end
+    end
+  end)
+
+  it("can be turned off, and can be replaced", function()
+    local shared = memory.new()
+
+    -- Off: the probe is limited like anything else.
+    local strict = akkar.new()
+    strict:use(limit.rate { per_second = 1, burst = 1, cache = shared,
+                            exempt = false })
+    strict:get("/health/live", function() return { ok = true } end)
+    local client = strict:test()
+    client:get "/health/live"
+    local hit_429 = false
+    for _ = 1, 10 do
+      if client:get("/health/live").status == 429 then hit_429 = true break end
+    end
+    assert.is_true(hit_429, "exempt = false did not turn the exemption off")
+
+    -- Replaced: a different prefix is exempt and the default one is not.
+    local other = memory.new()
+    local custom = akkar.new()
+    custom:use(limit.rate { per_second = 1, burst = 1, cache = other,
+                            exempt = { "/internal/" } })
+    custom:get("/internal/ping", function() return { ok = true } end)
+    for _ = 1, 8 do
+      assert.equal(200, custom:test():get("/internal/ping").status)
+    end
+  end)
+end)

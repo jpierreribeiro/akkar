@@ -526,7 +526,41 @@ function M.rate(options)
   local run = evaluator(RATE_SCRIPT)     -- holds a SHA, never a connection
   local state = {}                       -- outage flag; never a connection
 
+  -- HEALTH CHECKS ARE EXEMPT BY DEFAULT, and this is a defect being fixed
+  -- rather than a convenience being added.
+  --
+  -- A global rate limiter counts the orchestrator's probes along with
+  -- everybody else's traffic. Twelve requests to `/health/live` inside the
+  -- window answer 429; Kubernetes reads a 429 as a failed probe, and it
+  -- restarts a process that was perfectly healthy -- then does it again to the
+  -- replacement, because the limiter is shared. The protective feature causes
+  -- the outage.
+  --
+  -- Found by someone writing the guide's resilience page, who had to show the
+  -- 429 first and then four lines of exemption. A page teaching a workaround
+  -- for the framework's default is the framework getting the default wrong.
+  --
+  -- Prefix match rather than an exact list, because `/health/live`,
+  -- `/health/ready` and `/healthz` are all in the wild and nobody should have
+  -- to discover which spelling this module happened to pick. `exempt = false`
+  -- turns it off; `exempt = { "/internal/" }` replaces the list.
+  local exempt = options.exempt
+  if exempt == nil then exempt = { "/health", "/healthz", "/livez", "/readyz" } end
+
+  local function is_exempt(path)
+    if exempt == false or type(path) ~= "string" then return false end
+    for _, prefix_ in ipairs(exempt) do
+      if path:sub(1, #prefix_) == prefix_ then return true end
+    end
+    return false
+  end
+
   return function(req, next)
+    -- Before the store is touched at all: an exempt path must not cost a
+    -- round trip either, since a probe every second against a shared Redis is
+    -- a load nobody asked for.
+    if is_exempt(req.path) then return next(req) end
+
     local cache = options.cache or req.cache
     local reply = attempt(run, cache, { prefix .. key_for(options, req) },
                           { burst, per_second, cost }, options, req, state,
