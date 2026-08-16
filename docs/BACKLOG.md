@@ -688,6 +688,58 @@ is not a parameter anywhere in it — the host takes it from the running
 request. Any extension mechanism akkar grows, in any technology, has to be
 builder-shaped for that reason.
 
+## 10. The outbound path, which does not exist
+
+Found by inventory, verified in the code: `CAPABILITIES` in `akkar/init.lua`
+is `db`, `cache`, `log`, `clock` — **none of which leaves the process** — and
+nothing under `akkar/` requires an HTTP client.
+
+**akkar is complete on the inbound path and empty on the outbound one.**
+Routes, validation, pooling, jobs, cache, rate limit, idempotency, metrics,
+OpenAPI, scope, streaming, shutdown: every one of them is about *receiving* a
+request. Nothing in akkar *makes* one.
+
+That is why it never surfaced. The whole suite and every benchmark tests a
+server, so the missing half was never exercised by anything.
+
+Stated without softening: **akkar does not yet serve a service that calls
+another service**, which is most real backends. It is not a quality problem
+with what exists; it is the boundary of what was built.
+
+| | state | severity |
+|---|---|---|
+| HTTP client (`req.http`) | absent | **high** — blocks every external integration |
+| Password hashing | absent; OpenSSL already linked via luaossl | high *if* the app authenticates |
+| JWT | absent; HMAC/RSA already available | high *if* the app authenticates |
+| Response compression | absent | low — the proxy does it |
+| Cookies / sessions | absent | low for a JSON API on bearer tokens |
+| WebSocket | absent | depends on the application |
+
+**None of these is an architectural hole.** They are modules, and the
+primitives for most of them are already inside the binary: password hashing
+and JWT need PBKDF2/HMAC/RSA, and OpenSSL is already a dependency through
+luaossl; a client needs sockets, TLS and a pool, and cqueues, luaossl and
+`akkar/pool.lua` all exist.
+
+### The choice the client forces, and it mirrors the driver's
+
+Wrapping lua-http's client is the fast path and means **inheriting lua-http**
+— the library this project found a denial of service in, whose last commit is
+September 2024 and which `akkar/substrate.lua` now carries a repair for.
+
+The answer is probably the same one the driver just demonstrated: the value is
+in the **adapter** — deadline, pool, retry, metrics, and the client sitting
+behind the capability boundary the way `db` does — not in the transport. Wrap
+what exists, and swap the transport underneath if it hurts. `spec/db_spec.lua`
+running one contract against two drivers is the evidence that swapping costs
+one file.
+
+### Order
+
+1. **HTTP client as a capability** (`req.http`), with deadline and pool.
+2. **`akkar.crypto`** — password hashing and JWT over the already-linked OpenSSL.
+3. The rest when a real need appears.
+
 ## What is deliberately not being built
 
 Written down because the list keeps trying to grow.
