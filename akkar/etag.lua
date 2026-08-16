@@ -52,7 +52,7 @@ transport half, correct and free, and it is a great deal better than nothing --
 which is what almost every JSON API has today.
 ]]
 
-local cjson = require "cjson"
+local cjson = require "akkar.json"
 
 local M = {}
 
@@ -183,9 +183,6 @@ function M.new(options)
        and res.body ~= nil then
       local tag = M.of(res.body)
       if tag then
-        res.headers = res.headers or {}
-        res.headers["etag"] = tag
-
         -- The cheap half: a client that already holds this version gets 304
         -- and no body at all.
         if safe[method] and if_none and matches(if_none, tag) then
@@ -193,6 +190,33 @@ function M.new(options)
           not_modified.headers = { ["etag"] = tag }
           return not_modified
         end
+
+        -- A COPY, BECAUSE THIS USED TO MUTATE THE HANDLER'S OWN TABLE.
+        --
+        -- It read `res.headers = res.headers or {}` and then wrote the tag
+        -- into it -- on whatever table the handler returned. `akkar/init.lua`
+        -- documents this exact defect at length for `x-request-id`, and the
+        -- audit fixed it there and left it standing here: a handler is free to
+        -- return a hoisted or memoised response -- a constant 404, a cached
+        -- payload -- and then ONE table is shared by every request that
+        -- reaches it. Request A's etag is written into a table request B also
+        -- returns.
+        --
+        -- For an etag the consequence has a name. A cached payload tagged with
+        -- the first caller's hash keeps that tag after the payload changes, so
+        -- every client holding the old version is told 304 and never sees the
+        -- new one. Found by an agent auditing `akkar/limit.lua` for the same
+        -- pattern; the limiter had it too and both are copies now.
+        local tagged = akkar.response(res.status, res.body)
+        local headers = {}
+        for name, value in pairs(res.headers or {}) do headers[name] = value end
+        headers["etag"] = tag
+        tagged.headers = headers
+        tagged.raw, tagged.stream, tagged.release =
+          res.raw, res.stream, res.release
+        tagged.content_type = res.content_type
+        tagged.__pending = res.__pending
+        res = tagged
       end
     end
 

@@ -14,13 +14,66 @@ in a framework that exists:
 ]]
 
 local cqueues = require "cqueues"
+local time    = require "akkar.time"
 local server  = require "http.server"
 local headers = require "http.headers"
-local cjson   = require "cjson"
+local cjson   = require "akkar.json"
 local log     = require "akkar.log"
 local multipart = require "akkar.multipart"
 
 local akkar = {}
+
+-- ============================================================== hostile bytes
+--
+-- A JSON text SHALL be encoded in UTF-8 (RFC 8259). cjson does not enforce
+-- that on the way out: given a Lua string holding `\xC3\x28` it emits those
+-- bytes, and the document is then not JSON. Measured, not assumed.
+--
+-- akkar echoes plenty of caller-supplied text -- a path parameter into a 404,
+-- a header into a response, a validation error naming the value it rejected
+-- -- so a client sending eight bad bytes could make akkar answer something no
+-- strict parser will read.
+--
+-- CLEANED WHERE IT ENTERS, NOT WHERE IT LEAVES, and that is a measurement
+-- rather than a preference. Validating every encoded response was tried
+-- first: one `utf8.len` over the finished document costs **20.8% on a
+-- hundred-row response and 59.9% on a thousand**, which is a tax on exactly
+-- the endpoints this framework is trying to be good at. A path parameter and
+-- a header are tens of bytes, once per request, and the check is free at that
+-- size.
+--
+-- What that leaves outside the guarantee, said plainly: text coming back from
+-- the database. Postgres validates encoding on the way in for a UTF8
+-- database, so a `text` column is already valid; a `bytea` handed straight to
+-- a response is the caller's decision and akkar does not inspect it.
+--
+-- A valid string is returned UNCHANGED and allocates nothing, which is what
+-- keeps this off the allocation ceiling. Only bytes that are already broken
+-- pay for the repair.
+local function safe_text(value)
+  if type(value) ~= "string" then return value end
+  if utf8.len(value) then return value end
+
+  -- U+FFFD per invalid byte, which is what every other decoder does and what
+  -- makes the result inspectable rather than merely legal.
+  local out, i, n = {}, 1, #value
+  while i <= n do
+    local ok = utf8.len(value, i, i)
+    if ok then
+      local _, stop = utf8.offset(value, 2, i), nil
+      stop = (_ or (n + 1)) - 1
+      out[#out + 1] = value:sub(i, stop)
+      i = stop + 1
+    else
+      out[#out + 1] = "\239\191\189"      -- U+FFFD
+      i = i + 1
+    end
+  end
+  return table.concat(out)
+end
+
+akkar.safe_text = safe_text
+
 
 -- ================================================================= responses
 local Response = {}
@@ -141,7 +194,8 @@ akkar.defaults = {
 -- every entry becomes permanent: moving `req.db` to `ctx.db` later would force
 -- an edit to every handler ever written, which is exactly what the complexity
 -- ladder forbids.
-local CAPABILITIES = { db = true, cache = true, log = true, clock = true }
+local CAPABILITIES = { db = true, cache = true, log = true, clock = true,
+                       http = true }
 
 -- What each capability must be able to do.  Checked once at startup, so a
 -- misconfigured adapter fails at boot the way a duplicate route already does,
@@ -150,6 +204,11 @@ local CONTRACTS = {
   db    = { "one", "many", "exec", "transaction" },
   cache = { "get", "set", "del" },
   log   = { "debug", "info", "warn", "error", "with" },
+  -- The outbound half. `request` is the whole contract -- the verb helpers are
+  -- conveniences over it -- so an adapter answering only `request` is a valid
+  -- one, which is what makes a fake possible without reimplementing six
+  -- methods that all do the same thing.
+  http  = { "request", "get", "post" },
 }
 
 -- The framework's own voice.  Replaced by `app:run { log = ... }`, but present
@@ -164,6 +223,7 @@ local SETTINGS = {
   body_limit = true, timeout = true, shutdown_grace = true,
   check_capabilities = true, reuseport = true, strict = true,
   max_concurrent = true, trusted_proxies = true,
+  repair_substrate = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -442,9 +502,9 @@ local WATCHDOG_LIMIT        = 0.100   -- seconds of uninterrupted CPU
 -- Recorded rather than quietly reverted, because the reasoning was sound and
 -- someone will have it again.
 local function install_watchdog(where)
-  local cpu, last, warned = 0, cqueues.monotime(), false
+  local cpu, last, warned = 0, time.monotime(), false
   debug.sethook(function()
-    local now = cqueues.monotime()
+    local now = time.monotime()
     local dt = now - last
     last = now
     if dt < 0.050 then cpu = cpu + dt else cpu = 0 end
@@ -519,9 +579,9 @@ local function with_deadline(seconds, fn)
   -- descriptor for work that was already ready to run.
   cq:step(0)
 
-  local deadline = cqueues.monotime() + seconds
+  local deadline = time.monotime() + seconds
   while winner == nil do
-    local remaining = deadline - cqueues.monotime()
+    local remaining = deadline - time.monotime()
     if remaining <= 0 then break end
     cqueues.poll(cq, remaining)        -- yields to the outer controller
     cq:step(0)
@@ -624,6 +684,15 @@ end
 
 function App:use(fn)
   self.middleware[#self.middleware + 1] = fn
+  -- The chain is built once and memoised, and `app:test{}` builds it. So a
+  -- middleware registered after the first test client -- or after any earlier
+  -- `app:run` in the same process -- used to be appended to a list nobody
+  -- read again: it was silently ignored, and the failure looks exactly like
+  -- middleware that does not work.
+  --
+  -- Silent is the problem. Authentication registered one line too late is not
+  -- a bug that announces itself.
+  self._chain, self._chain_short = nil, nil
   return self
 end
 
@@ -853,7 +922,7 @@ end
 -- decoding first would let %2F smuggle a segment separator into a parameter.
 local function decode_params(names, captured)
   local params = {}
-  for i, name in ipairs(names) do params[name] = unescape(captured[i]) end
+  for i, name in ipairs(names) do params[name] = safe_text(unescape(captured[i])) end
   return params
 end
 
@@ -951,6 +1020,26 @@ end
 --- "internal server error"}`. A Lua error carries file paths, line numbers
 --- and sometimes SQL. The detail belongs in the log beside the request id,
 --- which is already how it works and is why the response carries that id.
+-- A 500 that has not consulted `app:on_error` yet.
+--
+-- The hook must run AFTER the request's capabilities are released, and the two
+-- paths that produce a 500 sat on opposite sides of that release: a middleware
+-- raising is caught outside it, a handler raising is caught deep inside, while
+-- the connection is still checked out. Calling the hook where the error was
+-- caught therefore handed one error handler a live `req.db` and the other one
+-- a connection already back in the pool -- and possibly already handed to
+-- another request. An `on_error` that records the failure in the database,
+-- which is the obvious shape for one, would have been writing it down through
+-- somebody else's connection.
+--
+-- So the cause travels to the release point and the hook runs there, once, on
+-- both paths. Wrapped in a table because the cause may legitimately be nil.
+local function pending_error(err)
+  local res = response(500, { error = "internal server error" })
+  res.__pending = { cause = err }
+  return res
+end
+
 local function internal_error(app, err, req)
   local fallback = response(500, { error = "internal server error" })
 
@@ -1000,9 +1089,9 @@ local function apply_response_schema(res, schema, where, app, req)
     internal:error("response does not match its schema", {
       at = where, fields = table.concat(detail, "; "),
     })
-    return internal_error(app,
+    return pending_error(
       "response does not match its schema at " .. tostring(where) ..
-      ": " .. table.concat(detail, "; "), req)
+      ": " .. table.concat(detail, "; "))
   end
   return response(res.status, cleaned, res.headers)
 end
@@ -1087,10 +1176,35 @@ local function dispatch(app, req)
     -- Response-as-error: a deep layer can signal HTTP without threading a
     -- return value back through every frame.
     if is_response(result) then return result end
+    -- THE ONE ERROR THAT DID NOT NAME ITS FIX.
+    --
+    -- Writing the beginner guide surfaced it. A handler doing `req.body.title`
+    -- on a request that carried no body raises `attempt to index a nil value
+    -- (field 'body')` -- true, useless, and the first thing anybody hits.
+    -- Every other message in this project names the mistake and the remedy
+    -- (`req.db is not configured; pass db = ... to app:run{}`); this one named
+    -- neither.
+    --
+    -- The hint is added HERE rather than by making `req.body` a guard object,
+    -- and the reason is worth recording so nobody 'improves' it later: a guard
+    -- is a table, tables are truthy, and `if req.body then` would start taking
+    -- the branch it exists to avoid -- then raising inside it. Worse, a route
+    -- that DOES declare a body schema passes `req.body` to `validate`, which
+    -- would receive a guard instead of nil and raise where it should answer
+    -- 422. Improving the message costs nothing and changes no semantics.
+    local detail = tostring(result)
+    if detail:find("index a nil value (field 'body')", 1, true) then
+      detail = detail ..
+        "\n  req.body is nil because this request carried no body." ..
+        "\n  Declare one on the route -- app:post(path, { body = { ... } }, " ..
+        "handler) -- and akkar will answer 422 before your handler runs, " ..
+        "instead of raising here."
+    end
+
     internal:error("handler raised", {
-      request_id = req.id, at = route.where, detail = tostring(result),
+      request_id = req.id, at = route.where, detail = detail,
     })
-    return internal_error(app, result, req)
+    return pending_error(result)
   end
 
   if opts and opts.response then
@@ -1198,12 +1312,15 @@ local function normalize_headers(source)
   if type(source.get) == "function" then          -- a lua-http headers object
     for name, value in source:each() do
       if name:sub(1, 1) ~= ":" then               -- drop :method, :path, ...
+        -- Header values are bytes as far as HTTP is concerned, and akkar puts
+        -- them in JSON responses. See `safe_text`.
+        local clean = safe_text(value)
         local existing = out[name]
-        out[name] = existing and (existing .. ", " .. value) or value
+        out[name] = existing and (existing .. ", " .. clean) or clean
       end
     end
   else
-    for name, value in pairs(source) do out[name:lower()] = value end
+    for name, value in pairs(source) do out[name:lower()] = safe_text(value) end
   end
   return out
 end
@@ -1283,7 +1400,11 @@ local function parse_query(qs)
   if not qs or qs == "" then return out end
   for pair in qs:gmatch "[^&]+" do
     local k, val = pair:match "^([^=]*)=?(.*)$"
-    if k and k ~= "" then out[unescape(k)] = unescape((val:gsub("+", " "))) end
+    if k and k ~= "" then
+      -- Percent-decoding turns %C3%28 into bytes that are not text, and a
+      -- query value reaches a validation error message and a response.
+      out[safe_text(unescape(k))] = safe_text(unescape((val:gsub("+", " "))))
+    end
   end
   return out
 end
@@ -1434,12 +1555,21 @@ local function handle(app, input)
     local winner, value = with_deadline(input.timeout, function()
       return normalize(chain(app, req))
     end)
-    if is_response(value) then
-      value.headers = value.headers or {}
-      value.headers["x-request-id"] = req.id
-      -- Echoed back so a client can tie the response to the trace it started.
-      if req.trace then value.headers["traceparent"] = req.trace.traceparent end
-    end
+    -- The request id and the traceparent are NOT written onto the response.
+    --
+    -- They used to be: `value.headers["x-request-id"] = req.id`, on whatever
+    -- table the handler returned. A handler is free to return a hoisted or
+    -- memoised response -- a constant 404, a cached payload -- and then one
+    -- table is shared by every request that reaches it, so request A's id was
+    -- written into a table request B was also returning. It is the identical
+    -- aliasing defect the audit fixed for `release`, left standing for
+    -- headers.
+    --
+    -- Copying the response to stamp it safely costs two tables per request,
+    -- and the allocation ceiling measured that at +264 bytes and refused it.
+    -- So neither: these travel BESIDE the response, as extra return values,
+    -- and each writer puts them on the wire itself. Nothing is mutated, and
+    -- the per-request cost is nothing.
     if winner == "TIMEOUT" then
       internal:warn("request deadline exceeded", {
         request_id = req.id, method = req.method, path = req.path,
@@ -1478,12 +1608,23 @@ local function handle(app, input)
     release_all()
   end
 
-  if not ok then
-    if is_response(res) then return res end
-    internal:error("middleware raised", { request_id = req.id, detail = tostring(res) })
-    return internal_error(app, res, req)
+  -- Beside the response, never on it. See the note at the stamp site above.
+  local trace_parent = req.trace and req.trace.traceparent
+
+  -- HERE, AND ONLY HERE, is where `on_error` runs -- after every capability
+  -- has gone back. A 500 raised deep inside the handler travelled out as a
+  -- `pending_error` rather than consulting the hook where it was caught, so
+  -- both paths reach the application's error handler in the same state.
+  if ok and is_response(res) and rawget(res, "__pending") then
+    res = internal_error(app, res.__pending.cause, req)
   end
-  return res
+
+  if not ok then
+    if is_response(res) then return res, req.id, trace_parent end
+    internal:error("middleware raised", { request_id = req.id, detail = tostring(res) })
+    return internal_error(app, res, req), req.id, trace_parent
+  end
+  return res, req.id, trace_parent
 end
 
 -- ==================================================================== server
@@ -1531,18 +1672,65 @@ end
 -- well, since a chunked body declares no length at all.  `get_body_as_string`
 -- has no limit of its own, so calling it on an untrusted request is how a
 -- client turns a 5 MB upload into whatever the process can allocate.
-local function read_body(stream, request_headers, limit)
+local function read_body(stream, request_headers, limit, budget)
   -- `:get` returns NO values when the header is absent, not nil, so it cannot
   -- be passed straight into tonumber() -- that call would receive zero
   -- arguments and raise.  Bind it first.
   local length = request_headers:get "content-length"
   local declared = length and tonumber(length)
+
+  -- A NEGATIVE LENGTH IS MALFORMED, and saying so here is the difference
+  -- between blaming the client and blaming the server. Without this, `-5`
+  -- passed the size check, reached the chunk reader, failed somewhere inside
+  -- lua-http and came back to the caller as a 503 -- akkar reporting its own
+  -- unavailability for a header the client typed wrong.
+  --
+  -- This fixes the ANSWER. The server is saved separately and was not, when
+  -- this comment was first written: `akkar.substrate` repairs the two ways a
+  -- malformed length takes a lua-http server down -- an unbounded spin in
+  -- `shutdown` for a length that is not a number, and an uncaught raise that
+  -- exits the process for one that is negative. See that module and
+  -- `docs/substrate/lua-http-wedge.md`.
+  if declared and declared < 0 then
+    return nil, "malformed"
+  end
+
   if declared and declared > limit then
     return nil, "declared"
   end
 
+  -- READING THE BODY HAS ITS OWN BUDGET.
+  --
+  -- This runs BEFORE `with_deadline` exists -- the handler cannot be given a
+  -- body it has not been read yet -- so for as long as it was unbounded, the
+  -- request deadline covered everything except the one phase an attacker
+  -- controls completely. A client that announces a megabyte and then sends a
+  -- byte a minute held a descriptor pair and an in-flight slot for as long as
+  -- it liked, and `max_concurrent` was the only thing in its way: slowloris,
+  -- against the one part of the request akkar had left without a clock.
+  --
+  -- The budget is a DEADLINE rather than a per-chunk timeout. Passing the
+  -- same timeout to every chunk -- which is what lua-http's own
+  -- `get_body_as_string` does -- means a client that sends one byte just
+  -- inside the limit, for ever, is never refused.
+  local deadline = budget and (time.monotime() + budget)
+
   local parts, total = {}, 0
-  for chunk in stream:each_chunk() do
+  while true do
+    local remaining
+    if deadline then
+      remaining = deadline - time.monotime()
+      if remaining <= 0 then return nil, "timeout" end
+    end
+
+    local chunk, err = stream:get_next_chunk(remaining)
+    if chunk == nil then
+      -- lua-http's own convention: no chunk and no error is the end of the
+      -- body; no chunk WITH an error is a failure, and a timeout is one.
+      if err == nil then break end
+      return nil, "timeout"
+    end
+
     total = total + #chunk
     if total > limit then return nil, "streamed" end
     parts[#parts + 1] = chunk
@@ -1562,6 +1750,61 @@ end
 -- mid-write and corrupts what the client already received.  This was learned
 -- on an earlier project, where the drain that never finished was one of two
 -- defects that killed it.
+--- Runs `fn` in the server's own event loop, for the life of the process.
+---
+--- WHY THIS EXISTS. Until it did, there was no supported way to run a
+--- background loop in the same process as `app:run`: the call ends in
+--- `s:loop()`, or in a controller wrapping exactly two tasks, and neither is
+--- reachable from outside. The cost showed up as a documentation cost, which
+--- is how it was found -- the smallest honest example of "the request should
+--- not wait for the email" is one process, an in-memory queue and a consumer
+--- sharing the loop, and that was not expressible. The guide's first working
+--- example needed Redis and a second process: a `docker run` and a third
+--- terminal before a beginner sees one job run.
+---
+---     app:task("emails", function(task)
+---       queue:consume(handlers, { should_stop = task.stopping })
+---     end)
+---
+--- `task.stopping` is a function, not a flag, so it can be handed straight to
+--- `Queue:consume`, which already takes `should_stop` in exactly that shape.
+--- The two were designed apart and fit, which is usually a sign the shape is
+--- the right one.
+---
+--- THIS IS NOT PARALLELISM. One Lua state runs one coroutine at a time, so a
+--- task that computes without yielding stops the server for exactly as long
+--- as it computes -- the same rule handlers live under, and the blocking
+--- watchdog will say so. Tasks are for work that WAITS: a queue, a timer, a
+--- poll. Work that burns CPU still belongs in another process.
+function App:task(name, fn)
+  if type(name) ~= "string" then
+    error("akkar: app:task needs a name first -- it is what the logs and the " ..
+          "restart counter call this task", 2)
+  end
+  if type(fn) ~= "function" then
+    error("akkar: app:task('" .. name .. "') needs a function", 2)
+  end
+  self.tasks = self.tasks or {}
+  for _, existing in ipairs(self.tasks) do
+    if existing.name == name then
+      error("akkar: a task named '" .. name .. "' is already registered; " ..
+            "two tasks with one name make a log line ambiguous", 2)
+    end
+  end
+  self.tasks[#self.tasks + 1] = { name = name, fn = fn }
+  return self
+end
+
+--- True once the server has drained and tasks are being asked to finish.
+---
+--- Deliberately NOT true during draining. A request still in flight may queue
+--- work, so a consumer that stopped at STOP_ACCEPTING would leave that work
+--- unconsumed and the shutdown would look clean while losing a job. See
+--- `App:stop`.
+function App:stopping()
+  return self.tasks_stopping == true
+end
+
 function App:stop(grace)
   if self.state ~= "RUNNING" then return self.state end
   grace = grace or self.shutdown_grace or 10
@@ -1571,10 +1814,10 @@ function App:stop(grace)
   pcall(function() self.server:pause() end)
 
   self.state = "DRAINING"
-  local deadline = cqueues.monotime() + grace
+  local deadline = time.monotime() + grace
   local warned = false
   while self.in_flight > 0 do
-    if cqueues.monotime() > deadline and not warned then
+    if time.monotime() > deadline and not warned then
       warned = true
       internal:warn("shutdown stalled; still waiting, nothing is being forced", {
         in_flight = self.in_flight, grace_s = grace,
@@ -1583,6 +1826,40 @@ function App:stop(grace)
     cqueues.poll(0.02)
   end
   if warned then internal:info("shutdown: drain completed") end
+
+  -- TASKS STOP AFTER THE DRAIN, NOT BEFORE IT, and the order is the whole
+  -- decision.
+  --
+  -- A request still in flight can enqueue work -- that is what a background
+  -- task is usually FOR -- so a consumer told to stop at STOP_ACCEPTING would
+  -- leave that work sitting there while the shutdown reported itself clean.
+  -- Draining first means nothing new can be enqueued by the time the
+  -- consumer is asked to finish, so the queue it leaves behind is only what
+  -- was already unfinished.
+  --
+  -- The wait is bounded by the same grace period, and expiring it is a
+  -- warning rather than a kill: `akkar.jobs` is at-least-once with a store
+  -- that supports it, so an unacknowledged job comes back on the next
+  -- `reap`. Forcing a task mid-item would trade a delay for a duplicate.
+  if self.tasks_running and self.tasks_running > 0 then
+    self.tasks_stopping = true
+    internal:info("shutdown: asking tasks to finish",
+                  { tasks = self.tasks_running })
+    local task_deadline = time.monotime() + grace
+    local said = false
+    while self.tasks_running > 0 do
+      if time.monotime() > task_deadline and not said then
+        said = true
+        internal:warn("shutdown: a task is still running and is not being " ..
+                      "forced; unacknowledged work returns on the next reap",
+                      { tasks = self.tasks_running, grace_s = grace })
+        break
+      end
+      cqueues.poll(0.02)
+    end
+    if not said then internal:info "shutdown: tasks finished" end
+  end
+  self.tasks_stopping = true
 
   self.state = "CLOSING"
   for _, closer in ipairs(self.closers) do pcall(closer) end
@@ -1616,6 +1893,22 @@ function App:run(config)
   -- live server is worse than the bug it was looking for.  Development and
   -- the test suite should turn it on; see `akkar.strict`.
   if config.strict then require("akkar.strict").on() end
+
+  -- REPAIR THE SUBSTRATE BEFORE BINDING A PORT.
+  --
+  -- One malformed header stops a lua-http server accepting for ever, and a
+  -- second one kills the process outright. Both are repaired by
+  -- `akkar.substrate`, which explains itself at length and carries the
+  -- measurements. Here rather than at require time: importing akkar should
+  -- not mutate a third-party library as a side effect, and the substrate
+  -- tests need the unpatched behaviour available to compare against.
+  --
+  -- Opt out with `repair_substrate = false` -- for anyone who would rather
+  -- carry the defect than a patched dependency, and so the specs can prove
+  -- what happens without it.
+  if config.repair_substrate ~= false then
+    require("akkar.substrate").apply()
+  end
 
   local port = config.port or 8080
   local host = config.host or "127.0.0.1"
@@ -1699,14 +1992,117 @@ function App:run(config)
   local max_concurrent = config.max_concurrent
   if max_concurrent == nil then max_concurrent = descriptor_ceiling() end
 
+  -- PUBLISHED ON THE APP, not merely handed to lua-http. `akkar.limit.shed`
+  -- sheds low-priority work at a fraction of this number and reads it from
+  -- here; while it was a local, that read returned nil and the shedder could
+  -- never fire in any app that did not pass `capacity` by hand -- which is to
+  -- say it was dead code in the shape most likely to be deployed. A ceiling
+  -- the server enforces and nothing else can read is half a ceiling.
+  self.max_concurrent = max_concurrent
+
+  -- TLS WITHOUT MAKING THE APPLICATION IMPORT luaossl.
+  --
+  -- `ctx` was a whitelisted option passed straight through to lua-http, so
+  -- serving HTTPS meant an application constructed a luaossl context by hand
+  -- -- and two substrate libraries appeared in its configuration. That is the
+  -- boundary this project says it keeps, breached in the one place where
+  -- getting it wrong is a security problem rather than an inconvenience.
+  --
+  -- `tls = { certificate = ..., key = ... }` is answered here instead. `ctx`
+  -- stays as the escape hatch for anyone who needs to configure ciphers,
+  -- client certificates or anything else akkar has no opinion about -- named
+  -- explicitly, so `grep ctx` is the complete list of applications reaching
+  -- past the boundary.
+  local tls_ctx = config.ctx
+  local tls_on  = config.tls and true or false
+  if type(config.tls) == "table" and not tls_ctx then
+    local ok, context = pcall(function()
+      local openssl_ctx = require "openssl.ssl.context"
+      local x509 = require "openssl.x509"
+      local pkey = require "openssl.pkey"
+
+      local certificate = config.tls.certificate
+        or error("akkar: tls needs `certificate` -- a PEM string or a path", 0)
+      local key = config.tls.key
+        or error("akkar: tls needs `key` -- a PEM string or a path", 0)
+
+      local function pem(value)
+        if value:find "-----BEGIN" then return value end
+        local file = assert(io.open(value, "r"),
+          "akkar: cannot read " .. tostring(value))
+        local contents = file:read "a"
+        file:close()
+        return contents
+      end
+
+      local ctx = openssl_ctx.new(config.tls.protocol or "TLS", true)
+      ctx:setCertificate(x509.new(pem(certificate)))
+      ctx:setPrivateKey(pkey.new(pem(key)))
+      return ctx
+    end)
+    if not ok then
+      error("akkar: could not build the TLS context: " .. tostring(context), 0)
+    end
+    tls_ctx = context
+  end
+
   local s = assert(server.listen {
-    host = host, port = port, tls = config.tls or false, ctx = config.ctx,
+    host = host, port = port, tls = tls_on, ctx = tls_ctx,
     reuseport = config.reuseport,
     max_concurrent = max_concurrent,
     onstream = function(_, stream)
       self.in_flight = self.in_flight + 1
+
+      -- Held out here because the WRITES BELOW CAN RAISE, and until they were
+      -- allowed to raise past a release this was a capability leak on the
+      -- most ordinary event a server sees: a client that goes away in the
+      -- middle of a body. `write_headers` and the terminating chunk both sit
+      -- outside the producer's own pcall, so a dead peer skipped
+      -- `res.release()` entirely -- one pool slot per occurrence, held for
+      -- the life of the process, and invisible to the suite because the test
+      -- client releases on both paths where the server did not.
+      local pending_release
+
+      -- A REQUEST WHOSE FRAMING lua-http REFUSES TO PARSE.
+      --
+      -- `get_headers` raises for a `Content-Length` that is not a number, or
+      -- is negative, and letting that raise travel on took the whole SERVER
+      -- down: the process stayed alive and the listening socket stayed open,
+      -- but nothing accepted again. Measured with one request --
+      -- `Content-Length: banana` -- after which `ss` showed a connection
+      -- sitting unaccepted in the queue for ever and every later client timed
+      -- out. One malformed header, one line, and the server is gone.
+      --
+      -- Found by `spec/framing_spec.lua`, which exists because the fuzzer
+      -- that goes through an HTTP client cannot express a request this wrong.
+      --
+      -- Answered 400 and closed HERE, before the raise can reach lua-http's
+      -- accept loop. The client is told its request was malformed, which is
+      -- true and is the whole of what akkar knows about it.
+      local got_headers, headers_or_why = pcall(function()
+        return assert(stream:get_headers())
+      end)
+
+      if not got_headers then
+        internal:warn("refusing a request akkar could not frame", {
+          detail = tostring(headers_or_why),
+        })
+        pcall(function()
+          local rh = headers.new()
+          rh:append(":status", "400")
+          rh:append("content-type", "application/json")
+          local body = cjson.encode { error = "malformed request" }
+          rh:append("content-length", tostring(#body))
+          stream:write_headers(rh, false)
+          stream:write_chunk(body, true)
+        end)
+        pcall(stream.shutdown, stream)
+        self.in_flight = self.in_flight - 1
+        return
+      end
+
       local ok, err = pcall(function()
-        local h = assert(stream:get_headers())
+        local h = headers_or_why
         -- The socket's own idea of who connected. Everything else about the
         -- client's identity is something the client typed.
         local peer
@@ -1717,9 +2113,16 @@ function App:run(config)
         local target = h:get ":path" or "/"
         local path, qs = target:match "^([^?]*)%??(.*)$"
 
-        local raw, oversize = read_body(stream, h, body_limit)
+        local raw, oversize = read_body(stream, h, body_limit, timeout)
         local body, short
-        if oversize then
+        if oversize == "malformed" then
+          short = response(400, { error = "malformed request" })
+        elseif oversize == "timeout" then
+          -- 408, not 503. The deadline that produces a 503 is akkar deciding
+          -- the handler took too long; this is the client never finishing the
+          -- request it started, which is what 408 is for.
+          short = response(408, { error = "timed out reading the request body" })
+        elseif oversize then
           short = response(413, { error = "request body exceeds " ..
                                           body_limit .. " bytes" })
         elseif raw and #raw > 0 then
@@ -1728,18 +2131,29 @@ function App:run(config)
           else short = response(value.status or 400, { error = value.message }) end
         end
 
-        local res = handle(self, {
+        local res, request_id, trace_parent = handle(self, {
           method = h:get ":method", path = path, query = parse_query(qs),
           body = body, headers = h, timeout = timeout,
           capabilities = config,
           peer = peer,
           short = short, stripped = true,
         })
+        -- Nil for anything that is not a stream: dispatch has already run
+        -- `release_all` for those. Captured before a single byte goes out.
+        pending_release = res.release
 
         local rh = headers.new()
         rh:append(":status", tostring(res.status))
         if res.headers then
           for name, value in pairs(res.headers) do rh:append(name, value) end
+        end
+        -- Onto the wire, not onto the handler's table. A handler that set one
+        -- of these itself keeps what it chose.
+        if request_id and not (res.headers and res.headers["x-request-id"]) then
+          rh:append("x-request-id", request_id)
+        end
+        if trace_parent and not (res.headers and res.headers["traceparent"]) then
+          rh:append("traceparent", trace_parent)
         end
         local is_head = h:get ":method" == "HEAD"
 
@@ -1768,7 +2182,7 @@ function App:run(config)
               -- chunk is the only signal left: the client sees a truncated
               -- response instead of a complete-looking lie.
               internal:error("stream producer failed", {
-                request_id = res.headers and res.headers["x-request-id"],
+                request_id = request_id,
                 wrote_bytes = wrote,
                 detail = tostring(failure),
                 hint = wrote and "response already committed; connection dropped"
@@ -1777,7 +2191,6 @@ function App:run(config)
             end
           end
 
-          if res.release then res.release() end
         else
           local payload = res.raw or (res.body and cjson.encode(res.body)) or nil
           if payload then
@@ -1791,14 +2204,48 @@ function App:run(config)
           if send_body then stream:write_chunk(payload, true) end
         end
       end)
+
+      -- On EVERY path, including the writes raising above.
+      if pending_release then pcall(pending_release) end
+
       if not ok then internal:error("stream failed", { detail = tostring(err) }) end
-      stream:shutdown()
+
+      -- `shutdown` guarded, and the count decremented behind nothing that can
+      -- raise. `App:stop` drains on `while in_flight > 0`, so a single raise
+      -- here used to park the shutdown state machine in DRAINING for ever:
+      -- the process would refuse to finish stopping, and the diagnostic it
+      -- printed would say it was still waiting for a request that had ended.
+      pcall(stream.shutdown, stream)
       self.in_flight = self.in_flight - 1
     end,
     onerror = function(_, _, op, e) internal:warn("transport", { op = op, detail = tostring(e) }) end,
   })
 
-  assert(s:listen())
+  -- THE PORT IS IN THE MESSAGE, because this is the first error a beginner
+  -- meets and the bare assert did not name it.
+  --
+  -- Writing the beginner guide found this: forgetting to stop the previous
+  -- server is the most common mistake anybody makes learning this, and what
+  -- akkar answered was `init.lua:2051: Address already in use` plus a
+  -- traceback -- no port, no suggestion, and a file and line pointing inside
+  -- the framework rather than at anything the reader wrote.
+  --
+  -- Every other error in this project names the mistake and the fix
+  -- (`req.db is not configured; pass db = ... to app:run{}`). This one did
+  -- not, and it is the one most likely to be somebody's first.
+  local listening, listen_error = s:listen()
+  if not listening then
+    local reason = tostring(listen_error)
+    if reason:find("Address already in use", 1, true) then
+      error(("akkar: port %s on %s is already in use.\n  Something else is " ..
+             "listening there -- most often a server from a previous run " ..
+             "that is still going.\n  Stop it, or start this one on another " ..
+             "port with app:run { port = %d }")
+            :format(tostring(port), tostring(host), tonumber(port) + 1), 0)
+    end
+    error(("akkar: could not listen on %s:%s -- %s")
+          :format(tostring(host), tostring(port), reason), 0)
+  end
   local _, bh, bp = s:localname()
   internal:info("listening", {
     url = string.format("%s://%s:%s", config.tls and "https" or "http",
@@ -1806,12 +2253,68 @@ function App:run(config)
   })
   self.server = s
 
+  -- A TASK THAT RAISES MUST NOT TAKE THE SERVER DOWN, and must not die
+  -- quietly either.
+  --
+  -- Those pull in opposite directions and the second is the one people get
+  -- wrong. A supervisor that swallows the error keeps the process up while
+  -- the queue behind the dead consumer grows, and nothing says so until
+  -- somebody notices the backlog hours later. So: log at error, count it,
+  -- and restart with a backoff that caps -- a task failing instantly in a
+  -- loop must not become a busy loop that starves the server it was supposed
+  -- to run beside.
+  --
+  -- A task that RETURNS without being asked to stop is also restarted, and is
+  -- also a warning. `Queue:consume` returns when its `should_stop` says so,
+  -- so a consumer coming back early means its stop condition is wrong, and
+  -- silently never running it again would hide that.
+  local function supervise(app, task)
+    return function()
+      app.tasks_running = (app.tasks_running or 0) + 1
+      local failures = 0
+      while not app.tasks_stopping do
+        local ok, err = pcall(task.fn, {
+          name = task.name,
+          stopping = function() return app.tasks_stopping == true end,
+          app = app,
+        })
+        if app.tasks_stopping then break end
+
+        if ok then
+          internal:warn("task returned before shutdown; restarting", {
+            task = task.name,
+          })
+        else
+          failures = failures + 1
+          app.task_failures = (app.task_failures or 0) + 1
+          internal:error("task raised; restarting", {
+            task = task.name, detail = tostring(err), failures = failures,
+          })
+        end
+
+        -- Doubling from 100 ms, capped at 30 s. The cap matters more than the
+        -- curve: an unreachable Redis should cost one line every half minute,
+        -- not a core.
+        local wait = math.min(30, 0.1 * 2 ^ math.min(failures, 8))
+        local until_ = time.monotime() + wait
+        while time.monotime() < until_ and not app.tasks_stopping do
+          cqueues.poll(math.min(0.2, until_ - time.monotime()))
+        end
+      end
+      app.tasks_running = app.tasks_running - 1
+    end
+  end
+
   -- The signal task, if one was installed, runs alongside the server rather
-  -- than instead of it.
-  if self.signal_task then
+  -- than instead of it -- and so does every registered task.
+  if self.signal_task or (self.tasks and #self.tasks > 0) then
     local cq = cqueues.new()
     cq:wrap(function() s:loop() end)
-    cq:wrap(self.signal_task)
+    if self.signal_task then cq:wrap(self.signal_task) end
+    for _, task in ipairs(self.tasks or {}) do
+      internal:info("task started", { task = task.name })
+      cq:wrap(supervise(self, task))
+    end
     return assert(cq:loop())
   end
   return assert(s:loop())
@@ -1834,7 +2337,7 @@ function App:test(config)
     return function(_, path, options)
       options = options or {}
       local p, qs = path:match "^([^?]*)%??(.*)$"
-      local res = handle(self, {
+      local res, request_id, trace_parent = handle(self, {
         method = method, path = p,
         query = parse_query(qs),
         body = options.body,
@@ -1863,8 +2366,22 @@ function App:test(config)
         end
         raw = table.concat(chunks)
       end
-      return { status = res.status, body = res.body, raw = raw,
-               headers = res.headers or {} }
+      -- A fresh table, carrying what the wire would have carried. Allocating
+      -- here is free -- this is a test client -- and returning the handler's
+      -- own table would hand a spec the very aliasing the server refuses to
+      -- create.
+      local seen = {}
+      if res.headers then
+        for name, value in pairs(res.headers) do seen[name] = value end
+      end
+      if request_id and seen["x-request-id"] == nil then
+        seen["x-request-id"] = request_id
+      end
+      if trace_parent and seen["traceparent"] == nil then
+        seen["traceparent"] = trace_parent
+      end
+
+      return { status = res.status, body = res.body, raw = raw, headers = seen }
     end
   end
   for _, m in ipairs { "get", "post", "put", "patch", "delete", "head", "options" } do
@@ -1926,7 +2443,24 @@ function App:handle_signals(signals)
 end
 
 -- Exposed so tests can express a JSON null without going through the wire.
+-- The serializer's sentinel, reached through the contract rather than lifted
+-- out of a dependency. It used to read `cjson.null` -- a C userdata from a
+-- library nothing in akkar's API mentions, handed to users as akkar's own
+-- value and compared by identity in dispatch. Swapping the JSON library would
+-- have changed the identity of a value people were holding.
 akkar.null = cjson.null
+akkar.json = cjson          -- `cjson` is `akkar.json` here; see that module
+
+-- Marks a table as a JSON array, so an EMPTY one encodes as `[]` not `{}`.
+--
+--     return { tasks = akkar.array(rows) }
+--
+-- An empty Lua table is both an empty list and an empty object and the
+-- encoder has to guess; it guesses object, so an empty result set answered
+-- `{"tasks":{}}` and a frontend calling `.map` on it threw. See
+-- `akkar/json.lua` for why this is a marker and not a walk.
+akkar.array = cjson.array
+akkar.empty_array = cjson.empty_array
 
 -- Exposed so the startup checks can be tested without binding a socket.
 akkar.check_capabilities = check_capability_contracts
@@ -1937,4 +2471,9 @@ akkar.strict = require "akkar.strict"
 
 akkar.Response = Response
 akkar.guard = guard
+
+-- Exposed because middleware has to tell a thrown response from a raised
+-- error, and the alternative was comparing metatables -- the framework's
+-- internals leaking into code written against it.
+akkar.is_response = is_response
 return akkar

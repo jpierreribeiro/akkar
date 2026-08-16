@@ -144,6 +144,10 @@ function Db:query(sql, ...)
     self.broken = true
     error("db: " .. tostring(res), 0)
   end
+  -- A driver that knows its connection is unusable is believed. The C driver
+  -- sets this when a query timed out with its result still in flight; pgmoon
+  -- has no equivalent and the flag is simply absent there.
+  if self.pg and self.pg.spoiled then self.broken = true end
   if not res then error("db: " .. tostring(err), 0) end
   return res
 end
@@ -165,6 +169,33 @@ end
 
 -- Closure-scoped transaction: commit at the end, rollback on any error.
 -- There is no path where a BEGIN stays open because someone forgot.
+--
+-- RETURNING A 4xx FROM INSIDE COMMITS. This is the expensive trap in this
+-- module and it is written here because it cost somebody an afternoon to find.
+--
+--     req.db:transaction(function(tx)
+--       tx:exec("insert into ...")
+--       if bad then return akkar.bad_request "no" end   -- COMMITS the insert
+--     end)
+--
+-- The closure returned, so the transaction succeeded, so it committed -- and
+-- the 400 travels up as the handler's response. The row is written and the
+-- caller is told their request was rejected, which is the worst of both.
+-- Confirmed against a real database while writing the beginner guide: a row
+-- landed from a request that answered 400.
+--
+-- `error(akkar.bad_request "no")` is the form that rolls back, and it is the
+-- form the rest of akkar already uses -- response-as-error exists precisely so
+-- a deep layer can signal HTTP without threading a return value through every
+-- frame. It is not caught here; `pcall` sees the raise, the rollback runs, and
+-- the response is re-raised for the handler chain to answer with.
+--
+-- This is NOT changed to treat a returned 4xx as a rollback, and the reason is
+-- that the change would be a guess about intent: a closure can legitimately
+-- return a 4xx after work that should persist -- recording the rejected
+-- attempt is the ordinary example. A rule that reads the status code would
+-- silently discard those writes instead, which is the same defect pointing the
+-- other way and harder to see.
 function Db:transaction(fn)
   self:query "begin"
   self.in_transaction = true
@@ -206,6 +237,70 @@ function Db:release()
   if self.pool then self.pool:put(self) else self:close() end
 end
 
+-- ================================================================ the C driver
+--
+-- `akkar.pq` presents a different surface from pgmoon -- `query(sql, params,
+-- deadline)` against `query(sql, ...)` -- so it enters through a shim that
+-- speaks pgmoon's shape. Everything above this line is then untouched: `Db`,
+-- the transaction, the scope wrapper and the pool never learn which driver is
+-- underneath, which is the claim `docs/PLAN.md` makes about the adapter
+-- boundary and the first chance to check it rather than assert it.
+--
+-- OPT-IN, and the default stays pgmoon on purpose. A driver becomes the
+-- default by proving itself, not by being newer, and the proof is
+-- `spec/db_spec.lua` running the same contract against both. Flipping the
+-- default is a separate commit with that evidence behind it.
+local function pq_open(config)
+  local ok, pq = pcall(require, "akkar.pq")
+  if not ok then
+    error("db: driver 'pq' needs akkar/pq_native.so -- build it with " ..
+          "src/build.sh, or use the default pgmoon driver.\n  " ..
+          tostring(pq), 0)
+  end
+
+  local conn, why = pq.connect(config)
+  if not conn then error("db: could not connect: " .. tostring(why), 0) end
+
+  -- `statement_timeout` for the same reason the pgmoon path sets it: closing
+  -- a connection frees akkar's slot but does not stop the query, so without
+  -- this a timeout makes the database busier rather than quieter.
+  if config.statement_timeout then
+    local ms = math.floor(config.statement_timeout * 1000)
+    local set, set_err = conn:query("set statement_timeout = " .. ms)
+    if not set then
+      -- Close before raising, exactly as the pgmoon path learned to: the
+      -- connection is authenticated by now, so raising out of `open` would
+      -- leave a live Postgres backend that nothing references while the pool
+      -- restored its slot.
+      pcall(function() conn:close() end)
+      error("db: could not set statement_timeout: " ..
+            tostring(set_err and set_err.message or set_err), 0)
+    end
+  end
+
+  return {
+    conn = conn,
+    --- pgmoon's signature: rows, or nil plus a message.
+    query = function(self, sql, ...)
+      -- `table.pack` and its `n` kept intact: a lone nil parameter is a SQL
+      -- NULL, and `#` cannot count it. See the note in `pq_send_query`.
+      local params
+      if select("#", ...) > 0 then params = table.pack(...) end
+      local rows, err = self.conn:query(sql, params)
+      if rows then return rows end
+
+      -- A TIMED-OUT QUERY POISONS ITS CONNECTION and the driver says so. The
+      -- result is still coming, so the next borrower would read this query's
+      -- rows as its own -- the identical defect `in_flight` was added to
+      -- catch on the pgmoon path, where an unread result set left the
+      -- connection refusing everything for the rest of its life.
+      if self.conn.spoiled then self.spoiled = true end
+      return nil, err and err.message or "query failed"
+    end,
+    disconnect = function(self) self.conn:close() end,
+  }
+end
+
 local M = {}
 
 -- ==================================================================== connect
@@ -214,6 +309,14 @@ local M = {}
 -- measured and what a one-off script wants.
 function M.connect(config)
   local function open()
+    if config.driver == "pq" then
+      return setmetatable({ pg = pq_open(config) }, Db)
+    end
+    if config.driver ~= nil and config.driver ~= "pgmoon" then
+      error("db: unknown driver '" .. tostring(config.driver) ..
+            "'; expected 'pgmoon' or 'pq'", 0)
+    end
+
     local pg = pgmoon.new {
       host = config.host or "127.0.0.1",
       port = config.port or 5432,
@@ -222,8 +325,39 @@ function M.connect(config)
       password = config.password,
       socket_type = "cqueues",
     }
-    local ok, err = pg:connect()
-    if not ok then error("db: could not connect: " .. tostring(err), 0) end
+    -- THE MESSAGE BELOW NEVER APPEARED, and that was the point of writing it.
+    --
+    -- `pg:connect()` does not return `nil, err` when the server is not there.
+    -- pgmoon RAISES, from inside its cqueues socket layer, so this line was
+    -- unreachable and what a developer actually saw was a bare traceback out
+    -- of `pgmoon/cqueues.lua:18` -- no host, no port, no hint that a database
+    -- was involved at all.
+    --
+    -- Found by someone writing the beginner guide, who stopped Postgres to
+    -- show what happens and got a stack trace pointing into a dependency.
+    -- That is the worst possible first encounter with a framework: the thing
+    -- that failed is your `docker run`, and the thing on screen is somebody
+    -- else's source file.
+    --
+    -- So the call is wrapped, and both shapes -- raised and returned -- end
+    -- in the same message, which names what was being connected to.
+    local ok, err = pcall(function() return pg:connect() end)
+    if ok and err == nil then ok = false end     -- `false, reason` from pgmoon
+    if not ok then
+      local reason = tostring(err)
+      -- The connection refused case is worth naming on its own, because it is
+      -- almost always a database that is not running rather than one that is
+      -- misconfigured, and those have different fixes.
+      local hint = reason:find("refused", 1, true)
+        and "\n  Nothing is listening there. Is the database running?"
+        or ""
+      error(("db: could not connect to %s:%s (database %q, user %q) -- %s%s")
+            :format(tostring(config.host or "127.0.0.1"),
+                    tostring(config.port or 5432),
+                    tostring(config.database or "?"),
+                    tostring(config.user or "?"),
+                    reason, hint), 0)
+    end
 
     -- Override pgmoon's number serializer per connection, so this fix needs
     -- no fork of the driver.
@@ -256,9 +390,18 @@ function M.connect(config)
     -- vanish outside one, which is where most queries run.
     if config.statement_timeout then
       local ms = math.floor(config.statement_timeout * 1000)
-      local ok, err = pg:query("set statement_timeout = " .. ms)
-      if not ok then
-        error("db: could not set statement_timeout: " .. tostring(err), 0)
+      local set, set_err = pg:query("set statement_timeout = " .. ms)
+      if not set then
+        -- DISCONNECT BEFORE RAISING. The connection is already open and
+        -- authenticated at this point, so raising out of `open` left a live
+        -- Postgres backend with nothing in this process referencing it. The
+        -- pool restores its slot on the error path and the descriptor does
+        -- not come back, so a database that fails this one statement --
+        -- because `statement_timeout` is not settable for that role, say --
+        -- burned a backend per attempt while the pool reported itself
+        -- healthy.
+        pcall(function() pg:disconnect() end)
+        error("db: could not set statement_timeout: " .. tostring(set_err), 0)
       end
     end
 

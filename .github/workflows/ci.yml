@@ -1,0 +1,219 @@
+# akkar CI
+#
+# `docs/BACKLOG.md` recorded CI in the "deliberately not building" table,
+# because "the audience is my own use". The audience changed -- see
+# `docs/PLAN.md` §1 -- and that decision is retracted with it. Until this file
+# existed, nothing but one laptop had ever run the 486 tests.
+#
+# THE PART THAT IS NOT BOILERPLATE: cqueues is built from a PINNED COMMIT of
+# upstream master, not from the published rock. The rock is from July 2020;
+# master has six years of fixes on top of it, including Lua 5.5 support and
+# LibreSSL compatibility. The project's own docs used to conclude from the
+# rock's date that the substrate was abandoned. It is not; only its releases
+# are.
+
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  # Pinned deliberately. Moving it is a decision with a diff, not a drift:
+  # `spec/substrate_spec.lua` is what says whether a new one still answers
+  # what akkar depends on.
+  CQUEUES_COMMIT: c36614982fe07917b2e1ce5a9e7a0e55b81be262
+
+jobs:
+  # ---------------------------------------------------------------- unit
+  # No services. This job proves the suite is green on a machine with no
+  # Postgres and no Redis -- which is the state the skip guards exist for and
+  # which nobody had ever verified.
+  unit:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        lua: ["5.4"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua ${{ matrix.lua }} and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            lua${{ matrix.lua }} liblua${{ matrix.lua }}-dev luarocks \
+            libssl-dev build-essential m4
+
+      - name: Cache the cqueues build
+        id: cqueues-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/cqueues-build
+          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua${{ matrix.lua }}-${{ runner.os }}
+
+      - name: Build cqueues from the pinned commit
+        if: steps.cqueues-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/wahern/cqueues.git ~/cqueues-build
+          cd ~/cqueues-build
+          git checkout "$CQUEUES_COMMIT"
+          make all${{ matrix.lua }} CPPFLAGS="-I/usr/include/lua${{ matrix.lua }}"
+
+      - name: Install cqueues
+        run: |
+          cd ~/cqueues-build
+          sudo make install${{ matrix.lua }} \
+            lua${{ matrix.lua }}path=/usr/local/share/lua/${{ matrix.lua }} \
+            lua${{ matrix.lua }}cpath=/usr/local/lib/lua/${{ matrix.lua }}
+
+      - name: Install the rest of the dependencies
+        run: |
+          sudo luarocks --lua-version ${{ matrix.lua }} install luaossl
+          sudo luarocks --lua-version ${{ matrix.lua }} install http
+          sudo luarocks --lua-version ${{ matrix.lua }} install lua-cjson
+          sudo luarocks --lua-version ${{ matrix.lua }} install pgmoon
+          sudo luarocks --lua-version ${{ matrix.lua }} install luasocket
+          sudo luarocks --lua-version ${{ matrix.lua }} install busted
+          sudo luarocks --lua-version ${{ matrix.lua }} install tl || \
+            echo "tl unavailable; spec/teal_spec.lua will report pending"
+
+      - name: The suite, with no database and no Redis
+        run: busted
+
+      # Exact, machine-independent, and the one number in `bench/` that
+      # belongs in CI. Timing benchmarks do not: `bench/README.md` says
+      # "nothing here runs in CI" and shared runners are why.
+      - name: Allocation ceiling
+        run: busted spec/allocation_spec.lua
+
+      - name: The substrate contract
+        run: busted spec/substrate_spec.lua
+
+      - name: Doctor
+        run: lua${{ matrix.lua }} bin/akkar doctor --no-probe
+
+  # --------------------------------------------------------- integration
+  # The same suite with the backends up, so the specs that skip themselves on
+  # a laptop actually run somewhere.
+  integration:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: akkar
+          POSTGRES_DB: akkar
+        # 55432 because that is what the specs look for.
+        ports: ["55432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            lua5.4 liblua5.4-dev luarocks libssl-dev build-essential m4 postgresql-client
+
+      - name: Cache the cqueues build
+        id: cqueues-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/cqueues-build
+          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua5.4-${{ runner.os }}
+
+      - name: Build cqueues from the pinned commit
+        if: steps.cqueues-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/wahern/cqueues.git ~/cqueues-build
+          cd ~/cqueues-build
+          git checkout "$CQUEUES_COMMIT"
+          make all5.4 CPPFLAGS="-I/usr/include/lua5.4"
+
+      - name: Install cqueues
+        run: |
+          cd ~/cqueues-build
+          sudo make install5.4 \
+            lua5.4path=/usr/local/share/lua/5.4 \
+            lua5.4cpath=/usr/local/lib/lua/5.4
+
+      - name: Install the rest of the dependencies
+        run: |
+          for rock in luaossl http lua-cjson pgmoon luasocket busted; do
+            sudo luarocks --lua-version 5.4 install "$rock"
+          done
+
+      - name: Create the fixture the examples and specs expect
+        env:
+          PGPASSWORD: akkar
+        run: |
+          psql -h 127.0.0.1 -p 55432 -U postgres -d akkar <<'SQL'
+          create table if not exists users (
+            id serial primary key, name text not null, email text);
+          insert into users (name, email) values
+            ('ada','ada@example.com'), ('alan','alan@example.com')
+          on conflict do nothing;
+          SQL
+
+      - name: The suite, with the backends up
+        run: busted
+
+  # -------------------------------------------------------------- install
+  # The job that would have caught `bin/akkar` never being installed: the
+  # rockspec has no `install.bin`, so the CLI the README documents as a shell
+  # command does not ship. Nothing in the repository would ever have noticed,
+  # because no documented flow installs the rock at all.
+  install:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            lua5.4 liblua5.4-dev luarocks libssl-dev build-essential m4
+
+      - name: Cache the cqueues build
+        id: cqueues-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/cqueues-build
+          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua5.4-${{ runner.os }}
+
+      - name: Build cqueues from the pinned commit
+        if: steps.cqueues-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/wahern/cqueues.git ~/cqueues-build
+          cd ~/cqueues-build
+          git checkout "$CQUEUES_COMMIT"
+          make all5.4 CPPFLAGS="-I/usr/include/lua5.4"
+
+      - name: Install cqueues
+        run: |
+          cd ~/cqueues-build
+          sudo make install5.4 \
+            lua5.4path=/usr/local/share/lua/5.4 \
+            lua5.4cpath=/usr/local/lib/lua/5.4
+
+      - name: Lint the rockspec
+        run: luarocks lint ./akkar-dev-1.rockspec
+
+      - name: Install akkar from its own rockspec
+        run: sudo luarocks --lua-version 5.4 make ./akkar-dev-1.rockspec
+
+      - name: Use the CLI from PATH, outside the source tree
+        run: |
+          cd /tmp
+          akkar version
+          akkar doctor --no-probe

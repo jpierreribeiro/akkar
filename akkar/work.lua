@@ -36,7 +36,7 @@ more than a helper that appears to solve it.
 ]]
 
 local cqueues = require "cqueues"
-local cjson   = require "cjson"
+local cjson   = require "akkar.json"
 
 local M = {}
 

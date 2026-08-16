@@ -131,63 +131,80 @@ end
 
 M.base_environment = base_environment
 
+-- A single `rep` can allocate more than the whole budget between two hook
+-- firings, and it is bounded on the real library, because `("x"):rep(n)`
+-- never touches the sandbox's copy.
+local MAX_STRING = 1024 * 1024
+
+-- THE RUN STATE IS PER COROUTINE, not per process and not per chunk.
+--
+-- It began as a pair of process globals: a depth counter incremented by `run`
+-- and decremented after, plus a single string limit that the last `compile`
+-- won. Two cross-tenant defects came out of that. A sandbox abandoned by a
+-- request deadline never ran the decrement -- an abandoned coroutine never
+-- resumes -- so one tenant's ceiling applied to the whole process, host code
+-- included, for the life of that process; measured, with a plain
+-- `("x"):rep(4 MiB)` in framework code failing under a 64-byte ceiling. And
+-- the single limit was last-writer-wins between tenants.
+--
+-- Keying on the coroutine fixed the ceiling and left the OTHER half of the
+-- state behind: `exceeded` and `reason` stayed on a table created once per
+-- `compile`, shared by every coroutine running that chunk -- and a compiled
+-- chunk is meant to be run many times, which is the entire reason `compile`
+-- and `run` are separate calls. Two tenants running one chunk therefore had
+-- two ways to reach into each other:
+--
+--   * one tenant exhausting its budget set `exceeded`, and the OTHER tenant's
+--     sandboxed `pcall` then refused to return normally -- killed by a
+--     neighbour's overrun, with the neighbour's message;
+--   * and `run` cleared `exceeded` on entry, so a tenant starting a run wiped
+--     the flag of a sibling already over its budget, and that sibling's
+--     `pcall` went back to swallowing the overrun -- which is precisely the
+--     escape `install_pcall` exists to close.
+--
+-- So everything a run mutates now lives in a fresh table per run, installed on
+-- the running coroutine and restored on exit. `chunk_state` keeps only what
+-- `compile` decided and no run may change. Weak keys throughout: an abandoned
+-- coroutine's entry is garbage nothing reads again, and a collected chunk
+-- takes its configuration with it.
+local active = setmetatable({}, { __mode = "k" })
+local chunk_state = setmetatable({}, { __mode = "k" })
+local bounds_installed = false
+
+local function current_state()
+  local co = coroutine.running()
+  return co and active[co] or nil
+end
+
+local function current_limit()
+  local state = current_state()
+  return state and state.max_string or nil
+end
+
 -- `pcall` and `xpcall` that cannot swallow a budget overrun.
 --
 -- A budget enforced by raising is enforced only if the error escapes, and a
 -- chunk is free to wrap its own loop in `pcall`. Lua has no uncatchable
 -- error, so these refuse to return normally once the run is over: ordinary
 -- errors stay catchable, and the one the hook throws does not.
-local function install_pcall(env, state)
+--
+-- The state is looked up at CALL time rather than closed over at compile
+-- time, because the caller is whichever coroutine is running this chunk right
+-- now, and the answer for one is not the answer for another.
+local function install_pcall(env)
   env.pcall = function(fn, ...)
     local results = table.pack(pcall(fn, ...))
-    if state.exceeded then error(state.reason, 0) end
+    local state = current_state()
+    if state and state.exceeded then error(state.reason, 0) end
     return table.unpack(results, 1, results.n)
   end
 
   env.xpcall = function(fn, handler, ...)
     local results = table.pack(xpcall(fn, handler, ...))
-    if state.exceeded then error(state.reason, 0) end
+    local state = current_state()
+    if state and state.exceeded then error(state.reason, 0) end
     return table.unpack(results, 1, results.n)
   end
-end
-
--- Per-chunk state, so `run` and the sandbox's own `pcall` agree on whether
--- the budget is gone.  Weak keys: a compiled chunk nobody holds is collected
--- along with its state.
-local chunk_state = setmetatable({}, { __mode = "k" })
-
--- A single `rep` can allocate more than the whole budget between two hook
--- firings, and it is bounded on the real library, because `("x"):rep(n)`
--- never touches the sandbox's copy.
-local MAX_STRING = 1024 * 1024
-
--- Per COROUTINE, not per process.
---
--- This was a pair of process globals: a depth counter incremented by `run`
--- and decremented after, plus a single limit that the last `compile` won.
--- Two defects came out of that, and both are cross-tenant:
---
--- A sandbox abandoned by a request deadline never runs the decrement, because
--- an abandoned coroutine never resumes. The bound then applied to the WHOLE
--- process, host code included, for the life of that process. Measured: one
--- timed-out request made a plain `("x"):rep(4 MiB)` in framework code fail
--- with one tenant's 64-byte ceiling.
---
--- And the single limit was last-writer-wins, so a tenant compiling with a
--- generous ceiling raised it for a tenant who had asked for nothing, and a
--- tenant compiling with a tiny one broke everybody else's strings.
---
--- Keyed on the running coroutine, both problems disappear by construction: an
--- abandoned coroutine's entry is simply garbage that nothing ever reads
--- again, and no two sandboxes can see each other's ceiling. The table holds
--- weak keys so a collected coroutine takes its entry with it.
-local MAX_STRING = 1024 * 1024
-local active = setmetatable({}, { __mode = "k" })
-local bounds_installed = false
-
-local function current_limit()
-  local co = coroutine.running()
-  return co and active[co] or nil
 end
 
 local function install_string_bounds()
@@ -244,8 +261,9 @@ function M.compile(source, options)
   env.string = env.string or {}
   env.string.rep = string.rep
 
-  local state = { max_string = options.max_string or MAX_STRING }
-  install_pcall(env, state)
+  -- What `compile` decided, and what no run may change.
+  local config = { max_string = options.max_string or MAX_STRING }
+  install_pcall(env)
 
   for name, value in pairs(options.expose or {}) do env[name] = value end
 
@@ -256,7 +274,7 @@ function M.compile(source, options)
   if not chunk then
     return nil, "akkar.vm: could not compile: " .. tostring(err)
   end
-  chunk_state[chunk] = state
+  chunk_state[chunk] = config
   return chunk
 end
 
@@ -282,8 +300,10 @@ function M.run(chunk, limits, ...)
   local max_memory_kb    = limits.memory_kb or 8192
   local step             = limits.check_every or 1000
 
-  local state = chunk_state[chunk] or {}
-  state.exceeded, state.reason = nil, nil
+  -- A FRESH state per run. Nothing here is shared with another run of the
+  -- same chunk, so neither can clear the other's flag or inherit its reason.
+  local config = chunk_state[chunk] or {}
+  local state = { max_string = config.max_string or MAX_STRING }
 
   local baseline = collectgarbage "count"
   local used, peak = 0, 0
@@ -316,7 +336,7 @@ function M.run(chunk, limits, ...)
   -- else and two tenants cannot see each other's ceiling.
   local co = coroutine.running()
   local restore = co and active[co]
-  if co then active[co] = state.max_string or MAX_STRING end
+  if co then active[co] = state end
 
   local results = table.pack(pcall(chunk, ...))
 

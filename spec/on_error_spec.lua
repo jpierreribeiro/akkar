@@ -149,3 +149,89 @@ describe("an error handler that declines", function()
     assert.equal("internal server error", res.body.error)
   end)
 end)
+
+describe("when app:on_error runs, relative to the release", function()
+  -- The two paths that produce a 500 sat on opposite sides of the release: a
+  -- middleware raising was caught outside it, a handler raising was caught
+  -- deep inside, with the connection still checked out. So one error handler
+  -- got a live `req.db` and the other got a connection already back in the
+  -- pool, and possibly already handed to another request.
+  --
+  -- That matters because the obvious thing to do in `on_error` is record the
+  -- failure -- often in the database. Doing that through a connection the
+  -- pool has given away is the defect this project keeps finding under other
+  -- names.
+  --
+  -- The rule chosen, and pinned here: capabilities are released FIRST, on
+  -- both paths. An error handler that needs I/O must open its own.
+  local function counting_db()
+    local released = 0
+    local handle = {
+      one = function() end, many = function() end,
+      exec = function() end, transaction = function() end,
+      release = function() released = released + 1 end,
+    }
+    return function() return handle end, function() return released end
+  end
+
+  it("runs after the release when a handler raises", function()
+    local factory, released = counting_db()
+    local seen
+    local app = akkar.new()
+    app:on_error(function() seen = released() end)
+    app:get("/boom", function(req)
+      local _ = req.db                    -- take the connection
+      error "the cursor died"
+    end)
+
+    app:test { db = factory }:get "/boom"
+    assert.equal(1, seen,
+      "on_error ran while the request still held its connection")
+  end)
+
+  it("runs after the release when middleware raises", function()
+    local factory, released = counting_db()
+    local seen
+    local app = akkar.new()
+    app:on_error(function() seen = released() end)
+    app:use(function(req)
+      local _ = req.db
+      error "middleware exploded"
+    end)
+    app:get("/fine", function() return { ok = true } end)
+
+    app:test { db = factory }:get "/fine"
+    assert.equal(1, seen,
+      "the two paths disagree about when the connection goes back")
+  end)
+
+  it("runs after the release when a response breaks its own schema", function()
+    local factory, released = counting_db()
+    local seen
+    local app = akkar.new()
+    app:on_error(function() seen = released() end)
+    app:get("/bad", { response = { id = "integer" } }, function(req)
+      local _ = req.db
+      return { id = "not an integer" }
+    end)
+
+    app:test { db = factory }:get "/bad"
+    assert.equal(1, seen, "the schema path skipped the release")
+  end)
+
+  it("still lets the handler shape the body", function()
+    -- Reordering must not cost the hook anything it could do before.
+    local app = akkar.new()
+    app:on_error(function(err, req)
+      return akkar.response(500, { type = "about:blank", instance = req.id,
+                                   detail = tostring(err) })
+    end)
+    app:get("/boom", function() error "the cursor died" end)
+
+    local res = app:test():get "/boom"
+    assert.equal(500, res.status)
+    assert.equal("about:blank", res.body.type)
+    assert.is_truthy(res.body.detail:find("the cursor died", 1, true))
+    assert.is_truthy(res.body.instance)
+  end)
+end)

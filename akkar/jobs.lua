@@ -23,7 +23,7 @@ belongs here.
 
 ## What a store MAY provide, and what it buys
 
-    store:schedule(key, encoded, run_at)  -- hold until a wall-clock time
+    store:schedule(key, encoded, delay)   -- hold for this many seconds
     store:promote(key, now)               -- move what is due into the queue
     store:claim(key, id, ttl)             -- false if this id was seen already
     store:peek(key, limit)                -- read without removing
@@ -67,10 +67,12 @@ door, which is a different thing from an idempotent handler and does not
 pretend to replace one.
 ]]
 
-local cjson = require "cjson"
+local cjson = require "akkar.json"
 
 local Queue = {}
 Queue.__index = Queue
+
+local time = require "akkar.time"
 
 local M = {}
 
@@ -116,6 +118,13 @@ function M.new(store, name, options)
   return setmetatable({
     store = store,
     key = "akkar:queue:" .. (name or "default"),
+    -- The EXACT bytes each in-flight job was stored as, keyed on the decoded
+    -- job and held weakly. Acknowledging re-encodes otherwise, and a table
+    -- does not promise to serialise the same way twice -- so a job could be
+    -- acknowledged with a string that does not match the one in the
+    -- processing set, silently leaving it to be reaped and run again. Weak
+    -- keys because a job the caller drops is not our business.
+    _claimed = setmetatable({}, { __mode = "k" }),
     retries = retries,
     backoff = options.backoff or {},
     dead_letter = options.dead_letter ~= false,
@@ -134,49 +143,103 @@ function Queue:dead_key() return self.key .. ":dead" end
 function Queue:push(kind, payload, options)
   options = options or {}
 
-  if options.id then
-    if not supports(self.store, "claim") then
-      error("akkar.jobs: this store cannot deduplicate -- it implements no " ..
-            ":claim, and taking the id while ignoring it would be worse than " ..
-            "refusing it", 2)
-    end
-    if not self.store:claim(self.key, options.id, options.id_ttl or 3600) then
-      return false, "duplicate"
-    end
+  if options.id and not supports(self.store, "claim") then
+    error("akkar.jobs: this store cannot deduplicate -- it implements no " ..
+          ":claim, and taking the id while ignoring it would be worse than " ..
+          "refusing it", 2)
+  end
+
+  local delayed = options.delay and options.delay > 0
+  if delayed and not supports(self.store, "schedule") then
+    error("akkar.jobs: this store cannot delay a job; it implements no " ..
+          ":schedule", 2)
   end
 
   local encoded = cjson.encode {
     id = options.id,
     kind = kind,
     payload = payload,
-    queued_at = os.time(),
+    queued_at = time.now(),
     attempts = 0,
   }
 
-  if options.delay and options.delay > 0 then
-    if not supports(self.store, "schedule") then
-      error("akkar.jobs: this store cannot delay a job; it implements no " ..
-            ":schedule", 2)
+  -- A DELAY, NOT A DEADLINE. The store computes the absolute time from its
+  -- own clock, because a timestamp computed here is this worker's opinion and
+  -- a fleet has several. See the header of `akkar/jobs/redis.lua`.
+  local delay = delayed and options.delay or 0
+
+  -- CLAIMING AND PUSHING ARE ONE STEP where the store can do it.
+  --
+  -- As two calls, a coroutine abandoned between them -- a request deadline
+  -- firing, which is ordinary -- left the id claimed for the full ttl with no
+  -- job anywhere. Every retry for the next hour is then refused as a
+  -- duplicate, about a job that was never queued. The mechanism that exists
+  -- to make a retry safe was the thing that made it useless.
+  if options.id and supports(self.store, "claim_and_enqueue") then
+    return self.store:claim_and_enqueue(self.key, options.id,
+                                        options.id_ttl or 3600, encoded, delay)
+  end
+
+  -- The two-step path, kept for a store that implements `claim` and not
+  -- `claim_and_enqueue`. The window above is open here, and it is open in
+  -- the direction of losing the job rather than running it twice.
+  if options.id then
+    if not self.store:claim(self.key, options.id, options.id_ttl or 3600) then
+      return false, "duplicate"
     end
-    return self.store:schedule(self.key, encoded, os.time() + options.delay)
+  end
+
+  if delayed then
+    return self.store:schedule(self.key, encoded, delay)
   end
 
   return self.store:enqueue(self.key, encoded)
 end
 
 --- Waits for one job, up to `timeout` seconds.  Returns nil on timeout.
+---
+--- Takes the RELIABLE path when the store offers one: the job moves to a
+--- processing set as it leaves the queue, in one step, and stays there until
+--- it is acknowledged. A worker that dies holding it leaves it recoverable
+--- rather than gone. See `Queue:consume` and `Queue:reap`.
 function Queue:pop(timeout)
   -- Anything whose time has come joins the queue before we look at it.
   if supports(self.store, "promote") then
-    self.store:promote(self.key, os.time())
+    self.store:promote(self.key)
   end
 
-  local encoded = self.store:dequeue(self.key, timeout or 5)
+  local encoded
+  if supports(self.store, "claim_pop") then
+    encoded = self.store:claim_pop(self.key, timeout or 5)
+  else
+    encoded = self.store:dequeue(self.key, timeout or 5)
+  end
   if not encoded then return nil end
   local ok, job = pcall(cjson.decode, encoded)
-  -- A job that cannot be decoded cannot be handled or retried, and leaving it
-  -- at the head of the queue would stall every worker behind it forever.
-  if not ok then return nil, "akkar.jobs: undecodable job discarded" end
+  if not ok then
+    -- DISCARDED MEANS DISCARDED, and for one commit it did not.
+    --
+    -- On the reliable path `claim_pop` has already moved these bytes into the
+    -- processing set, so returning here without removing them left the entry
+    -- checked out with nobody holding it: `ack` needs a decoded job to find
+    -- the bytes, and `reap` pushes stale entries BACK to the queue. The result
+    -- was a poison cycle -- queue, processing, reap, queue -- with a log line
+    -- claiming the thing had been discarded.
+    --
+    -- Worse than the old behaviour, which at least lost it once. A message
+    -- that describes what the code used to do is how a defect hides.
+    if supports(self.store, "ack") then
+      pcall(function() return self.store:ack(self.key, encoded) end)
+    end
+    if self.dead_letter then
+      -- Kept rather than dropped: bytes nobody can decode are exactly what
+      -- somebody will need to look at, and a dead-letter queue is where this
+      -- module already puts work it cannot finish.
+      pcall(function() return self.store:enqueue(self:dead_key(), encoded) end)
+    end
+    return nil, "akkar.jobs: undecodable job discarded"
+  end
+  self._claimed[job] = encoded
   return job
 end
 
@@ -209,17 +272,17 @@ end
 function Queue:fail(job, err)
   job.attempts = (job.attempts or 0) + 1
   job.last_error = tostring(err)
-  job.first_failed_at = job.first_failed_at or os.time()
+  job.first_failed_at = job.first_failed_at or time.now()
 
   if job.attempts <= self.retries then
     local delay = delay_for(job.attempts, self.backoff)
-    self.store:schedule(self.key, cjson.encode(job), os.time() + delay)
+    self.store:schedule(self.key, cjson.encode(job), delay)
     return "retried", delay
   end
 
   if not self.dead_letter then return "dropped" end
 
-  job.died_at = os.time()
+  job.died_at = time.now()
   self.store:enqueue(self:dead_key(), cjson.encode(job))
 
   -- An unbounded dead-letter queue is a memory leak with a respectable name.
@@ -229,19 +292,127 @@ function Queue:fail(job, err)
   return "buried"
 end
 
+
+--- True when this queue can survive a worker dying mid-job.
+---
+--- Worth asking rather than assuming: the answer decides whether a job that
+--- matters may go through here at all, and it depends on the store, not on
+--- the queue.
+function Queue:reliable()
+  return supports(self.store, "claim_pop") and supports(self.store, "ack")
+end
+
+--- Marks a job finished, so it stops being recoverable.
+---
+--- Called by `consume` after the handler returns AND after a failure has been
+--- retried or buried -- in both cases the job has been dealt with, and
+--- leaving it in the processing set would make `reap` run it again.
+function Queue:ack(job)
+  if not supports(self.store, "ack") then return false end
+  local encoded = self._claimed[job] or cjson.encode(job)
+  self._claimed[job] = nil
+  return self.store:ack(self.key, encoded)
+end
+
+--- Returns jobs abandoned by a worker that never came back.
+---
+--- `older_than` is in seconds and must exceed the longest a handler may
+--- legitimately take. Set it too low and a slow job is run twice while the
+--- first attempt is still going; that is the trade this method makes and it
+--- cannot be made safe from here, because only the application knows how long
+--- its work takes.
+---
+--- Returns how many were returned to the queue.
+function Queue:reap(older_than)
+  if not supports(self.store, "reap") then return 0 end
+  -- A WINDOW, NOT A CUTOFF, and the change is the whole clock fix.
+  --
+  -- This used to compute `now - older_than` here and send the answer. That
+  -- made every reap an assertion about time made by ONE worker, so a machine
+  -- whose clock had been stepped forward reclaimed jobs that other workers
+  -- were actively running -- at-least-once becoming at-least-twice because of
+  -- an NTP correction. Stepped backwards, nothing was ever reclaimed at all.
+  --
+  -- Sending the window instead lets the store answer with the clock every
+  -- worker shares. `spec/clock_spec.lua` holds both directions.
+  return self.store:reap(self.key, older_than or 300)
+end
+
+--- How many jobs are currently checked out by a worker.
+function Queue:in_flight()
+  if not supports(self.store, "in_flight") then return 0 end
+  return self.store:in_flight(self.key)
+end
+
 --- Consumes until `should_stop()` returns true.
+---
+--- **AT LEAST ONCE where the store can do it, at most once where it cannot,
+--- and `Queue:reliable()` says which one you have.**
+---
+--- With a store that offers `claim_pop` and `ack` -- Redis and the in-memory
+--- one both do -- a job moves to a processing set as it leaves the queue, in
+--- one step, and is acknowledged only after the handler has finished or its
+--- failure has been retried or buried. A worker killed in between leaves the
+--- job recoverable: `Queue:reap(older_than)` puts it back.
+---
+--- Nothing reaps automatically. A timer that returned jobs on its own would
+--- have to guess how long a handler may legitimately take, and guessing that
+--- runs live jobs twice. Call `reap` from wherever your deployment knows the
+--- answer -- a periodic task, a startup hook, an operator command.
+---
+--- With a store that offers neither, this is AT MOST ONCE and the loss is
+--- silent: `pop` is destructive, so between it and the handler finishing the
+--- job exists only in this worker's memory, and an ordinary deploy loses it.
+--- The retry policy does not cover that -- retries are for a handler that
+--- RAISED, and a worker that died raised nothing.
+---
+--- At-least-once means a handler can run twice. That is the trade, and it is
+--- the right way round: a job run twice is visible and fixable with an
+--- idempotency key, and a job silently lost is neither.
 function Queue:consume(handlers, options)
   options = options or {}
   local log = options.log
   local should_stop = options.should_stop or function() return false end
   local handled, failed, retried, buried = 0, 0, 0, 0
 
+  -- AN EMPTY POLL THAT DID NOT WAIT MUST WAIT HERE, or this loop is a spin.
+  --
+  -- `timeout = 0` tells the STORE not to block. Against Redis that never
+  -- mattered: `BRPOP` waits server-side and yields the coroutine while it
+  -- does, so the loop was paced by the store. Against the in-memory store
+  -- `pop(0)` returns immediately, and the loop had nothing to yield to --
+  -- 99.9% of a core, and the server it shares a process with stops answering
+  -- entirely.
+  --
+  -- Measured: a probe designed to finish in one second did not finish in
+  -- sixty, because the spinning consumer starved even the controller's own
+  -- timeout.
+  --
+  -- Found by an agent writing a recipe for an in-process worker, and it is
+  -- the exact shape `App:task`'s docstring suggests -- so the framework was
+  -- recommending it. `spec/task_spec.lua` used it too and passed, because a
+  -- test that exits as soon as its job is consumed never notices a spin.
+  --
+  -- The wait belongs here rather than in the store: a store honouring
+  -- `timeout = 0` is behaving correctly, and the caller who asked for it
+  -- wants a poll loop, not a busy loop. `idle` is how long an empty turn
+  -- costs, and only an EMPTY turn pays it -- a queue with work in it runs
+  -- flat out.
+  local idle = options.idle or 0.05
+  local store_waits = (options.timeout or 1) > 0
+
   while not should_stop() do
     local job, decode_error = self:pop(options.timeout or 1)
+
+    if not job and not decode_error and not store_waits and not should_stop() then
+      time.sleep(idle)
+    end
     if decode_error and log then
       log:warn("jobs: discarded an undecodable job")
     elseif job then
       local handler = handlers[job.kind]
+      local function done() self:ack(job) end
+
       if not handler then
         -- A job with no handler is usually a deployment in progress -- a
         -- worker running older code than the producer -- so it goes through
@@ -249,10 +420,14 @@ function Queue:consume(handlers, options)
         -- loses work that finishing the deploy would have run.
         if log then log:warn("jobs: no handler", { kind = job.kind }) end
         self:fail(job, "no handler registered for kind '" .. tostring(job.kind) .. "'")
+        done()
       else
         local ok, err = pcall(handler, job.payload, job)
         if ok then
           handled = handled + 1
+          -- AFTER the handler, never before. The whole point is that a worker
+          -- dying between the two leaves the job recoverable.
+          done()
         else
           failed = failed + 1
           local outcome, delay = self:fail(job, err)
@@ -264,6 +439,9 @@ function Queue:consume(handlers, options)
               detail = tostring(err),
             })
           end
+          -- The failure has been retried or buried, so this attempt is
+          -- finished even though the work is not.
+          done()
         end
       end
     end

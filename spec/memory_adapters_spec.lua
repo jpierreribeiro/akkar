@@ -67,10 +67,83 @@ describe("akkar.cache.memory", function()
   end)
 
   it("refuses a command it does not implement, instead of returning nil", function()
+    -- A command genuinely outside the contract. `ZADD` used to stand here and
+    -- no longer can: the sorted sets arrived so that `akkar.limit` and
+    -- `akkar.idempotency` could run their own scripts without a Redis.
     local c = cache.new()
-    local ok, err = pcall(function() return c:command("ZADD", "k", 1, "m") end)
+    local ok, err = pcall(function() return c:command("SUBSCRIBE", "channel") end)
     assert.is_false(ok)
     assert.is_truthy(tostring(err):match "implements the contract, not all of Redis")
+  end)
+
+  it("expires with the default clock, not only with an injected one", function()
+    -- The clock was called as a METHOD -- `self:now()` -- so the default
+    -- `os.time` received the cache table as its date argument and raised
+    -- "field 'year' missing in date table". Every expiry test injected a
+    -- clock, so the DEFAULT path was never exercised: an application using
+    -- `akkar.cache.memory` raised on its first key with a ttl, which is most
+    -- of the reason to have a cache at all.
+    local c = cache.new()
+    assert.equal("OK", c:set("k", "v", 60))
+    assert.equal("v", c:get "k")
+    assert.is_true(c:ttl "k" > 0)
+    assert.equal(1, c:expire("k", 30))
+  end)
+
+  it("runs the scripts akkar itself sends", function()
+    -- The point of the sorted sets and hashes: not Redis compatibility for
+    -- its own sake, but that the modules whose whole logic lives inside EVAL
+    -- become testable on a laptop with nothing running.
+    local c = cache.new()
+    local reply = c:command("EVAL", [[
+      redis.call('ZADD', KEYS[1], 10, 'a')
+      redis.call('ZADD', KEYS[1], 20, 'b')
+      redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', 15)
+      return { redis.call('ZCARD', KEYS[1]), tonumber(ARGV[1]) + 1 }
+    ]], 1, "spec:zset", "41")
+
+    assert.same({ 1, 42 }, reply)
+  end)
+
+  it("lets redis.pcall return the error that redis.call raises", function()
+    -- The one thing that distinguishes them, and this fake had `pcall` set to
+    -- the very same function as `call`. A script that inspects `.err` and
+    -- carries on -- the only reason to reach for `pcall` in the first place --
+    -- would pass here and abort against a real Redis.
+    local c = cache.new()
+
+    local reply = c:command("EVAL", [[
+      local bad = redis.pcall('NOSUCHCOMMAND', KEYS[1])
+      if type(bad) == 'table' and bad.err then return 'handled' end
+      return 'no error was reported'
+    ]], 1, "k")
+    assert.equal("handled", reply)
+
+    -- And the other half: `call` must still stop the script.
+    local ok = pcall(function()
+      return c:command("EVAL", [[
+        redis.call('NOSUCHCOMMAND', KEYS[1])
+        return 'kept going'
+      ]], 1, "k")
+    end)
+    assert.is_false(ok, "redis.call let the script continue past a failure")
+  end)
+
+  it("answers TIME from its own clock, so a script can be moved through time", function()
+    local at = 1755000000
+    local c = cache.new { now = function() return at end }
+    local reply = c:command("TIME")
+    assert.equal("1755000000", reply[1])
+
+    at = at + 60
+    assert.equal("1755000060", c:command("TIME")[1])
+  end)
+
+  it("makes SET NX a claim rather than a write", function()
+    local c = cache.new()
+    assert.equal("OK", c:command("SET", "k", "1", "NX", "EX", 60))
+    assert.is_nil(c:command("SET", "k", "2", "NX", "EX", 60))
+    assert.equal("1", c:get "k")
   end)
 
   it("works as req.cache with no Redis running", function()

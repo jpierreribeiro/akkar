@@ -20,3 +20,6 @@ luacov.report.out
 .idea/
 *.swp
 .DS_Store
+
+# rascunho de agentes; nada aqui é entregável
+.scratch/

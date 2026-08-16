@@ -107,6 +107,22 @@ stack traceback:
 Measured: 0.16–0.35 µs per switch, under 2% overhead. It stays on in
 production. Go does not warn about this; neither does Node.
 
+**What it cannot see, stated because this page overpromised until somebody
+checked.** The watchdog counts Lua instructions, so it notices Lua code that
+runs too long. A single call into C is one instruction and stays one
+instruction no matter how long it takes.
+
+The example that matters is password hashing: `akkar.crypto.hash_password` is
+PBKDF2 inside OpenSSL, it took **771 ms** in a measurement taken while writing
+the beginner guide, and the watchdog said nothing at all. The whole process
+was stopped for three quarters of a second in silence.
+
+That is why `akkar.crypto` points at `akkar.work` in its own docstring, and it
+is a real limit rather than a missing feature: there is no point at which Lua
+regains control during a C call, so there is nothing for a Lua-level watchdog
+to interrupt. `akkar/work.lua` says the same thing about native work in
+general.
+
 ---
 
 ## The ladder
@@ -656,7 +672,7 @@ JSON API has today, which is nothing.
 | `akkar.cache.memory` is per-process | two processes have two caches, and akkar's answer to more CPU is more processes |
 | Teal does not check schemas against handler output | schemas are runtime values; validation is what checks those |
 | Linear scan for dynamic routes | measured: 33 µs worst case at 50 routes against ~4000 µs for one query. Revisit past ~500 dynamic routes |
-| Pinned to Lua 5.4 | `cqueues` pins `lua == 5.4` and has had no release since 2020 — not `lua-http`, which accepts `>= 5.1` |
+| Runs on Lua 5.4, not yet 5.5 | The blocker is **`luaossl`**, whose makefile has no 5.5 target. `cqueues` master builds and runs an event loop under 5.5 once its vendored `lua-compat-5.3` is updated from v0.9; the published rock is what pins 5.4. Measured by `docs/runtime/lua55-probe.sh` |
 | `akkar.vm` is a sandbox, not an isolated VM | Lua 5.4 cannot make a separate state from Lua. Real within its stated limits; against hostile code, use a separate process |
 | Streaming holds its capabilities open | a slow client reading a streamed export keeps a pool slot for as long as it reads |
 | The database path is pgmoon in pure Lua | decoding rows into tables is 55% of a thousand-row query and needs a C driver to move |

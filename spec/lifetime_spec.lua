@@ -141,6 +141,121 @@ describe("a streamed response", function()
   end)
 end)
 
+describe("a slot reserved by an open that never finished", function()
+  -- `open` yields: it connects a socket, and on Postgres it authenticates and
+  -- sets `statement_timeout` besides. `live` used to be incremented BEFORE
+  -- that call, and the recovery underneath it only ran when the open RAISED.
+  -- An abandoned coroutine raises nothing -- it simply never comes back -- so
+  -- a deadline landing inside `open` took a slot out of the pool for the life
+  -- of the process. A pool of ten dies after ten such events.
+
+  local function parked_pool()
+    -- An `open` that never returns within the test.
+    return Pool.new(function()
+      cqueues.sleep(60)
+      return { close = function() end }
+    end, 1)
+  end
+
+  it("reserves the slot rather than spending it", function()
+    local pool = parked_pool()
+    local cq = cqueues.new()
+    cq:wrap(function() pool:get() end)
+    cq:step(0.05)
+
+    local stats = pool:stats()
+    assert.equal(1, stats.reserved, "an open in flight did not reserve a slot")
+    assert.equal(0, stats.live, "`live` counted a resource that does not exist yet")
+  end)
+
+  it("gives the slot back once nobody can come back for it", function()
+    local pool = parked_pool()
+
+    -- The controller and its coroutine go out of scope here, which is exactly
+    -- what a fired deadline does: it stops referencing the handler and moves
+    -- on. Nothing else holds the coroutine afterwards.
+    do
+      local cq = cqueues.new()
+      cq:wrap(function() pool:get() end)
+      cq:step(0.05)
+      assert.equal(1, pool:stats().reserved)
+    end
+
+    assert.equal(1, pool:reap(), "the abandoned reservation was not recovered")
+    assert.equal(0, pool:stats().reserved)
+    assert.equal(1, pool:stats().reaped, "the recovery was not counted")
+  end)
+
+  it("lets a later request through instead of parking for ever", function()
+    -- The point of the whole thing: after the abandonment, the pool of one
+    -- must still be able to serve somebody.
+    local opened = 0
+    local pool
+    pool = Pool.new(function()
+      opened = opened + 1
+      if opened == 1 then cqueues.sleep(60) end     -- the abandoned one
+      return { close = function() end }
+    end, 1)
+
+    do
+      local cq = cqueues.new()
+      cq:wrap(function() pool:get() end)
+      cq:step(0.05)
+    end
+
+    local served
+    local cq = cqueues.new()
+    cq:wrap(function() served = pool:get() ~= nil end)
+    assert(cq:loop(5))
+
+    assert.is_true(served, "the pool never recovered the abandoned slot")
+    assert.equal(1, pool:stats().live)
+  end)
+end)
+
+describe("a response the handler reuses", function()
+  it("is never stamped with the request that happened to return it", function()
+    -- `x-request-id` and the traceparent were written onto whatever table the
+    -- handler returned. A handler may return a hoisted or memoised response
+    -- -- a constant 404, a cached payload -- and then one table is shared by
+    -- every request that reaches it, so request A's id landed in a table
+    -- request B was also returning. Identical in shape to the `release`
+    -- aliasing the audit fixed, and left standing for headers.
+    --
+    -- Copying the response to stamp it safely measured +264 bytes per
+    -- request and the allocation ceiling refused it. So nothing is stamped:
+    -- the id travels beside the response and each writer puts it on the wire.
+    local shared = akkar.ok { cached = true }
+    local app = akkar.new()
+    app:get("/cached", function() return shared end)
+
+    local client = app:test {}
+    local first  = client:get "/cached"
+    local second = client:get "/cached"
+
+    assert.is_truthy(first.headers["x-request-id"])
+    assert.is_truthy(second.headers["x-request-id"])
+    assert.are_not.equal(first.headers["x-request-id"],
+                         second.headers["x-request-id"],
+                         "two requests were handed one id")
+
+    assert.is_nil(shared.headers,
+      "the id was written into the table the handler keeps returning")
+  end)
+
+  it("lets a handler keep a header it set itself", function()
+    local app = akkar.new()
+    app:get("/mine", function()
+      local res = akkar.ok { ok = true }
+      res.headers = { ["x-request-id"] = "chosen-by-the-handler" }
+      return res
+    end)
+
+    local res = app:test({}):get "/mine"
+    assert.equal("chosen-by-the-handler", res.headers["x-request-id"])
+  end)
+end)
+
 describe("the sandbox's string bound", function()
   local vm = require "akkar.vm"
 
@@ -164,4 +279,72 @@ describe("the sandbox's string bound", function()
     local refused = vm.eval("return #('x'):rep(1000)", { max_string = 512 })
     assert.is_false(refused, "one tenant's generous ceiling raised another's")
   end)
+end)
+
+describe("the sandbox's run state", function()
+  local vm = require "akkar.vm"
+
+  -- A chunk is COMPILED ONCE AND RUN MANY TIMES -- that is the whole reason
+  -- `compile` and `run` are separate calls -- so anything a run mutates on a
+  -- per-chunk table is shared with every other run of that chunk. Two tenants
+  -- executing the same published spec are the ordinary case, not the exotic
+  -- one.
+  --
+  -- Both runs below use ONE compiled chunk. `pause` is the only exposed host
+  -- function and it yields, which is what lets the two runs interleave -- the
+  -- same way a real sandbox interleaves when it touches anything doing I/O.
+  local SOURCE = [[
+    local rounds, nap = ...
+    pause(nap)
+    local ok = pcall(function()
+      local n = 0
+      for _ = 1, rounds do n = n + 1 end
+      return n
+    end)
+    return ok
+  ]]
+
+  it("does not let one run's overrun raise inside another", function()
+    -- `exceeded` and `reason` lived on the table `compile` created, so a
+    -- tenant that exhausted its budget set a flag the sandbox's own `pcall`
+    -- reads -- and the NEXT tenant's `pcall`, on the same chunk, then refused
+    -- to return normally and died with a stranger's message.
+    local chunk = assert(vm.compile(SOURCE, {
+      expose = { pause = function(s) cqueues.sleep(s) end },
+    }))
+
+    local greedy_ok, thrifty_ok, thrifty_report
+    local cq = cqueues.new()
+    cq:wrap(function()
+      -- Exhausts its budget shortly after waking.
+      greedy_ok = vm.run(chunk, { instructions = 2000, check_every = 200 },
+                         5000000, 0.02)
+    end)
+    cq:wrap(function()
+      -- Wakes later, does almost nothing, and must be unaffected.
+      local ok, _, report = vm.run(chunk, { instructions = 10e6 }, 10, 0.12)
+      thrifty_ok, thrifty_report = ok, report
+    end)
+    assert(cq:loop(10))
+
+    assert.is_false(greedy_ok, "the greedy run should have hit its budget")
+    assert.is_true(thrifty_ok,
+      "a neighbour's overrun reached into this run's pcall and raised")
+    assert.is_nil(thrifty_report.exceeded,
+      "this run reported a budget it never exceeded")
+  end)
+
+  -- THE OTHER HALF IS NOT PINNED, AND THIS IS WHY.
+  --
+  -- `run` also used to clear `exceeded` on entry, which reads like the mirror
+  -- defect: a tenant starting a run wipes the flag of a sibling already over
+  -- its budget, and that sibling's `pcall` goes back to swallowing the
+  -- overrun. Fresh state per run closes it by construction.
+  --
+  -- No probe demonstrates it, and it was not written down as fixed without
+  -- one. Between the hook raising and the sandbox's `pcall` reading the flag
+  -- there is no yield, so no sibling can be scheduled inside that window: a
+  -- run that has set the flag either raises straight out of the chunk or is
+  -- already inside the check. The clearing was wrong to write and appears not
+  -- to have been reachable. Both statements are worth keeping.
 end)

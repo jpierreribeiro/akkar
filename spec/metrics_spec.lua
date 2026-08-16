@@ -91,6 +91,49 @@ describe("metrics through requests", function()
     assert.is_truthy(text:match 'route="<unmatched>"')
   end)
 
+  it("observes a thrown response and a raised error, not just a return", function()
+    -- The middleware read `local res = next(req)` and observed `res.status`.
+    -- Raising is how akkar expresses a deliberate 404 and how a handler error
+    -- becomes a 500, so neither ever reached the histogram: the scrape showed
+    -- a clean latency distribution over the requests that happened to succeed
+    -- and said nothing about the ones that did not.
+    --
+    -- An operator reads this during an incident, and during an incident the
+    -- errors are the traffic.
+    local registry = metrics.new()
+    local app = akkar.new()
+    app:use(registry:middleware())
+    app:get("/gone", function() error(akkar.not_found "no such user") end)
+    app:get("/boom", function() error "the cursor died" end)
+    app:get("/fine", function() return { ok = true } end)
+
+    local c = app:test { log = akkar.log.new { level = "error", sink = function() end } }
+    assert.equal(404, c:get("/gone").status)
+    assert.equal(500, c:get("/boom").status)
+    assert.equal(200, c:get("/fine").status)
+
+    local text = registry:render()
+    assert.is_truthy(text:match 'route="/gone",status="404"} 1',
+      "a thrown response never reached the histogram")
+    assert.is_truthy(text:match 'route="/boom",status="500"} 1',
+      "a raised error never reached the histogram")
+    assert.is_truthy(text:match 'route="/fine",status="200"} 1')
+    assert.equal(3, count_series(text, "akkar_requests_total"))
+  end)
+
+  it("still lets the error through after measuring it", function()
+    -- Measuring must not swallow. A middleware that observed an error and
+    -- returned normally would turn every 500 into a 200 with no body.
+    local registry = metrics.new()
+    local app = akkar.new()
+    app:use(registry:middleware())
+    app:get("/gone", function() error(akkar.not_found "no such user") end)
+
+    local res = app:test():get "/gone"
+    assert.equal(404, res.status)
+    assert.equal("no such user", res.body.error)
+  end)
+
   it("serves the exposition over HTTP as text, not JSON", function()
     local app = instrumented()
     local res = app:test():get "/metrics"

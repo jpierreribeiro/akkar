@@ -478,8 +478,8 @@ that accepts anything while looking validated.
 ### Still open
 
 Nothing here blocks using akkar. Two items are closed by measurement rather
-than by work, and the third is the milestone everything else was clearing the
-way for.
+than by work, the soak has now been run and left one question behind it, and
+the milestone everything else was clearing the way for is still the milestone.
 
 - **Port a real service off Gin.** `docs/PLAN.md` names this as the milestone
   never reached, and it is the only honest test of completeness — it will
@@ -501,29 +501,320 @@ way for.
   Predictions are recorded in `METHOD.md` in advance, so the result cannot be
   retrofitted into a story afterwards.
 
-- **Soak test.** Every benchmark so far is twelve to fifteen seconds, which
-  says nothing about connection churn, memory growth or GC behaviour over
-  hours. Cheap to run now that a machine exists: start it, leave it, come
-  back. For a framework meant for production this is the largest unmeasured
-  thing left.
+- ~~**Soak test.**~~ **Run**, 45 minutes — `bench/study/results/soak.log`, written
+  up as section 7 of `bench/study/RESULTS.md`.
 
-  One specific question to answer with it: `/users/:id` p99 was 191 ms at one
-  process with 100 concurrent connections against `pool_size = 10`, so ninety
-  requests were queuing for a connection. Pool sizing against concurrency is
-  currently undocumented, and a soak run is where the guidance comes from.
+  Throughput drifted **+0.048%** from the first quarter to the last, resident
+  memory went 26 MB → 27 MB and then sat there for forty-four minutes,
+  descriptors climbed 60 → 80 by minute seventeen and stopped, and there were
+  **zero errors in roughly 19.9 million requests**. No leak of memory, of
+  descriptors or of database connections — which is the one thing this
+  project's ten-second measurements were never able to assert.
+
+  **The question it was supposed to answer is now answered**, by a second run
+  above capacity — `bench/study/saturation.sh`, written up as section 8 of
+  `bench/study/RESULTS.md`. The rule:
+
+  > Offered concurrency up to **twice** the pool is free. Past that it is paid
+  > for in the tail, and it buys nothing.
+
+  Throughput peaks at 2x capacity and *falls* beyond it, while p99 goes from
+  6.22 ms to 37.70 ms to 82.38 ms. So size the pool at about half the peak
+  concurrency you intend to accept, and refuse the rest with
+  `akkar.limit.concurrent` rather than queue it.
+
+  Three of the four predictions recorded before that run were wrong, and they
+  are scored in the results rather than quietly dropped.
+
+  Forty-five minutes also is not a night. The slope is flat enough to rule out
+  a leak at this timescale and not long enough to speak about a weekly one.
 
 - **Prefix-tree routing — measured, and the answer is no.** Worst-case dynamic
   match is 33 µs at 50 routes and 95 µs at 200, against roughly 4000 µs for one
   Postgres query. A prefix tree would buy 0.8% of a request. Revisit past ~500
   dynamic routes; until then this is optimising noise.
-- **Lua 5.5 — blocked, and not by a decision.** `cqueues` pins `lua == 5.4`
-  and has had no release since 2020. Supporting 5.5 would mean building Lua
-  5.5, forking `cqueues`, possibly adapting its C to 5.5 API changes, and
-  repeating for `luaossl`. That is taking on maintenance of a C library, not a
-  backlog item. It is the strongest argument yet for the adapter boundary, and
-  eventually for owning the substrate.
+- **Lua 5.5 — still blocked, but not by what this file used to say.** The old
+  entry read "`cqueues` pins `lua == 5.4` and has had no release since 2020.
+  Supporting 5.5 would mean building Lua 5.5, forking `cqueues`, possibly
+  adapting its C to 5.5 API changes, and repeating for `luaossl`." Every clause
+  of that has now been tested, and most of it is wrong.
+
+  Measured, reproducibly, by `docs/runtime/lua55-probe.sh`:
+
+  | | |
+  |---|---|
+  | Lua 5.5.1 | builds |
+  | `cqueues` at master | **builds and runs an event loop under 5.5** |
+  | `lua-cjson` | builds, encodes and decodes |
+  | `lpeg` | builds |
+  | `luaossl` 20250929 | **no 5.5 target at all** |
+  | akkar itself | does not load: `lua-http` needs `openssl.rand` |
+
+  The rock pins 5.4; **master does not** — it has commits through March 2026.
+  But its `KNOWN_APIS` listing 5.5 is not the same as building for it: the
+  build fails out of the box because cqueues vendors `lua-compat-5.3` **v0.9**,
+  whose header refuses anything past 5.04. Dropping in the current upstream
+  (0.15.1, which allows `< 5.6`) is sufficient — one stale vendored file, and
+  no fork of cqueues, no adaptation of its C.
+
+  **The real blocker is `luaossl`**, whose makefile declares
+  `KNOWN_APIS = 5.1 5.2 5.3 5.4` and has no 5.5 target to invoke. That is the
+  one to watch, and it is not the library anyone assumed.
+
+  So the honest position: 5.5 is one upstream compat bump and one luaossl
+  release away, neither of which is akkar's to write, and both of which akkar
+  can now detect the moment they land.
 
 ---
+
+## 7. The Postgres driver, and what measuring it corrected
+
+**Built and measured, not yet wired.** `akkar.pq` is libpq with the waiting
+done in Lua: `src/akkar_pq.c` speaks the protocol and materialises rows,
+`akkar/pq.lua` does every wait with `cqueues.poll`. `bench/driver/RESULTS.md`
+has the numbers and `spec/pq_spec.lua` pins the behaviour, including the one
+property that matters more than speed -- two concurrent 0.4 s queries finish
+in 0.4 s.
+
+**The correction is worth more than the driver.** This project had been
+quoting "32 us pgx, 82 us asyncpg, 330 us pgmoon" and reading the 330 as what
+pgmoon *adds*. `bench/driver/floor.c` -- the same query through blocking
+`PQexecParams` with no Lua at all -- costs **274.80 us on this laptop**. Those
+three figures were measured against each other on the EC2 box and are sound
+relative to one another; the inference drawn since is not. A driver cannot be
+blamed for the round trip.
+
+Driver cost, floor subtracted:
+
+| | 1 row | 1000 rows |
+|---|---:|---:|
+| pgmoon | 217 us | 12,243 us |
+| akkar.pq | 107 us | 1,686 us |
+
+**And the part that changes what to expect:** at one row the advantage does
+not clear the noise gate, and `/users/:id` -- the route in `bench/compare`, in
+the saturation study and in the soak -- is a one-row query. This will not move
+the headline throughput.
+
+### Owed on the driver
+
+- **Wire it into `akkar/db.lua`**, which still goes through pgmoon. The
+  adapter boundary is the whole reason this is one file's worth of work, and
+  that claim is now testable rather than asserted.
+- **Re-run on the study machine.** Every number above is a laptop with
+  Postgres in a container. Until it is repeated on the `c5.2xlarge`, none of
+  it may be compared with `bench/compare/RESULTS.md`.
+- **Measure the tail, not the mean.** 12,243 us of interpreter work per
+  thousand-row query is 12,243 us in which the single-threaded event loop runs
+  nothing else. That is the effect that should show up as p99 under load, and
+  it is unmeasured.
+- **A static libpq recipe for `akkar build`.** The Debian `libpq.a` drags in
+  pgcommon, pgport, curl, ssl, gssapi and ldap. Same class as the cqueues and
+  luaossl recipes; not started.
+- **Prepared statements.** Every query is an unnamed parse, exactly as pgmoon
+  does it. Named statements are where the remaining single-row gap probably
+  lives, and they bring a cache-invalidation problem with them.
+
+## 8. Astra, the competitive reference
+
+Astra (Rust + Tokio + Axum + SQLx, hosting Lua via mlua) is the closest thing
+to what akkar is trying to be, and it is treated as a reference rather than a
+threat. Three claims about it were **verified against the source** at commit
+`885586c`, v0.51.2, and all three are confirmed:
+
+- **`sql.leak()` per query.** `src/components/database.rs:251`, inside a macro
+  expanded for both Postgres and SQLite, reached by five Lua methods. The
+  `String` comes from the Lua argument on every call; there is no
+  `Box::from_raw` anywhere in the repository and no interning.
+- **Unbounded request body, with a limit knob that does not apply.**
+  `to_bytes(body, usize::MAX)` runs before any Lua. `DefaultBodyLimit` is
+  configurable and does *not* cover this path, because the handler takes the
+  raw `Request` extractor whose `from_request` is the identity; only
+  `Bytes`-based extractors read the limit. No `RequestBodyLimitLayer` exists.
+- **One global Lua VM serialises CPU work.** mlua's `ReentrantMutex` is taken
+  at the start of `poll` and held across `resume_inner`, so a handler that
+  never yields holds it for the whole request and other Tokio workers block on
+  it. `thread_pool_size` is a coroutine object pool, not parallelism.
+
+**What this does NOT license.** All three are implementation defects fixable
+in a patch, not consequences of choosing Rust. Positioning against them as
+permanent failings ages badly. What they are evidence about is process.
+
+### The experiments worth running
+
+- **Soak both runtimes side by side with RSS plotted.** The leak is the only
+  one of the three that draws itself on a graph, and the study machine exists
+  to produce that graph.
+- **Prove akkar's body limit cuts.** Astra's defect is not a missing limit; it
+  is a configurable limit that does not cover the hot path. A test that proves
+  akkar's knob actually truncates is worth more than the knob.
+- **Audit every concurrency knob akkar exposes** for the `thread_pool_size`
+  failure mode: a number that reads as parallelism and delivers a cache. If
+  the documentation does not say what a knob does *not* do, it is the same
+  trap.
+
+## 9. WebAssembly components — studied, measured, not decided
+
+`docs/wasm/DECISION.md` has the full study and `docs/wasm/akkar.wit` the world
+it produced. **The decision is blocked on one number, not on an argument**, and
+the order stands: the Postgres driver first.
+
+The premises broke in both directions. WASI 0.3 is real (11 June 2026,
+ratified). A C host **can** instantiate components today — Wasmtime's C API
+has 154 `wasmtime_component_*` symbols and a minimal C host was compiled and
+run to confirm it. But **WASI 0.3 does not reach the C API** (zero `wasip3`
+symbols; issue #13705 open and unanswered), and `wit-bindgen` is guest-side
+only, so host marshalling is hand-written against a 23-case union.
+
+**The number: 5.08 MB today against a 24.8 MB stripped C host that merely
+touches the component API.** Six times, in the dimension `docs/RUNTIME.md`
+sells. WAMR and wasm3 are small and have no Component Model at all; without
+components the story shrinks to "a plugin in C or Rust with an integer ABI".
+
+**The single experiment**, on the study machine: build `wasmtime-c-api` from
+source with the minimum set that still runs components, link a trivial C host,
+and ask whether it comes in under ~10 MB. Under 10, the rest is engineering.
+Still 25, akkar keeps `vm.lua` for untrusted-but-not-hostile hooks and puts
+hostile code in another process.
+
+**Two things worth keeping whatever the answer is.** First, `epoch_deadline_
+async_yield_and_update` **preempts a Wasm guest**, which is strictly more than
+akkar can do to a C function — `akkar/work.lua` documents that impossibility —
+so Wasm beats C on the very axis where C is feared. Second, and this holds
+even if Wasm is never adopted: **the plugin database interface cannot take a
+SQL string.** `akkar/scope.lua:15` refuses raw SQL because "a string cannot be
+scoped without parsing it", so the interface is builder-shaped and the scope
+is not a parameter anywhere in it — the host takes it from the running
+request. Any extension mechanism akkar grows, in any technology, has to be
+builder-shaped for that reason.
+
+## 10. The outbound path, which does not exist
+
+Found by inventory, verified in the code: `CAPABILITIES` in `akkar/init.lua`
+is `db`, `cache`, `log`, `clock` — **none of which leaves the process** — and
+nothing under `akkar/` requires an HTTP client.
+
+**akkar is complete on the inbound path and empty on the outbound one.**
+Routes, validation, pooling, jobs, cache, rate limit, idempotency, metrics,
+OpenAPI, scope, streaming, shutdown: every one of them is about *receiving* a
+request. Nothing in akkar *makes* one.
+
+That is why it never surfaced. The whole suite and every benchmark tests a
+server, so the missing half was never exercised by anything.
+
+Stated without softening: **akkar does not yet serve a service that calls
+another service**, which is most real backends. It is not a quality problem
+with what exists; it is the boundary of what was built.
+
+| | state | severity |
+|---|---|---|
+| HTTP client (`req.http`) | absent | **high** — blocks every external integration |
+| Password hashing | absent; OpenSSL already linked via luaossl | high *if* the app authenticates |
+| JWT | absent; HMAC/RSA already available | high *if* the app authenticates |
+| Response compression | absent | low — the proxy does it |
+| Cookies / sessions | absent | low for a JSON API on bearer tokens |
+| WebSocket | absent | depends on the application |
+
+**None of these is an architectural hole.** They are modules, and the
+primitives for most of them are already inside the binary: password hashing
+and JWT need PBKDF2/HMAC/RSA, and OpenSSL is already a dependency through
+luaossl; a client needs sockets, TLS and a pool, and cqueues, luaossl and
+`akkar/pool.lua` all exist.
+
+### The choice the client forces, and it mirrors the driver's
+
+Wrapping lua-http's client is the fast path and means **inheriting lua-http**
+— the library this project found a denial of service in, whose last commit is
+September 2024 and which `akkar/substrate.lua` now carries a repair for.
+
+The answer is probably the same one the driver just demonstrated: the value is
+in the **adapter** — deadline, pool, retry, metrics, and the client sitting
+behind the capability boundary the way `db` does — not in the transport. Wrap
+what exists, and swap the transport underneath if it hurts. `spec/db_spec.lua`
+running one contract against two drivers is the evidence that swapping costs
+one file.
+
+### Order
+
+1. **HTTP client as a capability** (`req.http`), with deadline and pool.
+2. **`akkar.crypto`** — password hashing and JWT over the already-linked OpenSSL.
+3. The rest when a real need appears.
+
+## 11. What writing the guide found, and what is still open
+
+Nine defects came out of writing beginner documentation, and none of them was
+caught by a thousand tests. The reason is structural and worth keeping: **a
+test never has to READ an error message, and never uses the API as somebody
+who has not seen it before.** Every one of these was found by an author who
+could not write an honest sentence about what the reader would see.
+
+Six are fixed: the bind error that did not name its port, `req.body` being nil
+with no explanation, `akkar.log` printing an id as `7.0`, the connection
+failure whose message was unreachable code, an empty list encoding as `{}`,
+and the README promising a watchdog that cannot see a C call.
+
+### Still open
+
+- **A job store fails at first push, not at construction.**
+  `jobs.new(redis.connect{...}, "email")` — note the missing call parentheses
+  — builds happily. The server starts, and the error arrives at the first
+  `push` as `attempt to call a nil value (method 'command')`, pointing inside
+  `akkar/jobs/redis.lua` rather than at the line that was wrong. akkar already
+  checks capability contracts at boot for this exact reason; the job store
+  does not get the same treatment.
+
+- **A global rate limiter throttles the health checks into a restart loop.**
+  Twelve requests to `/health/live` answer 429, an orchestrator reads that as
+  a failed probe, and it restarts a process that was healthy. The framework
+  has no built-in exemption, and this is the failure mode where a protective
+  feature causes the outage. Guide page 11 shows the 429 first and then the
+  four lines that fix it, which is a workaround in documentation for something
+  that should probably be a default.
+
+- ~~**No supported way to run a background loop in the same process as
+  `app:run`.**~~ **Built** as `app:task(name, fn)`; the decisions it was
+  waiting on are in the commit and in the module docstring. Original
+  statement kept below, because the reasoning for the shape came from it. It ends in `assert(s:loop())`, or -- when `handle_signals` was
+  called -- in a controller wrapping exactly two tasks, the server loop and
+  the signal task. Neither is reachable from outside, and `SETTINGS` has no
+  key for one, so there is nothing an application can pass.
+
+  The cost showed up as a documentation cost, which is how it was found. The
+  smallest honest example of "the request should not wait for the email" is
+  one process, an in-memory queue, and a consumer sharing the event loop.
+  That is not expressible, so the guide's first working example needs Redis
+  and a second process -- a `docker run` and a third terminal before a
+  beginner has seen one job run. Redis is right for anything real and heavy
+  for the idea.
+
+  Two things for whoever takes it. The workaround that exists today is
+  `cqueues.running():wrap(fn)` from inside a handler, which attaches to the
+  server's own controller; it works, and it stayed out of the guide because
+  "start your worker from inside a request" teaches a beginner something they
+  should unlearn. And `akkar.jobs.memory` already implements `claim_pop`,
+  `ack` and `reap`, so `Queue:reliable()` is true for it -- the store half is
+  not the gap, the place to run the consumer is.
+
+  Deliberately not designed here: a task-registration hook has real questions
+  in it about shutdown ordering and about whether a failing task should take
+  the server down, and those deserve a decision rather than a guess.
+
+- **`docs/DEPLOY.md` is not re-run by anything.** Its Dockerfile numbers and
+  its Railway transcript are true of a tree from one afternoon that has since
+  moved. `spec/docs_spec.lua` covers `docs/guide/` only, deliberately, and
+  this file is the one page outside it that makes measured claims.
+
+- **An `env` marker for the docs runner.** Page 12's application is `no-run`
+  because it refuses to start without `SESSION_SECRET`, `FRONTEND_ORIGIN` and
+  the `PG*` variables, and the runner has none to give it. It is verified by
+  being containerised instead, which the page says.
+
+  Two halves, and the second is the one that would be skipped: the block runs
+  with a supplied environment and stays up, AND the same block with one
+  variable removed exits non-zero and names that variable. A runner proving
+  only the first would leave the refusal untested while looking thorough —
+  the same shape as the skip guard this project once shipped that never
+  checked anything.
 
 ## What is deliberately not being built
 
@@ -531,10 +822,10 @@ Written down because the list keeps trying to grow.
 
 | Not building | Why |
 |---|---|
-| ORM, migrations, templating, HTML, admin, scaffolding | Out of scope in `PLAN.md` §1, permanently. |
+| ORM, ~~migrations~~, templating, HTML, admin, scaffolding | Out of scope in `PLAN.md` §1, permanently — **except migrations, and that exclusion is retracted.** It was grouped with the ORM and it does not belong there: an ORM is an opinion about modelling, which akkar refuses, while a migration runner is a ledger of applied files and a lock, with no opinion about a schema at all. And `akkar build` produces a binary whose whole promise is "copy it to a server" — a binary that cannot bring its own schema forward has an incomplete promise. Built as `akkar/migrate.lua`; see `docs/ROADMAP.md` §2.1. |
 | Adapters for payments, storage, mail | Past "JSON API framework". Own the contract, let libraries implement. |
-| `akkar build` producing a self-contained binary | Attractive, but Redbean is a *different substrate*, and `cqueues` is a C module. That is a substrate change, not a packaging step. |
-| CI, docs site, semantic versioning, compatibility policy, ADRs | The audience is my own use. Each costs before it pays. |
+| ~~`akkar build` producing a self-contained binary~~ | **Retracted — the reason was wrong.** It read "Redbean is a *different substrate*, and `cqueues` is a C module. That is a substrate change, not a packaging step." True of Redbean, and it does not follow for a C module: static linking changes no substrate. Measured since — cqueues runs an event loop inside a single 1.5 MB binary. See `docs/RUNTIME.md`. |
+| ~~CI, docs site, semantic versioning, compatibility policy, ADRs~~ | **Retracted with the audience.** These were excluded because "the audience is my own use". The audience changed; see `docs/PLAN.md` §1. |
 | A DX laboratory implementing the same API in eight frameworks | The cheap version captures most of the value: compare against Gin and FastAPI, which I already write daily and which need no toolchain. Read the docs for the rest. |
 
 ## Ideas parked, not rejected

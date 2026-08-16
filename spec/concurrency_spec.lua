@@ -42,6 +42,11 @@ describe("a controller costs descriptors", function()
 
   local function cost_of(make, n)
     collectgarbage(); collectgarbage()
+    -- Twice, and the first result is thrown away. `open_fds` opens a pipe to
+    -- do the counting, and the descriptors that pipe uses are not in steady
+    -- state until it has run once -- so the first measurement of a process
+    -- reads a number the second does not.
+    open_fds()
     local before = open_fds()
     local held = {}
     for i = 1, n do held[i] = make() end
@@ -61,7 +66,17 @@ describe("a controller costs descriptors", function()
     -- descriptors at all. It is not a drop-in -- see the note in App:run --
     -- but this is the measurement that says it is worth doing.
     local each = cost_of(function() return condition.new() end, 100)
-    assert.equal(0, each)
+
+    -- NOT `assert.equal(0, each)`, which is what this said and which failed
+    -- roughly one run in five. The counting itself opens a pipe, so a single
+    -- transient descriptor becomes 0.01 per condition and an exact zero
+    -- reports the instrument rather than the subject.
+    --
+    -- The property is that a condition costs no descriptor: a hundred of them
+    -- must not cost anything like a hundred. Ten is two orders of magnitude
+    -- below what would matter and far above the noise.
+    assert.is_true(each < 0.1,
+      string.format("a condition cost %.3f descriptors", each))
   end)
 end)
 
@@ -121,5 +136,29 @@ describe("the concurrency ceiling", function()
   it("lets an application override it", function()
     assert.is_true(akkar.defaults.max_concurrent == nil,
       "the ceiling is computed, not a fixed default")
+  end)
+
+  it("publishes the ceiling on the app, so other code can read it", function()
+    -- It was a local handed to lua-http and nothing else, which meant
+    -- `akkar.limit.shed` -- the one piece of the framework that needs to know
+    -- how loaded the server is -- read nil and could never fire. A ceiling
+    -- only the listener can see is half a ceiling.
+    local PORT = 8393
+    local app = akkar.new()
+    app:get("/ping", function() return { ok = true } end)
+
+    local cq = cqueues.new()
+    cq:wrap(function()
+      pcall(function()
+        app:run { port = PORT, check_capabilities = false, max_concurrent = 8,
+                  log = akkar.log.new { level = "error" } }
+      end)
+    end)
+    cq:wrap(function()
+      cqueues.sleep(0.2)
+      assert.equal(8, app.max_concurrent)
+      app:stop(1)
+    end)
+    assert(cq:loop(20))
   end)
 end)

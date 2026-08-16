@@ -101,9 +101,17 @@ end)
 -- ---------------------------------------------------------------------------
 
 local function reachable()
+  -- PING, not merely connect. `cqueues.socket.connect` builds the socket
+  -- lazily and touches the network on first use, so `pcall` around the
+  -- factory returns TRUE with nothing listening -- every Redis skip guard in
+  -- this suite was decorative, and only looked correct because a developer's
+  -- machine always had Redis running. CI's no-services job found it on its
+  -- first run.
   local ok, conn = pcall(redis.connect { pool_size = 0 })
-  if ok then conn:close() end
-  return ok
+  if not ok then return false end
+  local alive = pcall(function() return conn:ping() end)
+  conn:close()
+  return alive
 end
 
 if not reachable() then
@@ -112,6 +120,81 @@ if not reachable() then
   end)
   return
 end
+
+describe("a server that accepts and then says nothing", function()
+  -- `read_reply` had no bound at all: it waited exactly as long as the server
+  -- took, and the only thing above it was the request deadline -- which a
+  -- background worker does not have. A Redis that accepted the connection and
+  -- then stopped answering parked a `Queue:consume` worker for ever, with no
+  -- error, no log line, and nothing to distinguish it from an idle queue.
+  --
+  -- Not a fake socket: a real listener that accepts and never writes. The
+  -- property under test is what the socket layer does when a peer goes quiet,
+  -- and a double that decides to go quiet is testing the double.
+  local cqueues = require "cqueues"
+  local socket  = require "cqueues.socket"
+
+  it("gives up instead of waiting for ever", function()
+    local PORT = 8388
+    local server = socket.listen("127.0.0.1", PORT)
+
+    local failed_with, elapsed
+    local cq = cqueues.new()
+    cq:wrap(function()
+      local peer = server:accept()          -- accept, and answer nothing
+      cqueues.sleep(5)
+      peer:close()
+    end)
+    cq:wrap(function()
+      local conn = redis.connect { host = "127.0.0.1", port = PORT,
+                                   pool_size = 0, timeout = 0.3 }()
+      local started = cqueues.monotime()
+      local ok, err = pcall(function() return conn:ping() end)
+      elapsed = cqueues.monotime() - started
+      failed_with = not ok and tostring(err) or nil
+      conn:close()
+    end)
+    assert(cq:loop(15))
+    server:close()
+
+    assert.is_truthy(failed_with, "the command waited for a reply that never came")
+    assert.is_true(elapsed < 2,
+      "it waited " .. string.format("%.2f", elapsed) .. "s against a 0.3s timeout")
+  end)
+end)
+
+describe("a handshake the server refuses", function()
+  -- AUTH and SELECT run on a socket that is already open. Raising out of
+  -- `open` left it with nothing in this process referencing it: the pool
+  -- restores its slot on the error path, and the descriptor does not come
+  -- back. A wrong password therefore leaked one socket per attempt -- and a
+  -- pool under load retries, so that is one per request.
+  --
+  -- Counted rather than reasoned about, and deliberately WITHOUT forcing a
+  -- collection first: a descriptor that only returns when the collector runs
+  -- is the trap this project already recorded once, where an OS limit was
+  -- quietly tied to the pace of the GC.
+  local function open_fds()
+    local pid = io.open("/proc/self/stat"):read "n"
+    local n = 0
+    for _ in io.popen("ls /proc/" .. pid .. "/fd 2>/dev/null"):lines() do n = n + 1 end
+    return n
+  end
+
+  it("does not leave the socket open", function()
+    local before = open_fds()
+    for _ = 1, 25 do
+      local ok = pcall(function()
+        return redis.connect { pool_size = 0, password = "definitely-not-the-password" }()
+      end)
+      assert.is_false(ok, "Redis accepted a password it should not have")
+    end
+    local after = open_fds()
+
+    assert.is_true(after - before < 10,
+      ("25 refused handshakes leaked descriptors: %d -> %d"):format(before, after))
+  end)
+end)
 
 describe("akkar.redis against a real server", function()
   local conn

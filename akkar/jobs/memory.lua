@@ -20,6 +20,8 @@ local jobs = require "akkar.jobs"
 local Store = {}
 Store.__index = Store
 
+local time = require "akkar.time"
+
 local M = {}
 
 function Store:enqueue(key, encoded)
@@ -45,7 +47,14 @@ end
 --- Holds a job until `run_at`.  A list scanned on promote, not a heap: a
 --- process-local queue with enough scheduled jobs for that to matter has
 --- outgrown a process-local queue.
-function Store:schedule(key, encoded, run_at)
+--- Schedules a job `delay` seconds from now, by this process's clock.
+---
+--- The Redis store reads the SERVER's clock so that a fleet agrees; here
+--- there is only one process, so its own clock IS the shared one. A step of
+--- this process's clock moves everything in it together, which is the
+--- consistent -- if not always convenient -- answer.
+function Store:schedule(key, encoded, delay)
+  local run_at = time.now() + (delay or 0)
   local pending = self.scheduled[key]
   if not pending then pending = {} self.scheduled[key] = pending end
   pending[#pending + 1] = { run_at = run_at, encoded = encoded }
@@ -55,7 +64,8 @@ end
 --- Moves everything due into the queue proper, oldest first, and returns how
 --- many moved.  Ordering by `run_at` matters: two jobs that came due while
 --- nobody was looking should run in the order they were meant to.
-function Store:promote(key, now)
+function Store:promote(key)
+  local now = time.now()
   local pending = self.scheduled[key]
   if not pending or #pending == 0 then return 0 end
 
@@ -76,11 +86,90 @@ function Store:claim(key, id, ttl)
   local seen = self.claims[key]
   if not seen then seen = {} self.claims[key] = seen end
 
-  local now = os.time()
+  local now = time.now()
   local held = seen[id]
   if held and held > now then return false end
   seen[id] = now + (ttl or 3600)
   return true
+end
+
+--- Claims the id and enqueues the job as one indivisible step.
+---
+--- In one process with one coroutine at a time this is atomic by
+--- construction: nothing here yields, so nothing can be scheduled between the
+--- claim and the push. The method exists anyway, rather than letting
+--- `Queue:push` fall back to two calls, because the two stores must answer
+--- the same contract -- a fake whose safety property differs from the real
+--- one is how a test proves the wrong thing.
+function Store:claim_and_enqueue(key, id, ttl, encoded, run_at)
+  if not self:claim(key, id, ttl) then return false, "duplicate" end
+  if run_at and run_at > 0 then
+    return self:schedule(key, encoded, run_at)
+  end
+  return self:enqueue(key, encoded)
+end
+
+-- ================================================== at-least-once delivery
+--
+-- A job leaves the queue and enters the PROCESSING set in one step, and stays
+-- there until it is acknowledged. A worker that dies holding it leaves it
+-- recoverable rather than gone, which is the difference between at-most-once
+-- and at-least-once -- and `Queue:consume` was at-most-once, loudly
+-- documented, until this existed.
+--
+-- In one process the "worker died" case can only be simulated, and that is
+-- exactly what the specs do: pop without acknowledging, then reap.
+
+function Store:processing_key(key) return key .. ":processing" end
+
+--- Moves the oldest job into the processing set and returns it.
+function Store:claim_pop(key, _timeout)
+  local now = time.now()
+  local encoded = self:dequeue(key)
+  if not encoded then return nil end
+
+  local held = self.processing[key]
+  if not held then held = {} self.processing[key] = held end
+  held[#held + 1] = { encoded = encoded, at = now or time.now() }
+  return encoded
+end
+
+--- Drops a job from the processing set. Returns whether it was there.
+function Store:ack(key, encoded)
+  local held = self.processing[key]
+  if not held then return false end
+  for i, entry in ipairs(held) do
+    if entry.encoded == encoded then
+      table.remove(held, i)
+      return true
+    end
+  end
+  return false
+end
+
+--- Returns everything claimed before `cutoff` to the queue.
+---
+--- Oldest first, so a job abandoned twice does not overtake one abandoned
+--- once -- the same ordering promise `promote` makes.
+function Store:reap(key, older_than)
+  local cutoff = time.now() - (older_than or 300)
+  local held = self.processing[key]
+  if not held or #held == 0 then return 0 end
+
+  local stale, fresh = {}, {}
+  for _, entry in ipairs(held) do
+    if entry.at <= cutoff then stale[#stale + 1] = entry else fresh[#fresh + 1] = entry end
+  end
+  table.sort(stale, function(a, b) return a.at < b.at end)
+
+  for _, entry in ipairs(stale) do self:enqueue(key, entry.encoded) end
+  self.processing[key] = fresh
+  return #stale
+end
+
+function Store:in_flight(key)
+  local held = self.processing[key]
+  return held and #held or 0
 end
 
 --- Reads without removing, oldest first, to match what a reader expects.
@@ -113,11 +202,30 @@ function Store:scheduled_depth(key)
 end
 
 function M.store()
-  return setmetatable({ lists = {}, scheduled = {}, claims = {} }, Store)
+  return setmetatable({ lists = {}, scheduled = {}, claims = {},
+                        processing = {} }, Store)
 end
 
-function M.new(name)
-  return jobs.new(M.store(), name)
+--- Builds a queue on this store.
+---
+--- OPTIONS ARE FORWARDED, AND FOR A WHILE THEY WERE NOT.
+---
+--- `jobs.new(store, name, options)` has always accepted a retry policy, a
+--- backoff and a dead-letter setting -- and this constructor took only the
+--- name, so every one of them was dropped on the floor between the caller and
+--- the queue. `memory.new("emails", { retries = 3 })` produced a queue with
+--- `retries = 0` and said nothing.
+---
+--- The irony is the part worth recording: `akkar/jobs.lua` REFUSES a retry
+--- policy it cannot honour, and calls that refusal "the silent degradation
+--- this module exists to avoid". The policy never reached the check.
+---
+--- Found by an agent writing the reference documentation, who read the
+--- signature rather than the docstring -- and it had already been taught in
+--- `docs/guide/10-background-work.md`, whose retries section was configuring
+--- nothing at all.
+function M.new(name, options)
+  return jobs.new(M.store(), name, options)
 end
 
 M.Store = Store

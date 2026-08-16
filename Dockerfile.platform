@@ -1,0 +1,36 @@
+# Does akkar build and run on a platform nobody has ever tried?
+#
+# Alpine so musl is exercised too, and the whole suite is not run -- what is
+# being answered is narrower and more basic: do the C dependencies compile,
+# does the interpreter load them, and does a server answer a request.
+FROM alpine:3.20
+
+RUN apk add --no-cache \
+      lua5.4 lua5.4-dev luarocks5.4 \
+      build-base git openssl-dev libbsd-dev m4 zlib-dev curl
+
+# cqueues needs a BSD header musl does not ship; the deploy work already
+# found that and it is the one thing musl cost.
+RUN luarocks-5.4 install luaossl \
+ && luarocks-5.4 install lua-cjson \
+ && luarocks-5.4 install http \
+ && luarocks-5.4 install cqueues CFLAGS="-fPIC -I/usr/include/lua5.4"
+
+WORKDIR /app
+COPY akkar/ ./akkar/
+
+# The three questions, in order of how basic they are.
+RUN lua5.4 -e ' \
+  print("arch     = " .. (io.popen("uname -m"):read("l"))); \
+  print("lua int  = " .. math.maxinteger); \
+  print("pointer  = " .. (io.popen("getconf LONG_BIT"):read("l")) .. " bit"); \
+  local ok, akkar = pcall(require, "akkar"); \
+  print("require akkar = " .. tostring(ok) .. (ok and "" or (" -- " .. tostring(akkar)))); \
+  assert(ok, akkar); \
+  local app = akkar.new(); \
+  app:get("/ping", function() return { ok = true, arch = "here" } end); \
+  local res = app:test():get("/ping"); \
+  print("in-process request = " .. tostring(res.status) .. " " .. tostring(res.body and res.body.ok)); \
+  assert(res.status == 200); \
+  print("OK"); \
+'

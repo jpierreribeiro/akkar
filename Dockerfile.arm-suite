@@ -1,0 +1,44 @@
+# The test suite on ARM64, which is a much stronger question than "does it
+# load".
+#
+# The specs needing Postgres or Redis skip themselves -- their guards connect
+# rather than assume, which is a property this suite already pays for. What
+# runs here is everything that needs neither, which is most of the framework:
+# routing, validation, the response contract, jobs over memory, the cache, the
+# limiter, crypto, sessions, auth, JWT, CSRF, the sandbox, SQL building,
+# scope, multipart, etag, idempotency, and the substrate repair.
+FROM akkar-arm64
+
+RUN luarocks-5.4 install busted
+
+WORKDIR /app
+COPY spec/ ./spec/
+COPY akkar-dev-1.rockspec ./
+
+# Not the whole suite: the specs that spawn a server in a subprocess want a
+# free port and a Lua on PATH, and the ones wanting Postgres or Redis would
+# only report skips. Naming them is more honest than a wildcard that silently
+# does less than it looks like.
+RUN busted --lpath="./?.lua;./?/init.lua" --cpath="./?.so;;" \
+      spec/akkar_spec.lua \
+      spec/sql_spec.lua \
+      spec/scope_spec.lua \
+      spec/crypto_spec.lua \
+      spec/session_spec.lua \
+      spec/auth_spec.lua \
+      spec/jwt_spec.lua \
+      spec/csrf_spec.lua \
+      spec/vm_spec.lua \
+      spec/log_spec.lua \
+      spec/etag_spec.lua \
+      spec/multipart_spec.lua \
+      spec/memory_adapters_spec.lua \
+      spec/on_error_spec.lua \
+      spec/host_spec.lua \
+      spec/client_ip_spec.lua \
+      spec/stream_spec.lua \
+      spec/idempotency_spec.lua \
+      spec/properties_spec.lua \
+      spec/lifetime_spec.lua \
+      spec/shed_spec.lua \
+    2>&1 | tail -30

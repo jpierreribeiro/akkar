@@ -1,0 +1,557 @@
+--[[
+akkar.http — the outbound half, which did not exist.
+
+## Why this is a capability and not a `require`
+
+`docs/BACKLOG.md` section 10: akkar's capability set is `db`, `cache`, `log`
+and `clock`, none of which leaves the process, and nothing under `akkar/`
+required an HTTP client. So akkar was complete at receiving a request and
+empty at making one -- which is most of what a real backend does.
+
+The fix is not "expose lua-http to handlers". The rule this project keeps is
+that **all I/O goes through an adapter akkar owns, never through a library
+called directly from a handler**, and the reason is now measured rather than
+argued: `spec/db_spec.lua` runs one contract against two Postgres drivers, so
+swapping a transport costs one file. That matters more here than it did for
+the database, because the transport underneath this one is lua-http -- the
+library this project found a denial of service in, whose last commit is
+September 2024, and which `akkar/substrate.lua` already carries a repair for.
+
+So the value is in the ADAPTER: a deadline, a response ceiling, a retry policy
+that knows what is safe to repeat, trace propagation, and metrics. The
+transport is a detail, and it is meant to be.
+
+## The response is a value
+
+`res.status`, `res.headers`, `res.body`. Nothing is mutated and nothing is
+streamed by default, for the same reason handlers return instead of writing:
+a value can be logged, retried and asserted on, and a stream cannot be any of
+those twice.
+
+## THE CEILING IS ENFORCED WHERE THE BYTES ARRIVE
+
+This is the one design decision worth reading before using this module.
+
+Astra -- the closest comparable runtime -- buffers the entire request body
+with `to_bytes(body, usize::MAX)` before any user code runs, and it *has* a
+configurable body limit which does not apply to that path, because the limit
+belongs to a different extractor. Verified in its source, and it is a worse
+failure than having no limit at all: the knob reads as protection and is not.
+
+So here the ceiling is applied in the read loop itself, chunk by chunk, and
+the module refuses to grow past it rather than truncating silently. A response
+that exceeds it is an error with a name, not a short body that looks complete.
+`spec/http_spec.lua` proves the knob actually cuts, because a limit nobody
+tested is the Astra defect with a different accent.
+
+## THE POOL, AND THE TWO DEFECTS FOUND WHILE BUILDING IT
+
+Connections are now pooled per `scheme://host:port`, over `akkar/pool.lua` --
+the same pool the database and Redis use, not a second one. Reaching for the
+existing pool is not tidiness: `akkar/pool.lua` carries three properties that
+took real failures to learn (a slot is RESERVED before `open` yields, `put` is
+idempotent, `reap` recovers slots from abandoned coroutines), and a second
+pool written here would have had to learn all three again.
+
+The key is derived from the PARSED uri, not from the url string, so
+`http://x/a` and `http://x:80/b` share a pool and `http://x` and `https://x`
+never do. A pool shared across hosts is not a performance bug, it is a request
+sent to the wrong server.
+
+Reaching the pool meant leaving `request:go()`, which opens its own connection
+and hard-wires `connection:onidle(connection.close)`. Driving the stream by
+hand instead uncovered two defects in the code this file already shipped, both
+now measured and both fixed here:
+
+**The body read had no timeout at all.** `read_bounded` passed
+`time.monotime() + timeout` to `stream:get_next_chunk`, which takes a RELATIVE
+timeout, not an absolute deadline. So the argument was not "one second", it
+was "monotime seconds" -- seconds since boot, days on any machine that has
+been up a while. Proven directly against a server that sends its headers and
+then five bytes of a hundred-byte body and stalls: with `timeout = 1` the
+first chunk arrived, and the second call never returned. `timeout` bounded the
+connect and the headers and left the body unbounded, which is precisely the
+budget a slow-loris server needs to hold a handler for ever.
+
+**Every body over 1 KiB paid a fixed second.** `request:set_body` appends
+`expect: 100-continue` for any body longer than 1024 bytes, and lua-http then
+waits `expect_100_timeout` (one second) for a `100 Continue` that most servers
+never send. Measured against akkar's own server: a 10-byte body answered
+`201` in 0.002 s, a 2000-byte body answered **408 in 1.005 s** -- the wait
+outlived the server's own read timeout, so the large upload did not merely
+crawl, it FAILED. `akkar.storage` puts objects through this path, so it would
+have been a second per object and an error on any server with a one-second
+read timeout. The body is now framed with `content-length` and sent directly;
+no `expect` header is generated.
+
+## Reuse is checked before the connection is handed out, not after
+
+A pooled connection the peer closed while it was idle answers nothing: the
+write succeeds (it is buffered) and the read returns `Broken pipe`. Verified
+exactly that way here before the check was written.
+
+The check is that a connection sitting idle must have NOTHING readable on it.
+Anything readable is either a stale response body (the stream desynchronised)
+or the peer's FIN; neither is usable for the next request, so both are the
+same answer. It costs one zero-timeout poll and no read.
+
+`socket:eof("r")` is not that check and was tried first: it stayed FALSE on a
+socket whose peer had exited, because cqueues only learns about the FIN once a
+read goes looking for it. A check that never fires is worse than no check,
+since it reads like protection.
+
+## WHAT IT IS WORTH, MEASURED
+
+`spec/http_pool_spec.lua` prints these on every run, and they are printed
+whether or not they flatter the pool. Three hundred sequential GETs on
+loopback, best of five interleaved runs:
+
+    against a bare socket server   0.492 -> 0.241 ms/req   2.04x
+    against akkar's own server     0.743 -> 0.671 ms/req   1.11x
+
+The two numbers say different things and one alone would mislead. The second
+is a whole akkar request -- routing, schema, JSON -- and the connection is a
+small share of it. The first is a socket answering a fixed string, so nearly
+all of what is left IS the connection: **about 0.25 ms per request on
+loopback**, which is what one TCP handshake and one close cost here.
+
+**That is the WEAKEST case for pooling, and it is the only one measured.**
+Loopback has no round trip worth the name and no TLS. A real endpoint over a
+network adds an RTT to the handshake and a TLS one adds two more plus the
+certificate work -- so the saving there is larger by an amount this file has
+not measured and therefore does not claim. Pooling is on by default on the
+strength of the loopback number alone, which is the honest floor.
+]]
+
+local http_request = require "http.request"
+local http_client  = require "http.client"
+local cqueues      = require "cqueues"
+local Pool         = require "akkar.pool"
+local time         = require "akkar.time"
+
+local M = {}
+
+local Client = {}
+Client.__index = Client
+
+-- Methods a failed request may be retried on.
+--
+-- POST and PATCH are absent and that is the entire point. A retried POST is a
+-- second charge, a second email, a second order -- and a client that retries
+-- them by default turns one flaky network into duplicated side effects. A
+-- caller who knows their endpoint is idempotent can say so per call with
+-- `retry_unsafe = true`; nobody gets it by accident.
+local SAFE_TO_RETRY = {
+  GET = true, HEAD = true, PUT = true, DELETE = true,
+  OPTIONS = true, TRACE = true,
+}
+
+local DEFAULTS = {
+  timeout       = 10,        -- seconds for one attempt
+  max_body      = 8 * 1024 * 1024,
+  retries       = 0,         -- attempts BEYOND the first
+  retry_backoff = 0.1,
+  pool_size     = 8,         -- live connections per scheme://host:port
+}
+
+--- Seconds left before `deadline`, or nil when there is no deadline.
+---
+--- Every lua-http call below takes a RELATIVE timeout. Handing one an
+--- absolute deadline is the defect this module shipped with -- see the header
+--- -- so the conversion happens in one named place rather than at six call
+--- sites where the next person has to notice which kind of number it is.
+local function remaining(deadline)
+  if not deadline then return nil end
+  return deadline - time.monotime()
+end
+
+--- Reads a body with a hard ceiling, refusing rather than truncating.
+local function read_bounded(stream, limit, deadline)
+  local parts, total = {}, 0
+  while true do
+    local left = remaining(deadline)
+    if left and left <= 0 then
+      -- A NAMED TIMEOUT, not a hang. Before this, the deadline was passed
+      -- straight through as if it were a timeout and the read waited for
+      -- monotime seconds -- so a server that sent headers and then stopped
+      -- held the coroutine until the process died.
+      return nil, "timed out reading the response body"
+    end
+    local chunk, err = stream:get_next_chunk(left)
+    if chunk == nil then
+      -- `err == nil` is a clean end of body. Anything else is a real failure
+      -- and must not look like a complete short response.
+      if err then return nil, tostring(err) end
+      break
+    end
+    total = total + #chunk
+    if total > limit then
+      -- REFUSED, NOT TRUNCATED. A truncated body is indistinguishable from a
+      -- complete one at the call site, so the caller parses half a JSON
+      -- document and gets a confusing error somewhere else entirely.
+      return nil, ("response exceeded max_body of %d bytes"):format(limit)
+    end
+    parts[#parts + 1] = chunk
+  end
+  return table.concat(parts)
+end
+
+local function headers_to_table(h)
+  local out = {}
+  for name, value in h:each() do
+    if name:sub(1, 1) ~= ":" then
+      -- Repeated headers become a list rather than the last one winning,
+      -- because `set-cookie` legitimately repeats and silently keeping one is
+      -- how a session gets lost.
+      local existing = out[name]
+      if existing == nil then out[name] = value
+      elseif type(existing) == "table" then existing[#existing + 1] = value
+      else out[name] = { existing, value } end
+    end
+  end
+  return out
+end
+
+-- ==================================================================== pooling
+
+-- The connect timeout belongs to the CALL, and `Pool.new` takes an `open`
+-- that receives no arguments -- so a timeout captured when the pool was
+-- created would be the first caller's timeout for ever after.
+--
+-- `Pool:get` runs `open` with `pcall` in the very coroutine that called it, so
+-- the calling coroutine is an exact key. Weak, because an abandoned coroutine
+-- must not keep an entry alive; that is the same reasoning `Pool.opening`
+-- documents, and for the same reason.
+local CONNECT_TIMEOUT = setmetatable({}, { __mode = "k" })
+
+local Connection = {}
+Connection.__index = Connection
+
+--- True when this connection is fit to carry the next request.
+---
+--- See the header for why `socket:eof("r")` is not this test. The rule is that
+--- an idle client connection must have nothing to read: a byte waiting on it
+--- is either a response nobody asked for or the peer's FIN, and a request
+--- written on top of either one is a request that gets no answer.
+function Connection:alive()
+  local conn = self.conn
+  if not conn then return false end
+  local sock = conn.socket
+  -- lua-http drops the socket itself when the response said `Connection:
+  -- close`, so a nil socket here is the ordinary end of a keep-alive-less
+  -- exchange rather than an anomaly.
+  if not sock then return false end
+
+  local fd = sock:pollfd()
+  if not fd then return false end
+
+  -- A bare table with `pollfd` and `events` is a pollable object as far as
+  -- cqueues is concerned; polling the SOCKET object directly does not work
+  -- here, because an idle lua-http socket advertises no events and so is
+  -- never reported ready even when its peer has gone. Measured both ways.
+  local probe = { pollfd = fd, events = "r" }
+  return cqueues.poll(probe, 0) ~= probe
+end
+
+function Connection:close()
+  local conn = self.conn
+  self.conn = nil
+  if conn then pcall(function() conn:close() end) end
+end
+
+--- The pool for one origin, created on first use.
+function Client:pool_for(key, host, port, tls)
+  local pool = self.pools[key]
+  if pool then return pool end
+
+  pool = Pool.new(function()
+    local timeout = CONNECT_TIMEOUT[coroutine.running()] or self.timeout
+    local conn, err = http_client.connect({
+      host = host, port = port, tls = tls, version = self.http_version,
+    }, timeout)
+    -- `Pool:get` expects `open` to raise, and treats the raise as a slot that
+    -- must be given back -- so returning nil here would wedge the pool.
+    if not conn then error(tostring(err or "could not connect"), 0) end
+    return setmetatable({ conn = conn, key = key }, Connection)
+  end, self.pool_size, function(resource)
+    return self.reuse and not resource.broken and resource:alive()
+  end)
+
+  self.pools[key] = pool
+  return pool
+end
+
+-- How many times to take a dead connection out of the idle set before giving
+-- up. Bounded rather than `while true`: a peer that closes every connection
+-- the instant it is idle would otherwise spin here for ever, and a bounded
+-- loop turns that into an error with a name.
+local MAX_STALE = 4
+
+--- A connection for `key`, guaranteed to have looked alive a moment ago.
+function Client:acquire(key, host, port, tls, timeout)
+  local pool = self:pool_for(key, host, port, tls)
+  local co = coroutine.running()
+  CONNECT_TIMEOUT[co] = timeout
+
+  for _ = 1, MAX_STALE do
+    local ok, resource = pcall(pool.get, pool)
+    CONNECT_TIMEOUT[co] = nil
+    if not ok then return nil, tostring(resource) end
+
+    if not resource.handed_out then
+      -- Straight out of `open`, so there is nothing to check and a poll on it
+      -- would only cost a syscall. It is reported as NOT reused, because a
+      -- brand-new connection that fails has failed for a real reason and
+      -- repeating the request would only repeat it.
+      resource.handed_out = true
+      return resource, false
+    end
+    if resource:alive() then return resource, true end
+
+    -- Give it back so the PREDICATE rejects it: that closes the socket and
+    -- decrements `live` through the one accounting path pool.lua has. Closing
+    -- it here instead would leak the slot, which is the defect `Pool:put`
+    -- already documents from the other direction.
+    self.stale_reused = self.stale_reused + 1
+    resource.broken = true
+    pool:put(resource)
+    CONNECT_TIMEOUT[co] = timeout
+  end
+
+  CONNECT_TIMEOUT[co] = nil
+  return nil, ("the pool for %s kept returning connections the peer had closed")
+              :format(key)
+end
+
+--- One exchange on an already-acquired connection.
+---
+--- Returns the response value, or nil and a reason; the second return says
+--- whether the connection may go back to the idle set.
+local function transact(resource, req, body, deadline, limit)
+  local conn = resource.conn
+  local stream = conn and conn:new_stream()
+  -- `new_stream` returns nil once the socket is gone, which is the race the
+  -- liveness probe cannot close: the peer may send its FIN between the poll
+  -- and the write.
+  if not stream then return nil, "the pooled connection was closed", false end
+
+  local ok, err = stream:write_headers(req.headers, body == nil,
+                                       remaining(deadline))
+  if not ok then
+    stream:shutdown()
+    return nil, tostring(err or "could not send the request"), false
+  end
+
+  if body then
+    local wrote, why = stream:write_body_from_string(body, remaining(deadline))
+    if not wrote then
+      stream:shutdown()
+      return nil, tostring(why or "could not send the body"), false
+    end
+  end
+
+  local headers, reason
+  repeat
+    headers, reason = stream:get_headers(remaining(deadline))
+    if not headers then
+      stream:shutdown()
+      return nil, tostring(reason or "no response"), false
+    end
+    -- A 1xx is informational and another set of headers follows it. `101` is
+    -- the exception: it is final, and it is a protocol switch this client
+    -- does not do, so it is handed back to the caller as-is rather than
+    -- looped on for ever.
+    local status = headers:get ":status"
+  until status:sub(1, 1) ~= "1" or status == "101"
+
+  local text, why = read_bounded(stream, limit, deadline)
+  if text == nil then
+    stream:shutdown()
+    -- A body that was cut short leaves the stream part-read, so the
+    -- connection is desynchronised and must not be reused whatever the
+    -- headers said.
+    return nil, why, false
+  end
+
+  stream:shutdown()
+
+  return {
+    status  = tonumber(headers:get ":status"),
+    headers = headers_to_table(headers),
+    body    = text,
+  }, nil, true
+end
+
+--- One attempt. Returns a response value, or nil and a reason.
+function Client:attempt(method, url, options)
+  local req = http_request.new_from_uri(url)
+  req.headers:upsert(":method", method)
+
+  for name, value in pairs(self.headers or {}) do
+    req.headers:upsert(name:lower(), tostring(value))
+  end
+  for name, value in pairs(options.headers or {}) do
+    req.headers:upsert(name:lower(), tostring(value))
+  end
+
+  -- TRACE CONTEXT TRAVELS, and until now akkar parsed `traceparent` on the
+  -- way in and had nowhere to send it on the way out. A trace that stops at
+  -- the process boundary is a trace of one process.
+  if options.traceparent then
+    req.headers:upsert("traceparent", options.traceparent)
+  end
+
+  local body = options.body
+  if body ~= nil then
+    if type(body) == "table" then
+      body = require("akkar.json").encode(body)
+      req.headers:upsert("content-type", "application/json")
+    end
+    -- `content-length` set here rather than through `request:set_body`,
+    -- WHICH ALSO APPENDS `expect: 100-continue` ABOVE 1024 BYTES. See the
+    -- header: that header cost a measured 1.005 s and a 408 on a body of two
+    -- thousand bytes, against akkar's own server.
+    req.headers:upsert("content-length", ("%d"):format(#body))
+  else
+    body = nil
+  end
+
+  -- The key comes from the parsed uri: `req.host`, `req.port` and `req.tls`
+  -- are what lua-http will actually dial, so two urls that reach the same
+  -- origin share a pool and two that do not cannot.
+  local timeout = options.timeout or self.timeout
+  local scheme = req.tls and "https" or "http"
+  local key = ("%s://%s:%d"):format(scheme, req.host, req.port)
+  local limit = options.max_body or self.max_body
+
+  -- TWICE AT MOST, AND ONLY FOR A REUSED CONNECTION.
+  --
+  -- The liveness probe cannot be atomic with the write, so a connection can
+  -- die in the gap. Retrying that on a fresh connection is what every mature
+  -- client does, and it is what makes pooling safe to turn on by default --
+  -- but only when repeating the request is safe, because a POST that reached
+  -- the server before the socket broke has already had its effect. The same
+  -- rule as `SAFE_TO_RETRY`, applied to a different failure.
+  local repeatable = SAFE_TO_RETRY[method] or options.retry_unsafe
+  for try = 1, 2 do
+    local deadline = time.monotime() + timeout
+    local resource, reused = self:acquire(key, req.host, req.port, req.tls,
+                                          timeout)
+    if not resource then return nil, tostring(reused) end
+
+    local res, why, keep = transact(resource, req, body, deadline, limit)
+    resource.broken = not keep
+    resource.pool:put(resource)
+
+    if res then return res end
+    if not (reused and repeatable and try == 1) then return nil, why end
+    self.retried_stale = self.retried_stale + 1
+  end
+end
+
+--- Makes a request, retrying only what is safe to retry.
+function Client:request(method, url, options)
+  options = options or {}
+  method = method:upper()
+
+  local allowed = options.retries or self.retries
+  if allowed > 0 and not SAFE_TO_RETRY[method] and not options.retry_unsafe then
+    -- Not an error: the request still happens, once. Refusing outright would
+    -- make `retries` a setting nobody could apply globally.
+    allowed = 0
+  end
+
+  local last
+  for attempt = 0, allowed do
+    local res, why = self:attempt(method, url, options)
+    if res then
+      -- A 5xx is retried; a 4xx never is. The server telling you the request
+      -- was wrong will tell you again.
+      if res.status < 500 or attempt == allowed then return res end
+      last = ("status %d"):format(res.status)
+    else
+      last = why
+    end
+    if attempt < allowed then
+      time.sleep((options.retry_backoff or self.retry_backoff) * (2 ^ attempt))
+    end
+  end
+  return nil, last
+end
+
+function Client:get(url, options)    return self:request("GET", url, options) end
+function Client:head(url, options)   return self:request("HEAD", url, options) end
+function Client:post(url, options)   return self:request("POST", url, options) end
+function Client:put(url, options)    return self:request("PUT", url, options) end
+function Client:patch(url, options)  return self:request("PATCH", url, options) end
+function Client:delete(url, options) return self:request("DELETE", url, options) end
+
+--- Decodes a JSON response, or raises with the status so the caller can see it.
+function Client:json(method, url, options)
+  local res, why = self:request(method, url, options)
+  if not res then return nil, why end
+  if res.body == "" then return nil, "empty body" end
+  local ok, decoded = pcall(require("akkar.json").decode, res.body)
+  if not ok then return nil, "response was not JSON: " .. tostring(decoded) end
+  return decoded, res
+end
+
+--- Nothing to release per request: `attempt` returns the connection to its
+--- pool on every path, including the failing ones.
+---
+--- Kept as a no-op rather than deleted, because `req.http` is handed to
+--- handlers the way `req.db` is, and a capability whose release is the
+--- caller's to remember is a capability that leaks. Here there is nothing to
+--- remember, and saying so is cheaper than making the next reader check.
+function Client:release() end
+
+--- Closes every pooled connection. Idempotent.
+function Client:close()
+  for key, pool in pairs(self.pools) do
+    pool:close()
+    self.pools[key] = nil
+  end
+end
+
+--- What the pools are doing, per origin.
+---
+--- Per ORIGIN rather than one total, for the reason `Pool:stats` gives about
+--- `live` and `reserved`: a single number cannot say whether one host is
+--- saturated or every host is idle, and those want opposite responses.
+function Client:stats()
+  local out = { stale_reused = self.stale_reused,
+                retried_stale = self.retried_stale, origins = {} }
+  for key, pool in pairs(self.pools) do out.origins[key] = pool:stats() end
+  return out
+end
+
+--- Returns a factory, matching `db.connect` and `redis.connect`.
+function M.connect(config)
+  config = config or {}
+  local client = setmetatable({
+    headers       = config.headers,
+    timeout       = config.timeout or DEFAULTS.timeout,
+    max_body      = config.max_body or DEFAULTS.max_body,
+    retries       = config.retries or DEFAULTS.retries,
+    retry_backoff = config.retry_backoff or DEFAULTS.retry_backoff,
+    pool_size     = config.pool_size or DEFAULTS.pool_size,
+    -- `reuse = false` is a connection per request through the SAME code path,
+    -- not a second path. The predicate rejects every connection, so the pool
+    -- closes each one on return and the next call opens a fresh one. One
+    -- transport to test, and the old behaviour is still reachable for anyone
+    -- who has a proxy that mishandles keep-alive.
+    reuse         = config.reuse ~= false,
+    -- Left nil on purpose: lua-http then negotiates. Pinning 1.1 is available
+    -- for a peer that mis-advertises h2.
+    http_version  = config.http_version,
+    pools         = {},
+    stale_reused  = 0,
+    retried_stale = 0,
+  }, Client)
+  return function() return client end
+end
+
+M.Client = Client
+M.SAFE_TO_RETRY = SAFE_TO_RETRY
+
+return M

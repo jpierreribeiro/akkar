@@ -167,6 +167,20 @@ function Redis:ping()
   return self:command "PING"
 end
 
+--- Sets how long a read may wait, in seconds.
+---
+--- Needed because one command is legitimately slower than all the others:
+--- `BRPOP key N` blocks IN THE SERVER for up to N seconds, so a socket
+--- timeout below N would kill a wait that is working exactly as intended.
+--- The blocking caller raises the timeout around its own command and puts it
+--- back afterwards; everything else runs under the connection's default.
+--- Passing nothing puts the connection's own default back, so a caller that
+--- raised it cannot accidentally leave the socket unbounded.
+function Redis:settimeout(seconds)
+  if self.sock then self.sock:settimeout(seconds or self.timeout or 5) end
+  return self
+end
+
 function Redis:close()
   if self.sock then pcall(function() self.sock:close() end) end
   self.sock = nil
@@ -193,9 +207,37 @@ function M.connect(config)
     sock:setmode("bn", "bn")
     sock:onerror(function(_, _, why) return why end)
 
-    local conn = setmetatable({ sock = sock }, Redis)
-    if config.password then conn:command("AUTH", config.password) end
-    if config.database then conn:command("SELECT", config.database) end
+    -- A READ HAD NO BOUND AT ALL. `read_reply` waited exactly as long as the
+    -- server took, and the only thing above it was the request deadline --
+    -- which a background worker does not have. So a Redis that accepted the
+    -- connection and then stopped answering parked a `Queue:consume` worker
+    -- for ever, with no error, no log line and no way to tell it apart from
+    -- an idle queue.
+    --
+    -- A timed-out read also leaves the RESP stream out of step, and that is
+    -- already handled: `read_reply` returns no `kind` for a transport
+    -- failure, so `command` marks the connection broken and the pool's reuse
+    -- predicate closes it rather than handing the next request a reply that
+    -- belongs to somebody else.
+    sock:settimeout(config.timeout or 5)
+
+    local conn = setmetatable({ sock = sock, timeout = config.timeout or 5 }, Redis)
+
+    -- CLOSE THE SOCKET BEFORE RAISING. AUTH and SELECT run on a connection
+    -- that is already open, and raising out of `open` left it with nothing in
+    -- this process referencing it. The pool restores its slot on the error
+    -- path; the descriptor does not come back. A wrong password therefore
+    -- leaked one socket per attempt, for as long as something kept retrying
+    -- -- which is exactly what a pool under load does.
+    local ok, err_setup = pcall(function()
+      if config.password then conn:command("AUTH", config.password) end
+      if config.database then conn:command("SELECT", config.database) end
+    end)
+    if not ok then
+      pcall(function() conn:close() end)
+      error(err_setup, 0)
+    end
+
     return conn
   end
 

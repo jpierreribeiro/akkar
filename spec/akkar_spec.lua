@@ -160,6 +160,27 @@ describe("in-process test client", function()
   end)
 end)
 
+describe("middleware registered late", function()
+  it("still runs, because the chain is rebuilt", function()
+    -- The chain is built once and memoised, and `app:test{}` builds it. A
+    -- middleware added after that was appended to a list nobody read again:
+    -- silently ignored, and indistinguishable from middleware that does not
+    -- work. Authentication registered one line too late is not a bug that
+    -- announces itself.
+    local app = akkar.new()
+    app:get("/", function() return { ok = true } end)
+
+    local client = app:test {}
+    client:get "/"                      -- builds and memoises the chain
+
+    local ran = false
+    app:use(function(req, next) ran = true return next(req) end)
+    assert.equal(200, client:get("/").status)
+
+    assert.is_true(ran, "middleware registered after the first request was dropped")
+  end)
+end)
+
 describe("HTTP conformance", function()
   local function app_with_routes()
     local app = akkar.new()
