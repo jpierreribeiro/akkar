@@ -241,11 +241,23 @@ describe("what the store can honour", function()
     end)
   end)
 
-  it("knows the memory cache cannot", function()
-    -- With a per-process counter a fleet of six enforces six times the limit.
-    -- That is a useful development default and it is NOT rate limiting, so
-    -- the difference is detectable rather than discovered under load.
+  it("knows the memory cache runs scripts but is not shared", function()
+    -- `scriptable` used to answer both questions at once, and stopped the
+    -- moment the memory cache learned to run scripts -- which it did so these
+    -- limiters could be tested without a Redis. Running the script and being
+    -- one counter per process are now separate answers, because only the
+    -- second one decides whether a limit is a limit: a fleet of six with a
+    -- counter each enforces six times what was configured.
     local memory = require("akkar.cache.memory").new()
-    assert.is_false(akkar.limit.scriptable(memory))
+    assert.is_true(akkar.limit.scriptable(memory))
+    assert.is_false(akkar.limit.shared(memory))
+  end)
+
+  it("knows a real Redis is shared", function()
+    in_controller(function()
+      local conn = redis.connect { pool_size = 0 }()
+      assert.is_true(akkar.limit.shared(conn))
+      conn:close()
+    end)
   end)
 end)

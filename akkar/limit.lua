@@ -185,6 +185,22 @@ end
 
 M.scriptable = scriptable
 
+--- True when the store is shared across every process that talks to it.
+---
+--- The question `scriptable` used to stand in for. It stopped standing in for
+--- it when `akkar.cache.memory` learned to run scripts -- which it did so
+--- that these limiters could be tested without a Redis, and which does not
+--- make its counters any less per-process.
+---
+--- This is the one to check before believing a limit is a limit. With a
+--- per-process store, a fleet of six enforces six times what was configured:
+--- a useful development default, and not rate limiting.
+function M.shared(cache)
+  if not cache then return false end
+  if cache.per_process then return false end
+  return scriptable(cache)
+end
+
 -- ================================================================ middleware
 local function key_for(options, req)
   if options.key then return options.key(req) end
