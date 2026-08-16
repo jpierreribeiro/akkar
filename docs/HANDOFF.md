@@ -130,7 +130,69 @@ intermittent loss of its entire advantage is not proof.
 
 ---
 
-## What to point an instrument at next
+## What to do next, and what not to
+
+Asked directly what we should do, after measuring the gap against Gin. The
+answer the measurements support is **not** "chase Gin".
+
+### Do not rewrite lua-http for speed
+
+It is the largest single line in the `/ping` budget — 47 µs of 103 — and
+replacing it would take akkar from 0.19x of Gin to about 0.35x. That is real,
+and it is the wrong reason to do it, because **`/ping` is the route where
+applications spend the least time.**
+
+On `/rows/200` a request occupies roughly 570 µs of server time. Removing 47 µs
+of substrate is worth at most 8% there. The 2.79x that actually moved
+application performance came from the C driver, not from the framework path.
+
+Rewrite the substrate when there is a reason other than a benchmark: lua-http
+has had no release since September 2024, akkar already carries two
+denial-of-service repairs for it, and `docs/substrate/RESULT.md` plus the
+executable contract exist to make that move a measured step. Speed is the
+bonus, not the case.
+
+### 1. Explain the pq inconsistency, then make it the default
+
+This is the highest return available and most of the work is done. `akkar.pq`
+is **2.79x on a thousand rows** with p99 under saturation falling from 1.3 s to
+475 ms, and it is switched off by default for one unexplained reason: two
+anomalous windows in thirty, where a whole ten-second window ran at pgmoon's
+speed. pgmoon produced zero such windows in the same alternating runs.
+
+Per-request timing over a long run, not per-window throughput — that is the
+only instrument that says whether the window holds one long stall or a hundred
+thousand slightly slower requests. Everything needed is provisioned on the box.
+
+### 2. ~~Put a gate on the hot path~~ — DONE
+
+The allocation ceiling existed and was watching `app:test()`, which never calls
+`app:run` and therefore never touches lua-http, the socket, or the substrate
+repair. It is now also measured over a real socket against a real server, and
+calibrated by proving it fails on the commit it exists for: the old repair
+costs 511 bytes per request, the rewritten one costs zero, and the measurement
+repeats to within two bytes.
+
+### 3. Port a real application
+
+Unchanged as the largest gap, and `docs/UNKNOWNS.md` §10 still says so. Every
+defect this week was found by engineering an exposure — including the 408,
+which a benchmark gate caught, and the 4% regression, which surfaced only
+because a peer framework reproduced to 0.2% in the same table. **None was found
+by anybody using akkar to build something.**
+
+### Cheap things sitting on the table
+
+- **Generational collector**: 2.5% faster, p99 from 7.50 ms to 5.66 ms, 2 MB
+  less memory. Do not flip the default on ten seconds of evidence — the soak
+  that justifies it is the same soak the C driver needs, so run them together.
+- **`PROCS` sizing**: defaulting to physical cores leaves about 15% on the
+  table on any box with SMT. A paragraph in `docs/RUNTIME.md`, not a code
+  change.
+
+---
+
+## Instruments still unpointed
 
 Ranked by what they would actually tell you.
 
