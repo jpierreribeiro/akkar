@@ -23,7 +23,7 @@ belongs here.
 
 ## What a store MAY provide, and what it buys
 
-    store:schedule(key, encoded, run_at)  -- hold until a wall-clock time
+    store:schedule(key, encoded, delay)   -- hold for this many seconds
     store:promote(key, now)               -- move what is due into the queue
     store:claim(key, id, ttl)             -- false if this id was seen already
     store:peek(key, limit)                -- read without removing
@@ -163,7 +163,10 @@ function Queue:push(kind, payload, options)
     attempts = 0,
   }
 
-  local run_at = delayed and (time.now() + options.delay) or 0
+  -- A DELAY, NOT A DEADLINE. The store computes the absolute time from its
+  -- own clock, because a timestamp computed here is this worker's opinion and
+  -- a fleet has several. See the header of `akkar/jobs/redis.lua`.
+  local delay = delayed and options.delay or 0
 
   -- CLAIMING AND PUSHING ARE ONE STEP where the store can do it.
   --
@@ -174,7 +177,7 @@ function Queue:push(kind, payload, options)
   -- to make a retry safe was the thing that made it useless.
   if options.id and supports(self.store, "claim_and_enqueue") then
     return self.store:claim_and_enqueue(self.key, options.id,
-                                        options.id_ttl or 3600, encoded, run_at)
+                                        options.id_ttl or 3600, encoded, delay)
   end
 
   -- The two-step path, kept for a store that implements `claim` and not
@@ -187,7 +190,7 @@ function Queue:push(kind, payload, options)
   end
 
   if delayed then
-    return self.store:schedule(self.key, encoded, run_at)
+    return self.store:schedule(self.key, encoded, delay)
   end
 
   return self.store:enqueue(self.key, encoded)
@@ -202,12 +205,12 @@ end
 function Queue:pop(timeout)
   -- Anything whose time has come joins the queue before we look at it.
   if supports(self.store, "promote") then
-    self.store:promote(self.key, time.now())
+    self.store:promote(self.key)
   end
 
   local encoded
   if supports(self.store, "claim_pop") then
-    encoded = self.store:claim_pop(self.key, timeout or 5, time.now())
+    encoded = self.store:claim_pop(self.key, timeout or 5)
   else
     encoded = self.store:dequeue(self.key, timeout or 5)
   end
@@ -273,7 +276,7 @@ function Queue:fail(job, err)
 
   if job.attempts <= self.retries then
     local delay = delay_for(job.attempts, self.backoff)
-    self.store:schedule(self.key, cjson.encode(job), time.now() + delay)
+    self.store:schedule(self.key, cjson.encode(job), delay)
     return "retried", delay
   end
 
@@ -322,11 +325,17 @@ end
 --- Returns how many were returned to the queue.
 function Queue:reap(older_than)
   if not supports(self.store, "reap") then return 0 end
-  local now = time.now()
-  -- `now` as well as the cutoff: a store that keeps claim times separately
-  -- from the jobs themselves needs to be able to stamp an entry it finds
-  -- unstamped, rather than assume nobody holds it.
-  return self.store:reap(self.key, now - (older_than or 300), now)
+  -- A WINDOW, NOT A CUTOFF, and the change is the whole clock fix.
+  --
+  -- This used to compute `now - older_than` here and send the answer. That
+  -- made every reap an assertion about time made by ONE worker, so a machine
+  -- whose clock had been stepped forward reclaimed jobs that other workers
+  -- were actively running -- at-least-once becoming at-least-twice because of
+  -- an NTP correction. Stepped backwards, nothing was ever reclaimed at all.
+  --
+  -- Sending the window instead lets the store answer with the clock every
+  -- worker shares. `spec/clock_spec.lua` holds both directions.
+  return self.store:reap(self.key, older_than or 300)
 end
 
 --- How many jobs are currently checked out by a worker.

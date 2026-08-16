@@ -153,23 +153,48 @@ end)
 
 describe("scheduling", function()
   it("holds a delayed job until it is due", function()
+    -- MOVE THE CLOCK, do not hand the store a time.
+    --
+    -- `promote` used to take a "now" from the caller, and that is the thing
+    -- that let a stepped clock on one worker reclaim jobs from another. The
+    -- store owns its clock now, so a test that wants a minute to pass moves
+    -- the clock -- which is what `akkar/time.lua` was built for, and what
+    -- keeps this from sleeping sixty-one seconds.
+    local time = require "akkar.time"
+    local at = 1755000000
+    local restore = time.set {
+      now      = function() return at end,
+      monotime = function() return at end,
+      sleep    = function() end,
+    }
+    finally(function() restore() end)
+
     local q = queue()
     q:push("later", {}, { delay = 60 })
     assert.equal(0, q:depth())
     assert.is_nil(q:pop(0))
 
-    -- Reach into the store rather than sleeping a minute: what is being
-    -- tested is the due check, not the clock.
-    q.store:promote(q.key, os.time() + 61)
+    q.store:promote(q.key)
+    assert.equal(0, q:depth(), "a job due in a minute was promoted immediately")
+
+    at = at + 61
+    q.store:promote(q.key)
     assert.equal(1, q:depth())
     assert.equal("later", q:pop(0).kind)
   end)
 
   it("runs what came due in the order it was meant to", function()
     local q = queue()
-    q:push("second", {}, { delay = 20 })
-    q:push("first", {}, { delay = 10 })
-    q.store:promote(q.key, os.time() + 30)
+    -- SCHEDULED IN THE PAST rather than promoted with a fake "now".
+    --
+    -- This used to call `promote(key, os.time() + 30)` -- handing the store
+    -- a time from the caller, which is exactly what let an NTP step reclaim
+    -- live jobs and is why the contract now takes durations. A negative
+    -- delay puts the entries behind the store's own clock, so the ordering
+    -- is tested without anybody lying about the time.
+    q.store:schedule(q.key, require("cjson").encode { kind = "second", payload = {} }, -20)
+    q.store:schedule(q.key, require("cjson").encode { kind = "first", payload = {} }, -30)
+    q.store:promote(q.key)
 
     assert.equal("first", q:pop(0).kind)
     assert.equal("second", q:pop(0).kind)

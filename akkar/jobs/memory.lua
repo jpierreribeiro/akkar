@@ -47,7 +47,14 @@ end
 --- Holds a job until `run_at`.  A list scanned on promote, not a heap: a
 --- process-local queue with enough scheduled jobs for that to matter has
 --- outgrown a process-local queue.
-function Store:schedule(key, encoded, run_at)
+--- Schedules a job `delay` seconds from now, by this process's clock.
+---
+--- The Redis store reads the SERVER's clock so that a fleet agrees; here
+--- there is only one process, so its own clock IS the shared one. A step of
+--- this process's clock moves everything in it together, which is the
+--- consistent -- if not always convenient -- answer.
+function Store:schedule(key, encoded, delay)
+  local run_at = time.now() + (delay or 0)
   local pending = self.scheduled[key]
   if not pending then pending = {} self.scheduled[key] = pending end
   pending[#pending + 1] = { run_at = run_at, encoded = encoded }
@@ -57,7 +64,8 @@ end
 --- Moves everything due into the queue proper, oldest first, and returns how
 --- many moved.  Ordering by `run_at` matters: two jobs that came due while
 --- nobody was looking should run in the order they were meant to.
-function Store:promote(key, now)
+function Store:promote(key)
+  local now = time.now()
   local pending = self.scheduled[key]
   if not pending or #pending == 0 then return 0 end
 
@@ -115,7 +123,8 @@ end
 function Store:processing_key(key) return key .. ":processing" end
 
 --- Moves the oldest job into the processing set and returns it.
-function Store:claim_pop(key, _timeout, now)
+function Store:claim_pop(key, _timeout)
+  local now = time.now()
   local encoded = self:dequeue(key)
   if not encoded then return nil end
 
@@ -142,7 +151,8 @@ end
 ---
 --- Oldest first, so a job abandoned twice does not overtake one abandoned
 --- once -- the same ordering promise `promote` makes.
-function Store:reap(key, cutoff)
+function Store:reap(key, older_than)
+  local cutoff = time.now() - (older_than or 300)
   local held = self.processing[key]
   if not held or #held == 0 then return 0 end
 

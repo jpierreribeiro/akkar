@@ -44,7 +44,18 @@ local function manual(at)
   }
 end
 
-describe("a wall clock that jumps", function()
+-- THE IN-MEMORY STORE FOLLOWS ITS PROCESS'S CLOCK, and that is the right
+-- answer for it rather than an outstanding defect.
+--
+-- One process has one clock. If it is stepped, everything inside it stepped
+-- together and there is no second opinion to be wrong about. These tests
+-- therefore pin what that store DOES, so that a future change to it is a
+-- decision rather than an accident.
+--
+-- The dangerous version of this was the Redis store, where several workers
+-- each had an opinion and one wrong clock reclaimed everybody's work. That is
+-- fixed, and the fleet tests at the bottom of this file are the proof.
+describe("a wall clock that jumps, over the in-memory store", function()
   local clock, restore
 
   before_each(function()
@@ -75,16 +86,15 @@ describe("a wall clock that jumps", function()
       "scheduling is not wall-clock after all")
   end)
 
-  it("REAPS A LIVE WORKER'S JOB when the clock jumps forward", function()
-    -- The dangerous direction, and the one worth having a test for.
+  it("reclaims its own in-flight claim when its clock jumps forward", function()
+    -- In one process this is consistent: the claim and the cutoff are read
+    -- from the same clock, so a step moves both and the store simply believes
+    -- more time passed than did. The job comes back and runs again, which
+    -- at-least-once permits.
     --
-    -- `reap(older_than)` reclaims anything claimed before `now - older_than`.
-    -- A claim is stamped with the wall clock. So a forward step of more than
-    -- `older_than` makes EVERY claim look stale at once -- including the one
-    -- a worker is holding and actively running.
-    --
-    -- At-least-once becomes at-least-twice for every job in flight, caused by
-    -- a clock correction and nothing else.
+    -- The same shape across SEVERAL processes was the real defect: one
+    -- worker's correction made every other worker's live claim look stale.
+    -- That is what the Redis store no longer does.
     local queue = memory.new "clockspec_reap"
     queue:push("charge", { amount = 10 })
 
@@ -102,16 +112,21 @@ describe("a wall clock that jumps", function()
 
     local reclaimed = queue:reap(300)
     assert.equal(1, reclaimed,
-      "the claim survived a forward clock step, which would mean reaping is " ..
-      "not wall-clock after all")
+      "the claim survived a forward clock step; the in-memory store is " ..
+      "expected to follow its own clock")
     assert.equal(1, queue:depth(),
       "the job the live worker is running is back in the queue")
   end)
 
-  it("never reaps anything after the clock jumps backwards", function()
-    -- The other direction is quieter and also wrong: claims stamped with the
-    -- old, larger wall time look like they were taken in the future, so the
-    -- cutoff never reaches them and an abandoned job is never recovered.
+  it("stops reclaiming after its clock jumps backwards", function()
+    -- The quieter direction. Claims stamped with the old, larger wall time
+    -- look as though they were taken in the future, so the cutoff never
+    -- reaches them and an abandoned job waits until wall time catches up.
+    --
+    -- Pinned rather than fixed: for a single process this is the honest
+    -- consequence of following one clock, and the alternative -- a second,
+    -- monotonic stamp -- would buy nothing here and cannot work across
+    -- processes, which is where it would have mattered.
     local queue = memory.new "clockspec_back_reap"
     queue:push("charge", { amount = 10 })
     queue:pop(0)                                   -- claimed, never acked
@@ -119,7 +134,8 @@ describe("a wall clock that jumps", function()
     clock.step(-3600)
 
     assert.equal(0, queue:reap(300),
-      "an abandoned job was recovered despite the clock going back")
+      "an abandoned job was recovered despite the clock going back, which " ..
+      "the in-memory store cannot do")
     assert.equal(1, queue:in_flight(),
       "the job is stuck in the processing set until wall time catches up")
   end)
@@ -146,5 +162,114 @@ describe("a wall clock that jumps", function()
     assert.are_not.equal(math.floor(before), math.floor(wall_before),
       "monotime and now appear to be the same clock, which would make every " ..
       "deadline in akkar vulnerable to an NTP step")
+  end)
+end)
+
+describe("a fleet where one worker's clock is wrong", function()
+  -- THE FIX, AND THE ONLY TEST THAT CAN SHOW IT.
+  --
+  -- The tests above use the in-memory store, which is one process: if that
+  -- process's clock jumps, everything in it jumped together, and there is no
+  -- second opinion to disagree with. A fleet is different, and a fleet is
+  -- where the damage was: one worker's NTP correction reclaiming jobs that
+  -- other workers were running.
+  --
+  -- The store now reads the Redis server's clock inside its scripts, so the
+  -- caller's clock is not consulted at all. This test steps the CALLER's
+  -- clock by an hour and requires nothing to happen.
+  local jobs_redis = require "akkar.jobs.redis"
+  local redis      = require "akkar.redis"
+  local time       = require "akkar.time"
+
+  local function redis_reachable()
+    local ok, conn = pcall(redis.connect { pool_size = 0 })
+    if not ok then return false end
+    local alive = pcall(function() return conn:ping() end)
+    conn:close()
+    return alive
+  end
+
+  if not redis_reachable() then
+    pending "Redis is not reachable; skipping"
+    return
+  end
+
+  local queue, restore, at
+
+  before_each(function()
+    local cache = redis.connect { pool_size = 0 }()
+    for _, suffix in ipairs { "", ":processing", ":processing:at", ":scheduled", ":dead" } do
+      cache:del("akkar:queue:clockfleet" .. suffix)
+    end
+    queue = jobs_redis.new(cache, "clockfleet")
+
+    -- A caller whose wall clock is whatever we say it is.
+    at = 1755000000
+    restore = time.set {
+      now      = function() return at end,
+      monotime = function() return at end,
+      sleep    = function() end,
+    }
+  end)
+
+  after_each(function() if restore then restore() end end)
+
+  it("does not reap a live claim when the CALLER's clock jumps forward", function()
+    queue:push("charge", { amount = 10 })
+    local job = queue:pop(0)
+    assert.is_table(job)
+    assert.equal(1, queue:in_flight())
+
+    -- NTP corrects this worker forward by an hour. Against the old code every
+    -- claim in the fleet looked an hour stale at once, and this reaped a job
+    -- another worker was running.
+    at = at + 3600
+
+    assert.equal(0, queue:reap(300),
+      "a live claim was reclaimed because THIS worker's clock moved -- the " ..
+      "store is reading the caller's clock again")
+    assert.equal(1, queue:in_flight())
+    assert.equal(0, queue:depth())
+  end)
+
+  it("still reaps a genuinely abandoned claim", function()
+    -- The other half, and the one that makes the first meaningful: a fix that
+    -- simply stopped reaping would pass the test above and lose every
+    -- abandoned job for ever.
+    queue:push("charge", { amount = 10 })
+    queue:pop(0)                                   -- claimed, never acked
+
+    assert.equal(1, queue:reap(-1),
+      "an abandoned claim was not recovered; reaping is broken rather than " ..
+      "merely clock-independent")
+    assert.equal(1, queue:depth())
+    assert.equal(0, queue:in_flight())
+  end)
+
+  it("does not freeze reaping when the caller's clock jumps backwards", function()
+    queue:push("charge", { amount = 10 })
+    queue:pop(0)
+
+    at = at - 3600                                 -- NTP steps back an hour
+
+    assert.equal(1, queue:reap(-1),
+      "nothing was reclaimed after the caller's clock went back, which is " ..
+      "the old failure in the other direction")
+  end)
+
+  it("schedules by the server's clock, not the caller's", function()
+    -- A worker an hour behind used to schedule everything an hour late.
+    at = at - 3600
+    queue:push("later", {}, { delay = 1 })
+    assert.equal(1, tonumber(queue.store:scheduled_depth(queue.key)))
+
+    -- Not due yet by the SERVER's clock, whatever this worker believes.
+    assert.equal(0, queue.store:promote(queue.key))
+
+    queue.store:schedule(queue.key,
+      require("cjson").encode { kind = "overdue", payload = {} }, -1)
+    assert.equal(1, queue.store:promote(queue.key),
+      "an entry scheduled into the past was not promoted, so scheduling is " ..
+      "still following the caller")
   end)
 end)

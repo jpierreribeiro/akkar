@@ -15,6 +15,53 @@ the worker.
 
 local jobs = require "akkar.jobs"
 
+-- THE SERVER OWNS THE CLOCK, and until now the caller did.
+--
+-- Every time in this store -- when a delayed job is due, when a claim was
+-- taken, the cutoff a reap compares against -- used to be an absolute
+-- timestamp computed by the WORKER from its own wall clock and sent along.
+-- That is wrong in two ways, and one of them is dangerous.
+--
+-- The dangerous one: a wall clock can be STEPPED. NTP correcting a machine, a
+-- VM resumed from a snapshot, a container on a freshly corrected host. Step
+-- one worker's clock forward by more than the reap window and every claim in
+-- the entire fleet looks stale at once -- including the ones other workers
+-- are actively running. `spec/clock_spec.lua` demonstrates it: at-least-once
+-- becomes at-least-twice for every job in flight, caused by a clock
+-- correction and nothing else. Step it backwards and the opposite happens:
+-- claims look as though they were taken in the future, the cutoff never
+-- reaches them, and an abandoned job is never recovered at all.
+--
+-- The quieter one: workers disagree. Two machines a few seconds apart write
+-- claim times a few seconds apart, so "older than five minutes" means
+-- something slightly different depending on who is asking.
+--
+-- Both vanish if the timestamps come from one clock, and there is exactly one
+-- clock every worker already shares: the Redis server's. `redis.call('TIME')`
+-- inside a script is that clock, and `akkar/limit.lua` reached the same
+-- conclusion for the same reason -- its comment says timestamps come from
+-- Redis "rather than from the caller".
+--
+-- So the contract changed shape: this store takes DURATIONS -- a delay, a
+-- staleness window -- and computes absolute times itself. Monotonic time was
+-- never an option here, because a monotonic reading is meaningless to another
+-- process.
+local SERVER_NOW = "local t = redis.call('TIME') local now = tonumber(t[1]) "
+
+-- Sent as `EVAL` rather than cached as `EVALSHA`. `akkar.limit` caches,
+-- because it runs on every request and a kilobyte on the wire against a
+-- decision measured in microseconds is a bad trade. A job push is not that:
+-- it happens once per job, and the second round trip a cache miss costs is
+-- invisible beside the work the job represents. Correctness first, and no
+-- third copy of a SHA cache to keep in step with the other two.
+local function eval(cache, script, keys, args)
+  local argv = { #keys }
+  for _, k in ipairs(keys) do argv[#argv + 1] = k end
+  for _, a in ipairs(args) do argv[#argv + 1] = a end
+  return cache:command("EVAL", script, table.unpack(argv))
+end
+
+
 local Store = {}
 Store.__index = Store
 
@@ -59,8 +106,14 @@ end
 
 function Store:scheduled_key(key) return key .. ":scheduled" end
 
-function Store:schedule(key, encoded, run_at)
-  return self.cache:command("ZADD", self:scheduled_key(key), run_at, encoded)
+local SCHEDULE_SCRIPT = SERVER_NOW .. [[
+return redis.call('ZADD', KEYS[1], now + tonumber(ARGV[2]), ARGV[1])
+]]
+
+--- Schedules a job `delay` seconds from now, where now is the SERVER's now.
+function Store:schedule(key, encoded, delay)
+  return eval(self.cache, SCHEDULE_SCRIPT, { self:scheduled_key(key) },
+              { encoded, delay or 0 })
 end
 
 -- Read, remove and push, in one script.
@@ -74,10 +127,9 @@ end
 --
 -- A script removes the window rather than narrowing it, and costs one round
 -- trip instead of 2N+1.
-local PROMOTE_SCRIPT = [[
+local PROMOTE_SCRIPT = SERVER_NOW .. [[
 local zkey  = KEYS[1]
 local lkey  = KEYS[2]
-local now   = tonumber(ARGV[1])
 
 local due = redis.call('ZRANGEBYSCORE', zkey, '-inf', now)
 local moved = 0
@@ -97,13 +149,14 @@ return moved
 -- deduplication exists to make safe is then answered `false, "duplicate"`
 -- for an hour, about a job that was never queued. Worse than a double push,
 -- because a double push is visible and this is not.
-local CLAIM_AND_PUSH_SCRIPT = [[
+local CLAIM_AND_PUSH_SCRIPT = SERVER_NOW .. [[
 local claim_key = KEYS[1]
 local lkey      = KEYS[2]
 local zkey      = KEYS[3]
 local encoded   = ARGV[1]
 local ttl       = tonumber(ARGV[2])
-local run_at    = tonumber(ARGV[3])
+local delay     = tonumber(ARGV[3])
+local run_at    = delay > 0 and (now + delay) or 0
 
 if not redis.call('SET', claim_key, '1', 'NX', 'EX', ttl) then
   return -1
@@ -115,18 +168,6 @@ end
 return redis.call('LPUSH', lkey, encoded)
 ]]
 
--- Sent as `EVAL` rather than cached as `EVALSHA`. `akkar.limit` caches,
--- because it runs on every request and a kilobyte on the wire against a
--- decision measured in microseconds is a bad trade. A job push is not that:
--- it happens once per job, and the second round trip a cache miss costs is
--- invisible beside the work the job represents. Correctness first, and no
--- third copy of a SHA cache to keep in step with the other two.
-local function eval(cache, script, keys, args)
-  local argv = { #keys }
-  for _, k in ipairs(keys) do argv[#argv + 1] = k end
-  for _, a in ipairs(args) do argv[#argv + 1] = a end
-  return cache:command("EVAL", script, table.unpack(argv))
-end
 
 --- Moves everything due into the list, oldest due first, atomically.
 ---
@@ -134,19 +175,20 @@ end
 --- arbiter, and only the one whose remove returns 1 pushes it. That race
 --- costs a wasted read and never a duplicate job -- and now it cannot lose
 --- one either.
-function Store:promote(key, now)
+--- Moves everything due into the list, using the SERVER's clock.
+function Store:promote(key)
   local moved = eval(self.cache, PROMOTE_SCRIPT,
-                     { self:scheduled_key(key), key }, { now })
+                     { self:scheduled_key(key), key }, {})
   return tonumber(moved) or 0
 end
 
 --- Claims the id and enqueues the job in one round trip.
 ---
 --- Returns the depth after the push, or `false, "duplicate"`.
-function Store:claim_and_enqueue(key, id, ttl, encoded, run_at)
+function Store:claim_and_enqueue(key, id, ttl, encoded, delay)
   local reply = eval(self.cache, CLAIM_AND_PUSH_SCRIPT,
                      { key .. ":claim:" .. id, key, self:scheduled_key(key) },
-                     { encoded, ttl or 3600, run_at or 0 })
+                     { encoded, ttl or 3600, delay or 0 })
   local n = tonumber(reply)
   if n == -1 then return false, "duplicate" end
   return n
@@ -189,12 +231,12 @@ return redis.call('ZREM', KEYS[2], ARGV[1])
 -- between the `BLMOVE` and the `ZADD` below, and leaving them would make a
 -- job invisible for ever -- the precise failure this whole mechanism exists
 -- to remove.
-local REAP_SCRIPT = [[
+local REAP_SCRIPT = SERVER_NOW .. [[
 local processing = KEYS[1]
 local claimed    = KEYS[2]
 local queue      = KEYS[3]
-local cutoff     = tonumber(ARGV[1])
-local now        = tonumber(ARGV[2]) or cutoff
+local older_than = tonumber(ARGV[1])
+local cutoff     = now - older_than
 
 local moved = 0
 local stale = redis.call('ZRANGEBYSCORE', claimed, '-inf', cutoff)
@@ -234,15 +276,24 @@ return moved
 -- gap is what made `reap` capable of stealing a live worker's job. The
 -- comment at the top of this file claims these pairs are "kept in step by
 -- scripts, never by two round trips"; for this one pair it was not true.
-local CLAIM_POP_SCRIPT = [[
+local CLAIM_POP_SCRIPT = SERVER_NOW .. [[
 local job = redis.call('RPOPLPUSH', KEYS[1], KEYS[2])
 if not job then return false end
-redis.call('ZADD', KEYS[3], tonumber(ARGV[1]), job)
+redis.call('ZADD', KEYS[3], now, job)
 return job
 ]]
 
+-- Stamping for the BLOCKING claim, which cannot be one script: Redis refuses
+-- blocking commands inside a script, so `BLMOVE` happens outside and the
+-- stamp follows. The stamp still reads the SERVER's clock, which is the whole
+-- point -- a worker whose own clock has been stepped must not write a claim
+-- time nobody else agrees with.
+local STAMP_SCRIPT = SERVER_NOW .. [[
+return redis.call('ZADD', KEYS[1], now, ARGV[1])
+]]
+
 --- Moves one job from the queue to the processing list and returns it.
-function Store:claim_pop(key, timeout, now)
+function Store:claim_pop(key, timeout)
   local processing = self:processing_key(key)
   local encoded
 
@@ -252,8 +303,7 @@ function Store:claim_pop(key, timeout, now)
     -- inside a script -- which is why `reap` had to learn to adopt an
     -- unscored entry rather than reclaim it.
     encoded = eval(self.cache, CLAIM_POP_SCRIPT,
-                   { key, processing, self:claimed_key(key) },
-                   { tostring(now or 0) })
+                   { key, processing, self:claimed_key(key) }, {})
     if type(encoded) ~= "string" then return nil end
     return encoded
   else
@@ -272,7 +322,7 @@ function Store:claim_pop(key, timeout, now)
 
   -- Timestamped after the move, and `reap` treats an entry with no timestamp
   -- as stale precisely because a worker can die in between.
-  self.cache:command("ZADD", self:claimed_key(key), now or 0, encoded)
+  eval(self.cache, STAMP_SCRIPT, { self:claimed_key(key) }, { encoded })
   return encoded
 end
 
@@ -283,10 +333,12 @@ function Store:ack(key, encoded)
   return tonumber(removed) == 1
 end
 
-function Store:reap(key, cutoff, now)
+--- Reclaims anything claimed more than `older_than` seconds ago, by the
+--- SERVER's clock rather than by this worker's.
+function Store:reap(key, older_than)
   local moved = eval(self.cache, REAP_SCRIPT,
                      { self:processing_key(key), self:claimed_key(key), key },
-                     { cutoff, now or cutoff })
+                     { older_than })
   return tonumber(moved) or 0
 end
 
