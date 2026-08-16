@@ -147,11 +147,65 @@ local function run(path, seconds)
   return ok, output, how, code
 end
 
+--- Is anything already listening on the port the guide uses?
+---
+--- THE GUIDE BINDS ONE PORT ACROSS EVERY PAGE, on purpose: a reader following
+--- twelve pages should not have to track a different number on each. The cost
+--- is that every server example in this suite wants the same port, and if
+--- anything else holds it they ALL fail at once -- with akkar's bind error,
+--- which now names the port but is still an error about the framework
+--- appearing in a test about documentation.
+---
+--- That reads as "the guide is broken" when the truth is "you left a server
+--- running", so the check happens once, first, and says which it is. Found
+--- while two agents writing different pages collided on 3000; it would
+--- otherwise have been found by whoever ran the suite with their own dev
+--- server up, and they would have had a much worse time working it out.
+local GUIDE_PORT = 3000
+
+local function port_is_free()
+  -- `ss` rather than binding a socket ourselves: binding and closing races
+  -- with whatever we are trying to detect, and a false "free" is worse than
+  -- no check at all.
+  local pipe = io.popen(("ss -ltn 2>/dev/null | grep -c ':%d '"):format(GUIDE_PORT))
+  if not pipe then return true end          -- no `ss`: assume free, run anyway
+  local count = tonumber(pipe:read "a")
+  pipe:close()
+  return (count or 0) == 0
+end
+
 local files = doc_files()
 
 describe("the documentation", function()
   if #files == 0 then
     pending "docs/guide does not exist yet"
+    return
+  end
+
+  if not port_is_free() then
+    local message =
+      ("something is already listening on 127.0.0.1:%d, which every server " ..
+       "example in the guide binds. Stop it and run again -- these examples " ..
+       "were NOT run"):format(GUIDE_PORT)
+
+    -- SKIPPED ON A LAPTOP, FAILED IN CI, and the split is deliberate.
+    --
+    -- A developer with their own server on 3000 should get a skip and a clear
+    -- sentence, not sixteen failures about a framework. But a skip in CI is
+    -- the failure this project has already paid for once: `spec/db_spec.lua`
+    -- had a guard that never checked, so the database tests silently did not
+    -- run and the suite was green for it. CI found that on its first run.
+    --
+    -- CI has no business having anything on port 3000. If it does, the guide
+    -- went untested and the build must say so rather than pass quietly.
+    if os.getenv "CI" then
+      it("can bind the port the guide uses", function()
+        assert.is_true(false, message)
+      end)
+      return
+    end
+
+    pending(message)
     return
   end
 
