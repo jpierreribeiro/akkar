@@ -227,6 +227,65 @@ end
 --- while two agents writing different pages collided on 3000; it would
 --- otherwise have been found by whoever ran the suite with their own dev
 --- server up, and they would have had a much worse time working it out.
+-- A BLOCK THAT NEEDS A DATABASE MUST NOT FAIL WHERE THERE IS NONE.
+--
+-- Every other spec in this suite skips when Postgres is unreachable, and this
+-- one did not -- so the moment `docs/sql/` arrived, CI's `unit` job (which
+-- deliberately runs with no services) went red with twenty-one failures that
+-- all said "Connection refused". The pages were right; the runner had no
+-- notion that an example could need anything.
+--
+-- Detected rather than declared, for the same reason the server blocks are
+-- detected: a marker required on the common case is a marker that gets
+-- forgotten, and there are hundreds of blocks. A fence marker still works as
+-- an override for anything detection misses.
+--
+-- The check CONNECTS. This project has shipped a skip guard that never
+-- checked anything -- `spec/db_spec.lua` assumed a factory call meant a live
+-- server, and every database test silently did not run while the suite stayed
+-- green. `cqueues.socket.connect` builds lazily and succeeds with nothing
+-- listening, so the probe has to speak.
+local cqueues = require "cqueues"
+local socket  = require "cqueues.socket"
+
+local function reachable(host, port)
+  local ok = false
+  local cq = cqueues.new()
+  cq:wrap(function()
+    local conn = socket.connect(host, port)
+    if not conn then return end
+    conn:setmode("bn", "bn")
+    conn:onerror(function(_, _, why) return why end)
+    -- Writing a byte is what distinguishes "the port is open" from "connect
+    -- returned an object". A closed port fails here, not above.
+    ok = conn:write("\n") ~= nil
+    conn:close()
+  end)
+  cq:loop(2)
+  return ok
+end
+
+local HAVE_POSTGRES = reachable("127.0.0.1", 55432)
+local HAVE_REDIS    = reachable("127.0.0.1", 6379)
+
+--- Which service, if any, a block cannot run without.
+local function needs(code, marker)
+  if marker == "needs-db" then return "postgres" end
+  if marker == "needs-redis" then return "redis" end
+  if code:find("55432", 1, true)
+     or code:find("akkar.db", 1, true)
+     or code:find("akkar.migrate", 1, true)
+     or code:find('require "akkar.pq"', 1, true) then
+    return "postgres"
+  end
+  if code:find("6379", 1, true)
+     or code:find("akkar.redis", 1, true)
+     or code:find("jobs.redis", 1, true) then
+    return "redis"
+  end
+  return nil
+end
+
 local GUIDE_PORT = 3000
 
 local function port_is_free()
@@ -344,6 +403,13 @@ describe("the documentation", function()
             "field:\n  " .. tostring(why))
         end)
 
+      elseif block.marker == "server" and
+             ((needs(block.code, block.marker) == "postgres" and not HAVE_POSTGRES)
+              or (needs(block.code, block.marker) == "redis" and not HAVE_REDIS)) then
+        it("skips server " .. where .. ", which needs a service", function()
+          assert.is_truthy(block.code)
+        end)
+
       elseif block.marker == "server" then
         it("starts and keeps running: " .. where, function()
           -- A server example is correct precisely when it does NOT exit, so
@@ -364,7 +430,16 @@ describe("the documentation", function()
         end)
 
       else
-        it("runs " .. where, function()
+        local wants = needs(block.code, block.marker)
+        local missing = (wants == "postgres" and not HAVE_POSTGRES)
+                     or (wants == "redis" and not HAVE_REDIS)
+
+        it((missing and ("skips " .. where .. ", which needs " .. wants)
+                     or ("runs " .. where)), function()
+          -- Not a silent skip: the test name says which service was missing,
+          -- so a run with fewer examples than expected explains itself in the
+          -- output rather than in somebody's head.
+          if missing then return end
           local temp = write_temp(block.code, total)
           local ok, output = run(temp, 10)
           os.remove(temp)
