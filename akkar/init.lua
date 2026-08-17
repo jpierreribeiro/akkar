@@ -1680,6 +1680,22 @@ local function handle(app, input)
 
   local ok, res = pcall(function()
     local winner, value = with_deadline(input.timeout, function()
+      -- The budget, as a number every capability inside this execution can
+      -- read. `with_deadline` above still enforces it by arbitration; this
+      -- makes it VISIBLE, which is what stops `req.http` from calling the
+      -- service below with a fresh ten seconds while this request has
+      -- milliseconds left.
+      --
+      -- Inside the wrapped function, not outside: `with_deadline` runs the
+      -- handler in its own coroutine, and the budget is keyed by the coroutine
+      -- that will actually do the work.
+      --
+      -- No `finish()` on the error path, and it is not an oversight. The key is
+      -- the coroutine, the coroutine is per execution, and the table is weak --
+      -- so a raised handler leaves an entry that nothing can ever look up and
+      -- that the collector drops. Wrapping this in a pcall to call `finish()`
+      -- would cost a closure per request, and the ceiling has refused smaller.
+      execution.begin(input.timeout)
       return normalize(chain(app, req))
     end)
     -- The request id and the traceparent are NOT written onto the response.

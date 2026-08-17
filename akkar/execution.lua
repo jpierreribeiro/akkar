@@ -98,6 +98,89 @@ function M.id()
   return ID_PREFIX .. string.format("%06x", id_counter & 0xffffff)
 end
 
+-- ============================================================ the budget
+-- The deadline as a NUMBER the whole execution can read, rather than as a
+-- scheduler that watches it.
+--
+-- A wall-clock budget is one instant: `now + seconds`. Everything downstream
+-- needs the same one, and the reason is a defect that is in the tree today --
+-- `akkar/http.lua` opens every outbound call with its own `timeout = 10`, so a
+-- request with 200 ms left calls the service below it with ten seconds. That
+-- is the cascading-failure pattern the SRE book names, built in by default,
+-- and no amount of care at the call site fixes it because the call site does
+-- not know the budget.
+--
+-- KEYED BY THE RUNNING COROUTINE, WEAKLY, and that is not a new idea here:
+-- `akkar/http.lua` already keys its connect timeout the same way, and its
+-- comment gives the reasoning -- "the calling coroutine is an exact key. Weak,
+-- because an abandoned coroutine must not keep an entry alive."
+--
+-- What this buys over the alternatives, all of which were considered:
+--
+--   * a field on the capability     -- `http.connect` returns ONE shared client
+--                                      for the whole app, so a deadline on it
+--                                      would be one request's budget applied to
+--                                      every other request. That is the exact
+--                                      aliasing defect this project has fixed
+--                                      three times already.
+--   * an argument threaded through -- every adapter signature changes, and a
+--                                      third-party adapter that does not know
+--                                      about it silently loses its deadline.
+--   * a wrapper object per request  -- an allocation per request, and the
+--                                      ceiling has refused smaller ones.
+--
+-- This costs one hash insert per execution that HAS a budget, and nothing at
+-- all for one that does not.
+local deadlines = setmetatable({}, { __mode = "k" })
+
+--- Starts a budget for the running coroutine. `seconds` nil or <= 0 means no
+--- budget, and clears any inherited one rather than leaving it to be found.
+function M.begin(seconds)
+  local co = coroutine.running()
+  if not co then return end
+  if seconds and seconds > 0 then
+    deadlines[co] = time.monotime() + seconds
+  else
+    deadlines[co] = nil
+  end
+end
+
+--- Ends the budget for the running coroutine.
+---
+--- The weak table would drop it eventually, but "eventually" is the pace of
+--- the collector, and this project has already tied one operating-system limit
+--- to that pace by accident. Cleared explicitly.
+function M.finish()
+  local co = coroutine.running()
+  if co then deadlines[co] = nil end
+end
+
+--- The instant this execution must be done by, or nil when it has no budget.
+function M.deadline()
+  local co = coroutine.running()
+  return co and deadlines[co] or nil
+end
+
+--- Seconds left, or nil when there is no budget. Negative when it has passed,
+--- which a caller must treat as "already too late" rather than as "no limit" --
+--- passing a negative number to an I/O call is how you get a hang.
+function M.remaining()
+  local at = M.deadline()
+  if not at then return nil end
+  return at - time.monotime()
+end
+
+--- `want` seconds, or whatever the execution has left, whichever is smaller.
+---
+--- The one function a capability should call. Returns nil only when there is
+--- no budget anywhere, which means "your own default applies".
+function M.bounded(want)
+  local left = M.remaining()
+  if not left then return want end
+  if not want then return left end
+  return (left < want) and left or want
+end
+
 -- ================================================================== deadline
 -- Wall-clock budget for one execution.
 --

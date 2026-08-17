@@ -128,6 +128,9 @@ local http_client  = require "http.client"
 local cqueues      = require "cqueues"
 local Pool         = require "akkar.pool"
 local time         = require "akkar.time"
+-- For the execution's remaining budget. `akkar.execution` requires only
+-- cqueues and akkar.time, so this adds no cycle.
+local execution    = require "akkar.execution"
 
 local M = {}
 
@@ -419,7 +422,19 @@ function Client:attempt(method, url, options)
   -- The key comes from the parsed uri: `req.host`, `req.port` and `req.tls`
   -- are what lua-http will actually dial, so two urls that reach the same
   -- origin share a pool and two that do not cannot.
-  local timeout = options.timeout or self.timeout
+  -- BOUNDED BY THE EXECUTION, not only by this client's own default.
+  --
+  -- `DEFAULTS.timeout` is ten seconds. Without this line a request that has
+  -- 200 ms of its budget left calls the service below it with ten -- so the
+  -- caller gives up, the connection is dropped, and the callee keeps working
+  -- on an answer nobody will read. That is the cascading-failure pattern the
+  -- Google SRE book names, and gRPC's answer to it is exactly this: the
+  -- remaining budget travels with the call.
+  --
+  -- `options.timeout` still wins as a CEILING, not as a floor: asking for
+  -- thirty seconds inside a five-second request gets five. A caller cannot
+  -- widen a budget it did not set.
+  local timeout = execution.bounded(options.timeout or self.timeout)
   local scheme = req.tls and "https" or "http"
   local key = ("%s://%s:%d"):format(scheme, req.host, req.port)
   local limit = options.max_body or self.max_body
