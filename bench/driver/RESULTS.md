@@ -244,6 +244,35 @@ is the difference between a slow page and a timeout.
 
 ### 5.4 The finding that argues AGAINST flipping the default
 
+> ## CORRECTED — the finding below did not survive being investigated
+>
+> **`akkar.pq` is not less consistent than pgmoon.** Measured at the exact
+> configuration this section used — `/users/42`, sixteen connections, two
+> processes — pq comes back at **1.8% spread with zero anomalous windows**,
+> against the 21.4% and two reported here.
+>
+> The one raggedness that does reproduce belongs to the harness. Six
+> connections over two processes makes `SO_REUSEPORT` split them three-and-three
+> or five-and-one, re-drawn every window, and it hits **pgmoon harder than pq**
+> — 37.3% spread against 30.5%. One process cannot be split and both are smooth.
+>
+> A Postgres checkpoint was the first hypothesis and it is refuted: forced, it
+> costs pgmoon −0.0% and pq +0.1%.
+>
+> The likeliest source of the original number is this page's own method:
+> alternating drivers per repetition restarts both servers every time, so all
+> five of its windows measured a cold connection pool behind one three-second
+> warm-up. Alternating is right for comparing two variants and wrong for
+> measuring how consistent one is.
+>
+> `bench/driver/ANOMALY.md` has the four experiments, including the two that
+> refuted a hypothesis. The section is kept as written because it is what was
+> believed, and because the correction is the point.
+>
+> **The default still does not move**, for a reason that has nothing to do with
+> this section: `akkar.pq_native` is a separate rock, so a default of `pq`
+> would fail at the first query for anyone who installed only `akkar`.
+
 **The C driver is faster and less consistent, and consistency is not a
 secondary property.**
 

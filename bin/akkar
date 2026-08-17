@@ -27,6 +27,23 @@ local USAGE = [[
 akkar — an application runtime for backend services in Lua
 
 usage:
+  akkar new NAME
+
+    Creates a project that runs: an app, a spec, a migrations directory and a
+    README. Refuses to overwrite an existing one.
+
+  akkar run [app.lua] [--watch] [--root DIR]
+
+    Loads the file and starts it, with signal handling installed. The file
+    returns `app` or `app, config` -- the same shape doctor and build read.
+
+    --watch      restart when a file changes
+    --root DIR   what to watch; repeatable, defaults to .
+
+  akkar test [busted options]
+
+    Runs busted over spec/ with package.path pointing at this project.
+
   akkar doctor [app.lua] [--json] [--no-probe]
 
     Reports the runtime, the installed libraries, this application's routes
@@ -224,11 +241,208 @@ local function watch(args)
   })
 end
 
+-- ===================================================================== new
+--
+-- The first minute with a runtime decides whether there is a second one, and
+-- Lua's has historically been: choose an interpreter, a package manager, an
+-- event loop, an HTTP library, a TLS library, a JSON library and a Postgres
+-- driver, then find out which combination works. `akkar new` answers all of
+-- that by producing a project that runs.
+--
+-- Deliberately small. A scaffold that emits twelve files teaches its own
+-- layout instead of the framework, and every one of them is a file somebody
+-- has to read before they can delete it.
+local SCAFFOLD = {
+  ["app.lua"] = [[
+-- Return the app, and the configuration `app:run` should get. `akkar run`,
+-- `akkar doctor` and `akkar build` all load this file the same way, so one
+-- shape serves development, diagnosis and deployment.
+local akkar = require "akkar"
+
+local app = akkar.new()
+
+app:get("/health", function()
+  return { ok = true }
+end)
+
+app:get("/hello/:name", { params = { name = akkar.v.string { min = 1, max = 40 } } },
+  function(req)
+    return { hello = req.params.name }
+  end)
+
+return app, {
+  port = tonumber(os.getenv "PORT") or 8080,
+
+  -- Uncomment when you add a database, and `akkar doctor app.lua` will tell
+  -- you whether it answers.
+  -- db = require("akkar.db").connect {
+  --   host = os.getenv "PGHOST" or "127.0.0.1",
+  --   database = os.getenv "PGDATABASE" or "%s",
+  --   user = os.getenv "PGUSER" or "postgres",
+  --   password = os.getenv "PGPASSWORD",
+  -- },
+}
+]],
+
+  ["spec/app_spec.lua"] = [[
+-- `app:test()` runs a request through the whole chain -- routing, validation,
+-- middleware -- without opening a socket, so a test is fast and still real.
+package.path = "./?.lua;./?/init.lua;" .. package.path
+
+local app = require "app"
+
+describe("%s", function()
+  local client = app:test()
+
+  it("is healthy", function()
+    local res = client:get "/health"
+    assert.equal(200, res.status)
+    assert.is_true(res.body.ok)
+  end)
+
+  it("greets", function()
+    assert.equal("world", client:get("/hello/world").body.hello)
+  end)
+
+  it("refuses a name it was told not to accept", function()
+    -- 422 before the handler runs, with the failing field named.
+    local res = client:get("/hello/" .. string.rep("x", 100))
+    assert.equal(422, res.status)
+    assert.is_truthy(res.body.fields["params.name"])
+  end)
+end)
+]],
+
+  ["migrations/.keep"] = "",
+
+  ["README.md"] = [[
+# %s
+
+    akkar run          start it, on PORT or 8080
+    akkar run --watch  and restart when a file changes
+    akkar test         run spec/
+    akkar doctor app.lua   what is installed and whether it answers
+    akkar build app.lua    one executable, no Lua needed to run it
+
+SQL migrations go in `migrations/`, named so they sort in the order they
+should run -- `20260101120000_users.sql`. `akkar.migrate` applies them.
+]],
+}
+
+local function new(args)
+  local name
+  for _, a in ipairs(args) do
+    if a:sub(1, 1) == "-" then fail("unknown option " .. a) else name = a end
+  end
+  if not name then fail("new needs a name: akkar new my-api") end
+  if name:find "[^%w._-]" then
+    fail("'" .. name .. "' has characters a directory should not: use letters, " ..
+         "digits, dot, dash and underscore")
+  end
+
+  -- REFUSING TO WRITE OVER SOMETHING is the whole of the safety here. A
+  -- scaffold that overwrites is a scaffold that eats an afternoon's work the
+  -- first time somebody runs it in the wrong directory.
+  local probe = io.open(name .. "/app.lua", "r")
+  if probe then
+    probe:close()
+    fail(name .. "/app.lua already exists; refusing to overwrite it")
+  end
+
+  for path, template in pairs(SCAFFOLD) do
+    local full = name .. "/" .. path
+    local dir = full:match "^(.*)/[^/]*$"
+    if dir then os.execute(("mkdir -p %q"):format(dir)) end
+    local file, err = io.open(full, "w")
+    if not file then fail("could not write " .. full .. ": " .. tostring(err)) end
+    file:write((template:gsub("%%s", name)))
+    file:close()
+  end
+
+  io.write(("created %s\n\n  cd %s\n  akkar run\n\nthen: curl localhost:8080/health\n")
+           :format(name, name))
+end
+
+-- ===================================================================== run
+--
+-- The same file `doctor` and `build` read, started. It exists so that
+-- development uses the runtime deployment will use, rather than a `lua app.lua`
+-- that happens to work because of what is in this shell's LUA_PATH.
+local function run(args)
+  local path, watching, roots = nil, false, {}
+  local i = 1
+  while i <= #args do
+    local a = args[i]
+    if a == "--watch" then watching = true
+    elseif a == "--root" then
+      i = i + 1
+      if not args[i] then fail("--root needs a directory") end
+      roots[#roots + 1] = args[i]
+    elseif a:sub(1, 1) == "-" then fail("unknown option " .. a)
+    else path = a end
+    i = i + 1
+  end
+  path = path or "app.lua"
+
+  if watching then
+    -- Restarting is done by re-running THIS command without `--watch`, so the
+    -- watched process and the plain one are the same process, started the same
+    -- way. A reload that runs something subtly different is a reload that
+    -- hides the bug it was supposed to show you.
+    if #roots == 0 then roots = { "." } end
+    local self = arg[0] or "akkar"
+    io.write(("akkar run: watching %s\n"):format(table.concat(roots, ", ")))
+    return require("akkar.watch").run(
+      ("%q run %q"):format(self, path), roots, {
+        on_restart = function(changes)
+          io.write(("akkar run: %s changed, restarting\n"):format(changes[1]))
+        end,
+      })
+  end
+
+  local app, config = load_app(path)
+  app:handle_signals()
+  return app:run(config or {})
+end
+
+-- ==================================================================== test
+--
+-- A thin wrapper over busted rather than a runner of our own. Writing one
+-- would mean owning assertions, output formats and a plugin surface, to
+-- replace something every Lua developer already has.
+--
+-- What it adds is the part people get wrong: `package.path` pointing at the
+-- project, so `require "app"` in a spec finds the app.
+local function test(args)
+  local passthrough = table.concat(args, " ")
+  local busted = os.getenv "BUSTED" or "busted"
+
+  local probe = io.popen(("command -v %q 2>/dev/null"):format(busted))
+  local found = probe and probe:read "l"
+  if probe then probe:close() end
+  if not found or found == "" then
+    fail("busted is not installed, and `akkar test` runs it.\n" ..
+         "  luarocks install --local busted\n" ..
+         "  Or set BUSTED=/path/to/busted.")
+  end
+
+  local command = ("%q --lpath='./?.lua;./?/init.lua;;' %s"):format(found, passthrough)
+  local ok, how, code = os.execute(command)
+  if ok then os.exit(0) end
+  os.exit(how == "exit" and code or 1)
+end
+
 local command = arg[1]
 local rest = { table.unpack(arg, 2) }
 
 if command == "doctor" then
   doctor(rest)
+elseif command == "new" then
+  new(rest)
+elseif command == "run" then
+  run(rest)
+elseif command == "test" then
+  test(rest)
 elseif command == "watch" then
   watch(rest)
 elseif command == "build" then

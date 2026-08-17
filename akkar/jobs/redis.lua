@@ -46,7 +46,19 @@ local jobs = require "akkar.jobs"
 -- staleness window -- and computes absolute times itself. Monotonic time was
 -- never an option here, because a monotonic reading is meaningless to another
 -- process.
-local SERVER_NOW = "local t = redis.call('TIME') local now = tonumber(t[1]) "
+-- MICROSECONDS TOO, and dropping them cost the jitter.
+--
+-- This read `tonumber(t[1])` and threw away `t[2]`, so every scheduled
+-- time was rounded to a whole second. `jobs.delay_for` computes a
+-- FRACTIONAL delay on purpose -- full jitter, a uniform draw across the
+-- window -- and the fraction was then discarded. A hundred jobs failing
+-- together against a database that has just come back are supposed to
+-- spread across their window; with one-second resolution and a two-second
+-- default window they spread across two values.
+--
+-- Redis `TIME` already returns [seconds, microseconds]. The fix is the
+-- half of the answer that was being ignored.
+local SERVER_NOW = "local t = redis.call('TIME') local now = tonumber(t[1]) + tonumber(t[2]) / 1000000 "
 
 -- Sent as `EVAL` rather than cached as `EVALSHA`. `akkar.limit` caches,
 -- because it runs on every request and a kilobyte on the wire against a

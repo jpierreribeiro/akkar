@@ -80,9 +80,28 @@ The backoff schedule, exposed so a caller can print or test it. `attempt` is
 
 | field | type | default | meaning |
 |---|---|---|---|
-| `base` | number | `2` | the base of `base ^ attempt`, in seconds |
+| `first` | number | `base` | the first window, in seconds |
+| `factor` | number | `base` | what each window is multiplied by |
+| `base` | number | `2` | sets both `first` and `factor` at once, giving `base ^ attempt` |
 | `max` | number | `300` | the ceiling on that window |
 | `jitter` | boolean | `true` | when not `false`, the answer is a uniform draw between zero and the window |
+
+The window is `first * factor ^ (attempt - 1)`, capped at `max`. `base` is the
+shorthand for the case where those two are the same number, and it is the
+default, so `{}` is `2, 4, 8, 16` exactly as before.
+
+`first` and `factor` exist because `base ^ attempt` cannot express the schedule
+most retrying systems use — a fixed first delay that doubles. Delivering
+webhooks to somebody else's endpoint is the usual case:
+
+```lua no-run
+{ first = 60, factor = 2, max = 4 * 60 * 60 }   --> 60, 120, 240, 480, ... 4h
+```
+
+**Resolution is sub-second**, and the fraction matters: with jitter on, the
+answer is a fraction of the window, and both stores keep it. The memory store
+schedules against a monotonic clock and the Redis store reads the microseconds
+from the server's `TIME`.
 
 Jitter is not decoration. A hundred jobs that failed against a database which
 has just come back would otherwise all retry on the same second.

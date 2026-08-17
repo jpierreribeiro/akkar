@@ -135,7 +135,16 @@ about, including the two classic JWT confusions in their strong form. That is
 not the same as an adversarial review. Self-written security tests find the
 attacks you thought of.
 
-## 10. The one that finds what none of the above can
+## 10. ~~The one that finds what none of the above can~~ — STARTED
+
+**Done once, and it worked.** One vertical slice of a live escrow platform —
+eleven endpoints out of 105 — found **six defects in under an hour**, including
+one that served an authenticated route with no credential: `app:mount`
+discarded the mounted app's middleware entirely. See `docs/PORT-FINDINGS.md`.
+
+The instrument is no longer unpointed, but the sentence below still stands for
+everything it has not touched: no worker, no webhooks, no frontend, no load,
+and ninety-four routes.
 
 **Porting a real application.** This was named at the start of the hardening
 work and remains the largest gap. Engineered exposure finds the class of
@@ -143,8 +152,11 @@ defect you know how to look for; a port finds the ten or twenty gaps nobody
 planned for, which is exactly the category everything above is trying to
 approximate and cannot.
 
-Every gap found this session was found by engineering. **None was found by
-use.**
+Every gap found in the engineering sessions was found by engineering. The port
+changed that: of its six findings, the one that matters most — a mounted app
+serving protected routes to anybody — had been sitting in `docs/HANDOFF.md`
+for a day, listed beside ergonomic gaps, because nobody had tried to
+protect a group of routes.
 
 ---
 

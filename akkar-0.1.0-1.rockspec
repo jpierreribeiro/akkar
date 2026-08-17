@@ -106,10 +106,14 @@ build = {
     -- The Lua half of the Postgres driver. Its C half, `akkar.pq_native`, is
     -- DELIBERATELY NOT HERE: declaring it would make libpq a hard dependency
     -- of `luarocks install akkar` and break the install for everyone who does
-    -- not use Postgres. It is built by `src/build.sh` and required only by
-    -- this module, which nothing else requires yet -- `akkar/db.lua` still
-    -- goes through pgmoon. See `bench/driver/RESULTS.md` for why that wiring
-    -- is a separate decision.
+    -- not use Postgres. It ships as its own rock instead --
+    -- `akkar-pq-0.1.0-1.rockspec` -- so `db.connect { driver = "pq" }` is an
+    -- option an installed copy of akkar can actually satisfy.
+    --
+    -- `akkar/db.lua` IS wired to it and has been since the driver landed; the
+    -- sentence that used to sit here saying otherwise was true for about a day.
+    -- What remains true is that pgmoon is the DEFAULT, and
+    -- `bench/driver/RESULTS.md` §5.4 has the measured reason.
     ["akkar.pq"] = "akkar/pq.lua",
     ["akkar.redis"] = "akkar/redis.lua",
     ["akkar.sql"] = "akkar/sql.lua",

@@ -253,8 +253,20 @@ end
 local function pq_open(config)
   local ok, pq = pcall(require, "akkar.pq")
   if not ok then
-    error("db: driver 'pq' needs akkar/pq_native.so -- build it with " ..
-          "src/build.sh, or use the default pgmoon driver.\n  " ..
+    -- THE MESSAGE NAMES THE INSTALL, not a script in a checkout.
+    --
+    -- It used to say "build it with src/build.sh", which is only useful to
+    -- somebody who already has the repository cloned. Anyone who installed
+    -- akkar from luarocks has the Lua half of this driver and not the C half,
+    -- and telling them to run a shell script they do not have is how a
+    -- supported option reads as a broken one.
+    error("db: driver 'pq' needs the C module akkar.pq_native, which is a " ..
+          "separate rock:\n" ..
+          "    luarocks install akkar-pq PQ_INCDIR=$(pg_config --includedir)\n" ..
+          "  PQ_INCDIR is needed on Debian and Ubuntu, where libpq-fe.h " ..
+          "lives in /usr/include/postgresql.\n" ..
+          "  From a checkout, src/build.sh does the same thing. Or drop the " ..
+          "'driver' option and use the default pgmoon driver.\n  " ..
           tostring(pq), 0)
   end
 

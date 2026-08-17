@@ -87,7 +87,7 @@ at shutdown.
   reason mentions a refused connection
 - `db: could not set statement_timeout: <reason>`, after disconnecting
 - `db: unknown driver '<name>'; expected 'pgmoon' or 'pq'`
-- `db: driver 'pq' needs akkar/pq_native.so -- build it with src/build.sh, or use the default pgmoon driver.`
+- `db: driver 'pq' needs the C module akkar.pq_native, which is a separate rock: luarocks install akkar-pq ...`
 
 ```lua
 local db = require "akkar.db"
@@ -413,12 +413,50 @@ open.pool:close()
 
 ## The pq driver
 
-`driver = "pq"` uses `akkar.pq`, a driver over libpq that waits in Lua. It
-needs `akkar/pq_native.so`, built by `src/build.sh`. Without that file the
-factory raises and names the script.
+`driver = "pq"` uses `akkar.pq`, a driver over libpq that waits in Lua.
 
-pgmoon is the default and stays the default. A driver becomes the default by
-proving itself against the same contract, not by being newer.
+### Installing it
+
+The C half is a **separate rock**, because linking libpq into `akkar` itself
+would break `luarocks install akkar` for everyone who does not use Postgres:
+
+```sh
+luarocks install akkar-pq PQ_INCDIR=$(pg_config --includedir)
+```
+
+`PQ_INCDIR` is needed on Debian and Ubuntu, where `libpq-fe.h` lives in
+`/usr/include/postgresql` rather than anywhere LuaRocks looks by default. On a
+system that puts it somewhere standard, plain `luarocks install akkar-pq`
+works. From a checkout, `src/build.sh` does the same thing.
+
+Without the C module the factory raises and names the install line — the
+option fails loudly at connect time, not quietly at the first query.
+
+### What it buys, and why it is not the default
+
+Measured end to end over HTTP on a reserved machine, against pgmoon:
+
+| route | pgmoon | akkar.pq |
+|---|---:|---:|
+| one row | 7,040 req/s | **8,969** (1.27x) |
+| a hundred rows | 2,392 | **5,031** (2.10x) |
+| a thousand rows | 333 | **928** (2.79x) |
+| p99, a thousand rows, saturated | 1300 ms | **475 ms** |
+
+**pgmoon is still the default, and not because of any doubt about `akkar.pq`.**
+The C half is a separate rock, so a default of `pq` would fail at the first
+query for everyone who installed only `akkar`. That is packaging, not judgement.
+
+An earlier consistency objection has been **withdrawn**. It reported that
+`akkar.pq` lost two windows in thirty where pgmoon lost none; investigated, the
+number does not reproduce — 1.8% spread and zero anomalous windows at the same
+configuration — and the one raggedness that does reproduce is the harness
+splitting a small number of connections across processes, which hits pgmoon
+harder. `bench/driver/ANOMALY.md` has the four experiments, two of which
+refuted a hypothesis.
+
+So: **if you install `akkar-pq`, use it.** Both numbers and the correction are
+in `bench/driver/RESULTS.md` §5.
 
 Everything on this page behaves the same either way: the shim gives `akkar.pq`
 pgmoon's shape, and `Connection`, the transaction, the scope wrapper and the
@@ -607,6 +645,20 @@ A response that is a function is called as `response(sql, ...)`. A response
 that is a single row is returned as a one-row list, so `one` and `many` both
 work against the same programming. A response of `nil`, including a function
 returning nothing, is an empty list.
+
+**An empty table is one empty row, not zero rows.** `{}` has no `[1]`, so it
+takes the single-row branch and `one` hands back a truthy table with nothing in
+it. To program a miss, use a function:
+
+```lua no-run
+fake:on("where id", function() return nil end)   -- zero rows
+fake:on("where id", {})                          -- ONE row, with no columns
+```
+
+And `reset` does not unprogram anything — it clears the log and the transaction
+flags. Since `many` returns the **first** pattern that matches, programming the
+same pattern again never wins. Build a new fake for a scenario that needs a
+different answer to the same query.
 
 **Returns** a list of rows.
 

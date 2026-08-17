@@ -34,6 +34,24 @@ io.stderr:write(("driver=%s\n"):format(driver or "pgmoon"))
 
 local lean = os.getenv "AKKAR_LEAN" == "1"
 
+-- HOW MUCH OF THE FRAMEWORK'S COST IS THE COLLECTOR?
+--
+-- akkar allocates about 2,166 bytes per request; the hand-written floor in
+-- `bench/study/floors.lua` allocates a small fraction of that. Collector work
+-- scales with allocation, so some unknown share of akkar's per-request cost
+-- is not akkar's code running but Lua reclaiming what it produced.
+--
+-- This is a knob, not a rewrite, which makes it worth pricing before anyone
+-- proposes a rewrite. `AKKAR_GC=off` is not a shipping configuration -- memory
+-- grows without bound -- it exists to put an upper bound on what collector
+-- tuning could ever buy.
+local gc = os.getenv "AKKAR_GC"
+if gc == "off" then collectgarbage "stop"
+elseif gc == "gen" then collectgarbage "generational"
+elseif gc == "lazy" then collectgarbage("incremental", 400, 400, 13)
+end
+if gc then io.stderr:write(("gc=%s\n"):format(gc)) end
+
 local app = akkar.new()
 app:get("/ping", function() return { pong = true } end)
 
