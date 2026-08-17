@@ -153,13 +153,31 @@ jobs:
           path: ~/cqueues-build
           key: cqueues-${{ env.CQUEUES_COMMIT }}-lua${{ matrix.lua }}-${{ matrix.os }}
 
+      # OpenSSL has to be pointed at on macOS and does not on Linux, and the
+      # difference is not a preference: Homebrew's `openssl@3` is keg-only, so
+      # `openssl/ssl.h` is in nobody's default include path. cqueues' makefile
+      # does not read `OPENSSL_DIR` -- that is a luarocks convention -- so the
+      # directories go in as compiler flags or not at all.
+      #
+      # This was the second thing the macOS job found, after the Lua version:
+      # `socket.c:42: fatal error: 'openssl/ssl.h' file not found`, with
+      # `cqueues.c` having compiled cleanly just before it.
       - name: Build cqueues from the pinned commit
         if: steps.cqueues-cache.outputs.cache-hit != 'true'
         run: |
           git clone https://github.com/wahern/cqueues.git ~/cqueues-build
           cd ~/cqueues-build
           git checkout "$CQUEUES_COMMIT"
-          make all${{ matrix.lua }} CPPFLAGS="-I$LUA_INC"
+
+          CPP="-I$LUA_INC"
+          LDF=""
+          if [ -n "${OPENSSL_DIR:-}" ]; then
+            CPP="$CPP -I$OPENSSL_DIR/include"
+            LDF="-L$OPENSSL_DIR/lib"
+            echo "openssl headers: $OPENSSL_DIR/include"
+            ls "$OPENSSL_DIR/include/openssl/ssl.h"
+          fi
+          make all${{ matrix.lua }} CPPFLAGS="$CPP" LDFLAGS="$LDF"
 
       - name: Install cqueues
         run: |
