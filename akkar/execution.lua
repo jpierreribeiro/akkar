@@ -199,38 +199,46 @@ end
 -- by the deadline; that is what the watchdog reports instead.
 local controller_pool = {}
 
--- RECYCLING IS OFF BY DEFAULT, and it was on until the suite started
--- segfaulting. `docs/substrate/SEGFAULT.md` has the whole account; the short
--- version is that every recorded crash lands on one instruction --
--- `table_LLRB_FIND`, walking a pollset's file-descriptor tree -- and a
--- controlled experiment came back:
+-- RECYCLING IS ON, AND IT IS UNDER SUSPICION. Both halves matter, so both are
+-- written here rather than one being left for somebody to discover.
+--
+-- The suite segfaults intermittently, and every recorded crash lands on one
+-- instruction: `table_LLRB_FIND`, walking a pollset's file-descriptor tree.
+-- Recycling pollsets is the thing akkar does that most cqueues users do not.
+-- A controlled experiment, alternating, all 1,699 tests in every run:
 --
 --     pool on  (64)   3 crashes / 6 runs
 --     pool off (0)    0 crashes / 6 runs
 --
--- Both arms ran all 1,699 tests every time, so the exposure was equal. That
--- is a one-sided Fisher exact p of about 0.09: suggestive rather than proven,
--- and it is not being called proof. What makes it act-on-able is that it
--- agrees with the mechanism -- the crash is in a pollset's descriptor tree,
--- and recycling pollsets is precisely what this pool does.
+-- Then the cost of turning it off was measured, isolated to this one commit
+-- on the study box, five alternating repetitions:
 --
--- The price is measured and it is real: 719 bytes per request, which is what
--- a fresh `cqueues.new()` costs, and `spec/allocation_spec.lua` carries a
--- raised socket ceiling with this comment as its reason. Memory corruption in
--- a service runtime is categorically worse than five percent more allocation,
--- so the trade is not close.
+--     pool on      19,409 req/s   p99 6.19 ms
+--     pool off     18,078 req/s   p99 8.48 ms      -6.9%, and a 37% worse tail
 --
--- WHAT WAS NOT DONE, and why: removing the controller altogether would have
--- cost nothing and fixed this outright, but it breaks a guarantee the README
--- sells. `spec/akkar_spec.lua` has a handler that calls `cqueues.sleep(2)`
--- against a 0.15 s budget and must answer 503. `sleep` goes through no akkar
--- adapter, so only a controller can cut it off. Bounding I/O through
--- capabilities -- which F2 does -- covers everything akkar mediates and
--- nothing it does not.
+-- So the trade is a permanent 6.9% of throughput and a much worse tail against
+-- a one-sided Fisher exact p of about 0.09. THAT IS NOT ENOUGH EVIDENCE FOR
+-- THAT PRICE. The default was flipped to 0 and flipped back when the number
+-- came in, which is the benchmark doing its job.
 --
--- `AKKAR_CONTROLLER_POOL=64` restores the old behaviour for anyone measuring
--- this, and it is how the experiment above was run. Read once, at load.
-local POOL_LIMIT = tonumber(os.getenv "AKKAR_CONTROLLER_POOL") or 0
+-- The crash is also not new -- it predates every change made this week. A
+-- pre-existing bug does not become urgent enough to buy at 6.9% just because
+-- somebody finally looked at it.
+--
+-- WHAT WOULD SETTLE IT: more repetitions of the same experiment. If pool-off
+-- stays at zero over twenty runs, the price is worth paying and this comment
+-- should say so. Better still, the actual cqueues defect -- two targeted
+-- reproducers failed to reproduce it outside the suite, so the mechanism is
+-- inferred, not understood. `docs/substrate/SEGFAULT.md` has the full account.
+--
+-- WHAT IS NOT AN OPTION: removing the controller altogether. It would cost
+-- nothing and fix this outright, and it breaks a guarantee the README sells --
+-- `spec/akkar_spec.lua` has a handler calling `cqueues.sleep(2)` against a
+-- 0.15 s budget that must answer 503. `sleep` goes through no akkar adapter,
+-- so only a controller can cut it off.
+--
+-- `AKKAR_CONTROLLER_POOL=0` turns recycling off. Read once, at load.
+local POOL_LIMIT = tonumber(os.getenv "AKKAR_CONTROLLER_POOL") or 64
 
 --- Runs `fn` under a wall-clock budget. Returns the outcome and the result:
 --- `"COMPLETION"`, or `"TIMEOUT"`, and raises on `"ERROR"`.

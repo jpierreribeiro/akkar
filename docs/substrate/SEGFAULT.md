@@ -155,10 +155,44 @@ raises it above suggestive is that it agrees with the mechanism: the crash is in
 a pollset's descriptor tree, recycling pollsets is what the pool does, and
 turning recycling off is what stopped it.
 
-**The definitive test is F2 itself.** After F2 there is no controller per
-request and therefore no pool at all. If the crashes stop for good, that is the
-proof; if they survive, the hypothesis was wrong and this page should say so
-next to the table above.
+### Then the fix was priced, and not bought
+
+Turning recycling off was made the default for about an hour. Then the cost
+came in, isolated to that one commit on the study box, five alternating
+repetitions with the machine at 99% idle:
+
+| | req/s | p50 | p99 | spread |
+|---|---:|---:|---:|---:|
+| pool on | 19,409 | 5.14 ms | **6.19 ms** | 1.6% |
+| pool off | 18,078 | 5.09 ms | **8.48 ms** | 1.3% |
+
+**−6.9% of throughput and a 37% worse tail**, permanently, against evidence at
+p ≈ 0.09. For a runtime that argues about predictability, the p99 is the worse
+half of that.
+
+So the default went back to recycling. Writing down why, because reverting a
+safety fix looks careless without it:
+
+- **p ≈ 0.09 does not buy 6.9%.** Six runs an arm is enough to justify more
+  runs, not enough to justify a permanent regression on the hot path.
+- **The crash is not new.** It predates every change made this week. A
+  pre-existing bug does not become urgent enough to buy at that price merely
+  because somebody finally looked at it.
+- **The mechanism is inferred, not understood.** Two targeted reproducers
+  failed. Paying a known cost to fix an unknown thing is how you end up with
+  both.
+
+**What would change the answer:** twenty runs an arm. If pool-off stays at
+zero, the price is worth paying and this page should say so. Better still, the
+actual cqueues defect — with a mechanism in hand, the fix is probably neither
+719 bytes nor 6.9%.
+
+**The definitive test is still F2**, and it is half-blocked. After F2 there is
+no controller per request and therefore no pool — but only for I/O akkar
+mediates. `spec/akkar_spec.lua` has a handler calling `cqueues.sleep(2)`
+against a 0.15 s budget that must answer 503, and `sleep` goes through no
+adapter, so the controller cannot simply be deleted. That is a correction to
+the plan, which assumed it could.
 
 ## The experiment as run
 
