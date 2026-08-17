@@ -130,7 +130,37 @@ Nothing touches the fileno tree, the pollset, or memory management. Upgrading
 would not fix this, and saying otherwise would have sent somebody down a
 packaging path for a memory bug.
 
-## The experiment that is running
+## The experiment, and its result
+
+**The controller pool is implicated.**
+
+| arm | crashes | runs |
+|---|---:|---:|
+| pool ON (64, the default) | **3** | 6 |
+| pool OFF (`AKKAR_CONTROLLER_POOL=0`) | **0** | 6 |
+
+Alternating, same machine, same suite, twelve runs. A crash is exit 135
+(SIGBUS) or 139 (SIGSEGV); the OFF arm's exit 1 every time is the allocation
+ceiling failing on purpose, not a crash.
+
+**The comparison is fair, and this was checked rather than assumed:** every OFF
+run reported 1,698 successes and 1 failure — the full 1,699 tests — so it had
+exactly the same opportunity to crash as the ON arm. An arm that aborted early
+would have had less exposure and the result would have meant nothing.
+
+**Honest about the statistics:** 3-of-6 against 0-of-6 is a one-sided Fisher
+exact p of about 0.09. That is suggestive, not conclusive at any conventional
+threshold, and saying otherwise would be dressing up six runs as proof. What
+raises it above suggestive is that it agrees with the mechanism: the crash is in
+a pollset's descriptor tree, recycling pollsets is what the pool does, and
+turning recycling off is what stopped it.
+
+**The definitive test is F2 itself.** After F2 there is no controller per
+request and therefore no pool at all. If the crashes stop for good, that is the
+proof; if they survive, the hypothesis was wrong and this page should say so
+next to the table above.
+
+## The experiment as run
 
 `AKKAR_CONTROLLER_POOL=0` makes every execution take a fresh controller and
 return none, which turns pollset recycling off without changing anything else.
@@ -138,10 +168,29 @@ Two arms, alternating, six repetitions each, exit codes recorded:
 
     pool ON  (64, the default)   vs   pool OFF (0)
 
-If OFF stops crashing, the pool is implicated and F2 deletes the bug. If both
-arms crash, the pool is exonerated and this page needs a new suspect — the most
-likely next one being `akkar/substrate.lua`, which patches lua-http's stream
-internals and is the other thing akkar does that nobody else does.
+The next suspect, if F2 does not settle it, is `akkar/substrate.lua` — it
+patches lua-http's stream internals and is the other thing akkar does that
+nobody else does.
+
+### A number the experiment produced on its way past
+
+The OFF arm fails `spec/allocation_spec.lua` — not a crash, the ceiling doing
+its job:
+
+```
+allocation through the real server regressed: 15,427 bytes/request, ceiling 14,900
+```
+
+Against 14,708 with the pool on. **So recycling controllers is worth 719 bytes
+per request**, which is what a fresh `cqueues.new()` costs, and nobody had put a
+figure on it before.
+
+That is a lower bound on what F2 buys, not an upper one: F2 does not make the
+controller cheaper, it stops allocating one at all, so it collects these 719
+bytes *and* the pooling machinery *and* the two descriptors — three on kqueue.
+
+It also means the OFF arm cannot be run as a permanent configuration, only as
+an experiment. Which is fine: it exists to answer one question.
 
 ## What it is NOT
 
