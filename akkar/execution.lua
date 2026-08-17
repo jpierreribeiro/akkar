@@ -115,7 +115,19 @@ end
 -- yielding on I/O.  A handler burning CPU in a tight loop is not interrupted
 -- by the deadline; that is what the watchdog reports instead.
 local controller_pool = {}
-local POOL_LIMIT = 64
+
+-- The pool size, overridable at load for one reason: it is the prime suspect
+-- in `docs/substrate/SEGFAULT.md`. Four crashes, all at the same instruction --
+-- `table_LLRB_FIND` walking a pollset's file-descriptor tree -- and recycling
+-- pollsets is the thing akkar does that most cqueues users do not.
+--
+-- `AKKAR_CONTROLLER_POOL=0` turns recycling off: every execution gets a fresh
+-- controller and none is ever reused. If the crashes stop, the pool is
+-- implicated; if they continue, it is not, and that is worth as much.
+--
+-- Read once, at load, so nothing checks an environment variable per request.
+-- This goes away with the pool itself when F2 lands.
+local POOL_LIMIT = tonumber(os.getenv "AKKAR_CONTROLLER_POOL") or 64
 
 --- Runs `fn` under a wall-clock budget. Returns the outcome and the result:
 --- `"COMPLETION"`, or `"TIMEOUT"`, and raises on `"ERROR"`.

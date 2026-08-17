@@ -26,13 +26,26 @@ being worked on** (`akkar/execution.lua` did not exist until 12:32), and two
 predate that session's first commit. Two distinct signals, which is usually
 one memory bug seen from two angles rather than two bugs.
 
-## Where
+## Where — and it is the same instruction every time
 
 ```
 $ addr2line -f -C -e ~/.luarocks/lib/lua/5.4/_cqueues.so 0x1423b
 table_LLRB_FIND
 src/cqueues.c:1192
 ```
+
+Every recorded crash resolves to that one address:
+
+| pid | signal | frame 0 |
+|---|---|---|
+| 1543389 | SIGBUS | `table_LLRB_FIND` +0x1423b |
+| 1547847 | SIGBUS | `table_LLRB_FIND` +0x1423b |
+| 1552159 | SIGSEGV | `table_LLRB_FIND` +0x1423b |
+| 1569745 | SIGSEGV | `table_LLRB_FIND` +0x1423b |
+
+One bug, deterministic in place and nondeterministic in trigger. Two signals
+from one instruction is what a garbage pointer looks like: sometimes it lands
+on an unmapped page (SIGSEGV), sometimes on a misaligned address (SIGBUS).
 
 `table` here is not the timer tree. `cqueues.c` generates two:
 
@@ -63,11 +76,72 @@ pollset and closed elsewhere — by a pool returning a connection, by a stream
 shutting down — leaves the pollset holding a node for an fd that is gone, and
 the next `find` on that tree walks it.
 
-**This is a hypothesis, not a diagnosis.** What supports it: the crash is in
-the fd table specifically; akkar recycles pollsets, which most cqueues users
-do not; and the crashes cluster in the part of the suite that spawns servers
-and times requests out. What would confirm it: a build of cqueues with
-`-fsanitize=address`, and a reproduction under it.
+And the reason a use-after-free here does not fault immediately, which is the
+same reason it is intermittent:
+
+```c
+static int fileno_del(struct cqueue *Q, struct fileno *fileno, _Bool update) {
+        ...
+        LLRB_REMOVE(table, &Q->fileno.table, fileno);
+        LIST_REMOVE(fileno, le);
+        pool_put(&Q->pool.fileno, fileno);      /* <- cqueues' own freelist */
+```
+
+A removed node goes back to a cqueues object pool, not to the allocator. So a
+node used after removal reads plausible memory that has since become a freelist
+link, and the tree walk follows it. The crash happens later, somewhere else,
+under load — which is exactly what is observed.
+
+**This is a hypothesis, not a diagnosis**, and three attempts to confirm it
+have not.
+
+## Three things that did NOT confirm it
+
+Recorded because a negative result that goes unwritten gets re-run by the next
+person.
+
+**1. A minimal reproducer did not reproduce.** Pure cqueues, no akkar: a pool
+of 64 controllers, real sockets registered inside them, a `with_deadline` copied
+in shape from `akkar/execution.lua`, deadlines firing on a third of the rounds
+and abandoning coroutines mid-read, all driven from an outer controller through
+`cqueues.poll` exactly as akkar nests them. **8,000 rounds, 2,666 abandoned,
+5,333 controller reuses, no crash.** So the pattern alone is not sufficient, and
+whatever the suite adds — TLS, lua-http streams, `akkar/substrate.lua` patching
+lua-http's internals, signals, threads — is part of it.
+
+**2. AddressSanitizer found nothing.** cqueues rebuilt at the pinned commit with
+`-fsanitize=address -fno-omit-frame-pointer -O1 -g3`, loaded ahead of the
+installed copy, whole suite run under it: 1,699 passing, zero reports. That is
+**not an exoneration.** ASan changes allocation layout and slows everything
+down, which is the classic way to hide a race, and this bug needs a race to
+show. It does mean ASan is the wrong instrument here, not that the bug is
+absent.
+
+**3. The pinned commit is not the fix.** This was the tempting explanation --
+the machine runs the 2020 release, so surely the pin repairs it. `cqueues.c`
+differs by **seven lines** between `rel-20200726` and `c366149`:
+
+```
+> (void)status; (void)ctx;                                    x2, unused-arg warnings
+> if (NULL == lua_pushvfstring(L, fmt, ap)) lua_error(L);      a Lua 5.5 concern
+```
+
+Nothing touches the fileno tree, the pollset, or memory management. Upgrading
+would not fix this, and saying otherwise would have sent somebody down a
+packaging path for a memory bug.
+
+## The experiment that is running
+
+`AKKAR_CONTROLLER_POOL=0` makes every execution take a fresh controller and
+return none, which turns pollset recycling off without changing anything else.
+Two arms, alternating, six repetitions each, exit codes recorded:
+
+    pool ON  (64, the default)   vs   pool OFF (0)
+
+If OFF stops crashing, the pool is implicated and F2 deletes the bug. If both
+arms crash, the pool is exonerated and this page needs a new suspect — the most
+likely next one being `akkar/substrate.lua`, which patches lua-http's stream
+internals and is the other thing akkar does that nobody else does.
 
 ## What it is NOT
 
@@ -99,9 +173,9 @@ the assumption of the pin.
 
 Fixing that is worth doing on its own merits. It will not fix this crash.
 
-## Why it is not being chased right now
+## Why F2 matters here
 
-Because there is a plan item that removes the suspect entirely.
+There is a plan item that removes the suspect entirely.
 
 F2 of the runtime programme replaces the per-request cqueues controller with a
 deadline carried as a number in the execution scope, enforced at the adapter
