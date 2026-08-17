@@ -212,6 +212,11 @@ local CONTRACTS = {
 -- The framework's own voice.  Replaced by `app:run { log = ... }`, but present
 -- so nothing has to be configured for diagnostics to appear.
 local internal = log.new { level = "info", format = "text" }
+-- Told to `akkar.execution` at load, not only when `App:run` reassigns it.
+-- `App:test` never calls `App:run`, so without this the test client's
+-- `req.log` would index a nil -- and the test client is the path most of this
+-- suite takes.
+execution.default_log(internal)
 
 
 -- Everything else app:run{} accepts.  Listed so that a typo is an error rather
@@ -1541,6 +1546,69 @@ akkar.etag_of = require("akkar.etag").of
 
 -- Builds `req` and runs the chain.  Shared by the server and the test client,
 -- so both travel exactly the same path.
+-- The carrier's metatable, built ONCE at load rather than per request.
+--
+-- It used to be constructed inside `handle`: a table, a closure and the
+-- closure's upvalues, on every request -- including every request that reads
+-- no capability at all. Hoisting it is what pays for the extraction.
+--
+-- The closure captured `input`; this reaches it through `req.__input`, which
+-- is why `user` left the constructor to make room for that key.
+--
+-- WHAT STAYS HERE AND WHY: `ip`, `trace` and `user` are HTTP's, not an
+-- execution's. `akkar.execution` owns the closed capability set and would
+-- have to learn what a header is to own these -- which is the boundary the
+-- whole split exists to draw.
+local REQUEST_MT = {
+    __index = function(self, key)
+      -- Parsed on first read, like a capability, and for the same kind of
+      -- reason: putting it in the constructor added a ninth field to `req`,
+      -- which grew the table's hash part and cost 191 bytes on EVERY request
+      -- including the overwhelming majority that carry no trace at all. The
+      -- allocation ceiling test caught it.
+      --
+      -- Only cached when there is something to cache: a nil result leaves the
+      -- table exactly as it was, so a request without the header stays free.
+      -- Read from the closure over `input` rather than from fields on `req`.
+      -- Putting the peer and the proxy list in the constructor added two
+      -- fields, grew the table's hash part and cost 392 bytes on EVERY
+      -- request -- the same trap `trace` fell into, caught by the same
+      -- allocation ceiling.
+      if key == "ip" then
+        -- `capabilities` IS the config table, so the proxy list is already
+        -- reachable without adding a field to anything. Two extra keys on the
+        -- test client's input table alone cost 200 bytes a request.
+        local input = rawget(self, "__input")
+        local settings = input.capabilities or {}
+        local address = client_ip(input.peer or settings.peer,
+                                  rawget(self, "headers")["x-forwarded-for"],
+                                  settings.trusted_proxies)
+        if address then rawset(self, "ip", address) end
+        return address
+      end
+
+      if key == "trace" then
+        local parsed = trace_context(rawget(self, "headers"))
+        if parsed then rawset(self, "trace", parsed) end
+        return parsed
+      end
+
+      -- `user` is resolved here rather than written into the constructor,
+      -- and deliberately WITHOUT `rawset`: caching it would add a ninth key
+      -- to `req` and cost the 192 bytes the constructor note describes.
+      -- `guard` returns one shared object per name, so every read gets the
+      -- same table the constructor used to hold.
+      if key == "user" then
+        return guard("req.user",
+          "req.user is not set; this route is missing the authentication middleware")
+      end
+
+      -- The closed capability set, acquired and tracked for release by the
+      -- module. Anything outside it reads nil, exactly as before.
+      return execution.acquire(self, rawget(self, "__input"), key)
+    end,
+}
+
 local function handle(app, input)
   -- Before the chains are built, because the selected app has its own.
   local requested_host = input.host
@@ -1597,7 +1665,20 @@ local function handle(app, input)
     headers = request_headers,
     host    = normalize_host(requested_host),
     id      = request_id(request_headers),
-    user    = guard("req.user", "req.user is not set; this route is missing the authentication middleware"),
+    -- THE EXECUTION RECORD, and it is here instead of `user` rather than as
+    -- well as it.
+    --
+    -- `req` is EXACTLY EIGHT KEYS and the ninth costs 192 measured bytes: a
+    -- Lua table constructor sizes its hash part by key count, and nine crosses
+    -- a power-of-two boundary. So hoisting the metatable out of `handle` --
+    -- which is what pays for this whole refactor -- had to buy its link back
+    -- to `input` with a key, and `user` is the one that can leave.
+    --
+    -- It can leave because `guard` returns ONE SHARED object per name, so
+    -- resolving `user` lazily in `__index` returns the identical table this
+    -- line did. `akkar/limit.lua` reads `req.user` and documents that it is
+    -- never nil; that stays true.
+    __input = input,
   }
 
   -- ASSIGNED AFTER THE CONSTRUCTOR, and only when there is one.
@@ -1625,73 +1706,8 @@ local function handle(app, input)
   --
   -- A capability that was never configured reads as a guard, so the error
   -- says what is missing instead of indexing a nil.
-  local to_release = {}
-  setmetatable(req, {
-    __index = function(self, key)
-      -- Parsed on first read, like a capability, and for the same kind of
-      -- reason: putting it in the constructor added a ninth field to `req`,
-      -- which grew the table's hash part and cost 191 bytes on EVERY request
-      -- including the overwhelming majority that carry no trace at all. The
-      -- allocation ceiling test caught it.
-      --
-      -- Only cached when there is something to cache: a nil result leaves the
-      -- table exactly as it was, so a request without the header stays free.
-      -- Read from the closure over `input` rather than from fields on `req`.
-      -- Putting the peer and the proxy list in the constructor added two
-      -- fields, grew the table's hash part and cost 392 bytes on EVERY
-      -- request -- the same trap `trace` fell into, caught by the same
-      -- allocation ceiling.
-      if key == "ip" then
-        -- `capabilities` IS the config table, so the proxy list is already
-        -- reachable without adding a field to anything. Two extra keys on the
-        -- test client's input table alone cost 200 bytes a request.
-        local settings = input.capabilities or {}
-        local address = client_ip(input.peer or settings.peer,
-                                  rawget(self, "headers")["x-forwarded-for"],
-                                  settings.trusted_proxies)
-        if address then rawset(self, "ip", address) end
-        return address
-      end
 
-      if key == "trace" then
-        local parsed = trace_context(rawget(self, "headers"))
-        if parsed then rawset(self, "trace", parsed) end
-        return parsed
-      end
-
-      if not CAPABILITIES[key] then return nil end
-      local provided = input.capabilities and input.capabilities[key]
-      local value
-      if key == "log" then
-        -- `log` is the one capability with a default, because diagnostics
-        -- that need configuring before they appear are diagnostics nobody
-        -- sees.  Bound to the request id here, so a handler writing
-        -- `req.log:info(...)` correlates without doing anything.
-        value = (provided or internal):with { request_id = self.id }
-      elseif provided == nil then
-        value = guard("req." .. key,
-                      "req." .. key .. " is not configured; pass " ..
-                      key .. " = ... to app:run{}")
-      elseif callable(provided) then
-        value = provided()
-        if type(value) == "table" and type(value.release) == "function" then
-          to_release[#to_release + 1] = value
-        end
-      else
-        value = provided
-      end
-      rawset(self, key, value)      -- acquired once per request, not per read
-      return value
-    end,
-  })
-
-  -- Releasing is the framework's job, not the handler's.  It happens on every
-  -- exit -- normal return, thrown response, handler error, deadline -- because
-  -- a connection that leaks on the error path leaks exactly when load is
-  -- highest.
-  local function release_all()
-    for _, resource in ipairs(to_release) do pcall(function() resource:release() end) end
-  end
+  setmetatable(req, REQUEST_MT)
 
   -- A request that failed to parse still traverses the chain, so logging
   -- middleware sees the 400.  Middleware returning garbage cannot escape
@@ -1751,14 +1767,11 @@ local function handle(app, input)
     streamed.raw = res.raw
     -- Composed, not overwritten: middleware may already have deferred work of
     -- its own onto the response, and the concurrency limiter does exactly that.
-    local deferred = res.release
-    streamed.release = function()
-      if deferred then pcall(deferred) end
-      release_all()
-    end
+    -- The composition lives in `akkar.execution` so there is one of it.
+    streamed.release = execution.deferred(input, res.release)
     res = streamed
   else
-    release_all()
+    execution.release(input)
   end
 
   -- Beside the response, never on it. See the note at the stamp site above.
@@ -2075,7 +2088,14 @@ function App:run(config)
   local timeout    = config.timeout    or akkar.defaults.timeout
   -- An app-supplied logger replaces the framework's own voice, so a service
   -- gets one stream in one format rather than two.
+  --
+  -- TOLD TO `akkar.execution` TOO, and forgetting to would be silent. That
+  -- module supplies `req.log` when no `log` capability was passed, so a
+  -- service that configured a logger here and nowhere else would keep getting
+  -- akkar's default voice inside handlers -- correct-looking output in the
+  -- wrong format, on one path only.
   if config.log then internal = config.log end
+  execution.default_log(internal)
   self.shutdown_grace = config.shutdown_grace or akkar.defaults.shutdown_grace
   self.state, self.in_flight, self.closers = "RUNNING", 0, {}
 
@@ -2298,7 +2318,7 @@ function App:run(config)
           short = short, stripped = true,
         })
         -- Nil for anything that is not a stream: dispatch has already run
-        -- `release_all` for those. Captured before a single byte goes out.
+        -- `execution.release` for those. Captured before a byte goes out.
         pending_release = res.release
 
         local rh = headers.new()

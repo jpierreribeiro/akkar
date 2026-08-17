@@ -98,6 +98,117 @@ function M.id()
   return ID_PREFIX .. string.format("%06x", id_counter & 0xffffff)
 end
 
+-- ============================================================== the lifetime
+-- Acquiring capabilities, and releasing them exactly once.
+--
+-- THE RECORD IS A TABLE THE CALLER ALREADY HAS. Allocation on this path is
+-- measured, and a scope object costs 152 bytes against 169 of headroom under
+-- the ceiling -- so there is no scope object. The HTTP layer passes the
+-- `input` table its server already built; a worker will pass the job's.
+--
+-- THE CARRIER IS WHATEVER THE HANDLER SEES. In HTTP that is `req`, which is
+-- why `req.db` keeps working: it is still `req`, with a metatable that knows
+-- how to fetch a capability the first time it is read.
+
+--- The framework's own logger, replaced when an application configures one.
+---
+--- A MUTABLE MODULE LOCAL, and it has to be, because `App:run { log = ... }`
+--- can change it after this module has loaded. The trap it replaces: while
+--- this default lived in `init.lua` as a local, moving the acquisition here
+--- would have captured whatever it was at load time, so a service that
+--- configured a logger would still get akkar's own voice in `req.log` --
+--- silently, and only when no `log` capability was passed.
+local default_log
+
+--- Sets the logger an execution falls back to. Called from `App:run`.
+function M.default_log(logger)
+  default_log = logger
+end
+
+--- Fetches one capability for an execution, caching it on the carrier.
+---
+--- Returns nil for anything outside the closed set, so the caller's metatable
+--- can handle its own transport-specific fields first and delegate the rest
+--- here. This module never learns what a header is.
+function M.acquire(carrier, record, key)
+  if not M.CAPABILITIES[key] then return nil end
+
+  local provided = record.capabilities and record.capabilities[key]
+  local value
+
+  if key == "log" then
+    -- `log` is the one capability with a default, because diagnostics that
+    -- need configuring before they appear are diagnostics nobody sees. Bound
+    -- to the execution's id, so `log:info(...)` correlates for free.
+    value = (provided or default_log):with { request_id = carrier.id }
+  elseif provided == nil then
+    value = M.guard("req." .. key,
+                    "req." .. key .. " is not configured; pass " ..
+                    key .. " = ... to app:run{}")
+  elseif type(provided) == "function"
+      or (getmetatable(provided) or {}).__call then
+    value = provided()
+    if type(value) == "table" and type(value.release) == "function" then
+      -- LAZILY, and that is the whole reason this is a field rather than a
+      -- constructor argument. An execution that acquires nothing releasable
+      -- -- which is every `/ping` -- never allocates this table.
+      local list = record.released
+      if not list then list = {} record.released = list end
+      list[#list + 1] = value
+    end
+  else
+    value = provided
+  end
+
+  rawset(carrier, key, value)     -- acquired once per execution, not per read
+  return value
+end
+
+--- Installs the carrier's metatable. One call so the HTTP layer does not have
+--- to know the shape of what it is installing.
+function M.attach(carrier, mt)
+  return setmetatable(carrier, mt)
+end
+
+--- Releases everything this execution acquired. Idempotent.
+---
+--- Releasing is the framework's job, not the handler's, and it happens on
+--- every exit -- normal return, thrown response, handler error, deadline --
+--- because a connection that leaks on the error path leaks exactly when load
+--- is highest.
+---
+--- The list is cleared before anything runs, so a second call is a no-op
+--- rather than a double release. That is new: `handle` called `release_all`
+--- from exactly one place, so it could not happen. A worker loop can.
+function M.release(record)
+  local list = record.released
+  if not list then return end
+  record.released = nil
+  for i = 1, #list do
+    local resource = list[i]
+    pcall(resource.release, resource)
+  end
+end
+
+--- The deferred release, for a response whose body has not been produced yet.
+---
+--- COMPOSES, NEVER OVERWRITES, and the cost of getting that wrong is on
+--- record: writing `release` onto a handler's own returned table meant a
+--- handler returning a hoisted or memoised response had request A's closure
+--- overwritten by request B -- A's connection never released, B's released
+--- twice, and the second release found the pool already cleared and CLOSED a
+--- connection sitting idle in it. One leaked slot, one poisoned entry, one
+--- 500 to an innocent request, per occurrence.
+---
+--- `previous` is whatever `akkar/limit.lua`, `etag.lua`, `csrf.lua`,
+--- `auth.lua` or `compress.lua` already deferred.
+function M.deferred(record, previous)
+  return function()
+    if previous then pcall(previous) end
+    M.release(record)
+  end
+end
+
 -- ============================================================ the budget
 -- The deadline as a NUMBER the whole execution can read, rather than as a
 -- scheduler that watches it.
