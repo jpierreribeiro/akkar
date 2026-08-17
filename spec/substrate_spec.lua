@@ -31,43 +31,68 @@ local akkar   = require "akkar"
 local cqueues = require "cqueues"
 
 describe("cqueues: the concurrency model", function()
-  it("costs exactly two descriptors per controller", function()
+  it("costs exactly the descriptors per controller this platform costs", function()
     -- `akkar/init.lua` spends one controller per in-flight request for its
     -- deadline, so this number IS the concurrency ceiling: against
     -- `ulimit -n 1024` it puts the wall at about 500 concurrent requests, and
     -- `descriptor_ceiling()` derives `max_concurrent` from it directly.
     -- A substitute that costs three moves the ceiling by a third.
-    local function open_fds()
-      local pid = io.open("/proc/self/stat"):read "n"
-      local n = 0
-      for _ in io.popen("ls /proc/" .. pid .. "/fd 2>/dev/null"):lines() do n = n + 1 end
-      return n
-    end
+    --
+    -- WHICH IS NOT A HYPOTHETICAL, and the platform matrix is what found it:
+    -- the cost is 2 on Linux and 3 on macOS -- epoll against kqueue. This
+    -- used to assert 2 everywhere, so what the number is on each platform is
+    -- pinned in `portable`, and an unmeasured platform is pending rather than
+    -- assumed. Loosening this to a range that swallows both would have made
+    -- the suite green and thrown the finding away.
+    -- Through `portable`, because a Mac has no /proc and this used to be
+    -- `io.open("/proc/self/stat"):read "n"` -- which is not a skip on macOS,
+    -- it is `attempt to index a nil value`. Only the delta is read here, and
+    -- the delta survives the platform difference.
+    local portable = require "spec.support.portable"
+    local function open_fds() return portable.open_fds() end
 
     collectgarbage() collectgarbage()
     local before = open_fds()
+    if not before then
+      -- Not zero. "Cannot count" must never be reported as "nothing leaked".
+      pending "descriptors cannot be counted here: no /proc and no lsof"
+      return
+    end
     local held = {}
     for i = 1, 50 do held[i] = cqueues.new() end
     local after = open_fds()
 
+    local expected = portable.descriptors_per_controller
+    if not expected then
+      pending(("nobody has measured what a controller costs on %s")
+              :format(tostring(portable.os_name)))
+      return
+    end
+
     local per = (after - before) / 50
-    assert.is_true(per >= 1.9 and per <= 2.1,
-      ("a controller costs %.2f descriptors, not 2"):format(per))
+    assert.is_true(per >= expected - 0.1 and per <= expected + 0.1,
+      ("a controller costs %.2f descriptors on %s, not %d")
+      :format(per, tostring(portable.os_name), expected))
   end)
 
   it("costs no descriptor for a condition", function()
     -- Why `akkar/pool.lua` parks waiters on a condition rather than on a
     -- controller: a pool of thirty waiters must not cost sixty descriptors.
     local condition = require "cqueues.condition"
-    local function open_fds()
-      local pid = io.open("/proc/self/stat"):read "n"
-      local n = 0
-      for _ in io.popen("ls /proc/" .. pid .. "/fd 2>/dev/null"):lines() do n = n + 1 end
-      return n
-    end
+    -- Through `portable`, because a Mac has no /proc and this used to be
+    -- `io.open("/proc/self/stat"):read "n"` -- which is not a skip on macOS,
+    -- it is `attempt to index a nil value`. Only the delta is read here, and
+    -- the delta survives the platform difference.
+    local portable = require "spec.support.portable"
+    local function open_fds() return portable.open_fds() end
 
     collectgarbage() collectgarbage()
     local before = open_fds()
+    if not before then
+      -- Not zero. "Cannot count" must never be reported as "nothing leaked".
+      pending "descriptors cannot be counted here: no /proc and no lsof"
+      return
+    end
     local held = {}
     for i = 1, 50 do held[i] = condition.new() end
     local grew = open_fds() - before

@@ -32,11 +32,43 @@ tick; a tree where that matters is a tree that wants a real build system.
 
 local M = {}
 
+-- `stat -c %Y` is GNU coreutils. BSD stat -- which is what macOS has -- asks
+-- the same question as `stat -f %m` and rejects `-c` outright.
+--
+-- The consequence was not a warning. `stat_mtime` returned nil for every
+-- file, every snapshot compared nil to nil, and `akkar watch` sat there
+-- reporting no changes for ever: no error, no output, a watcher that had
+-- simply stopped watching. The platform matrix found it as three empty tables
+-- in `spec/watch_spec.lua` and one failing example in `docs/reference/watch.md`.
+--
+-- Resolved once at load, by trying each spelling on a path that certainly
+-- exists rather than by branching on the OS name: `uname` would be a guess
+-- about which `stat` is installed, and a Linux box can have the BSD one.
+local STAT_FORMAT = (function()
+  for _, form in ipairs { "stat -c %%Y %q 2>/dev/null",
+                          "stat -f %%m %q 2>/dev/null" } do
+    local pipe = io.popen(form:format("."))
+    if pipe then
+      local stamp = pipe:read "l"
+      pipe:close()
+      if tonumber(stamp) then return form end
+    end
+  end
+  return nil
+end)()
+
+--- Whether this machine can be watched at all.
+---
+--- Exposed so `bin/akkar watch` can say so instead of running a loop that
+--- will never fire. Silence is the worst possible report from a watcher.
+M.can_stat = STAT_FORMAT ~= nil
+
 local function stat_mtime(path)
   -- `stat` rather than opening the file: opening a file the editor is
   -- half-way through writing gives a truncated read, and a watcher that
   -- restarts on a partial save restarts twice per keystroke.
-  local pipe = io.popen(("stat -c %%Y %q 2>/dev/null"):format(path))
+  if not STAT_FORMAT then return nil end
+  local pipe = io.popen(STAT_FORMAT:format(path))
   if not pipe then return nil end
   local stamp = pipe:read "l"
   pipe:close()

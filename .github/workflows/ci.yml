@@ -30,54 +30,259 @@ jobs:
   # No services. This job proves the suite is green on a machine with no
   # Postgres and no Redis -- which is the state the skip guards exist for and
   # which nobody had ever verified.
+  #
+  # AND IT IS THE JOB THAT ANSWERS "WHERE DOES AKKAR RUN".
+  #
+  # Until this matrix existed, CI was `ubuntu-24.04` and nothing else. ARM64
+  # had been measured exactly once, by hand; macOS never. That was tolerable
+  # for a library and is not for something calling itself a runtime, because
+  # the promise of a runtime IS the combination that works. `docs/UNKNOWNS.md`
+  # §1 has carried this as the largest known gap.
+  #
+  # The other two jobs stay on ubuntu on purpose: `integration` needs service
+  # containers, which macOS runners do not have, and `install` is about
+  # packaging rather than about platform.
+  #
+  # macOS is a QUESTION, not an assertion. Nobody has ever built akkar there,
+  # so the first runs may well be red -- and a red run that says "luaossl does
+  # not build against this OpenSSL" is the finding, not a failure of the CI
+  # file. The steps below echo what they resolved before using it, so a break
+  # is diagnosable from the log without a second push.
   unit:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        lua: ["5.4"]
+        # `include` rather than a cross product: these are the three
+        # combinations worth paying for, not every pairing of two lists.
+        # macos-14 is Apple Silicon, so it covers macOS and a second arm64.
+        include:
+          - { os: ubuntu-24.04,     lua: "5.4" }
+          - { os: ubuntu-24.04-arm, lua: "5.4" }
+          - { os: macos-14,         lua: "5.4" }
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Lua ${{ matrix.lua }} and build dependencies
+      - name: Install Lua ${{ matrix.lua }} and build dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             lua${{ matrix.lua }} liblua${{ matrix.lua }}-dev luarocks \
             libssl-dev build-essential m4
+          {
+            echo "LUA_BIN=lua${{ matrix.lua }}"
+            echo "LUA_INC=/usr/include/lua${{ matrix.lua }}"
+            echo "ROCKS=sudo luarocks"
+            echo "LUA_SHARE=/usr/local/share/lua/${{ matrix.lua }}"
+            echo "LUA_LIB=/usr/local/lib/lua/${{ matrix.lua }}"
+          } >> "$GITHUB_ENV"
 
+      # Homebrew, not apt, and NOT under sudo: brew's luarocks writes inside
+      # the brew prefix, which the runner user owns. `sudo luarocks` there
+      # resolves a different HOME and a different tree, and installs rocks the
+      # test run cannot see.
+      # `lua@5.4`, NOT `lua`.
+      #
+      # The first run of this matrix installed `lua` and the build died on
+      #
+      #     compat-5.3.h:404: error: "unsupported Lua version
+      #                               (i.e. not Lua 5.1, 5.2, 5.3, or 5.4)"
+      #
+      # because Homebrew's `lua` formula is now **5.5**. The macOS job had
+      # accidentally become a Lua 5.5 probe, and it reproduced in CI exactly
+      # the blocker `README.md` already documents: cqueues' vendored
+      # `lua-compat-5.3` is at v0.9 and stops at 5.4. Nothing about macOS was
+      # wrong; the Lua was.
+      #
+      # `lua@5.4` is keg-only, so nothing is linked into PATH and every path
+      # below has to be taken from its own prefix. The version is ASSERTED
+      # afterwards, because the whole point is that this went unnoticed once.
+      - name: Install Lua ${{ matrix.lua }} and build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install lua@${{ matrix.lua }} luarocks openssl@3 m4 pkg-config
+
+          # Resolved, not assumed. Homebrew's prefix differs between Apple
+          # Silicon (/opt/homebrew) and Intel (/usr/local).
+          BREW=$(brew --prefix)
+          LUA_PREFIX=$(brew --prefix lua@${{ matrix.lua }})
+          SSL_PREFIX=$(brew --prefix openssl@3)
+          export PKG_CONFIG_PATH="$LUA_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+          INC=$(pkg-config --variable=includedir lua 2>/dev/null || true)
+          [ -z "$INC" ] && INC="$LUA_PREFIX/include/lua${{ matrix.lua }}"
+          [ -d "$INC" ] || INC="$LUA_PREFIX/include"
+
+          echo "brew prefix    : $BREW"
+          echo "lua prefix     : $LUA_PREFIX"
+          echo "openssl prefix : $SSL_PREFIX"
+          echo "lua headers    : $INC"
+          ls "$INC" | head -5
+
+          # THE ASSERTION. A keg-only formula plus a `lua` on PATH that is a
+          # different version is exactly how the first run got 5.5 quietly.
+          "$LUA_PREFIX/bin/lua" -v
+          "$LUA_PREFIX/bin/lua" -e 'assert(_VERSION == "Lua ${{ matrix.lua }}",
+            "expected Lua ${{ matrix.lua }}, got " .. _VERSION)'
+          grep -q 'LUA_VERSION_NUM.*504' "$INC/lua.h" \
+            || { echo "headers are not 5.4"; grep LUA_VERSION_NUM "$INC/lua.h"; exit 1; }
+
+          {
+            echo "$LUA_PREFIX/bin"
+          } >> "$GITHUB_PATH"
+          {
+            echo "LUA_BIN=$LUA_PREFIX/bin/lua"
+            echo "LUA_INC=$INC"
+            echo "ROCKS=luarocks --lua-dir=$LUA_PREFIX"
+            echo "LUA_SHARE=$BREW/share/lua/${{ matrix.lua }}"
+            echo "LUA_LIB=$BREW/lib/lua/${{ matrix.lua }}"
+            echo "OPENSSL_DIR=$SSL_PREFIX"
+            echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
+          } >> "$GITHUB_ENV"
+
+      # The key carries `matrix.os`, not `runner.os`. Both ubuntu runners
+      # report `Linux`, so a shared key would have handed the arm64 job an
+      # x86-64 build of cqueues -- a cache poisoning that would fail as a
+      # confusing link error rather than as a cache problem.
       - name: Cache the cqueues build
         id: cqueues-cache
         uses: actions/cache@v4
         with:
           path: ~/cqueues-build
-          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua${{ matrix.lua }}-${{ runner.os }}
+          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua${{ matrix.lua }}-${{ matrix.os }}
 
+      # OpenSSL has to be pointed at on macOS and does not on Linux, and the
+      # difference is not a preference: Homebrew's `openssl@3` is keg-only, so
+      # `openssl/ssl.h` is in nobody's default include path. cqueues' makefile
+      # does not read `OPENSSL_DIR` -- that is a luarocks convention -- so the
+      # directories go in as compiler flags or not at all.
+      #
+      # This was the second thing the macOS job found, after the Lua version:
+      # `socket.c:42: fatal error: 'openssl/ssl.h' file not found`, with
+      # `cqueues.c` having compiled cleanly just before it.
       - name: Build cqueues from the pinned commit
         if: steps.cqueues-cache.outputs.cache-hit != 'true'
         run: |
           git clone https://github.com/wahern/cqueues.git ~/cqueues-build
           cd ~/cqueues-build
           git checkout "$CQUEUES_COMMIT"
-          make all${{ matrix.lua }} CPPFLAGS="-I/usr/include/lua${{ matrix.lua }}"
 
-      - name: Install cqueues
-        run: |
-          cd ~/cqueues-build
-          sudo make install${{ matrix.lua }} \
-            lua${{ matrix.lua }}path=/usr/local/share/lua/${{ matrix.lua }} \
-            lua${{ matrix.lua }}cpath=/usr/local/lib/lua/${{ matrix.lua }}
+          CPP="-I$LUA_INC"
+          LDF=""
+          if [ -n "${OPENSSL_DIR:-}" ]; then
+            CPP="$CPP -I$OPENSSL_DIR/include"
+            LDF="-L$OPENSSL_DIR/lib"
+            echo "openssl headers: $OPENSSL_DIR/include"
+            ls "$OPENSSL_DIR/include/openssl/ssl.h"
+          fi
+          make all${{ matrix.lua }} CPPFLAGS="$CPP" LDFLAGS="$LDF"
 
+      # cqueues names these variables WITHOUT the dot -- `lua54path`, not
+      # `lua5.4path` (GNUmakefile:43-44, `$(subst .,,$(1))`). We had been
+      # passing the dotted spelling, which make happily accepts as a variable
+      # nobody reads, so the install silently fell back to `prefix ?=
+      # /usr/local`.
+      #
+      # On Linux that was invisible: /usr/local/{share,lib}/lua/5.4 is exactly
+      # where the apt lua5.4 looks anyway, and LUA_SHARE/LUA_LIB were set to
+      # those same paths, so the wrong spelling produced the right result. On
+      # macOS the fallback tried to mkdir /usr/local/lib without sudo and the
+      # accident finally showed up as `Permission denied`.
+      #
+      # The assertion after it is the point: the file has to be where we said
+      # it would be, not merely somewhere.
+      # This runs BEFORE the pinned cqueues is installed, and the order is the
+      # whole point. `http` depends on cqueues, luarocks has no idea our
+      # hand-built one exists, and so it fetches the release rock and says so:
+      #
+      #     Warning: /usr/local/lib/lua/5.4/_cqueues.so is not tracked by this
+      #     installation of LuaRocks. Moving it to .../_cqueues.so~
+      #     cqueues 20200726.54-0 is now installed in /usr/local
+      #
+      # That is the pinned build being deleted by the step after it. It has
+      # been happening on Linux since this workflow was written, which means
+      # `CQUEUES_COMMIT` has never been what CI tested -- the release tarball
+      # was. The pin exists because `akkar/substrate.lua` patches cqueues'
+      # internals, so testing a different cqueues than we pin is the one thing
+      # this step must not do.
       - name: Install the rest of the dependencies
         run: |
-          sudo luarocks --lua-version ${{ matrix.lua }} install luaossl
-          sudo luarocks --lua-version ${{ matrix.lua }} install http
-          sudo luarocks --lua-version ${{ matrix.lua }} install lua-cjson
-          sudo luarocks --lua-version ${{ matrix.lua }} install pgmoon
-          sudo luarocks --lua-version ${{ matrix.lua }} install luasocket
-          sudo luarocks --lua-version ${{ matrix.lua }} install busted
-          sudo luarocks --lua-version ${{ matrix.lua }} install tl || \
+          # luaossl needs to be pointed at Homebrew's OpenSSL on macOS; on
+          # Linux the system one is where its build script already looks.
+          EXTRA=""
+          [ -n "${OPENSSL_DIR:-}" ] && EXTRA="OPENSSL_DIR=$OPENSSL_DIR CRYPTO_DIR=$OPENSSL_DIR"
+          $ROCKS --lua-version ${{ matrix.lua }} install luaossl $EXTRA
+          for rock in http lua-cjson pgmoon luasocket busted; do
+            $ROCKS --lua-version ${{ matrix.lua }} install "$rock"
+          done
+          $ROCKS --lua-version ${{ matrix.lua }} install tl || \
             echo "tl unavailable; spec/teal_spec.lua will report pending"
+
+      # ...and the pinned build goes in last, over whatever luarocks left.
+      #
+      # The destination has to be removed first, and the first attempt at this
+      # step is why. `make install` is dependency-driven: the files luarocks
+      # just wrote are newer than build objects restored from cache, so make
+      # said `Nothing to be done for 'install5.4'` and skipped the copy. The
+      # step passed, the release rock stayed, and only the COMMIT assertion
+      # below noticed -- which is the entire reason it exists.
+      - name: Install the pinned cqueues, last, over the release rock
+        run: |
+          cd ~/cqueues-build
+          SUDO='${{ runner.os == 'Linux' && 'sudo' || '' }}'
+          $SUDO rm -f  "$LUA_LIB/_cqueues.so"
+          $SUDO rm -rf "$LUA_SHARE/cqueues.lua" "$LUA_SHARE/cqueues"
+          NODOT="$(echo '${{ matrix.lua }}' | tr -d .)"
+          ${{ runner.os == 'Linux' && 'sudo' || '' }} make install${{ matrix.lua }} \
+            "lua${NODOT}path=$LUA_SHARE" \
+            "lua${NODOT}cpath=$LUA_LIB"
+          test -f "$LUA_LIB/_cqueues.so" \
+            || { echo "_cqueues.so is not in $LUA_LIB"; ls -R "$LUA_LIB" || true; exit 1; }
+          test -f "$LUA_SHARE/cqueues.lua" \
+            || { echo "cqueues.lua is not in $LUA_SHARE"; ls "$LUA_SHARE" || true; exit 1; }
+
+      # Homebrew's luarocks is not run under sudo, so it deploys into the
+      # runner's own tree, which nothing searches by default -- that is where
+      # `module 'cjson' not found` came from, and `busted` was not on PATH
+      # either. Linux needs none of this: `sudo luarocks` deploys into
+      # /usr/local, which the apt lua5.4 already searches.
+      #
+      # The brew prefix goes FIRST, because the rocks tree carries the release
+      # copy of cqueues and the pinned build has to win the lookup.
+      - name: Put the rocks and the pinned cqueues on the path (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          eval "$($ROCKS --lua-version ${{ matrix.lua }} path)"
+          echo "$HOME/.luarocks/bin" >> "$GITHUB_PATH"
+          echo "LUA_PATH=$LUA_SHARE/?.lua;$LUA_SHARE/?/init.lua;$LUA_PATH;;" >> "$GITHUB_ENV"
+          echo "LUA_CPATH=$LUA_LIB/?.so;$LUA_CPATH;;" >> "$GITHUB_ENV"
+          echo "path : $LUA_SHARE/?.lua;$LUA_SHARE/?/init.lua;$LUA_PATH;;"
+          echo "cpath: $LUA_LIB/?.so;$LUA_CPATH;;"
+
+      - name: What this platform actually resolved
+        run: |
+          $LUA_BIN -v
+          $LUA_BIN -e 'print("cqueues  " .. (require("cqueues").VERSION or "?"))'
+          $LUA_BIN -e 'print("openssl  " .. require("openssl").version())' || true
+          $LUA_BIN -e 'print("cjson    " .. (require("cjson")._VERSION or "?"))'
+
+          # The assertion that would have caught the overwrite on day one.
+          # `COMMIT` only exists when cqueues is compiled with
+          # -DCQUEUES_COMMIT (src/cqueues.c:2955), which our build passes and
+          # the release rock does not -- so a missing field means the pinned
+          # build lost, and a different value means it lost to something else.
+          $LUA_BIN -e '
+            local want = os.getenv("CQUEUES_COMMIT")
+            local got  = require("cqueues").COMMIT
+            print("cqueues from " .. (package.searchpath("cqueues", package.path) or "?"))
+            if not got then
+              error("cqueues has no COMMIT field: this is the release rock, "
+                    .. "not the pinned build")
+            end
+            assert(got == want, "cqueues is " .. got .. ", pinned is " .. want)
+            print("commit   " .. got .. "  (pinned)")'
 
       - name: The suite, with no database and no Redis
         run: busted
@@ -92,7 +297,7 @@ jobs:
         run: busted spec/substrate_spec.lua
 
       - name: Doctor
-        run: lua${{ matrix.lua }} bin/akkar doctor --no-probe
+        run: $LUA_BIN bin/akkar doctor --no-probe
 
   # --------------------------------------------------------- integration
   # The same suite with the backends up, so the specs that skip themselves on
@@ -130,7 +335,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/cqueues-build
-          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua5.4-${{ runner.os }}
+          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua5.4-ubuntu-24.04
 
       - name: Build cqueues from the pinned commit
         if: steps.cqueues-cache.outputs.cache-hit != 'true'
@@ -140,18 +345,29 @@ jobs:
           git checkout "$CQUEUES_COMMIT"
           make all5.4 CPPFLAGS="-I/usr/include/lua5.4"
 
-      - name: Install cqueues
-        run: |
-          cd ~/cqueues-build
-          sudo make install5.4 \
-            lua5.4path=/usr/local/share/lua/5.4 \
-            lua5.4cpath=/usr/local/lib/lua/5.4
-
       - name: Install the rest of the dependencies
         run: |
           for rock in luaossl http lua-cjson pgmoon luasocket busted; do
             sudo luarocks --lua-version 5.4 install "$rock"
           done
+
+      # Last, over the cqueues that `http` just pulled in, and with the
+      # variable names cqueues actually reads. Same reasoning as the unit job.
+      - name: Install the pinned cqueues, last, over the release rock
+        run: |
+          cd ~/cqueues-build
+          # See the unit job: without this, `make install` finds the luarocks
+          # files newer than the cached objects and copies nothing.
+          sudo rm -f  /usr/local/lib/lua/5.4/_cqueues.so
+          sudo rm -rf /usr/local/share/lua/5.4/cqueues.lua \
+                      /usr/local/share/lua/5.4/cqueues
+          sudo make install5.4 \
+            lua54path=/usr/local/share/lua/5.4 \
+            lua54cpath=/usr/local/lib/lua/5.4
+          lua5.4 -e '
+            local got = require("cqueues").COMMIT
+            assert(got == os.getenv("CQUEUES_COMMIT"),
+                   "cqueues is not the pinned build: " .. tostring(got))'
 
       - name: Create the fixture the examples and specs expect
         env:
@@ -189,7 +405,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/cqueues-build
-          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua5.4-${{ runner.os }}
+          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua5.4-ubuntu-24.04
 
       - name: Build cqueues from the pinned commit
         if: steps.cqueues-cache.outputs.cache-hit != 'true'
@@ -199,18 +415,30 @@ jobs:
           git checkout "$CQUEUES_COMMIT"
           make all5.4 CPPFLAGS="-I/usr/include/lua5.4"
 
-      - name: Install cqueues
-        run: |
-          cd ~/cqueues-build
-          sudo make install5.4 \
-            lua5.4path=/usr/local/share/lua/5.4 \
-            lua5.4cpath=/usr/local/lib/lua/5.4
-
       - name: Lint the rockspec
         run: luarocks lint ./akkar-dev-1.rockspec
 
       - name: Install akkar from its own rockspec
         run: sudo luarocks --lua-version 5.4 make ./akkar-dev-1.rockspec
+
+      # After the rockspec, which resolves cqueues as a dependency and would
+      # otherwise move this aside. This job only runs the CLI, but a job that
+      # tests installation should install what we say we install.
+      - name: Install the pinned cqueues, last, over the release rock
+        run: |
+          cd ~/cqueues-build
+          # See the unit job: without this, `make install` finds the luarocks
+          # files newer than the cached objects and copies nothing.
+          sudo rm -f  /usr/local/lib/lua/5.4/_cqueues.so
+          sudo rm -rf /usr/local/share/lua/5.4/cqueues.lua \
+                      /usr/local/share/lua/5.4/cqueues
+          sudo make install5.4 \
+            lua54path=/usr/local/share/lua/5.4 \
+            lua54cpath=/usr/local/lib/lua/5.4
+          lua5.4 -e '
+            local got = require("cqueues").COMMIT
+            assert(got == os.getenv("CQUEUES_COMMIT"),
+                   "cqueues is not the pinned build: " .. tostring(got))'
 
       - name: Use the CLI from PATH, outside the source tree
         run: |

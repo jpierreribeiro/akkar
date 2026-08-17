@@ -30,14 +30,16 @@ describe("a controller costs descriptors", function()
   local condition = require "cqueues.condition"
 
   --- Counts this process's descriptors. Reading /proc/self/fd through
-  --- io.popen measures the SUBPROCESS, so the pid comes from /proc/self/stat
-  --- first -- a mistake this project has already made once.
-  local pid = io.open("/proc/self/stat"):read("l"):match "^(%d+)"
+  --- io.popen measures the SUBPROCESS, so the pid is resolved first -- a
+  --- mistake this project has already made once. `portable` keeps that
+  --- reasoning and adds the machines with no /proc, where `lsof` answers and
+  --- the absolute number differs but the delta, which is all this measures,
+  --- does not.
+  local portable = require "spec.support.portable"
   local function open_fds()
-    local h = io.popen("ls /proc/" .. pid .. "/fd 2>/dev/null | wc -l")
-    local n = tonumber(h:read "l") or 0
-    h:close()
-    return n
+    -- nil, not 0. A machine that cannot count descriptors must not report
+    -- "nothing leaked"; `cost_of` turns the nil into a pending instead.
+    return portable.open_fds()
   end
 
   local function cost_of(make, n)
@@ -48,17 +50,35 @@ describe("a controller costs descriptors", function()
     -- reads a number the second does not.
     open_fds()
     local before = open_fds()
+    if not before then return nil end
     local held = {}
     for i = 1, n do held[i] = make() end
     local after = open_fds()
+    if not after then return nil end
     return (after - before) / n, held
   end
 
-  it("is two per controller, exactly", function()
+  it("is exactly what a controller costs on this platform", function()
     -- Deterministic: no timing, no noise floor, no quiet machine needed.
+    --
+    -- Not deterministic across platforms, though, which is what the matrix
+    -- found: 2 on epoll, 3 on kqueue. The expected number is pinned per
+    -- platform in `portable` rather than widened into a range, because the
+    -- range that passes on both is a range that notices neither.
     local each = cost_of(function() return cqueues.new() end, 100)
-    assert.is_true(each > 1.9 and each < 2.1,
-      string.format("a controller cost %.2f descriptors", each))
+    if not each then
+      pending "descriptors cannot be counted here: no /proc and no lsof"
+      return
+    end
+    local expected = portable.descriptors_per_controller
+    if not expected then
+      pending(("nobody has measured what a controller costs on %s")
+              :format(tostring(portable.os_name)))
+      return
+    end
+    assert.is_true(each > expected - 0.1 and each < expected + 0.1,
+      string.format("a controller cost %.2f descriptors on %s, not %d",
+                    each, tostring(portable.os_name), expected))
   end)
 
   it("is zero for a condition, which is what makes the real fix possible", function()
@@ -66,6 +86,10 @@ describe("a controller costs descriptors", function()
     -- descriptors at all. It is not a drop-in -- see the note in App:run --
     -- but this is the measurement that says it is worth doing.
     local each = cost_of(function() return condition.new() end, 100)
+    if not each then
+      pending "descriptors cannot be counted here: no /proc and no lsof"
+      return
+    end
 
     -- NOT `assert.equal(0, each)`, which is what this said and which failed
     -- roughly one run in five. The counting itself opens a pipe, so a single
@@ -121,10 +145,22 @@ describe("the concurrency ceiling", function()
   it("is derived from the descriptor limit when nobody sets one", function()
     -- A default nobody can compute is a default nobody trusts, so the number
     -- comes from /proc/self/limits rather than from a constant someone liked.
+    --
+    -- Which is also the limit of it: `descriptor_ceiling` in `akkar/init.lua`
+    -- returns nil where that file does not exist, and `akkar/limit.lua` warns
+    -- once when it does. That degradation is deliberate and documented, so
+    -- this test states the platform rather than failing on it -- `io.lines`
+    -- on a missing path RAISES, which would have read as a broken ceiling.
+    local limits = io.open "/proc/self/limits"
+    if not limits then
+      pending "no /proc/self/limits here: the ceiling is not derived on this platform"
+      return
+    end
     local soft
-    for line in io.lines "/proc/self/limits" do
+    for line in limits:lines() do
       soft = soft or line:match "^Max open files%s+(%d+)"
     end
+    limits:close()
     assert.is_truthy(soft, "this platform does not expose the limit")
 
     -- Two descriptors per in-flight request, a third of the budget left for

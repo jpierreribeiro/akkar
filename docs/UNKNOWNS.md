@@ -31,25 +31,29 @@ been pointed at.** Here they are, as far as they can be enumerated.
 
 ---
 
-## 1. Platform — the one that was found by being asked
+## 1. Platform — MOSTLY CLOSED. See `docs/PLATFORMS.md`
 
-**Status: a real gap, now being measured rather than assumed.**
+**Status: measured. Linux x86-64, Linux arm64 and macOS arm64 all run the full
+suite in CI.**
 
-CI runs `ubuntu-24.04` and nothing else. There is no mention of `arm64`,
-`aarch64`, `macos`, `darwin` or `windows` anywhere in `.github/workflows/`,
-`docs/RUNTIME.md` or `docs/DEPLOY.md`. Every measurement in this repository
-was taken on Linux, glibc or musl, x86-64.
+ARM64 went green on the first run with no changes. macOS took seven, and only
+one of the seven was about akkar rather than about the build or the harness: a
+cqueues controller costs **three** descriptors on kqueue against two on epoll,
+which is the number `descriptor_ceiling()` divides by. Three real defects came
+out of it — `akkar watch` was silently dead off Linux, `Registry:memory()`
+reported a resident size of zero, and the test harness called five Linux-only
+commands by name.
 
-What that leaves unknown, in rough order of likelihood to bite:
+The full account, with the numbers, is `docs/PLATFORMS.md`.
 
-- **ARM64.** Now the default on Apple laptops and cheap on every cloud. The C
-  dependencies — cqueues, luaossl, lua-cjson, lpeg, and akkar's own libpq
-  binding — have never been compiled for it here.
-- **macOS.** Different libc, different `kqueue` rather than `epoll` (cqueues
-  supports both, unverified here), different OpenSSL provenance.
+What is still genuinely unknown:
+
 - **32-bit.** `lua_Integer` is 64-bit on a 64-bit build and akkar's C driver
   binds integers as `int8` on that assumption; `strtoll` and `size_t` appear
   in `src/akkar_pq.c` without a size audit.
+- **musl.** Alpine is the common container base and has not been run.
+- **Intel macOS.** The matrix runs Apple Silicon. Prefixes are resolved rather
+  than hardcoded, so it should work, and "should" is the word doing the work.
 - **Windows.** Almost certainly not, and saying so is better than leaving it
   ambiguous.
 

@@ -45,6 +45,8 @@ wrongness, and saying so is more honest than implying otherwise.
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
+local portable = require "spec.support.portable"
+
 local TMP = os.getenv "CLAUDE_JOB_DIR"
 TMP = (TMP and TMP .. "/tmp") or "/tmp"
 
@@ -215,7 +217,11 @@ local function write_temp(code, index)
 end
 
 local function run(path, seconds)
-  local command = ("timeout %d lua5.4 %q 2>&1"):format(seconds or 10, path)
+  -- Bounded through `spec/support/portable`, because `timeout` is coreutils
+  -- and a Mac does not have it. This one line was 299 of the 318 failures the
+  -- first macOS run reported, all of them reading as broken documentation.
+  local command = portable.timeout(seconds or 10,
+    ("%s %q"):format(portable.lua, path)) .. " 2>&1"
   local pipe = io.popen(command)
   local output = pipe:read "a"
   local ok, how, code = pipe:close()
@@ -298,14 +304,13 @@ end
 local GUIDE_PORT = 3000
 
 local function port_is_free()
-  -- `ss` rather than binding a socket ourselves: binding and closing races
-  -- with whatever we are trying to detect, and a false "free" is worse than
-  -- no check at all.
-  local pipe = io.popen(("ss -ltn 2>/dev/null | grep -c ':%d '"):format(GUIDE_PORT))
-  if not pipe then return true end          -- no `ss`: assume free, run anyway
-  local count = tonumber(pipe:read "a")
-  pipe:close()
-  return (count or 0) == 0
+  -- Asking the system rather than binding a socket ourselves: binding and
+  -- closing races with whatever we are trying to detect, and a false "free"
+  -- is worse than no check at all. `ss` is iproute2 and a Mac answers this
+  -- with `lsof`, which is why the lookup lives in `portable`.
+  local in_use = portable.port_in_use(GUIDE_PORT)
+  if in_use == nil then return true end     -- cannot tell: run anyway
+  return not in_use
 end
 
 local files = doc_files()
@@ -432,7 +437,10 @@ describe("the documentation", function()
 
           assert.is_falsy(output:find("stack traceback", 1, true),
             "a server example raised:\n" .. output)
-          assert.is_falsy(output:match "lua5%.4:.*error",
+          -- The interpreter prefixes its errors with its own argv[0], so the
+          -- pattern has to be the name we actually spawned rather than the
+          -- Debian one: on a source-built Lua it is `lua:`, not `lua5.4:`.
+          assert.is_falsy(output:match(portable.lua:gsub("%p", "%%%0") .. ":.*error"),
             "a server example failed to start:\n" .. output)
           assert.is_true(os.clock() - started >= 0,
             "unreachable, kept so the timing variable is used")
