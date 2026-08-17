@@ -214,6 +214,45 @@ function M.open_fds(pid)
   return nil
 end
 
+--- What `uname -s` says, or nil.
+---
+--- Everything else in this file refuses to branch on the OS name, and this is
+--- the exception that proves the rule: it exists for facts that are genuinely
+--- properties of the kernel rather than of what happens to be installed. A
+--- cqueues controller costs two descriptors on epoll and three on kqueue --
+--- that IS the operating system, and asking `command -v` about it would be
+--- asking the wrong question.
+M.os_name = (function()
+  local pipe = io.popen "uname -s 2>/dev/null"
+  if not pipe then return nil end
+  local name = (pipe:read "l" or ""):match "%S+"
+  pipe:close()
+  return name
+end)()
+
+--- What one cqueues controller costs here, or nil where nobody has measured.
+---
+--- MEASURED, on both platforms, and the numbers are not the same:
+---
+---     Linux  (epoll)   2.00 per controller
+---     Darwin (kqueue)  3.00 per controller
+---
+--- The Linux number was confirmed with /proc and with `lsof` on the same 50
+--- controllers -- both said exactly 2.00 -- so the Darwin number is a
+--- substrate difference and not an artefact of counting it differently there.
+---
+--- This is the concurrency ceiling: `descriptor_ceiling` in `akkar/init.lua`
+--- divides the descriptor limit by this number. It divides by 2
+--- unconditionally, which is right on Linux and would over-promise by half on
+--- a Mac -- today that is latent, because the same function reads
+--- /proc/self/limits and so derives nothing at all off Linux.
+---
+--- nil for anything else on purpose: a guess here becomes a wrong ceiling.
+M.descriptors_per_controller =
+  (M.os_name == "Linux"  and 2)
+  or (M.os_name == "Darwin" and 3)
+  or nil
+
 -- ----------------------------------------------------------------- the mtime
 
 --- Sets `path`'s modification time to `epoch`.

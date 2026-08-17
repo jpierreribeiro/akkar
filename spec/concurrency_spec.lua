@@ -58,15 +58,27 @@ describe("a controller costs descriptors", function()
     return (after - before) / n, held
   end
 
-  it("is two per controller, exactly", function()
+  it("is exactly what a controller costs on this platform", function()
     -- Deterministic: no timing, no noise floor, no quiet machine needed.
+    --
+    -- Not deterministic across platforms, though, which is what the matrix
+    -- found: 2 on epoll, 3 on kqueue. The expected number is pinned per
+    -- platform in `portable` rather than widened into a range, because the
+    -- range that passes on both is a range that notices neither.
     local each = cost_of(function() return cqueues.new() end, 100)
     if not each then
       pending "descriptors cannot be counted here: no /proc and no lsof"
       return
     end
-    assert.is_true(each > 1.9 and each < 2.1,
-      string.format("a controller cost %.2f descriptors", each))
+    local expected = portable.descriptors_per_controller
+    if not expected then
+      pending(("nobody has measured what a controller costs on %s")
+              :format(tostring(portable.os_name)))
+      return
+    end
+    assert.is_true(each > expected - 0.1 and each < expected + 0.1,
+      string.format("a controller cost %.2f descriptors on %s, not %d",
+                    each, tostring(portable.os_name), expected))
   end)
 
   it("is zero for a condition, which is what makes the real fix possible", function()

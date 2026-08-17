@@ -184,6 +184,24 @@ function Registry:memory()
     statm:close()
     local pages = fields and fields:match "%d+%s+(%d+)"
     if pages then rss_bytes = tonumber(pages) * 4096 end
+  else
+    -- No /proc, which is every platform that is not Linux. Reporting zero
+    -- there is worse than reporting nothing: a resident size of 0 reads as a
+    -- process using no memory, and the pair of numbers exists precisely so a
+    -- leak outside the Lua heap is visible.
+    --
+    -- `ps -o rss=` is POSIX and answers in kilobytes. `$PPID` inside the
+    -- popen'd shell IS this process -- reading `ps` for the shell itself
+    -- would measure the subprocess, which is the mistake to avoid here.
+    --
+    -- Only on the fallback path: Linux keeps the file read, and does not pay
+    -- for a subprocess per scrape.
+    local pipe = io.popen "ps -o rss= -p $PPID 2>/dev/null"
+    if pipe then
+      local kb = tonumber((pipe:read "a" or ""):match "%d+")
+      pipe:close()
+      if kb then rss_bytes = kb * 1024 end
+    end
   end
 
   return lua_bytes, rss_bytes
