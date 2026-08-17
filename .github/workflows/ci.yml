@@ -179,12 +179,31 @@ jobs:
           fi
           make all${{ matrix.lua }} CPPFLAGS="$CPP" LDFLAGS="$LDF"
 
+      # cqueues names these variables WITHOUT the dot -- `lua54path`, not
+      # `lua5.4path` (GNUmakefile:43-44, `$(subst .,,$(1))`). We had been
+      # passing the dotted spelling, which make happily accepts as a variable
+      # nobody reads, so the install silently fell back to `prefix ?=
+      # /usr/local`.
+      #
+      # On Linux that was invisible: /usr/local/{share,lib}/lua/5.4 is exactly
+      # where the apt lua5.4 looks anyway, and LUA_SHARE/LUA_LIB were set to
+      # those same paths, so the wrong spelling produced the right result. On
+      # macOS the fallback tried to mkdir /usr/local/lib without sudo and the
+      # accident finally showed up as `Permission denied`.
+      #
+      # The assertion after it is the point: the file has to be where we said
+      # it would be, not merely somewhere.
       - name: Install cqueues
         run: |
           cd ~/cqueues-build
+          NODOT="$(echo '${{ matrix.lua }}' | tr -d .)"
           ${{ runner.os == 'Linux' && 'sudo' || '' }} make install${{ matrix.lua }} \
-            lua${{ matrix.lua }}path="$LUA_SHARE" \
-            lua${{ matrix.lua }}cpath="$LUA_LIB"
+            "lua${NODOT}path=$LUA_SHARE" \
+            "lua${NODOT}cpath=$LUA_LIB"
+          test -f "$LUA_LIB/_cqueues.so" \
+            || { echo "_cqueues.so is not in $LUA_LIB"; ls -R "$LUA_LIB" || true; exit 1; }
+          test -f "$LUA_SHARE/cqueues.lua" \
+            || { echo "cqueues.lua is not in $LUA_SHARE"; ls "$LUA_SHARE" || true; exit 1; }
 
       - name: Install the rest of the dependencies
         run: |
