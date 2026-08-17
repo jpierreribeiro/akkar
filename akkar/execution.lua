@@ -218,7 +218,18 @@ local POOL_LIMIT = tonumber(os.getenv "AKKAR_CONTROLLER_POOL") or 64
 --- Does NOT release anything. See `M.attempt` and `M.run`.
 function M.with_deadline(seconds, fn)
   if not seconds or seconds <= 0 or not cqueues.running() then
-    return "COMPLETION", fn()          -- no budget, or no controller to yield to
+    -- THE BUDGET IS PUBLISHED EVEN HERE, and the reason is `app:test`.
+    --
+    -- Without a controller there is nothing to arbitrate with, so this branch
+    -- cannot abandon a handler -- but capabilities can still honour the
+    -- number, and `app:test { timeout = 4 }` runs entirely down this path. A
+    -- deadline that a test cannot see but production can is a trap: it makes
+    -- the tested behaviour and the shipped behaviour different in exactly the
+    -- dimension the test was written to check.
+    --
+    -- `seconds` nil or <= 0 clears rather than inherits.
+    M.begin(seconds)
+    return "COMPLETION", fn()
   end
 
   -- Controllers are pooled, and speed is only one of three reasons.
@@ -242,6 +253,10 @@ function M.with_deadline(seconds, fn)
   local winner, result
 
   cq:wrap(function()
+    -- The budget starts inside the coroutine that will do the work, because
+    -- it is keyed by that coroutine. Every capability the handler touches can
+    -- now read how long it has.
+    M.begin(seconds)
     local ok, res = pcall(fn)
     if winner == nil then              -- first arbitrating event wins
       winner = ok and "COMPLETION" or "ERROR"
@@ -271,6 +286,27 @@ function M.with_deadline(seconds, fn)
   end
 
   if winner == nil then winner = "TIMEOUT" end
+
+  -- A FAILURE AFTER THE BUDGET PASSED IS THE DEADLINE, NOT AN ERROR.
+  --
+  -- Two arbiters now race for the same instant. The controller above expires
+  -- at the deadline; so does the socket timeout each capability sets from the
+  -- same budget. Whichever fires first, the request is over for the same
+  -- reason -- but when the socket wins, the handler RAISES, and without this
+  -- the client is told 500 for what is plainly a timeout.
+  --
+  -- Caught by `spec/abandoned_spec.lua`, which asserted 503 and got 500 the
+  -- moment the database started honouring the budget. A deadline is not a
+  -- server error, and reporting it as one sends whoever reads the log looking
+  -- for a bug that is not there.
+  --
+  -- Completion is still never overturned: a handler that finished at 4.99 s
+  -- against a 5 s budget has completed, and this branch is only reached when
+  -- it failed.
+  if winner == "ERROR" and time.monotime() >= deadline then
+    winner = "TIMEOUT"
+  end
+
   if winner == "ERROR" then error(result, 0) end
   return winner, result
 end

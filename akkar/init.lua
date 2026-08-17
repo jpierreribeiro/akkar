@@ -299,7 +299,10 @@ local function warn_unbounded_statements(instance, config)
     log_to:warn("db has no statement_timeout, so a request deadline does " ..
                   "not stop the query", {
       request_deadline_s = config.timeout or akkar.defaults.timeout,
-      consequence = "an abandoned query keeps a backend busy after the 503",
+      consequence = "an abandoned query keeps a backend busy after the 503, " ..
+                    "and akkar discards the connection rather than reading a " ..
+                    "reply it can no longer place -- so every timed-out query " ..
+                    "also costs a reconnect",
       fix = "db.connect { statement_timeout = <seconds> }, matching the deadline",
     })
   end
@@ -1275,6 +1278,24 @@ local function dispatch(app, req)
     -- Response-as-error: a deep layer can signal HTTP without threading a
     -- return value back through every frame.
     if is_response(result) then return result end
+
+    -- A FAILURE AFTER THE BUDGET PASSED IS THE DEADLINE, NOT A BUG.
+    --
+    -- Now that capabilities bound their own I/O by the execution's budget, the
+    -- deadline usually arrives as a raised socket timeout rather than as the
+    -- controller giving up -- and this pcall catches it before `with_deadline`
+    -- ever sees it, so the request would answer 500.
+    --
+    -- 500 says "akkar has a bug"; 503 says "this took too long". Getting that
+    -- backwards sends whoever reads the log hunting for a defect that is not
+    -- there, and it is what `spec/abandoned_spec.lua` caught the moment the
+    -- database started honouring the budget: it asserted 503 and got 500.
+    --
+    -- The raise is still logged by the caller, so the cause is not lost.
+    local left = execution.remaining()
+    if left and left <= 0 then
+      return response(503, { error = "request deadline exceeded" })
+    end
     -- THE ONE ERROR THAT DID NOT NAME ITS FIX.
     --
     -- Writing the beginner guide surfaced it. A handler doing `req.body.title`
@@ -1679,23 +1700,12 @@ local function handle(app, input)
   if input.short then req.__short = input.short end
 
   local ok, res = pcall(function()
+    -- `with_deadline` publishes the budget to the coroutine it runs this in,
+    -- so every capability the handler touches can read how long it has left.
+    -- That is what stops `req.http` from calling the service below with a
+    -- fresh ten seconds while this request has milliseconds, and what lets
+    -- `req.db` bound its own wire call by the same number.
     local winner, value = with_deadline(input.timeout, function()
-      -- The budget, as a number every capability inside this execution can
-      -- read. `with_deadline` above still enforces it by arbitration; this
-      -- makes it VISIBLE, which is what stops `req.http` from calling the
-      -- service below with a fresh ten seconds while this request has
-      -- milliseconds left.
-      --
-      -- Inside the wrapped function, not outside: `with_deadline` runs the
-      -- handler in its own coroutine, and the budget is keyed by the coroutine
-      -- that will actually do the work.
-      --
-      -- No `finish()` on the error path, and it is not an oversight. The key is
-      -- the coroutine, the coroutine is per execution, and the table is weak --
-      -- so a raised handler leaves an entry that nothing can ever look up and
-      -- that the collector drops. Wrapping this in a pcall to call `finish()`
-      -- would cost a closure per request, and the ceiling has refused smaller.
-      execution.begin(input.timeout)
       return normalize(chain(app, req))
     end)
     -- The request id and the traceparent are NOT written onto the response.
