@@ -123,8 +123,8 @@ not measured and therefore does not claim. Pooling is on by default on the
 strength of the loopback number alone, which is the honest floor.
 ]]
 
-local http_request = require "http.request"
-local http_client  = require "http.client"
+local http_request = require "akkar.vendor.http.request"
+local http_client  = require "akkar.vendor.http.client"
 local cqueues      = require "cqueues"
 local Pool         = require "akkar.pool"
 local time         = require "akkar.time"

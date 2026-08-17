@@ -15,8 +15,8 @@ in a framework that exists:
 
 local cqueues = require "cqueues"
 local time    = require "akkar.time"
-local server  = require "http.server"
-local headers = require "http.headers"
+local server  = require "akkar.vendor.http.server"
+local headers = require "akkar.vendor.http.headers"
 local cjson   = require "akkar.json"
 local log     = require "akkar.log"
 local multipart = require "akkar.multipart"
