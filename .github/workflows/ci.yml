@@ -221,9 +221,19 @@ jobs:
             echo "tl unavailable; spec/teal_spec.lua will report pending"
 
       # ...and the pinned build goes in last, over whatever luarocks left.
+      #
+      # The destination has to be removed first, and the first attempt at this
+      # step is why. `make install` is dependency-driven: the files luarocks
+      # just wrote are newer than build objects restored from cache, so make
+      # said `Nothing to be done for 'install5.4'` and skipped the copy. The
+      # step passed, the release rock stayed, and only the COMMIT assertion
+      # below noticed -- which is the entire reason it exists.
       - name: Install the pinned cqueues, last, over the release rock
         run: |
           cd ~/cqueues-build
+          SUDO='${{ runner.os == 'Linux' && 'sudo' || '' }}'
+          $SUDO rm -f  "$LUA_LIB/_cqueues.so"
+          $SUDO rm -rf "$LUA_SHARE/cqueues.lua" "$LUA_SHARE/cqueues"
           NODOT="$(echo '${{ matrix.lua }}' | tr -d .)"
           ${{ runner.os == 'Linux' && 'sudo' || '' }} make install${{ matrix.lua }} \
             "lua${NODOT}path=$LUA_SHARE" \
@@ -346,6 +356,11 @@ jobs:
       - name: Install the pinned cqueues, last, over the release rock
         run: |
           cd ~/cqueues-build
+          # See the unit job: without this, `make install` finds the luarocks
+          # files newer than the cached objects and copies nothing.
+          sudo rm -f  /usr/local/lib/lua/5.4/_cqueues.so
+          sudo rm -rf /usr/local/share/lua/5.4/cqueues.lua \
+                      /usr/local/share/lua/5.4/cqueues
           sudo make install5.4 \
             lua54path=/usr/local/share/lua/5.4 \
             lua54cpath=/usr/local/lib/lua/5.4
@@ -412,6 +427,11 @@ jobs:
       - name: Install the pinned cqueues, last, over the release rock
         run: |
           cd ~/cqueues-build
+          # See the unit job: without this, `make install` finds the luarocks
+          # files newer than the cached objects and copies nothing.
+          sudo rm -f  /usr/local/lib/lua/5.4/_cqueues.so
+          sudo rm -rf /usr/local/share/lua/5.4/cqueues.lua \
+                      /usr/local/share/lua/5.4/cqueues
           sudo make install5.4 \
             lua54path=/usr/local/share/lua/5.4 \
             lua54cpath=/usr/local/lib/lua/5.4
