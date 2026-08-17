@@ -10,11 +10,12 @@
 # Gin came back within 0.2% of its published number and FastAPI within 0.1%.
 # The machine reproduced. akkar did not.
 #
-# So this alternates two trees on /ping, same process count, same cores, same
-# generator, restarting between every repetition so drift cannot be attributed
-# to one of them.
+# So this alternates two trees on one route, same process count, same cores,
+# same generator, restarting between every repetition so drift cannot be
+# attributed to one of them.
 #
 #   usage: regression.sh <baseline-ref> [head-ref]
+#          ROUTE=/users/42 regression.sh ...   # see ROUTE below
 #
 # Trees are prepared as separate clones under ~/study rather than by checking
 # out in place, because a shared tree means whichever ran last is what both
@@ -33,6 +34,18 @@ REPS=${REPS:-5}
 CONNS=${CONNS:-100}
 THREADS=${THREADS:-4}
 PROCS=${PROCS:-2}
+
+# The route to alternate on. `/ping` is the default because it is the framework
+# path with no database in it, and every published figure used it.
+#
+# It is a variable because `/ping` cannot see everything. It declares no schema,
+# so it never calls `validate` -- a change to the validation path is invisible
+# here, and that path is now under its own allocation ceiling precisely because
+# nothing else was watching it. A phase that touches validation should measure
+# `ROUTE=/users/42`, which does.
+#
+#     ROUTE=/users/42 bash bench/study/regression.sh origin/main HEAD
+ROUTE=${ROUTE:-/ping}
 HZ=$(getconf CLK_TCK)
 
 BASE_TREE=$HOME/study/tree-base
@@ -100,13 +113,13 @@ for rep in $(seq 1 "$REPS"); do
     [ "$variant" = head ] && local_tree=$HEAD_TREE
     start_tree "$local_tree" || exit 1
     [ "$rep" -eq 1 ] && {
-      probe_body "http://127.0.0.1:$PORT/ping" >/dev/null || {
+      probe_body "http://127.0.0.1:$PORT$ROUTE" >/dev/null || {
         echo "REFUSING: $variant did not answer"; exit 1; }
       taskset -c "$GENERATOR" wrk -t"$THREADS" -c"$CONNS" -d3s \
-        "http://127.0.0.1:$PORT/ping" >/dev/null 2>&1
+        "http://127.0.0.1:$PORT$ROUTE" >/dev/null 2>&1
     }
     b=$(cpu_ticks); ws=$(date +%s.%N)
-    line=$(run_wrk "http://127.0.0.1:$PORT/ping" "$DURATION" "$CONNS" "$THREADS") || exit 1
+    line=$(run_wrk "http://127.0.0.1:$PORT$ROUTE" "$DURATION" "$CONNS" "$THREADS") || exit 1
     we=$(date +%s.%N); a=$(cpu_ticks)
     c=$(awk -v x="$b" -v y="$a" -v hz="$HZ" -v s="$ws" -v e="$we" \
       'BEGIN{printf "%.2f", ((y-x)/hz)/(e-s)}')

@@ -151,8 +151,9 @@ Two things this mapping does not do. `match` is copied through unchanged, and
 akkar's `match` is a Lua pattern while OpenAPI's `pattern` is an ECMA-262
 regular expression, so a rule like `match = "^%d+$"` produces a `pattern` no
 JSON Schema validator will read the way akkar does. And a rule this module does
-not recognise becomes an empty schema `{}` rather than an error, where
-`akkar.validate` raises `unknown schema type` when the route is first used.
+not recognise becomes an empty schema `{}` rather than an error, where a route
+declaring it raises `unknown schema type` at the line that declares it — so in
+practice a bad rule fails the boot long before this module sees it.
 
 ## openapi.serve(app, path, info)
 

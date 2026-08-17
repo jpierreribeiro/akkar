@@ -64,6 +64,71 @@ describe("allocation per request", function()
   end)
 end)
 
+-- ========================================================= the validated route
+--
+-- THE CEILING ABOVE WATCHES A ROUTE WITH NO SCHEMA, so it has never seen the
+-- validation path at all. `/ping` declares nothing, therefore never calls
+-- `validate`, therefore could not notice that a route WITH a schema was
+-- rebuilding every shorthand rule on every request for the life of the process.
+--
+-- Measured before the repair, four shorthand rules:
+--
+--     /ping                      2,452 bytes/request
+--     shorthand schema           4,428
+--     the same schema via v.*    4,012      <- 416 bytes cheaper, for nothing
+--
+-- Two different numbers for two spellings of the same schema. That difference
+-- IS the defect, and the property below is a stronger guard than any ceiling:
+-- it cannot drift, because it compares the two forms against each other rather
+-- than against a constant somebody will edit.
+
+describe("allocation on a route that validates", function()
+  local shorthand, builder
+
+  local function app_with(params, query)
+    local app = akkar.new()
+    app:get("/s/:id", { params = params, query = query },
+            function(req) return { id = req.params.id } end)
+    return app:test()
+  end
+
+  local PATH = "/s/7?limit=10&cursor=abc&sort=name"
+
+  setup(function()
+    shorthand = app_with(
+      { id = "integer" },
+      { limit = "integer?", cursor = "string?", sort = "string?" })
+    builder = app_with(
+      { id = akkar.v.integer { min = 1 } },
+      { limit  = akkar.v.integer { optional = true },
+        cursor = akkar.v.string  { optional = true },
+        sort   = akkar.v.string  { optional = true } })
+    bytes_per_request(shorthand, PATH, 200)
+    bytes_per_request(builder,   PATH, 200)
+  end)
+
+  it("costs the same whether the schema is written short or with v.*", function()
+    -- The two describe the same schema, so they must cost the same. Before
+    -- schemas were expanded at registration they differed by 416 bytes -- one
+    -- table per shorthand rule, per request, for ever.
+    local short = bytes_per_request(shorthand, PATH, 2000)
+    local built = bytes_per_request(builder,   PATH, 2000)
+    assert.is_true(math.abs(short - built) < 40,
+      string.format("the two spellings cost differently: shorthand %.0f, v.* %.0f",
+                    short, built))
+  end)
+
+  it("stays under the ceiling for a validated route", function()
+    -- 3,900 measured. The ceiling is deliberately BELOW 4,012 -- the figure
+    -- with `failures` allocated eagerly -- so that reintroducing that one
+    -- empty table per `validate` call fails here rather than passing as noise.
+    local bytes = bytes_per_request(shorthand, PATH, 2000)
+    assert.is_true(bytes < 4000,
+      string.format("validated-route allocation regressed: %.0f bytes/request, "
+                    .. "ceiling 4000", bytes))
+  end)
+end)
+
 -- ============================================================ the real server
 --
 -- THE CEILING ABOVE WAS WATCHING THE WRONG PATH, and that cost 4% of `/ping`
