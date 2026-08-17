@@ -646,6 +646,20 @@ that is a single row is returned as a one-row list, so `one` and `many` both
 work against the same programming. A response of `nil`, including a function
 returning nothing, is an empty list.
 
+**An empty table is one empty row, not zero rows.** `{}` has no `[1]`, so it
+takes the single-row branch and `one` hands back a truthy table with nothing in
+it. To program a miss, use a function:
+
+```lua no-run
+fake:on("where id", function() return nil end)   -- zero rows
+fake:on("where id", {})                          -- ONE row, with no columns
+```
+
+And `reset` does not unprogram anything — it clears the log and the transaction
+flags. Since `many` returns the **first** pattern that matches, programming the
+same pattern again never wins. Build a new fake for a scenario that needs a
+different answer to the same query.
+
 **Returns** a list of rows.
 
 **Raises** `akkar.db.memory: no response programmed for query: <sql>` and

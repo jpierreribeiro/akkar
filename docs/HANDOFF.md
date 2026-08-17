@@ -205,6 +205,58 @@ Three ways to waste a run, each of which cost one:
 
 ---
 
+## Teaching akkar, and why it is also an instrument
+
+`~/Desktop/akkar-exercise-spike/` — a spike answering one question: can a
+backend exercise in akkar be graded inside the constraints `dalivim-runner`
+imposes on Lua? Isolated mode, one entry file, no network, a hard `RLIMIT_AS`.
+
+**Yes, comfortably.** Two exercises, twelve submissions, **12.8 MB peak RSS
+against a 256 MB address-space cap, 40–100 ms per grading, no network at all.**
+
+`app:test()` is what makes it possible: a request goes through routing,
+validation, middleware and the handler **without opening a socket**, so a
+backend exercise becomes a deterministic function call — the only shape an
+isolated jail runs.
+
+The runner's `-E` decides the design. It ignores `LUA_INIT`, `LUA_PATH` and
+`LUA_CPATH`, so akkar cannot arrive through the environment. Either it lives in
+the image's system path, or the interpreter is not `lua5.4` at all: it is the
+single binary `akkar build` produces, which carries akkar and 46 native modules
+and hosts code it never embedded.
+
+### And it is an instrument for akkar
+
+Writing **one** exercise against `akkar.db.memory` surfaced five API surprises,
+none of which any test in this repository would have caught:
+
+| | |
+|---|---|
+| `check_capabilities` is not an `app:test{}` option | akkar refused it by name, which is right |
+| the query log records values as `args`, not `params` | documented, and easy to assume wrong |
+| `:on(pattern, {})` is **one empty row**, not zero | zero rows needs a function returning nil |
+| `Memory:reset()` does **not** clear programmed responses | and `find` returns the first match, so re-programming never wins |
+| an unprogrammed query **raises** | which is the right default, and not obvious |
+
+Only the third is arguably a defect: an empty table is what anyone reaches for
+to mean "no rows", and a row with no columns has no use. It was **not changed**
+— five specs depend on the current behaviour, and changing an API on a
+preference in the middle of other work is how a framework acquires surprises
+rather than loses them. It is documented instead.
+
+That is the argument for the teaching idea as engineering rather than as a
+product: exercises are miniature ports, a grader running learner code is a
+fuzzer for the API surface and the error messages, and a hundred learners would
+be the largest source of *found by use* this project could have.
+
+### The lesson that cost two distractors
+
+A distractor only teaches if it is genuinely wrong, and the only way to know is
+to run it. Two were written as traps and passed, correctly — a float path that
+`math.ceil` makes integral, and a "returns the whole row" that a fixture with
+exactly the right columns cannot catch. **Failing somebody for being right is
+the worst defect an exercise platform can have.**
+
 ## The port lives outside this repository
 
 `~/Desktop/escrow-akkar/` — three slices of a private escrow service, ported to
