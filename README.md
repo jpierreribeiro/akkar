@@ -1,8 +1,8 @@
 # akkar
 
-A microframework for JSON APIs in Lua 5.4, on `cqueues` and `lua-http`.
-
-No nginx, no C, no build step. One coroutine per request.
+**An application runtime for backend services in Lua 5.4**, on `cqueues` and
+`lua-http`. One coroutine per request, one thread per process, no nginx in
+front.
 
 **akkar turns common server mistakes into impossible states or explicit
 errors.** Handlers return, so a double response cannot happen. I/O goes through
@@ -12,38 +12,197 @@ never reaches a handler. Bodies and deadlines are bounded by default, so an
 unbounded request cannot happen. And when something blocks the event loop —
 the one failure Lua servers hide best — it says so, with a file and a line.
 
+```sh
+akkar new my-api && cd my-api && akkar run
+```
+
 ```lua
-local app = require("akkar").new()
+local akkar = require "akkar"
+
+local app = akkar.new()
 app:get("/", function() return { hello = "world" } end)
-app:run()
+
+return app
 ```
 
 ---
 
 ## Status
 
-**Under construction, for my own use.** The substrate is proven and the
-ergonomics are settled — see `docs/substrate/RESULT.md`. Production shape is
-in: body limits, deadlines, pooling, graceful shutdown, structured logs,
-metrics, OpenAPI, multipart, an in-memory adapter for every capability, Teal
-declarations, and a strict mode that turns an accidental global into an error.
+**Under construction, and used in earnest only by its author.** 1,696 tests,
+zero failures. The substrate is proven, the ergonomics are settled, and the
+production shape is in — body limits, deadlines, pooling, graceful shutdown,
+structured logs, metrics, tracing, OpenAPI, migrations, jobs, sessions, an
+in-memory adapter for every capability, Teal declarations, and a strict mode
+that turns an accidental global into an error.
 
-Measured on a c5.2xlarge: linear scaling across physical cores, and the
-database dominating a real request twelve to one. See `bench/RESULTS.md`.
+**What it is not yet.** CI runs `ubuntu-24.04` and nothing else: ARM64 has been
+measured once by hand and macOS never, which matters more for something calling
+itself a runtime than it would for a library. Nobody outside this repository has
+put a request through it. No adversarial security review has happened, and the
+last two security defects were found by accident while building something else.
+`docs/UNKNOWNS.md` is the honest list.
 
-There is no compatibility policy. The API will change.
+**And it is not published.** akkar is not on luarocks.org, so installing means
+pointing LuaRocks at a rockspec URL. That is a release step nobody has taken,
+not a technical obstacle.
 
 There is no compatibility policy. The API will change.
 
 ## Installing
 
+**akkar is not on luarocks.org.** It has never been published there, and until
+it is, `luarocks install akkar` finds nothing. Install from the rockspec, which
+LuaRocks fetches and then pulls the source from the tag the rockspec pins:
+
 ```sh
-luarocks install --local --only-deps akkar-dev-1.rockspec
+luarocks install https://raw.githubusercontent.com/jpierreribeiro/akkar/main/akkar-0.1.0-1.rockspec
+```
+
+That puts the modules and the `akkar` command in place. Needs Lua 5.4 and
+OpenSSL headers; tested against OpenSSL 3.0.13.
+
+The Postgres driver written in C is a **separate rock**, because linking libpq
+into `akkar` itself would make it a hard dependency for everyone who never
+touches Postgres:
+
+```sh
+luarocks install https://raw.githubusercontent.com/jpierreribeiro/akkar/main/akkar-pq-0.1.0-1.rockspec \
+  PQ_INCDIR=$(pg_config --includedir)
+```
+
+`PQ_INCDIR` is needed on Debian and Ubuntu, where `libpq-fe.h` lives in
+`/usr/include/postgresql` rather than anywhere LuaRocks looks.
+
+Then `db.connect { driver = "pq" }`. It is **1.27x on a single row and 2.79x on
+a thousand**, with p99 under saturation falling from 1.3 s to 475 ms —
+`bench/driver/RESULTS.md` §5. pgmoon stays the default only because a default
+of `pq` would fail at the first query for anyone who did not install this rock.
+
+From a checkout, for working on akkar itself:
+
+```sh
+luarocks install --local --only-deps akkar-0.1.0-1.rockspec
 eval "$(luarocks path --bin)"
 busted
 ```
 
-Needs Lua 5.4 and OpenSSL headers. Tested against OpenSSL 3.0.13.
+---
+
+## The whole surface, on one page
+
+Thirty-six modules and eight commands. This table exists because the author
+lost track of them, and if the author loses track nobody else stands a chance.
+Every row links to its reference page.
+
+**The command line** — installing the rock puts `akkar` on your PATH.
+
+| | |
+|---|---|
+| [`akkar new`](docs/reference/cli.md) | a project that runs: app, spec, migrations, README |
+| [`akkar run`](docs/reference/cli.md) | start it; `--watch` restarts on a change |
+| [`akkar test`](docs/reference/cli.md) | busted over `spec/`, with the path set for you |
+| [`akkar doctor`](docs/reference/doctor.md) | what is installed, and whether it answers |
+| [`akkar build`](docs/RUNTIME.md) | one executable, no Lua needed to run it |
+| [`akkar archive`](docs/RUNTIME.md) | the static archives `build` consumes |
+| [`akkar watch`](docs/reference/cli.md) | restart any command when files change |
+| `akkar version` | the version, and the Lua under it |
+
+**Handling a request**
+
+| | |
+|---|---|
+| [`akkar`](docs/reference/akkar.md) | routes, the request table, responses, `app:run`, `app:test` |
+| [`akkar.v`](docs/reference/akkar.md#akkarv) | schemas for params, query, body and response |
+| [`akkar.openapi`](docs/reference/openapi.md) | the document, from the schemas already written |
+| [`akkar.etag`](docs/reference/etag.md) | `If-Match`, so a second writer cannot erase the first |
+| [`akkar.idempotency`](docs/reference/idempotency.md) | the same `Idempotency-Key` charged once |
+| [`akkar.limit`](docs/reference/limit.md) | concurrency and rate, decided inside Redis |
+| [`akkar.compress`](docs/reference/compress.md) | gzip on the way out |
+| [`akkar.static`](docs/reference/static.md) | files, with caching headers |
+| [`akkar.multipart`](docs/reference/multipart.md) | uploads |
+
+**The capabilities a handler receives** — a closed set, so `req` cannot become
+a global by another name.
+
+| | |
+|---|---|
+| [`req.db`](docs/reference/db.md) | Postgres, four methods, pooled |
+| [`req.cache`](docs/reference/redis.md) | Redis, or an in-process implementation |
+| [`req.log`](docs/reference/log.md) | structured, with the request id bound in |
+| [`req.clock`](docs/reference/time.md) | the clock, so a deadline test need not sleep |
+| [`req.http`](docs/reference/http.md) | outbound HTTP, pooled, with a ceiling |
+
+**Data**
+
+| | |
+|---|---|
+| [`akkar.db`](docs/reference/db.md) | the adapter and the connection factory |
+| [`akkar.pq`](docs/reference/db.md#the-pq-driver) | the C driver over libpq, opt-in |
+| [`akkar.sql`](docs/reference/sql.md) | a builder where a value can never become SQL |
+| [`akkar.scope`](docs/reference/scope.md) | a tenant a query cannot escape |
+| [`akkar.pool`](docs/reference/pool.md) | connection pooling, used by db and http |
+| [`akkar.migrate`](docs/reference/migrate.md) | migrations, from a directory or as data |
+| [`akkar.redis`](docs/reference/redis.md) | the cache adapter |
+| [`akkar.json`](docs/reference/json.md) | encoding, with `null` and empty-array handling |
+
+**Identity**
+
+| | |
+|---|---|
+| [`akkar.auth`](docs/reference/auth.md) | session, bearer and API key, one middleware |
+| [`akkar.session`](docs/reference/session.md) | server-side sessions behind a signed cookie |
+| [`akkar.jwt`](docs/reference/jwt.md) | verify only, on purpose |
+| [`akkar.csrf`](docs/reference/csrf.md) | double-submit, for cookie sessions |
+| [`akkar.crypto`](docs/reference/crypto.md) | hashing, HMAC, password hashing, random |
+
+**Work that outlives the request**
+
+| | |
+|---|---|
+| [`akkar.jobs`](docs/reference/jobs.md) | at-least-once queues, retries, dead letters |
+| [`akkar.work`](docs/reference/work.md) | native work that would block the loop |
+| [`app:task`](docs/reference/akkar.md#apptaskname-fn) | a supervised loop in the server's own process |
+
+**Operating it**
+
+| | |
+|---|---|
+| [`akkar.health`](docs/reference/health.md) | liveness and readiness, separately |
+| [`akkar.metrics`](docs/reference/metrics.md) | Prometheus, with the request path instrumented |
+| [`akkar.trace`](docs/reference/trace.md) | W3C trace context, propagated and exported |
+| [`akkar.log`](docs/reference/log.md) | JSON or text, with redaction |
+| [`akkar.config`](docs/reference/config.md) | environment, typed and validated at boot |
+| [`akkar.doctor`](docs/reference/doctor.md) | the library combination, checked |
+
+**Reaching outward**
+
+| | |
+|---|---|
+| [`akkar.http`](docs/reference/http.md) | a client with a pool, retries and a body ceiling |
+| [`akkar.email`](docs/reference/email.md) | SMTP |
+| [`akkar.storage`](docs/reference/storage.md) | S3-compatible object storage, signed |
+
+**The runtime itself**
+
+| | |
+|---|---|
+| [`akkar.build`](docs/RUNTIME.md) | the single-executable host |
+| [`akkar.watch`](docs/reference/cli.md#akkar-watch----command) | file watching for development |
+| [`akkar.strict`](docs/reference/strict.md) | an accidental global becomes an error |
+| [`akkar.substrate`](docs/substrate/lua-http-wedge.md) | the lua-http defects akkar repairs at runtime |
+| [`akkar.time`](docs/reference/time.md) | the clock the framework reads |
+| [`akkar.vm`](docs/reference/vm.md) | a sandbox for untrusted Lua — read its limits first |
+
+**Adapters that need nothing running** — every capability ships one, so tests
+and small deployments need no infrastructure.
+
+| | |
+|---|---|
+| [`akkar.db.memory`](docs/reference/db.md#akkardbmemory) | programmed queries, and `:hang()`, `:fail()`, `:drop()` |
+| [`akkar.cache.memory`](docs/reference/redis.md) | a real cache with expiry, per process |
+| [`akkar.jobs.memory`](docs/reference/jobs.md#memorynewname) | a queue in one process |
+| [`akkar.jobs.redis`](docs/reference/jobs.md#redisnewcache-name) | a queue a fleet shares |
 
 ---
 
@@ -75,7 +234,7 @@ Postgres adapter as the reference, not as the only permitted one. Owning every
 driver would make akkar the bottleneck.
 
 `req` stays deliberately small. Capabilities come from a **closed set** — `db`,
-`cache`, `log`, `clock` — because `req` accumulating `req.mailer`,
+`cache`, `log`, `clock`, `http` — because `req` accumulating `req.mailer`,
 `req.payments` and `req.storage` is how a request object becomes a global by
 another name. Unknown options are rejected at startup rather than ignored:
 
@@ -348,16 +507,46 @@ PORT=8099 lua5.4 examples/crud.lua
 
 ## Documentation
 
+**Learning it**
+
 | | |
 |---|---|
-| `docs/PLAN.md` | objective, the verified ladder, invariants, risks, milestones |
-| `docs/DECISIONS.md` | nine design decisions, with alternatives side by side |
-| `types/` | Teal declarations, checked on every test run |
-| `docs/BACKLOG.md` | what is done, what is next, and what is deliberately not built |
-| `docs/substrate/RESULT.md` | substrate proof: TLS, driver concurrency, CRUD |
-| `bench/README.md` | throughput, multicore scaling, and what a blocking handler costs |
-| `bench/RESULTS.md` | measured on a c5.2xlarge, including the run that was wrong |
-| `examples/crud.lua` | ten scenarios against a real Postgres |
+| [`docs/guide/`](docs/guide/) | thirteen pages for somebody new to backends, in order |
+| [`docs/sql/`](docs/sql/) | SQL and migrations, from nothing to a schema that changes |
+| [`docs/recipes/`](docs/recipes/) | nineteen tasks, each one page |
+| [`docs/reference/`](docs/reference/) | every module, every symbol |
+| [`docs/why/`](docs/why/) | the decisions, with the alternatives beside them |
+| [`examples/crud.lua`](examples/crud.lua) | ten scenarios against a real Postgres |
+
+**Deploying and operating it**
+
+| | |
+|---|---|
+| [`docs/DEPLOY.md`](docs/DEPLOY.md) | Railway, Docker, and what breaks in a scratch container |
+| [`docs/RUNTIME.md`](docs/RUNTIME.md) | `akkar build`, and what it still needs by hand |
+| [`docs/reference/cli.md`](docs/reference/cli.md) | the eight commands |
+
+**What is measured, and what is not**
+
+| | |
+|---|---|
+| [`bench/study/RESULTS.md`](bench/study/RESULTS.md) | against Gin and FastAPI, saturation, an eight-hour soak |
+| [`bench/study/WHERE-THE-GAP-IS.md`](bench/study/WHERE-THE-GAP-IS.md) | the gap attributed: cqueues 11%, lua-http 46%, akkar 43% |
+| [`bench/driver/RESULTS.md`](bench/driver/RESULTS.md) | pgmoon against the C driver, isolated and through HTTP |
+| [`bench/driver/ANOMALY.md`](bench/driver/ANOMALY.md) | four experiments, two of which refuted a hypothesis |
+| [`docs/PERFORMANCE-STUDY.md`](docs/PERFORMANCE-STUDY.md) | ten findings, including the ones that were wrong |
+| [`docs/UNKNOWNS.md`](docs/UNKNOWNS.md) | **what nobody has looked at** |
+
+**Where it is going**
+
+| | |
+|---|---|
+| [`docs/RUNTIME-1.0.md`](docs/RUNTIME-1.0.md) | what stays in Lua, what earns C, what ships together |
+| [`docs/PORT-FINDINGS.md`](docs/PORT-FINDINGS.md) | nine defects a real service found, and how |
+| [`docs/HANDOFF.md`](docs/HANDOFF.md) | where things stand, and what to do next |
+| [`docs/PLAN.md`](docs/PLAN.md) | the verified ladder, invariants, milestones |
+| [`docs/BACKLOG.md`](docs/BACKLOG.md) | done, next, and deliberately not built |
+| [`types/`](types/) | Teal declarations, checked on every test run |
 
 ## Safe defaults
 
@@ -487,7 +676,7 @@ was to make the choice explicit, not to leave the capability out.
 ```lua
 local queue = jobs.new(store, "email", {
   retries = 3,                       -- attempts after the first
-  backoff = { base = 2, max = 300 }, -- 2s, 4s, 8s ... capped at five minutes
+  backoff = { first = 60, factor = 2, max = 4 * 3600 },  -- 60s, 120s, 240s ... capped at four hours
 })
 
 queue:push("charge", { order = 41 }, { id = "charge:order:41" })  -- once only
@@ -675,7 +864,7 @@ JSON API has today, which is nothing.
 | Runs on Lua 5.4, not yet 5.5 | The blocker is **`luaossl`**, whose makefile has no 5.5 target. `cqueues` master builds and runs an event loop under 5.5 once its vendored `lua-compat-5.3` is updated from v0.9; the published rock is what pins 5.4. Measured by `docs/runtime/lua55-probe.sh` |
 | `akkar.vm` is a sandbox, not an isolated VM | Lua 5.4 cannot make a separate state from Lua. Real within its stated limits; against hostile code, use a separate process |
 | Streaming holds its capabilities open | a slow client reading a streamed export keeps a pool slot for as long as it reads |
-| The database path is pgmoon in pure Lua | decoding rows into tables is 55% of a thousand-row query and needs a C driver to move |
+| The database path is pgmoon **by default** | decoding rows in the interpreter is 55% of a thousand-row query. `akkar-pq` moves it — 2.79x on a thousand rows — and is a separate rock so libpq stays optional |
 
 ## License
 
