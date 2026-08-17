@@ -112,27 +112,71 @@ The interpreter is `argv[0]` from `/proc/self/cmdline`, read as a file, with a
 walk to the most negative `arg` index as the fallback. The harness is now
 version-agnostic, which is what a multi-version CI needs anyway.
 
-## What is still broken
+## The crash, and what it actually was
 
-The socket and event-loop specs crash under 5.5 — `akkar_spec`,
-`concurrency_spec`, `substrate_repair_spec`. The crash is in `auxgetstr`
-(`lapi.c`), which is a different signature from the `table_LLRB_FIND` crash
-`docs/substrate/SEGFAULT.md` tracks on 5.4.
+An earlier version of this page said the socket specs crashed under 5.5, in
+`auxgetstr` (`lapi.c`), and could not say whether that was 5.5's fault or the
+memory corruption already tracked on 5.4.
 
-Two possibilities, and this page does not choose between them:
+**It was neither. It was a stale C module, and the whole thing is one
+sentence:** `akkar/pq_native.so` in the tree is built for Lua 5.4, and
+`spec/db_spec.lua` puts `./?.so` on `package.cpath`.
 
-- 5.5 has a real incompatibility with cqueues, this build of it, or the updated
-  compat shim
-- the memory corruption already known on 5.4 surfaces differently under a
-  different allocator
+What makes it nasty rather than obvious:
 
-Both deserve the same instrument: a cqueues built for 5.5 under
-AddressSanitizer. That has not been done.
+```
+require "akkar.pq_native"   -- succeeds under 5.5
+pq.VERSION                  -- reads correctly: "akkar.pq 0.1"
+pq.connect_start(...)       -- core dump
+```
 
-**So Lua 5.5 is not adopted, and akkar still ships on 5.4.** What changed is
-that the blocker is now specific and local instead of "upstream, indefinitely":
-one makefile patch to send, one vendored header to update, and one crash to
-diagnose.
+Loading a C module built for a different Lua is **not** a clean failure. The
+`luaopen_` symbol resolves, the table comes back, its fields read fine — and
+then the first real call walks a `lua_State` laid out differently than the one
+it was compiled against.
+
+Take that one file out of the tree and the whole suite runs:
+
+```
+Lua 5.4    1,710 successes / 0 failures / 0 errors / 0 pending
+Lua 5.5    1,672 successes / 0 failures / 0 errors / 2 pending
+```
+
+The 38-test gap is fully accounted for: `pq_spec` and `db_spec`'s C-driver half
+skip because `pq_native.so` is not built for 5.5, and `teal_spec` skips because
+`tl` is not installed there. Nothing fails.
+
+## The guard this produced
+
+`src/akkar_pq.c` now records `LUA_VERSION_NUM` at compile time, and
+`akkar/pq.lua` refuses a module whose marker disagrees with the running Lua.
+A segfault becomes an error that names the fix.
+
+A module with **no** marker is allowed through, and that is deliberate: every
+`.so` built before this change lacks one, including correct ones, so refusing
+them would turn a working 5.4 install into a hard error and drop the C
+driver's test coverage with it. The marker closes the hole for every build
+from here on. `AKKAR_PQ_SKIP_ABI_CHECK=1` disables the check.
+
+Until a stale `.so` is rebuilt, **remove it before running under a different
+Lua** — that is the whole workaround.
+
+## Where this leaves 5.5
+
+Supported, not yet recommended, and `akkar doctor` says exactly that:
+
+```
+runtime
+  ok    Lua 5.5
+        supported; needs luaossl and cqueues built for 5.5 -- see docs/substrate/LUA-55.md
+```
+
+The rockspec already allowed `lua >= 5.4, < 5.6`; the doctor was the only
+thing hardcoding 5.4, with a reason that had stopped being true.
+
+What still stands between 5.5 and "recommended" is packaging, not code: a
+luaossl whose makefile lists 5.5, and a cqueues whose vendored compat shim is
+current. Both are one patch each, upstream, and neither is akkar's to merge.
 
 ## Reproducing this
 

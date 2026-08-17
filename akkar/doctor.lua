@@ -107,13 +107,28 @@ end
 function M.check_environment(report)
   report = report or new_report()
 
-  -- The Lua version, and the pin that makes it non-negotiable.
+  -- The Lua version.
+  --
+  -- 5.4 and 5.5 both, and the second one is recent enough to explain. This
+  -- used to fail anything but 5.4, with the reason "cqueues pins it exactly
+  -- and has had no release since 2020" -- which stopped being true: cqueues
+  -- gained 5.5 support upstream in March 2026, in the commit akkar pins, and
+  -- the whole suite has since been run under 5.5.
+  --
+  -- 5.5 is NOT yet the recommended version, and `docs/substrate/LUA-55.md`
+  -- says why -- it needs a luaossl built by hand and a cqueues whose vendored
+  -- compat shim has been updated, neither of which luarocks will do for you.
+  -- So it passes with a note rather than silently, because somebody on 5.5
+  -- has done something deliberate and should be told the ground is newer.
   local version = _VERSION
   if version == "Lua 5.4" then
-    report:ok("runtime", version, "cqueues pins lua == 5.4, so this is the only supported one")
+    report:ok("runtime", version, "the version akkar ships and tests against")
+  elseif version == "Lua 5.5" then
+    report:ok("runtime", version,
+      "supported; needs luaossl and cqueues built for 5.5 -- see docs/substrate/LUA-55.md")
   else
     report:fail("runtime", version,
-      "akkar runs on Lua 5.4; cqueues pins it exactly and has had no release since 2020",
+      "akkar runs on Lua 5.4 or 5.5",
       "install Lua 5.4 and rebuild the rocks against it")
   end
 

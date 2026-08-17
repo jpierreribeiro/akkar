@@ -45,6 +45,44 @@ local cqueues = require "cqueues"
 local pq      = require "akkar.pq_native"
 local time    = require "akkar.time"
 
+-- REFUSE A C MODULE BUILT FOR A DIFFERENT LUA, because the alternative is a
+-- segfault rather than an error.
+--
+-- `pq_native.so` built against 5.4 loads into 5.5 without complaint: the
+-- symbol resolves, the table comes back, `VERSION` reads correctly. The first
+-- real call then dumps core, because the two versions do not lay out a
+-- `lua_State` the same way. Found porting akkar to Lua 5.5, where a stale .so
+-- in the tree killed the whole suite before it printed one line.
+--
+-- A MISSING MARKER IS ALLOWED THROUGH, and the reasoning is worth stating
+-- because the strict version was written first and then measured.
+--
+-- Refusing it would be safer in the abstract and worse in practice: every
+-- `pq_native.so` built before this commit lacks the marker, INCLUDING correct
+-- ones, so a strict check turns a working 5.4 install into a hard error and
+-- silently drops the C driver's test coverage with it. That is paying a
+-- certain cost today against a hazard that only exists when somebody changes
+-- Lua versions.
+--
+-- The marker closes the hole for every build from here on. Until a stale one
+-- is rebuilt, `docs/substrate/LUA-55.md` names it as the thing to remove
+-- before running under a different Lua.
+--
+-- `AKKAR_PQ_SKIP_ABI_CHECK=1` disables the check entirely, for anyone whose
+-- build is right and whose marker disagrees for a reason we did not foresee.
+-- `_VERSION` is the only version Lua exposes to Lua, so the C constant is
+-- reconstructed from it: "Lua 5.4" -> 504.
+local major, minor = _VERSION:match "(%d+)%.(%d+)"
+local running = major and (tonumber(major) * 100 + tonumber(minor))
+
+if not os.getenv "AKKAR_PQ_SKIP_ABI_CHECK" then
+  if pq.LUA_VERSION_NUM and running and pq.LUA_VERSION_NUM ~= running then
+    error(("akkar.pq_native was built for Lua %.1f and this is %s; rebuild it "
+           .. "(luarocks install akkar-pq) or remove the stale pq_native.so")
+          :format(pq.LUA_VERSION_NUM / 100, _VERSION), 0)
+  end
+end
+
 local M = {}
 
 local Conn = {}
