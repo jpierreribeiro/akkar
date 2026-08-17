@@ -30,28 +30,99 @@ jobs:
   # No services. This job proves the suite is green on a machine with no
   # Postgres and no Redis -- which is the state the skip guards exist for and
   # which nobody had ever verified.
+  #
+  # AND IT IS THE JOB THAT ANSWERS "WHERE DOES AKKAR RUN".
+  #
+  # Until this matrix existed, CI was `ubuntu-24.04` and nothing else. ARM64
+  # had been measured exactly once, by hand; macOS never. That was tolerable
+  # for a library and is not for something calling itself a runtime, because
+  # the promise of a runtime IS the combination that works. `docs/UNKNOWNS.md`
+  # §1 has carried this as the largest known gap.
+  #
+  # The other two jobs stay on ubuntu on purpose: `integration` needs service
+  # containers, which macOS runners do not have, and `install` is about
+  # packaging rather than about platform.
+  #
+  # macOS is a QUESTION, not an assertion. Nobody has ever built akkar there,
+  # so the first runs may well be red -- and a red run that says "luaossl does
+  # not build against this OpenSSL" is the finding, not a failure of the CI
+  # file. The steps below echo what they resolved before using it, so a break
+  # is diagnosable from the log without a second push.
   unit:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        lua: ["5.4"]
+        # `include` rather than a cross product: these are the three
+        # combinations worth paying for, not every pairing of two lists.
+        # macos-14 is Apple Silicon, so it covers macOS and a second arm64.
+        include:
+          - { os: ubuntu-24.04,     lua: "5.4" }
+          - { os: ubuntu-24.04-arm, lua: "5.4" }
+          - { os: macos-14,         lua: "5.4" }
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Lua ${{ matrix.lua }} and build dependencies
+      - name: Install Lua ${{ matrix.lua }} and build dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             lua${{ matrix.lua }} liblua${{ matrix.lua }}-dev luarocks \
             libssl-dev build-essential m4
+          {
+            echo "LUA_BIN=lua${{ matrix.lua }}"
+            echo "LUA_INC=/usr/include/lua${{ matrix.lua }}"
+            echo "ROCKS=sudo luarocks"
+            echo "LUA_SHARE=/usr/local/share/lua/${{ matrix.lua }}"
+            echo "LUA_LIB=/usr/local/lib/lua/${{ matrix.lua }}"
+          } >> "$GITHUB_ENV"
 
+      # Homebrew, not apt, and NOT under sudo: brew's luarocks writes inside
+      # the brew prefix, which the runner user owns. `sudo luarocks` there
+      # resolves a different HOME and a different tree, and installs rocks the
+      # test run cannot see.
+      - name: Install Lua ${{ matrix.lua }} and build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install lua luarocks openssl@3 m4 pkg-config
+
+          # Resolved, not assumed. Homebrew's prefix differs between Apple
+          # Silicon (/opt/homebrew) and Intel (/usr/local), and the Lua
+          # headers have moved between formula versions.
+          BREW=$(brew --prefix)
+          LUA_PREFIX=$(brew --prefix lua)
+          SSL_PREFIX=$(brew --prefix openssl@3)
+          INC=$(pkg-config --variable=includedir lua 2>/dev/null || true)
+          [ -z "$INC" ] && INC="$LUA_PREFIX/include/lua${{ matrix.lua }}"
+          [ -d "$INC" ] || INC="$LUA_PREFIX/include"
+
+          echo "brew prefix    : $BREW"
+          echo "lua prefix     : $LUA_PREFIX"
+          echo "openssl prefix : $SSL_PREFIX"
+          echo "lua headers    : $INC"
+          ls "$INC" | head -5
+
+          {
+            echo "LUA_BIN=lua"
+            echo "LUA_INC=$INC"
+            echo "ROCKS=luarocks"
+            echo "LUA_SHARE=$BREW/share/lua/${{ matrix.lua }}"
+            echo "LUA_LIB=$BREW/lib/lua/${{ matrix.lua }}"
+            echo "OPENSSL_DIR=$SSL_PREFIX"
+          } >> "$GITHUB_ENV"
+
+      # The key carries `matrix.os`, not `runner.os`. Both ubuntu runners
+      # report `Linux`, so a shared key would have handed the arm64 job an
+      # x86-64 build of cqueues -- a cache poisoning that would fail as a
+      # confusing link error rather than as a cache problem.
       - name: Cache the cqueues build
         id: cqueues-cache
         uses: actions/cache@v4
         with:
           path: ~/cqueues-build
-          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua${{ matrix.lua }}-${{ runner.os }}
+          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua${{ matrix.lua }}-${{ matrix.os }}
 
       - name: Build cqueues from the pinned commit
         if: steps.cqueues-cache.outputs.cache-hit != 'true'
@@ -59,25 +130,34 @@ jobs:
           git clone https://github.com/wahern/cqueues.git ~/cqueues-build
           cd ~/cqueues-build
           git checkout "$CQUEUES_COMMIT"
-          make all${{ matrix.lua }} CPPFLAGS="-I/usr/include/lua${{ matrix.lua }}"
+          make all${{ matrix.lua }} CPPFLAGS="-I$LUA_INC"
 
       - name: Install cqueues
         run: |
           cd ~/cqueues-build
-          sudo make install${{ matrix.lua }} \
-            lua${{ matrix.lua }}path=/usr/local/share/lua/${{ matrix.lua }} \
-            lua${{ matrix.lua }}cpath=/usr/local/lib/lua/${{ matrix.lua }}
+          ${{ runner.os == 'Linux' && 'sudo' || '' }} make install${{ matrix.lua }} \
+            lua${{ matrix.lua }}path="$LUA_SHARE" \
+            lua${{ matrix.lua }}cpath="$LUA_LIB"
 
       - name: Install the rest of the dependencies
         run: |
-          sudo luarocks --lua-version ${{ matrix.lua }} install luaossl
-          sudo luarocks --lua-version ${{ matrix.lua }} install http
-          sudo luarocks --lua-version ${{ matrix.lua }} install lua-cjson
-          sudo luarocks --lua-version ${{ matrix.lua }} install pgmoon
-          sudo luarocks --lua-version ${{ matrix.lua }} install luasocket
-          sudo luarocks --lua-version ${{ matrix.lua }} install busted
-          sudo luarocks --lua-version ${{ matrix.lua }} install tl || \
+          # luaossl needs to be pointed at Homebrew's OpenSSL on macOS; on
+          # Linux the system one is where its build script already looks.
+          EXTRA=""
+          [ -n "${OPENSSL_DIR:-}" ] && EXTRA="OPENSSL_DIR=$OPENSSL_DIR CRYPTO_DIR=$OPENSSL_DIR"
+          $ROCKS --lua-version ${{ matrix.lua }} install luaossl $EXTRA
+          for rock in http lua-cjson pgmoon luasocket busted; do
+            $ROCKS --lua-version ${{ matrix.lua }} install "$rock"
+          done
+          $ROCKS --lua-version ${{ matrix.lua }} install tl || \
             echo "tl unavailable; spec/teal_spec.lua will report pending"
+
+      - name: What this platform actually resolved
+        run: |
+          $LUA_BIN -v
+          $LUA_BIN -e 'print("cqueues  " .. (require("cqueues").VERSION or "?"))'
+          $LUA_BIN -e 'print("openssl  " .. require("openssl").version())' || true
+          $LUA_BIN -e 'print("cjson    " .. (require("cjson")._VERSION or "?"))'
 
       - name: The suite, with no database and no Redis
         run: busted
@@ -92,7 +172,7 @@ jobs:
         run: busted spec/substrate_spec.lua
 
       - name: Doctor
-        run: lua${{ matrix.lua }} bin/akkar doctor --no-probe
+        run: $LUA_BIN bin/akkar doctor --no-probe
 
   # --------------------------------------------------------- integration
   # The same suite with the backends up, so the specs that skip themselves on
@@ -130,7 +210,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/cqueues-build
-          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua5.4-${{ runner.os }}
+          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua5.4-ubuntu-24.04
 
       - name: Build cqueues from the pinned commit
         if: steps.cqueues-cache.outputs.cache-hit != 'true'
@@ -189,7 +269,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/cqueues-build
-          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua5.4-${{ runner.os }}
+          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua5.4-ubuntu-24.04
 
       - name: Build cqueues from the pinned commit
         if: steps.cqueues-cache.outputs.cache-hit != 'true'
