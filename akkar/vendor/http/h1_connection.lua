@@ -358,8 +358,11 @@ end
 
 function connection_methods:write_status_line(httpversion, status_code, reason_phrase, timeout)
 	assert(httpversion == 1.0 or httpversion == 1.1)
-	assert(status_code:match("^[1-9]%d%d$"), "invalid status code")
-	assert(type(reason_phrase) == "string" and reason_phrase:match("^[^\r\n]*$"), "invalid reason phrase")
+	-- AKKAR: `find` rather than `match` -- same pattern, same rejections, but
+	-- it answers with positions instead of allocating a copy of the string it
+	-- just validated. Once per response.
+	assert(status_code:find("^[1-9]%d%d$"), "invalid status code")
+	assert(type(reason_phrase) == "string" and reason_phrase:find("^[^\r\n]*$"), "invalid reason phrase")
 	local line = string.format("HTTP/%s %s %s\r\n", httpversion == 1.0 and "1.0" or "1.1", status_code, reason_phrase)
 	local ok, err, errno = self.socket:xwrite(line, "f", timeout)
 	if not ok then
@@ -369,8 +372,17 @@ function connection_methods:write_status_line(httpversion, status_code, reason_p
 end
 
 function connection_methods:write_header(k, v, timeout)
-	assert(type(k) == "string" and k:match("^[^:\r\n]+$"), "field name invalid")
-	assert(type(v) == "string" and v:sub(-1, -1) ~= "\n" and not v:match("\n[^ ]"), "field value invalid")
+	-- AKKAR: the same three checks without the three allocations, once per
+	-- header of every response.
+	--
+	-- `match` returns the matched text, so validating a name allocated a copy
+	-- of it; `sub(-1, -1)` built a one-character string to compare against
+	-- "\n". `find` and `byte` answer the same questions with numbers.
+	--
+	-- The checks themselves are unchanged and they are not decorative: they
+	-- are what stops a header value from injecting CRLF into the response.
+	assert(type(k) == "string" and k:find("^[^:\r\n]+$"), "field name invalid")
+	assert(type(v) == "string" and v:byte(-1) ~= 10 and not v:find("\n[^ ]"), "field value invalid")
 	local ok, err, errno = self.socket:xwrite(k..": "..v.."\r\n", "f", timeout)
 	if not ok then
 		return nil, err, errno

@@ -20,38 +20,32 @@ local entry_mt = {
 	__index = entry_methods;
 }
 
-local never_index_defaults = {
-	authorization = true;
-	["proxy-authorization"] = true;
-	cookie = true;
-	["set-cookie"] = true;
-}
+-- AKKAR: `never_index_defaults` and the `never_index` field on every entry
+-- are gone. They are HPACK's -- the HTTP/2 header-compression flag meaning
+-- "never place this in the dynamic table" -- and HTTP/2 went when the
+-- HTTP/1.1 half of this library was vendored. They were being carried on
+-- every header of every request and read by nobody.
+--
+-- A Lua table constructor sizes its hash part by key count: three keys reserve
+-- four slots, two reserve two. Per header, per request.
 
-local function new_entry(name, value, never_index)
-	if never_index == nil then
-		never_index = never_index_defaults[name] or false
-	end
+local function new_entry(name, value)
 	return setmetatable({
 		name = name;
 		value = value;
-		never_index = never_index;
 	}, entry_mt)
 end
 
-function entry_methods:modify(value, never_index)
+function entry_methods:modify(value)
 	self.value = value
-	if never_index == nil then
-		never_index = never_index_defaults[self.name] or false
-	end
-	self.never_index = never_index
 end
 
 function entry_methods:unpack()
-	return self.name, self.value, self.never_index
+	return self.name, self.value
 end
 
 function entry_methods:clone()
-	return new_entry(self.name, self.value, self.never_index)
+	return new_entry(self.name, self.value)
 end
 
 
@@ -213,7 +207,10 @@ local function default_cmp(a, b)
 	if a.value ~= b.value then
 		return a.value < b.value
 	end
-	return a.never_index
+	-- Same name and same value: the two are indistinguishable, so the order
+	-- between them cannot matter. This used to break the tie on
+	-- `never_index`, which no longer exists.
+	return false
 end
 
 function headers_methods:sort()
