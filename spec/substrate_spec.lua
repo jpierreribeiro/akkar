@@ -37,15 +37,20 @@ describe("cqueues: the concurrency model", function()
     -- `ulimit -n 1024` it puts the wall at about 500 concurrent requests, and
     -- `descriptor_ceiling()` derives `max_concurrent` from it directly.
     -- A substitute that costs three moves the ceiling by a third.
-    local function open_fds()
-      local pid = io.open("/proc/self/stat"):read "n"
-      local n = 0
-      for _ in io.popen("ls /proc/" .. pid .. "/fd 2>/dev/null"):lines() do n = n + 1 end
-      return n
-    end
+    -- Through `portable`, because a Mac has no /proc and this used to be
+    -- `io.open("/proc/self/stat"):read "n"` -- which is not a skip on macOS,
+    -- it is `attempt to index a nil value`. Only the delta is read here, and
+    -- the delta survives the platform difference.
+    local portable = require "spec.support.portable"
+    local function open_fds() return portable.open_fds() end
 
     collectgarbage() collectgarbage()
     local before = open_fds()
+    if not before then
+      -- Not zero. "Cannot count" must never be reported as "nothing leaked".
+      pending "descriptors cannot be counted here: no /proc and no lsof"
+      return
+    end
     local held = {}
     for i = 1, 50 do held[i] = cqueues.new() end
     local after = open_fds()
@@ -59,15 +64,20 @@ describe("cqueues: the concurrency model", function()
     -- Why `akkar/pool.lua` parks waiters on a condition rather than on a
     -- controller: a pool of thirty waiters must not cost sixty descriptors.
     local condition = require "cqueues.condition"
-    local function open_fds()
-      local pid = io.open("/proc/self/stat"):read "n"
-      local n = 0
-      for _ in io.popen("ls /proc/" .. pid .. "/fd 2>/dev/null"):lines() do n = n + 1 end
-      return n
-    end
+    -- Through `portable`, because a Mac has no /proc and this used to be
+    -- `io.open("/proc/self/stat"):read "n"` -- which is not a skip on macOS,
+    -- it is `attempt to index a nil value`. Only the delta is read here, and
+    -- the delta survives the platform difference.
+    local portable = require "spec.support.portable"
+    local function open_fds() return portable.open_fds() end
 
     collectgarbage() collectgarbage()
     local before = open_fds()
+    if not before then
+      -- Not zero. "Cannot count" must never be reported as "nothing leaked".
+      pending "descriptors cannot be counted here: no /proc and no lsof"
+      return
+    end
     local held = {}
     for i = 1, 50 do held[i] = condition.new() end
     local grew = open_fds() - before

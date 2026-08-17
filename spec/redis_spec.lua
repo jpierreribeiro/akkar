@@ -174,15 +174,21 @@ describe("a handshake the server refuses", function()
   -- collection first: a descriptor that only returns when the collector runs
   -- is the trap this project already recorded once, where an OS limit was
   -- quietly tied to the pace of the GC.
+  -- Through `portable`: a machine with no /proc answered this with `attempt
+  -- to index a nil value` rather than with a skip.
+  local portable = require "spec.support.portable"
   local function open_fds()
-    local pid = io.open("/proc/self/stat"):read "n"
-    local n = 0
-    for _ in io.popen("ls /proc/" .. pid .. "/fd 2>/dev/null"):lines() do n = n + 1 end
+    local n = portable.open_fds()
+    if not n then return nil end
     return n
   end
 
   it("does not leave the socket open", function()
     local before = open_fds()
+    if not before then
+      pending "descriptors cannot be counted here: no /proc and no lsof"
+      return
+    end
     for _ = 1, 25 do
       local ok = pcall(function()
         return redis.connect { pool_size = 0, password = "definitely-not-the-password" }()

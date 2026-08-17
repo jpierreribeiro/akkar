@@ -56,8 +56,10 @@ end)
 
 -- ===================================================================== live
 
+local portable = require "spec.support.portable"
+
 local function have_lua()
-  local pipe = io.popen "lua5.4 -v 2>&1"
+  local pipe = io.popen(portable.lua .. " -v 2>&1")
   if not pipe then return false end
   local out = pipe:read "a"
   pipe:close()
@@ -90,8 +92,8 @@ local function run_program(source, seconds)
   file:write(source)
   file:close()
 
-  local pipe = assert(io.popen(
-    ("timeout %d lua5.4 %q 2>&1"):format(seconds or 15, path)))
+  local pipe = assert(io.popen(portable.timeout(seconds or 15,
+    ("%s %q"):format(portable.lua, path)) .. " 2>&1"))
   local output = pipe:read "a"
   pipe:close()
   os.remove(path)

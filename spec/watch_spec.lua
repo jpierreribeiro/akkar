@@ -10,7 +10,8 @@ enough tests that sleep.
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
-local watch = require "akkar.watch"
+local watch    = require "akkar.watch"
+local portable = require "spec.support.portable"
 
 local function scratch()
   local dir = os.tmpname()
@@ -89,8 +90,9 @@ describe("the loop", function()
         -- Change the file on the second tick only.
         if tick == 2 then
           write(dir .. "/app.lua", "return 2")
-          local stamp = os.time() + 60
-          os.execute(("touch -d @%d %q"):format(stamp, dir .. "/app.lua"))
+          -- `touch -d @epoch` is GNU; BSD touch rejects it. `portable` spells
+          -- it the way both accept.
+          portable.touch_at(dir .. "/app.lua", os.time() + 60)
         end
       end,
       on_restart = function(changes) restarts[#restarts + 1] = changes end,

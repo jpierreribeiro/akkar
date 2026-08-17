@@ -19,8 +19,10 @@ entirely in whether the thing it emits runs.
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
+local portable = require "spec.support.portable"
+
 local function have_lua()
-  local pipe = io.popen "lua5.4 -v 2>&1"
+  local pipe = io.popen(portable.lua .. " -v 2>&1")
   if not pipe then return false end
   local out = pipe:read "a"
   pipe:close()
@@ -60,8 +62,9 @@ end
 
 --- Runs the CLI in `dir` and returns its output and whether it succeeded.
 local function cli(dir, args, timeout)
-  local command = ("cd %q && %s timeout %d lua5.4 %q/bin/akkar %s 2>&1")
-    :format(dir, ENV, timeout or 30, ROOT, args)
+  local command = ("cd %q && %s %s 2>&1"):format(dir, ENV,
+    portable.timeout(timeout or 30,
+      ("%s %q/bin/akkar %s"):format(portable.lua, ROOT, args)))
   local pipe = assert(io.popen(command))
   local out = pipe:read "a"
   local ok = pipe:close()
@@ -144,12 +147,14 @@ describe("akkar run", function()
     cli(dir, "new demo")
 
     local PORT = 8385
-    -- `setsid ... &` and nothing else: `disown` is a bashism and `os.execute`
-    -- runs `sh`, which reported "disown: not found" and left the reader
-    -- wondering why the server had not started.
-    os.execute(("cd %q/demo && PORT=%d %s setsid lua5.4 %q/bin/akkar run " ..
-                ">/dev/null 2>%q/run.err &")
-               :format(dir, PORT, ENV, ROOT, dir))
+    -- `setsid ... &` where there is a `setsid`, and a plain `&` where there
+    -- is not -- `disown` is NOT the fallback: it is a bashism, and
+    -- `os.execute` runs `sh`, which reported "disown: not found" and left the
+    -- reader wondering why the server had not started.
+    os.execute(("cd %q/demo && PORT=%d %s %s"):format(dir, PORT, ENV,
+      portable.detached(
+        ("%s %q/bin/akkar run"):format(portable.lua, ROOT),
+        dir .. "/run.err")))
 
     local health, greeting, refused
     local cq = cqueues.new()
@@ -178,11 +183,10 @@ describe("akkar run", function()
     cq:loop(30)
 
     -- Stop it by port rather than by name: `pkill -f lua5.4` in a suite that
-    -- spawns interpreters is a way to kill the suite.
-    local probe = io.popen(("ss -ltnp 2>/dev/null | awk '/:%d /{print $NF}'"):format(PORT))
-    local line = probe and probe:read "a" or ""
-    if probe then probe:close() end
-    local pid = line:match "pid=(%d+)"
+    -- spawns interpreters is a way to kill the suite. `ss` is iproute2, so
+    -- the lookup itself lives in `portable`; the reason for it does not
+    -- change across platforms.
+    local pid = portable.pid_on_port(PORT)
     if pid then os.execute(("kill %s 2>/dev/null"):format(pid)) end
 
     local err = io.open(dir .. "/run.err", "r")

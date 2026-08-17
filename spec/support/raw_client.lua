@@ -20,8 +20,9 @@ fate, and this process is free to send bytes no client would send and wait
 with a bounded loop.
 ]]
 
-local cqueues = require "cqueues"
-local socket  = require "cqueues.socket"
+local cqueues  = require "cqueues"
+local socket   = require "cqueues.socket"
+local portable = require "spec.support.portable"
 
 local M = {}
 
@@ -93,7 +94,11 @@ function M.start_on(port, extra)
   -- Its output goes to a FILE, not to /dev/null. A harness that cannot say
   -- why the server did not start is a harness that costs an afternoon.
   local log = path .. ".log"
-  os.execute(("setsid %s %q >%q 2>&1 &"):format(M.binary or "lua5.4", path, log))
+  -- `setsid` when there is one -- a Mac has none, and `portable` falls back to
+  -- a plain `&`, which detaches enough here because `os.execute`'s `sh` exits
+  -- immediately and the child is reparented rather than killed.
+  os.execute(portable.detached(
+    ("%s %q"):format(M.binary or portable.lua, path), log))
 
   -- Wait for the port rather than sleeping a guessed amount: a fixed sleep is
   -- either too short on a loaded machine or wasted on an idle one.
