@@ -82,18 +82,35 @@ jobs:
       # the brew prefix, which the runner user owns. `sudo luarocks` there
       # resolves a different HOME and a different tree, and installs rocks the
       # test run cannot see.
+      # `lua@5.4`, NOT `lua`.
+      #
+      # The first run of this matrix installed `lua` and the build died on
+      #
+      #     compat-5.3.h:404: error: "unsupported Lua version
+      #                               (i.e. not Lua 5.1, 5.2, 5.3, or 5.4)"
+      #
+      # because Homebrew's `lua` formula is now **5.5**. The macOS job had
+      # accidentally become a Lua 5.5 probe, and it reproduced in CI exactly
+      # the blocker `README.md` already documents: cqueues' vendored
+      # `lua-compat-5.3` is at v0.9 and stops at 5.4. Nothing about macOS was
+      # wrong; the Lua was.
+      #
+      # `lua@5.4` is keg-only, so nothing is linked into PATH and every path
+      # below has to be taken from its own prefix. The version is ASSERTED
+      # afterwards, because the whole point is that this went unnoticed once.
       - name: Install Lua ${{ matrix.lua }} and build dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
           brew update
-          brew install lua luarocks openssl@3 m4 pkg-config
+          brew install lua@${{ matrix.lua }} luarocks openssl@3 m4 pkg-config
 
           # Resolved, not assumed. Homebrew's prefix differs between Apple
-          # Silicon (/opt/homebrew) and Intel (/usr/local), and the Lua
-          # headers have moved between formula versions.
+          # Silicon (/opt/homebrew) and Intel (/usr/local).
           BREW=$(brew --prefix)
-          LUA_PREFIX=$(brew --prefix lua)
+          LUA_PREFIX=$(brew --prefix lua@${{ matrix.lua }})
           SSL_PREFIX=$(brew --prefix openssl@3)
+          export PKG_CONFIG_PATH="$LUA_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
           INC=$(pkg-config --variable=includedir lua 2>/dev/null || true)
           [ -z "$INC" ] && INC="$LUA_PREFIX/include/lua${{ matrix.lua }}"
           [ -d "$INC" ] || INC="$LUA_PREFIX/include"
@@ -104,13 +121,25 @@ jobs:
           echo "lua headers    : $INC"
           ls "$INC" | head -5
 
+          # THE ASSERTION. A keg-only formula plus a `lua` on PATH that is a
+          # different version is exactly how the first run got 5.5 quietly.
+          "$LUA_PREFIX/bin/lua" -v
+          "$LUA_PREFIX/bin/lua" -e 'assert(_VERSION == "Lua ${{ matrix.lua }}",
+            "expected Lua ${{ matrix.lua }}, got " .. _VERSION)'
+          grep -q 'LUA_VERSION_NUM.*504' "$INC/lua.h" \
+            || { echo "headers are not 5.4"; grep LUA_VERSION_NUM "$INC/lua.h"; exit 1; }
+
           {
-            echo "LUA_BIN=lua"
+            echo "$LUA_PREFIX/bin"
+          } >> "$GITHUB_PATH"
+          {
+            echo "LUA_BIN=$LUA_PREFIX/bin/lua"
             echo "LUA_INC=$INC"
-            echo "ROCKS=luarocks"
+            echo "ROCKS=luarocks --lua-dir=$LUA_PREFIX"
             echo "LUA_SHARE=$BREW/share/lua/${{ matrix.lua }}"
             echo "LUA_LIB=$BREW/lib/lua/${{ matrix.lua }}"
             echo "OPENSSL_DIR=$SSL_PREFIX"
+            echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
           } >> "$GITHUB_ENV"
 
       # The key carries `matrix.os`, not `runner.os`. Both ubuntu runners
