@@ -193,18 +193,20 @@ jobs:
       #
       # The assertion after it is the point: the file has to be where we said
       # it would be, not merely somewhere.
-      - name: Install cqueues
-        run: |
-          cd ~/cqueues-build
-          NODOT="$(echo '${{ matrix.lua }}' | tr -d .)"
-          ${{ runner.os == 'Linux' && 'sudo' || '' }} make install${{ matrix.lua }} \
-            "lua${NODOT}path=$LUA_SHARE" \
-            "lua${NODOT}cpath=$LUA_LIB"
-          test -f "$LUA_LIB/_cqueues.so" \
-            || { echo "_cqueues.so is not in $LUA_LIB"; ls -R "$LUA_LIB" || true; exit 1; }
-          test -f "$LUA_SHARE/cqueues.lua" \
-            || { echo "cqueues.lua is not in $LUA_SHARE"; ls "$LUA_SHARE" || true; exit 1; }
-
+      # This runs BEFORE the pinned cqueues is installed, and the order is the
+      # whole point. `http` depends on cqueues, luarocks has no idea our
+      # hand-built one exists, and so it fetches the release rock and says so:
+      #
+      #     Warning: /usr/local/lib/lua/5.4/_cqueues.so is not tracked by this
+      #     installation of LuaRocks. Moving it to .../_cqueues.so~
+      #     cqueues 20200726.54-0 is now installed in /usr/local
+      #
+      # That is the pinned build being deleted by the step after it. It has
+      # been happening on Linux since this workflow was written, which means
+      # `CQUEUES_COMMIT` has never been what CI tested -- the release tarball
+      # was. The pin exists because `akkar/substrate.lua` patches cqueues'
+      # internals, so testing a different cqueues than we pin is the one thing
+      # this step must not do.
       - name: Install the rest of the dependencies
         run: |
           # luaossl needs to be pointed at Homebrew's OpenSSL on macOS; on
@@ -218,12 +220,59 @@ jobs:
           $ROCKS --lua-version ${{ matrix.lua }} install tl || \
             echo "tl unavailable; spec/teal_spec.lua will report pending"
 
+      # ...and the pinned build goes in last, over whatever luarocks left.
+      - name: Install the pinned cqueues, last, over the release rock
+        run: |
+          cd ~/cqueues-build
+          NODOT="$(echo '${{ matrix.lua }}' | tr -d .)"
+          ${{ runner.os == 'Linux' && 'sudo' || '' }} make install${{ matrix.lua }} \
+            "lua${NODOT}path=$LUA_SHARE" \
+            "lua${NODOT}cpath=$LUA_LIB"
+          test -f "$LUA_LIB/_cqueues.so" \
+            || { echo "_cqueues.so is not in $LUA_LIB"; ls -R "$LUA_LIB" || true; exit 1; }
+          test -f "$LUA_SHARE/cqueues.lua" \
+            || { echo "cqueues.lua is not in $LUA_SHARE"; ls "$LUA_SHARE" || true; exit 1; }
+
+      # Homebrew's luarocks is not run under sudo, so it deploys into the
+      # runner's own tree, which nothing searches by default -- that is where
+      # `module 'cjson' not found` came from, and `busted` was not on PATH
+      # either. Linux needs none of this: `sudo luarocks` deploys into
+      # /usr/local, which the apt lua5.4 already searches.
+      #
+      # The brew prefix goes FIRST, because the rocks tree carries the release
+      # copy of cqueues and the pinned build has to win the lookup.
+      - name: Put the rocks and the pinned cqueues on the path (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          eval "$($ROCKS --lua-version ${{ matrix.lua }} path)"
+          echo "$HOME/.luarocks/bin" >> "$GITHUB_PATH"
+          echo "LUA_PATH=$LUA_SHARE/?.lua;$LUA_SHARE/?/init.lua;$LUA_PATH;;" >> "$GITHUB_ENV"
+          echo "LUA_CPATH=$LUA_LIB/?.so;$LUA_CPATH;;" >> "$GITHUB_ENV"
+          echo "path : $LUA_SHARE/?.lua;$LUA_SHARE/?/init.lua;$LUA_PATH;;"
+          echo "cpath: $LUA_LIB/?.so;$LUA_CPATH;;"
+
       - name: What this platform actually resolved
         run: |
           $LUA_BIN -v
           $LUA_BIN -e 'print("cqueues  " .. (require("cqueues").VERSION or "?"))'
           $LUA_BIN -e 'print("openssl  " .. require("openssl").version())' || true
           $LUA_BIN -e 'print("cjson    " .. (require("cjson")._VERSION or "?"))'
+
+          # The assertion that would have caught the overwrite on day one.
+          # `COMMIT` only exists when cqueues is compiled with
+          # -DCQUEUES_COMMIT (src/cqueues.c:2955), which our build passes and
+          # the release rock does not -- so a missing field means the pinned
+          # build lost, and a different value means it lost to something else.
+          $LUA_BIN -e '
+            local want = os.getenv("CQUEUES_COMMIT")
+            local got  = require("cqueues").COMMIT
+            print("cqueues from " .. (package.searchpath("cqueues", package.path) or "?"))
+            if not got then
+              error("cqueues has no COMMIT field: this is the release rock, "
+                    .. "not the pinned build")
+            end
+            assert(got == want, "cqueues is " .. got .. ", pinned is " .. want)
+            print("commit   " .. got .. "  (pinned)")'
 
       - name: The suite, with no database and no Redis
         run: busted
@@ -286,18 +335,24 @@ jobs:
           git checkout "$CQUEUES_COMMIT"
           make all5.4 CPPFLAGS="-I/usr/include/lua5.4"
 
-      - name: Install cqueues
-        run: |
-          cd ~/cqueues-build
-          sudo make install5.4 \
-            lua5.4path=/usr/local/share/lua/5.4 \
-            lua5.4cpath=/usr/local/lib/lua/5.4
-
       - name: Install the rest of the dependencies
         run: |
           for rock in luaossl http lua-cjson pgmoon luasocket busted; do
             sudo luarocks --lua-version 5.4 install "$rock"
           done
+
+      # Last, over the cqueues that `http` just pulled in, and with the
+      # variable names cqueues actually reads. Same reasoning as the unit job.
+      - name: Install the pinned cqueues, last, over the release rock
+        run: |
+          cd ~/cqueues-build
+          sudo make install5.4 \
+            lua54path=/usr/local/share/lua/5.4 \
+            lua54cpath=/usr/local/lib/lua/5.4
+          lua5.4 -e '
+            local got = require("cqueues").COMMIT
+            assert(got == os.getenv("CQUEUES_COMMIT"),
+                   "cqueues is not the pinned build: " .. tostring(got))'
 
       - name: Create the fixture the examples and specs expect
         env:
@@ -345,18 +400,25 @@ jobs:
           git checkout "$CQUEUES_COMMIT"
           make all5.4 CPPFLAGS="-I/usr/include/lua5.4"
 
-      - name: Install cqueues
-        run: |
-          cd ~/cqueues-build
-          sudo make install5.4 \
-            lua5.4path=/usr/local/share/lua/5.4 \
-            lua5.4cpath=/usr/local/lib/lua/5.4
-
       - name: Lint the rockspec
         run: luarocks lint ./akkar-dev-1.rockspec
 
       - name: Install akkar from its own rockspec
         run: sudo luarocks --lua-version 5.4 make ./akkar-dev-1.rockspec
+
+      # After the rockspec, which resolves cqueues as a dependency and would
+      # otherwise move this aside. This job only runs the CLI, but a job that
+      # tests installation should install what we say we install.
+      - name: Install the pinned cqueues, last, over the release rock
+        run: |
+          cd ~/cqueues-build
+          sudo make install5.4 \
+            lua54path=/usr/local/share/lua/5.4 \
+            lua54cpath=/usr/local/lib/lua/5.4
+          lua5.4 -e '
+            local got = require("cqueues").COMMIT
+            assert(got == os.getenv("CQUEUES_COMMIT"),
+                   "cqueues is not the pinned build: " .. tostring(got))'
 
       - name: Use the CLI from PATH, outside the source tree
         run: |
