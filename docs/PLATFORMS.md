@@ -125,6 +125,21 @@ documentation examples.
 it returns nil and the caller reports pending — never zero, which would have
 meant "nothing leaked".
 
+## What is pending rather than passing on macOS
+
+The two jobs run the same 1563 tests. Linux passes 1551 with 12 pending;
+macOS passes 1549 with 14. The twelve are the same on both — Postgres, Redis
+and the C driver, none of which the unit job has. The two extra are:
+
+| test | why |
+|---|---|
+| `spec/concurrency_spec.lua:156` | no `/proc/self/limits`, so the ceiling is not derived here at all — see difference 1 |
+| `spec/build_spec.lua:263` | `akkar build` needs `liblua5.4.a`, and Homebrew's `lua@5.4` does not ship a static library |
+
+The second means **`akkar build` is unverified on macOS**. It is not known to
+be broken; it is known not to have been run. Building the single binary there
+would need a static Lua from source.
+
 ## What is still unmeasured
 
 - **32-bit.** `lua_Integer` is 64-bit on a 64-bit build, and akkar's C driver
