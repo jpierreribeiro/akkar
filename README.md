@@ -43,23 +43,36 @@ put a request through it. No adversarial security review has happened, and the
 last two security defects were found by accident while building something else.
 `docs/UNKNOWNS.md` is the honest list.
 
+**And it is not published.** akkar is not on luarocks.org, so installing means
+pointing LuaRocks at a rockspec URL. That is a release step nobody has taken,
+not a technical obstacle.
+
 There is no compatibility policy. The API will change.
 
 ## Installing
 
+**akkar is not on luarocks.org.** It has never been published there, and until
+it is, `luarocks install akkar` finds nothing. Install from the rockspec, which
+LuaRocks fetches and then pulls the source from the tag the rockspec pins:
+
 ```sh
-luarocks install akkar
+luarocks install https://raw.githubusercontent.com/jpierreribeiro/akkar/main/akkar-0.1.0-1.rockspec
 ```
 
-Needs Lua 5.4 and OpenSSL headers. Tested against OpenSSL 3.0.13.
+That puts the modules and the `akkar` command in place. Needs Lua 5.4 and
+OpenSSL headers; tested against OpenSSL 3.0.13.
 
 The Postgres driver written in C is a **separate rock**, because linking libpq
 into `akkar` itself would make it a hard dependency for everyone who never
 touches Postgres:
 
 ```sh
-luarocks install akkar-pq PQ_INCDIR=$(pg_config --includedir)
+luarocks install https://raw.githubusercontent.com/jpierreribeiro/akkar/main/akkar-pq-0.1.0-1.rockspec \
+  PQ_INCDIR=$(pg_config --includedir)
 ```
+
+`PQ_INCDIR` is needed on Debian and Ubuntu, where `libpq-fe.h` lives in
+`/usr/include/postgresql` rather than anywhere LuaRocks looks.
 
 Then `db.connect { driver = "pq" }`. It is **1.27x on a single row and 2.79x on
 a thousand**, with p99 under saturation falling from 1.3 s to 475 ms —
@@ -82,7 +95,7 @@ Thirty-six modules and eight commands. This table exists because the author
 lost track of them, and if the author loses track nobody else stands a chance.
 Every row links to its reference page.
 
-**The command line** — `luarocks install akkar` puts `akkar` on your PATH.
+**The command line** — installing the rock puts `akkar` on your PATH.
 
 | | |
 |---|---|

@@ -23,7 +23,12 @@ commits, MERGEABLE, 1,696 tests passing. This session does not merge to `main`.
 cd ~/Desktop/akkar && git pull --ff-only origin main
 ```
 
-**3. Two things are billing.** The `c5.2xlarge` at `100.48.219.220` has been up
+**3. akkar has never been published.** It is not on luarocks.org, so the README
+tells people to install from a rockspec URL — which works, and was tested, but
+is not what anyone expects to type. `luarocks upload` is a release step nobody
+has taken; there is no technical obstacle and no CI job for it either.
+
+**4. Two things are billing.** The `c5.2xlarge` at `100.48.219.220` has been up
 27 hours and is idle. The Railway service `akkar-deploy-test` is still live from
 an earlier session. Neither is in use.
 
