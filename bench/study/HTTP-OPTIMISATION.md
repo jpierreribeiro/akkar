@@ -116,6 +116,12 @@ overwhelming case has one request in flight and no pipelining.
 
 **`never_index` removed from every header entry: −432 bytes, −2.8%.**
 
+**Throughput is NOT measured for this change.** The study box became
+unreachable before the run, and `bench/study/regression.sh` is the only
+instrument this project trusts for timing. −432 bytes is what is claimed; a
+percentage of requests per second is not, and 2.8% of allocation does not
+imply 2.8% of anything else.
+
 It is HPACK's flag — "never place this header in HTTP/2's dynamic table" —
 which is why `authorization` and `cookie` default to true. HTTP/2 went when the
 h1 half was vendored, so the field was carried on every header of every request
