@@ -199,18 +199,38 @@ end
 -- by the deadline; that is what the watchdog reports instead.
 local controller_pool = {}
 
--- The pool size, overridable at load for one reason: it is the prime suspect
--- in `docs/substrate/SEGFAULT.md`. Four crashes, all at the same instruction --
--- `table_LLRB_FIND` walking a pollset's file-descriptor tree -- and recycling
--- pollsets is the thing akkar does that most cqueues users do not.
+-- RECYCLING IS OFF BY DEFAULT, and it was on until the suite started
+-- segfaulting. `docs/substrate/SEGFAULT.md` has the whole account; the short
+-- version is that every recorded crash lands on one instruction --
+-- `table_LLRB_FIND`, walking a pollset's file-descriptor tree -- and a
+-- controlled experiment came back:
 --
--- `AKKAR_CONTROLLER_POOL=0` turns recycling off: every execution gets a fresh
--- controller and none is ever reused. If the crashes stop, the pool is
--- implicated; if they continue, it is not, and that is worth as much.
+--     pool on  (64)   3 crashes / 6 runs
+--     pool off (0)    0 crashes / 6 runs
 --
--- Read once, at load, so nothing checks an environment variable per request.
--- This goes away with the pool itself when F2 lands.
-local POOL_LIMIT = tonumber(os.getenv "AKKAR_CONTROLLER_POOL") or 64
+-- Both arms ran all 1,699 tests every time, so the exposure was equal. That
+-- is a one-sided Fisher exact p of about 0.09: suggestive rather than proven,
+-- and it is not being called proof. What makes it act-on-able is that it
+-- agrees with the mechanism -- the crash is in a pollset's descriptor tree,
+-- and recycling pollsets is precisely what this pool does.
+--
+-- The price is measured and it is real: 719 bytes per request, which is what
+-- a fresh `cqueues.new()` costs, and `spec/allocation_spec.lua` carries a
+-- raised socket ceiling with this comment as its reason. Memory corruption in
+-- a service runtime is categorically worse than five percent more allocation,
+-- so the trade is not close.
+--
+-- WHAT WAS NOT DONE, and why: removing the controller altogether would have
+-- cost nothing and fixed this outright, but it breaks a guarantee the README
+-- sells. `spec/akkar_spec.lua` has a handler that calls `cqueues.sleep(2)`
+-- against a 0.15 s budget and must answer 503. `sleep` goes through no akkar
+-- adapter, so only a controller can cut it off. Bounding I/O through
+-- capabilities -- which F2 does -- covers everything akkar mediates and
+-- nothing it does not.
+--
+-- `AKKAR_CONTROLLER_POOL=64` restores the old behaviour for anyone measuring
+-- this, and it is how the experiment above was run. Read once, at load.
+local POOL_LIMIT = tonumber(os.getenv "AKKAR_CONTROLLER_POOL") or 0
 
 --- Runs `fn` under a wall-clock budget. Returns the outcome and the result:
 --- `"COMPLETION"`, or `"TIMEOUT"`, and raises on `"ERROR"`.

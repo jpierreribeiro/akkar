@@ -222,8 +222,28 @@ describe("allocation per request, through a real socket", function()
     --
     -- If an honest change needs more, raise it and say why -- the number only
     -- means something while somebody has to argue for each rise.
-    assert.is_true(bytes < 14900,
+    --
+    -- RAISED ONCE, FROM 14,900 TO 15,600, AND HERE IS THE ARGUMENT.
+    --
+    -- `akkar/execution.lua` stopped recycling cqueues controllers. Every
+    -- execution now builds a fresh one, which is 719 bytes it used to borrow:
+    -- 14,708 becomes 15,427.
+    --
+    -- It was not bought for speed or for tidiness. The suite was segfaulting
+    -- -- every recorded crash on one instruction, `table_LLRB_FIND`, walking a
+    -- pollset's file-descriptor tree -- and a controlled experiment measured
+    -- three crashes in six runs with recycling on against none in six with it
+    -- off, both arms running all 1,699 tests every time. See
+    -- `docs/substrate/SEGFAULT.md`, including the part where two targeted
+    -- reproducers failed to reproduce it outside the suite, so the mechanism
+    -- is inferred rather than understood.
+    --
+    -- Memory corruption in a service runtime is categorically worse than five
+    -- percent more allocation. That is the whole argument, and if the crash is
+    -- ever traced to something else, this ceiling should come back down with
+    -- the recycling.
+    assert.is_true(bytes < 15600,
       string.format("allocation through the real server regressed: " ..
-                    "%.0f bytes/request, ceiling 14900", bytes))
+                    "%.0f bytes/request, ceiling 15600", bytes))
   end)
 end)
