@@ -20,6 +20,9 @@ local headers = require "http.headers"
 local cjson   = require "akkar.json"
 local log     = require "akkar.log"
 local multipart = require "akkar.multipart"
+-- The execution machinery, with no HTTP in it. `akkar.execution` requires only
+-- `cqueues` and `akkar.time`, so there is no cycle back to this file.
+local execution = require "akkar.execution"
 
 local akkar = {}
 
@@ -187,15 +190,10 @@ akkar.defaults = {
 --   capabilities   db, cache, log, clock
 --                  infrastructure injected from app:run{}
 --
--- A capability is infrastructure the framework knows how to inject, guard and
--- fake.  Anything belonging to the application -- a mailer, a payment gateway,
--- a recommendation service -- does not qualify and must be closed over by the
--- handler instead.  Without an admission rule this table grows forever, and
--- every entry becomes permanent: moving `req.db` to `ctx.db` later would force
--- an edit to every handler ever written, which is exactly what the complexity
--- ladder forbids.
-local CAPABILITIES = { db = true, cache = true, log = true, clock = true,
-                       http = true }
+-- The closed set now lives in `akkar/execution.lua`, because it is a property
+-- of an execution and not of a request. Aliased as a local so every use below
+-- reads exactly as it did.
+local CAPABILITIES = execution.CAPABILITIES
 
 -- What each capability must be able to do.  Checked once at startup, so a
 -- misconfigured adapter fails at boot the way a duplicate route already does,
@@ -621,106 +619,18 @@ local function remove_watchdog()
 end
 
 -- ================================================================== deadline
--- Wall-clock budget for one request.
---
--- Arbitration follows one rule, learned the expensive way on an earlier
--- project: THE WINNER IS DECIDED BY THE FIRST ARBITRATING EVENT AND A LATE
--- EVENT NEVER OVERTURNS IT.  A handler that finishes at 4.99 s against a 5 s
--- deadline has completed; reporting that as a timeout would discard work that
--- actually happened, which is how this goes wrong silently.
---
--- A nested controller is stepped through `cqueues.poll`, never `loop`, because
--- calling loop() from inside the server's controller would block every other
--- request -- exactly the failure this is meant to prevent.
---
--- HONEST LIMIT: this is cooperative.  It can only fire while the handler is
--- yielding on I/O.  A handler burning CPU in a tight loop is not interrupted
--- by the deadline; that is what the watchdog below reports instead.
-local controller_pool = {}
-local POOL_LIMIT = 64
+-- Moved to `akkar/execution.lua` whole, comments included: a wall-clock budget
+-- is a property of an execution, not of an HTTP request. Aliased as a local so
+-- every call site below is unchanged.
+local with_deadline = execution.with_deadline
 
-local function with_deadline(seconds, fn)
-  if not seconds or seconds <= 0 or not cqueues.running() then
-    return "COMPLETION", fn()          -- no budget, or no controller to yield to
-  end
-
-  -- Controllers are pooled, and speed is only one of three reasons.
-  --
-  -- Three separate investigations landed on this object.  A fresh
-  -- `cqueues.new()` per request cost 25 us of akkar's 34.7 us total overhead;
-  -- it contributed to the 2,814 bytes of garbage a trivial request produced;
-  -- and each controller holds **exactly 2.00 file descriptors**, confirmed at
-  -- three different limits:
-  --
-  --     ulimit -n 256   ->  126 controllers   (2.03 each)
-  --     ulimit -n 1024  ->  510 controllers   (2.01 each)
-  --     ulimit -n 4096  -> 2046 controllers   (2.00 each)
-  --
-  -- Those descriptors came back only when the collector ran, which quietly
-  -- tied a hard operating-system limit to the pace of the garbage collector.
-  -- Nothing declared that, and no profile would have shown it.
-  local cq = table.remove(controller_pool) or cqueues.new()
-  local winner, result
-
-  cq:wrap(function()
-    local ok, res = pcall(fn)
-    if winner == nil then              -- first arbitrating event wins
-      winner = ok and "COMPLETION" or "ERROR"
-      result = res
-    end
-  end)
-
-  -- Step before polling.  `wrap` only queues the coroutine, so the handler has
-  -- not started yet; polling first made every synchronous request wait on a
-  -- descriptor for work that was already ready to run.
-  cq:step(0)
-
-  local deadline = time.monotime() + seconds
-  while winner == nil do
-    local remaining = deadline - time.monotime()
-    if remaining <= 0 then break end
-    cqueues.poll(cq, remaining)        -- yields to the outer controller
-    cq:step(0)
-  end
-
-  -- Only an empty controller goes back.  A handler abandoned by the deadline
-  -- is still running inside its controller, and reusing that would hand the
-  -- next request someone else's unfinished work -- the same class of bug as a
-  -- pooled database connection with a transaction still open.
-  if cq:empty() and #controller_pool < POOL_LIMIT then
-    controller_pool[#controller_pool + 1] = cq
-  end
-
-  if winner == nil then winner = "TIMEOUT" end
-  if winner == "ERROR" then error(result, 0) end
-  return winner, result
-end
 
 -- ==================================================================== guards
--- Invariant: reading something that was never configured gives a useful
--- message, not "attempt to index a nil value".
--- A guard is immutable and its identity carries no meaning, so one per name
--- is built once and shared.  Every request was allocating a table, a
--- metatable and three closures to represent the same nothing.
---
--- `__newindex` is what makes sharing safe: without it, `req.user.id = 1` on
--- an unauthenticated request would silently write into an object every other
--- request also holds.  With it, that line says what is actually wrong.
-local guards = {}
-local function guard(name, hint)
-  local existing = guards[name]
-  if existing then return existing end
+-- Moved to `akkar/execution.lua`: a guard is what an unconfigured capability
+-- reads as, and capabilities are an execution concern. Aliased so the call
+-- sites below are unchanged.
+local guard = execution.guard
 
-  local fail = function() error(hint, 2) end
-  local g = setmetatable({}, {
-    __index = fail,
-    __call = fail,
-    __newindex = fail,
-    __tostring = function() return "<" .. name .. " missing>" end,
-  })
-  guards[name] = g
-  return g
-end
 
 local function unescape(s)
   return (s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
@@ -1445,18 +1355,14 @@ end
 -- across services, generated otherwise.  Not a UUID: this only has to be
 -- unique enough to correlate lines within a window, and pulling in a UUID
 -- library for that would be a dependency bought with nothing.
--- A random prefix chosen once per process, then a counter.  Two RNG calls per
--- request bought nothing: within a process a counter cannot collide at all,
--- which is strictly better than hoping two 48-bit draws differ, and across
--- processes the prefix separates them.
-local ID_PREFIX = string.format("%08x", math.random(0, 0xffffffff))
-local id_counter = 0
-
+-- The generating half moved to `akkar/execution.lua`: every execution has an
+-- identity, and only HTTP has an opinion about honouring a caller's header.
+-- That split is deliberate -- `execution.id()` cannot be handed a header,
+-- because trusting one is a transport decision and belongs here.
 local function request_id(headers)
   local given = headers and headers["x-request-id"]
   if given and #given > 0 and #given <= 200 then return given end
-  id_counter = id_counter + 1
-  return ID_PREFIX .. string.format("%06x", id_counter & 0xffffff)
+  return execution.id()
 end
 
 -- W3C Trace Context, which is the same idea as `x-request-id` with a format
