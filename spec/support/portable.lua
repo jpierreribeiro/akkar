@@ -45,11 +45,55 @@ M.have = have
 
 --- The interpreter to spawn children with.
 ---
---- `lua5.4` is the Debian name. Homebrew's `lua@5.4` installs both `lua` and
---- `lua5.4`, but a source build installs only `lua`, so the versioned name is
---- preferred and the bare one is the fallback. `AKKAR_LUA` overrides both,
---- which is what a machine with several Luas needs.
+--- THE ONE RUNNING THIS SUITE, before any name on PATH. A spawned server has
+--- to be the same Lua as the process spawning it: it inherits `LUA_PATH` and
+--- `LUA_CPATH`, and those point at ONE version's modules.
+---
+--- Found by running the suite under Lua 5.5, where twenty-two framing cases
+--- failed with `the server never started listening; it said: lua5.4:`. The
+--- harness had resolved `lua5.4` from PATH -- correctly, it was there -- and
+--- handed it 5.5's module paths, so every spawned server died on the first
+--- `require`. That read as twenty-two protocol defects and was one harness
+--- assumption.
+---
+--- RESOLVED WITHOUT A SUBPROCESS, and the first attempt shows why that
+--- matters. It ran `readlink -f /proc/self/exe` through `io.popen` and got
+--- back `/usr/bin/readlink`: inside the popen'd process, `/proc/self` IS
+--- readlink. That is the identical mistake `spec/concurrency_spec.lua`
+--- documents for descriptor counting -- "reading /proc/self/fd through
+--- io.popen measures the SUBPROCESS" -- made again in a new place.
+---
+--- `/proc/self/cmdline` first: its first NUL-separated field is argv[0], which
+--- IS the interpreter, and reading a file spawns nothing.
+---
+--- AND `arg[-1]` IS NOT THE INTERPRETER, which was the second wrong guess
+--- here. luarocks launches busted as
+---
+---     lua5.4 -e 'package.path=...' /path/to/busted
+---
+--- so `arg[-1]` is that `-e` chunk, `arg[-2]` is `-e`, and the interpreter is
+--- at `arg[-3]`. Handing the chunk to a shell produced 407 failures reading
+--- `sh: 1: Syntax error: "(" unexpected`. The interpreter is at the MOST
+--- NEGATIVE index, whatever that turns out to be, so the walk finds it rather
+--- than assuming its depth.
+local function running_interpreter()
+  local f = io.open("/proc/self/cmdline", "rb")
+  if f then
+    local raw = f:read "a" or ""
+    f:close()
+    local argv0 = raw:match "^[^%z]+"
+    if argv0 and argv0 ~= "" then return argv0 end
+  end
+  if type(arg) == "table" then
+    local i = 0
+    while arg[i - 1] ~= nil do i = i - 1 end
+    if i < 0 and type(arg[i]) == "string" and arg[i] ~= "" then return arg[i] end
+  end
+  return nil
+end
+
 M.lua = os.getenv "AKKAR_LUA"
+  or running_interpreter()
   or (have "lua5.4" and "lua5.4")
   or (have "lua" and "lua")
   or "lua5.4"                    -- report the missing name we actually expect

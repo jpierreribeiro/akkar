@@ -120,8 +120,12 @@ end
 --- `If-Match: "a", "b"` is a list, and `*` means "any current version".
 local function matches(header, tag)
   if header == "*" then return true end
-  for candidate in header:gmatch '[^,]+' do
-    candidate = candidate:match "^%s*(.-)%s*$"
+  for raw in header:gmatch '[^,]+' do
+    -- Trimmed into a SEPARATE local rather than back over the loop variable.
+    -- Lua 5.5 makes a for-loop control variable const, so the old
+    -- `candidate = candidate:match(...)` is a compile error there -- one of
+    -- exactly two in the whole tree.
+    local candidate = raw:match "^%s*(.-)%s*$"
     -- A weak validator (W/"x") is not usable for a conditional WRITE, per
     -- RFC 7232: it promises semantic equivalence, not byte equality.
     if candidate == tag then return true end

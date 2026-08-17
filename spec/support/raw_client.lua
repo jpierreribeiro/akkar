@@ -43,14 +43,22 @@ app:run { port = %d, check_capabilities = false, timeout = 1,
 ]==]
 
 --- True when a Lua interpreter can be spawned at all.
+---
+--- It asks `portable.lua`, which resolves the interpreter RUNNING THIS SUITE
+--- rather than the first plausible name on PATH. That distinction is not
+--- theoretical: this function used to try `lua5.4` first, and under Lua 5.5 it
+--- found one -- correctly, it was installed -- and handed it 5.5's `LUA_PATH`.
+--- Every spawned server then died on its first `require`, and twenty-two
+--- framing cases reported protocol failures that were nothing of the kind.
+---
+--- A spawned server inherits this process's module paths, so it has to be this
+--- process's Lua.
 function M.available()
-  for _, binary in ipairs { "lua5.4", "lua" } do
-    local pipe = io.popen(binary .. " -v 2>&1")
-    if pipe then
-      local out = pipe:read "a"
-      pipe:close()
-      if out and out:find "Lua" then M.binary = binary return true end
-    end
+  local pipe = io.popen(("%q -v 2>&1"):format(portable.lua))
+  if pipe then
+    local out = pipe:read "a"
+    pipe:close()
+    if out and out:find "Lua" then M.binary = portable.lua return true end
   end
   return false
 end
@@ -103,7 +111,7 @@ function M.start_on(port, extra, prelude)
   -- a plain `&`, which detaches enough here because `os.execute`'s `sh` exits
   -- immediately and the child is reparented rather than killed.
   os.execute(portable.detached(
-    ("%s %q"):format(M.binary or portable.lua, path), log))
+    ("%q %q"):format(M.binary or portable.lua, path), log))
 
   -- Wait for the port rather than sleeping a guessed amount: a fixed sleep is
   -- either too short on a loaded machine or wasted on an idle one.

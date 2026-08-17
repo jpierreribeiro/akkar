@@ -723,8 +723,11 @@ function M.new(options)
       if if_none == "*" then
         fresh = true
       else
-        for candidate in if_none:gmatch "[^,]+" do
-          candidate = candidate:match "^%s*(.-)%s*$"
+        -- A separate local, not a write back over the loop variable: Lua 5.5
+        -- makes for-loop control variables const. See the same fix in
+        -- `akkar/etag.lua`; these two were the only sites in the tree.
+        for raw in if_none:gmatch "[^,]+" do
+          local candidate = raw:match "^%s*(.-)%s*$"
           -- `W/"x"` is a weak validator and IS usable here: RFC 9110 says
           -- If-None-Match compares with the weak function, unlike If-Match.
           if candidate == tag or candidate == "W/" .. tag then fresh = true end
