@@ -23,6 +23,7 @@ local multipart = require "akkar.multipart"
 -- The execution machinery, with no HTTP in it. `akkar.execution` requires only
 -- `cqueues` and `akkar.time`, so there is no cycle back to this file.
 local execution = require "akkar.execution"
+local bitwise = require "akkar.bitwise"
 
 local akkar = {}
 
@@ -256,7 +257,7 @@ local function nearest(word, candidates)
       best, best_distance = candidate, previous[#candidate]
     end
   end
-  if best_distance <= math.max(2, #word // 3) then return best end
+  if best_distance <= math.max(2, bitwise.idiv(#word, 3)) then return best end
 end
 
 local function check_config(config, allowed, what)
@@ -1421,7 +1422,7 @@ local function trace_context(headers)
     traceparent = given,
     trace_id = trace_id,
     span_id = span_id,
-    sampled = tonumber(flags, 16) & 0x01 == 1,
+    sampled = bitwise.band(tonumber(flags, 16), 0x01) == 1,
     tracestate = headers["tracestate"],
   }
 end
@@ -1480,8 +1481,8 @@ local function in_cidr(address, cidr)
   local a, b = ipv4_to_int(address), ipv4_to_int(base)
   if not a or not b or not bits or bits < 0 or bits > 32 then return false end
   if bits == 0 then return true end
-  local mask = (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF
-  return (a & mask) == (b & mask)
+  local mask = bitwise.band(bitwise.lshift(0xFFFFFFFF, 32 - bits), 0xFFFFFFFF)
+  return bitwise.band(a, mask) == bitwise.band(b, mask)
 end
 akkar.in_cidr = in_cidr
 

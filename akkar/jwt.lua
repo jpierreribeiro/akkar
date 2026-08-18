@@ -98,6 +98,7 @@ token text. Non-canonical trailing bits are refused for the same reason.
 local crypto = require "akkar.crypto"
 local json   = require "akkar.json"
 local time   = require "akkar.time"
+local bitwise = require "akkar.bitwise"
 
 local M = {}
 
@@ -188,12 +189,12 @@ function M.b64url_decode(text)
     if value == nil then
       return nil, ("contains %q, which is not base64url"):format(char)
     end
-    bits  = (bits << 6) | value
+    bits  = bitwise.bor(bitwise.lshift(bits, 6), value)
     width = width + 6
     if width >= 8 then
       width = width - 8
-      out[#out + 1] = string.char((bits >> width) & 0xff)
-      bits = bits & ((1 << width) - 1)
+      out[#out + 1] = string.char(bitwise.band(bitwise.rshift(bits, width), 0xff))
+      bits = bitwise.band(bits, bitwise.lshift(1, width) - 1)
     end
   end
 

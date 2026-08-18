@@ -53,6 +53,7 @@ which is what almost every JSON API has today.
 ]]
 
 local cjson = require "akkar.json"
+local bitwise = require "akkar.bitwise"
 
 local M = {}
 
@@ -69,7 +70,7 @@ local FNV_PRIME  = 0x100000001b3
 local function fnv1a(s)
   local hash = FNV_OFFSET
   for i = 1, #s do
-    hash = hash ~ s:byte(i)
+    hash = bitwise.bxor(hash, s:byte(i))
     hash = hash * FNV_PRIME
   end
   return string.format("%016x", hash)

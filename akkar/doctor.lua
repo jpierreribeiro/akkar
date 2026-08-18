@@ -39,6 +39,7 @@ the app declares one **is**, because the server would refuse to boot anyway.
     lua -e 'require("akkar.doctor").cli{ json = true }'
 ]]
 
+local bitwise = require "akkar.bitwise"
 local M = {}
 
 -- ==================================================================== findings
@@ -187,9 +188,9 @@ function M.check_environment(report)
     -- luaossl returns OPENSSL_VERSION_NUMBER, a packed integer.  Printing it
     -- raw ("805306576") is a doctor telling you a true fact you cannot use.
     if ok and type(raw) == "number" then
-      local major = (raw >> 28) & 0xFF
-      local minor = (raw >> 20) & 0xFF
-      local patch = (raw >> 4)  & 0xFF
+      local major = bitwise.band(bitwise.rshift(raw, 28), 0xFF)
+      local minor = bitwise.band(bitwise.rshift(raw, 20), 0xFF)
+      local patch = bitwise.band(bitwise.rshift(raw, 4),  0xFF)
       report:ok("optional", "openssl runtime",
                 ("%d.%d.%d (0x%08x)"):format(major, minor, patch, raw))
     elseif ok and raw then

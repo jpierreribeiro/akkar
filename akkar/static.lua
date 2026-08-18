@@ -167,6 +167,7 @@ information-disclosure default that nobody consciously chose, and every server
 that shipped one on by default later shipped an advisory about it.
 ]]
 
+local bitwise = require "akkar.bitwise"
 local M = {}
 
 --- Whether the symlink protection above is actually active in this process.
@@ -433,10 +434,10 @@ local MONTHS = { Jan = 1, Feb = 2, Mar = 3, Apr = 4, May = 5, Jun = 6,
 --- which is exact for every date rather than for a window around now.
 local function days_from_civil(y, m, d)
   y = y - (m <= 2 and 1 or 0)
-  local era = (y >= 0 and y or y - 399) // 400
+  local era = bitwise.idiv((y >= 0 and y or y - 399), 400)
   local yoe = y - era * 400
-  local doy = (153 * (m + (m > 2 and -3 or 9)) + 2) // 5 + d - 1
-  local doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+  local doy = bitwise.idiv(153 * (m + (m > 2 and -3 or 9)) + 2, 5) + d - 1
+  local doe = yoe * 365 + bitwise.idiv(yoe, 4) - bitwise.idiv(yoe, 100) + doy
   return era * 146097 + doe - 719468
 end
 

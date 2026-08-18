@@ -40,6 +40,7 @@ then delegates here. This module never learns what a header is.
 local cqueues   = require "cqueues"
 local condition = require "cqueues.condition"
 local time    = require "akkar.time"
+local bitwise = require "akkar.bitwise"
 
 local M = {}
 
@@ -96,7 +97,7 @@ local id_counter = 0
 --- here, because "trust a header" is a transport question.
 function M.id()
   id_counter = id_counter + 1
-  return ID_PREFIX .. string.format("%06x", id_counter & 0xffffff)
+  return ID_PREFIX .. string.format("%06x", bitwise.band(id_counter, 0xffffff))
 end
 
 -- ============================================================== the lifetime

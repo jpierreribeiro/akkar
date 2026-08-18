@@ -46,6 +46,7 @@ logged in.
 ]]
 
 local rand   = require "openssl.rand"
+local bitwise = require "akkar.bitwise"
 local digest = require "openssl.digest"
 local hmac   = require "openssl.hmac"
 local kdf    = require "openssl.kdf"
@@ -81,7 +82,8 @@ function M.to_hex(bytes)
   local out = {}
   for i = 1, #bytes do
     local b = bytes:byte(i)
-    out[i] = HEX:sub((b >> 4) + 1, (b >> 4) + 1) .. HEX:sub((b & 15) + 1, (b & 15) + 1)
+    local hi, lo = bitwise.rshift(b, 4), bitwise.band(b, 15)
+    out[i] = HEX:sub(hi + 1, hi + 1) .. HEX:sub(lo + 1, lo + 1)
   end
   return table.concat(out)
 end
@@ -116,7 +118,7 @@ function M.equal(a, b)
   if #a ~= #b then return false end
   local diff = 0
   for i = 1, #a do
-    diff = diff | (a:byte(i) ~ b:byte(i))
+    diff = bitwise.bor(diff, bitwise.bxor(a:byte(i), b:byte(i)))
   end
   return diff == 0
 end

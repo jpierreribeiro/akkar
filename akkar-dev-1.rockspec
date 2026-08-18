@@ -103,6 +103,11 @@ build = {
   modules = {
     ["akkar"]    = "akkar/init.lua",
     ["akkar.auth"] = "akkar/auth.lua",
+    -- Bitwise operations and integer division, spelled as functions so the
+    -- nine files that use them parse under LuaJIT, where `&`, `|`, `~`, `<<`,
+    -- `>>` and `//` are syntax errors rather than missing functions. See
+    -- `docs/substrate/LUAJIT.md`.
+    ["akkar.bitwise"] = "akkar/bitwise.lua",
     ["akkar.build"] = "akkar/build.lua",
     ["akkar.db"] = "akkar/db.lua",
     ["akkar.db.memory"] = "akkar/db/memory.lua",
