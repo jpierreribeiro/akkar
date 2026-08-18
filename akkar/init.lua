@@ -1939,37 +1939,55 @@ local function read_body(stream, request_headers, limit, budget)
   -- documented way served nothing at all.
   local deadline = budget and budget > 0 and (time.monotime() + budget) or nil
 
-  -- GROW THE SOCKET'S READ BUFFER TO FIT THE BODY, ONCE, BEFORE READING IT.
+  -- THE BUFFER IS NOT GROWN HERE, AND THE CODE THAT DID IT HAS BEEN REMOVED.
   --
-  -- `socket_buffer` defaults to 1024, which gives back 5.4 KB per idle
-  -- connection. That default was chosen from a syscall count taken on a
-  -- 13-byte reply and a request with NO BODY, and it was wrong for anything
-  -- larger. Counted with `strace -c` over 400 POSTs carrying a 2 KB JSON
-  -- body, against the same run at 4096:
+  -- It used to call `sock:setbufsiz(content_length)` before reading the body,
+  -- on the reasoning that `socket_buffer` defaults to 1024 and a larger body
+  -- would then be read in buffer-sized pieces, each one a trip through the
+  -- event loop. The table that justified it read:
   --
   --     buffer   read   write   sendto   epoll_wait   epoll_ctl
   --       1024   6513    2254     1800         5410        1808
   --       4096   4266    1356     1350         4063         910
   --
-  -- +53% reads, +66% writes and +99% epoll_ctl, because a body larger than
-  -- the buffer is read in buffer-sized pieces and each piece is a trip
-  -- through the event loop.
+  -- **Both halves of that were wrong.** The counts came from a harness where
+  -- client and server shared one process, and `socket_buffer` writes the
+  -- socket PROTOTYPE -- so the server was being charged for the test client's
+  -- syscalls too. Re-counted with the server alone in its own process, over
+  -- ~16,300 requests per run and three repetitions, every figure landing
+  -- within 0.001 of the last:
   --
-  -- The fix is not a bigger default -- a bigger default pays on every idle
-  -- connection for a body most requests do not have, and whatever number is
-  -- picked, a body one byte larger costs the same again. akkar knows
-  -- `content-length` HERE, before a byte of body is read, and cqueues' buffer
-  -- can only ever grow (`fifo_realloc` refuses to shrink), so the buffer is
-  -- sized for this request and stays sized for the connection.
+  --                          read   write   sendto   epoll_wait   epoll_ctl
+  --     keep-alive    1024   4.00    1.00     2.00         4.00        2.00
+  --     keep-alive    4096   4.00    1.00     2.00         4.00        2.00
+  --     new conn      1024   7.00    1.00     2.00         5.00        0
+  --     new conn      4096   4.00    1.00     2.00         5.00        0
   --
-  -- Bounded by `limit`, which is already the body limit: a client cannot make
-  -- the server allocate a buffer for a body it will not be allowed to send.
-  if declared and declared > 0 then
-    local want = declared < limit and declared or limit
-    local connection = stream.connection
-    local sock = connection and connection.socket
-    if sock then pcall(sock.setbufsiz, sock, want) end
-  end
+  -- Only reads move, and only on a connection that has not been used before.
+  -- Under keep-alive the difference is EXACTLY ZERO, because cqueues' fifo
+  -- only ever grows: the first request on a connection grows it past the
+  -- body and every later request reads in one go. `socket_buffer` is a
+  -- per-connection cost, not a per-request one. The writes, `sendto` and
+  -- `epoll_ctl` differences were entirely the client's.
+  --
+  -- And the fix did not fix it. Counted with it and without it, in both
+  -- shapes, the reads are byte-identical:
+  --
+  --     read(6, ..., 1024) = 1024   read(6, ..., 134) = 134
+  --     read(6, ..., 1024) = 1024   read(6, ..., 2048) = 2
+  --
+  -- The call fires and succeeds -- instrumented, it prints
+  -- `want=2048 ok=true` and `setbufsiz` returns the previous size -- and the
+  -- reads that follow do not change. The likely reason, untested: the fifo's
+  -- already-allocated block bounds each read, and raising the minimum size
+  -- mid-stream does not repack it.
+  --
+  -- So it was three lines that looked like they were doing something and were
+  -- not, which is worse than nothing. WHAT WOULD ACTUALLY WORK, if the
+  -- connection-per-request shape ever matters: a larger `socket_buffer`, or
+  -- growing the buffer when the connection is accepted rather than when a
+  -- body is about to be read. Measured under strace, 1024 costs about 8% of
+  -- throughput in that shape and nothing at all under keep-alive.
 
   local parts, total = {}, 0
   while true do

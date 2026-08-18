@@ -26,7 +26,17 @@ verify_reservation || exit 1
 
 BASE_REF=${1:?usage: regression.sh <baseline-ref> [head-ref]}
 HEAD_REF=${2:-HEAD}
-ROOT=${ROOT:-$HOME/akkar}
+# RESOLVED, NOT TAKEN AS GIVEN. On the benchmark box `$HOME/akkar` is a
+# SYMLINK to the working checkout, and `cp -a` faithfully copies a symlink --
+# so `tree-base` and `tree-head` both became links to the same repository,
+# `git checkout --detach` ran against the working repo itself, and this script
+# spent months comparing one tree with itself. The clean-tree gate below did
+# not catch it: a detached checkout of the same repo IS clean.
+#
+# Every number this script produced with the default ROOT compared a tree to
+# itself, which is why it kept reporting "100.5% of baseline".
+ROOT=$(readlink -f "${ROOT:-$HOME/akkar}")
+[ -d "$ROOT/.git" ] || { echo "REFUSING: $ROOT is not a git checkout"; exit 1; }
 APPS=${APPS:-$HOME/study/apps}
 PORT=${PORT:-8500}
 DURATION=${DURATION:-10s}
@@ -65,7 +75,11 @@ prepare() {   # ref, destination
   local ref=$1 dest=$2
   rm -rf "$dest"
   git -C "$ROOT" worktree prune 2>/dev/null
-  cp -a "$ROOT" "$dest"
+  # `-L` as well as the resolved ROOT: belt and braces, because the failure
+  # this guards against is silent and cost every measurement taken with it.
+  cp -aL "$ROOT" "$dest"
+  [ -L "$dest" ] && { echo "REFUSING: $dest is a symlink, not a copy"; return 1; }
+  [ "$dest" -ef "$ROOT" ] && { echo "REFUSING: $dest is the same directory as $ROOT"; return 1; }
   # `-f`, because the copy may carry edits shipped to the box by hand, and a
   # checkout that silently keeps them would measure neither ref.
   git -C "$dest" checkout -q -f --detach "$ref" 2>/dev/null || {
@@ -87,6 +101,30 @@ prepare() {   # ref, destination
 echo "preparing trees"
 prepare "$BASE_REF" "$BASE_TREE" || exit 1
 prepare "$HEAD_REF" "$HEAD_TREE" || exit 1
+
+# RE-VERIFIED AFTER BOTH, WHICH IS THE CHECK THAT WOULD HAVE CAUGHT IT.
+#
+# Checking a tree right after preparing it proves nothing about the state it
+# will be measured in. When the two trees were the same directory, preparing
+# head silently moved base as well -- and each `prepare` had already printed
+# its own reassuring line by then. So the refs are confirmed here, once both
+# exist, which is the only moment that corresponds to the measurement.
+[ "$BASE_TREE" -ef "$HEAD_TREE" ] && {
+  echo "REFUSING: the two trees are the same directory"; exit 1; }
+base_at=$(git -C "$BASE_TREE" rev-parse HEAD)
+head_at=$(git -C "$HEAD_TREE" rev-parse HEAD)
+base_want=$(git -C "$ROOT" rev-parse "$BASE_REF^{commit}")
+head_want=$(git -C "$ROOT" rev-parse "$HEAD_REF^{commit}")
+[ "$base_at" = "$base_want" ] || {
+  echo "REFUSING: base tree is at $base_at, $BASE_REF is $base_want"; exit 1; }
+[ "$head_at" = "$head_want" ] || {
+  echo "REFUSING: head tree is at $head_at, $HEAD_REF is $head_want"; exit 1; }
+if [ "$base_at" = "$head_at" ]; then
+  echo "REFUSING: $BASE_REF and $HEAD_REF are the same commit ($base_at)."
+  echo "There is nothing to compare, and a run that reports ~100% of baseline"
+  echo "from two identical trees is the failure this line exists to name."
+  exit 1
+fi
 echo
 
 stop_all() { pkill -f "study/apps/serve[.]lua" 2>/dev/null; sleep 2; }
