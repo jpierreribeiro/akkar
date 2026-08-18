@@ -101,6 +101,7 @@ round, `akkar.etag` would receive a response whose `body` is nil, tag nothing,
 and its 304 path would quietly stop working. Nothing would raise.
 ]]
 
+local text = require "akkar.text"
 local M = {}
 
 --- Types worth compressing. Prefixes and exact matches, plus the structured
@@ -392,7 +393,7 @@ end
 function M.merge_vary(existing)
   if not existing or existing == "" then return "Accept-Encoding" end
   for field in existing:gmatch "[^,]+" do
-    if (field:match "^%s*(.-)%s*$"):lower() == "accept-encoding" then
+    if text.trim(field):lower() == "accept-encoding" then
       return existing
     end
   end

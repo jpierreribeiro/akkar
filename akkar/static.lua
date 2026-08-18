@@ -168,6 +168,7 @@ that shipped one on by default later shipped an advisory about it.
 ]]
 
 local bitwise = require "akkar.bitwise"
+local text = require "akkar.text"
 local M = {}
 
 --- Whether the symlink protection above is actually active in this process.
@@ -515,7 +516,10 @@ end
 function M.parse_range(header, size)
   if type(header) ~= "string" then return nil, "ignore" end
 
-  local spec = header:match "^%s*bytes%s*=%s*(.-)%s*$"
+  -- The `bytes=` prefix still needs a pattern; only the trailing trim,
+  -- which walked the whole value, is replaced.
+  local spec = header:match "^%s*bytes%s*=%s*(.*)$"
+  if spec then spec = text.trim(spec) end
   if not spec then return nil, "ignore" end
 
   -- Multiple ranges: declined, see the module comment. Not an error.
@@ -755,7 +759,7 @@ function M.new(options)
         -- makes for-loop control variables const. See the same fix in
         -- `akkar/etag.lua`; these two were the only sites in the tree.
         for raw in if_none:gmatch "[^,]+" do
-          local candidate = raw:match "^%s*(.-)%s*$"
+          local candidate = text.trim(raw)
           -- `W/"x"` is a weak validator and IS usable here: RFC 9110 says
           -- If-None-Match compares with the weak function, unlike If-Match.
           if candidate == tag or candidate == "W/" .. tag then fresh = true end

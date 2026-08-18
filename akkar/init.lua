@@ -24,6 +24,7 @@ local multipart = require "akkar.multipart"
 -- `cqueues` and `akkar.time`, so there is no cycle back to this file.
 local execution = require "akkar.execution"
 local bitwise = require "akkar.bitwise"
+local text = require "akkar.text"
 
 local akkar = {}
 
@@ -1506,7 +1507,11 @@ local function client_ip(peer, forwarded, trusted)
 
   local hops = {}
   for hop in tostring(forwarded):gmatch "[^,]+" do
-    hops[#hops + 1] = hop:match "^%s*(.-)%s*$"
+    -- `text.trim`, not `^%s*(.-)%s*$`: this trims a hop out of a header
+    -- THE CLIENT SENT, and the pattern's cost tracked the string's
+    -- length rather than the whitespace. Ten kilobytes in one
+    -- `X-Forwarded-For` cost 515 us against 83 us for a whole request.
+    hops[#hops + 1] = text.trim(hop)
   end
 
   for i = #hops, 1, -1 do

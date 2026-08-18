@@ -77,6 +77,7 @@ the returned error table for anything the code does not cover.
 local crypto = require "akkar.crypto"
 local http   = require "akkar.http"
 local time   = require "akkar.time"
+local text = require "akkar.text"
 
 local M = {}
 
@@ -372,8 +373,10 @@ end
 --- this does not understand is still in the caller's hands rather than
 --- discarded on the way past.
 local function s3_error(res)
-  local code = res.body and res.body:match "<Code>%s*(.-)%s*</Code>"
-  local message = res.body and res.body:match "<Message>%s*(.-)%s*</Message>"
+  local code = res.body and res.body:match "<Code>(.-)</Code>"
+  if code then code = text.trim(code) end
+  local message = res.body and res.body:match "<Message>(.-)</Message>"
+  if message then message = text.trim(message) end
   return {
     status = res.status,
     code = code,

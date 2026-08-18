@@ -54,6 +54,7 @@ which is what almost every JSON API has today.
 
 local cjson = require "akkar.json"
 local bitwise = require "akkar.bitwise"
+local text = require "akkar.text"
 
 local M = {}
 
@@ -126,7 +127,7 @@ local function matches(header, tag)
     -- Lua 5.5 makes a for-loop control variable const, so the old
     -- `candidate = candidate:match(...)` is a compile error there -- one of
     -- exactly two in the whole tree.
-    local candidate = raw:match "^%s*(.-)%s*$"
+    local candidate = text.trim(raw)
     -- A weak validator (W/"x") is not usable for a conditional WRITE, per
     -- RFC 7232: it promises semantic equivalence, not byte equality.
     if candidate == tag then return true end
