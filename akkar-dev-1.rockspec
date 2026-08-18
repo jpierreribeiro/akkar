@@ -49,8 +49,27 @@ dependencies = {
 
   -- Server, event loop and TLS.
   "cqueues >= 20200726, < 20300000",
-  "http >= 0.4, < 1.0",
   "luaossl >= 20250929, < 20300000",
+
+  -- WHAT `akkar/vendor/http/` NEEDS, DECLARED RATHER THAN INHERITED.
+  --
+  -- The HTTP/1.1 half of lua-http is vendored into this tree, and it brings
+  -- its own dependencies with it. Until this block existed they arrived by
+  -- accident: `http >= 0.4` was still declared, so LuaRocks pulled these five
+  -- in transitively and `luarocks install akkar` worked -- right up until
+  -- somebody acted on the obvious thought, "we vendor http, so drop the
+  -- dependency". That would have been a correct-looking edit that broke every
+  -- fresh install, and nothing here would have said why.
+  --
+  -- Each one is load-bearing, and the file that needs it is named:
+  "basexx >= 0.4.0, < 1.0",          -- request.lua, Basic auth
+  "binaryheap >= 0.4, < 1.0",        -- cookie.lua and hsts.lua, expiry
+  "fifo >= 0.2, < 1.0",              -- h1_connection.lua, pipelining
+  "lpeg >= 1.0.0, < 2.0",            -- util.lua, h1_stream.lua, request.lua
+  "lpeg_patterns >= 0.5, < 1.0",     -- the same three, header grammars
+  -- NOT `zlib`: `h1_stream.lua` reaches for it through pcall and runs
+  -- without it, so a hard bound here would make a Content-Encoding this
+  -- runtime never requires into an install-time requirement.
 
   -- Serialization.  Reached through `akkar.json`, never required directly.
   "lua-cjson >= 2.1.0, < 3.0",
@@ -64,8 +83,15 @@ dependencies = {
   "luasocket >= 3.1.0, < 4.0",
 }
 
+-- `http` IS STILL HERE, AND ONLY HERE. akkar no longer requires upstream
+-- lua-http at runtime -- it carries its own copy. The specs require it as an
+-- INDEPENDENT CLIENT: `spec/framing_spec.lua` and `spec/fuzz_spec.lua` speak
+-- to our server with somebody else's implementation, so a framing bug that is
+-- symmetric between our reader and our writer cannot pass its own tests.
+-- Testing a vendored parser with the vendored parser proves nothing.
 test_dependencies = {
   "busted >= 2.3.0",
+  "http >= 0.4, < 1.0",
 }
 
 test = {

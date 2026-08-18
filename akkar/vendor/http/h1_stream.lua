@@ -9,7 +9,13 @@ local new_headers = require "akkar.vendor.http.headers".new
 local reason_phrases = require "akkar.vendor.http.h1_reason_phrases"
 local stream_common = require "akkar.vendor.http.stream_common"
 local util = require "akkar.vendor.http.util"
-local has_zlib, zlib = pcall(require, "http.zlib")
+-- Vendored, like everything else in this directory. This line said
+-- `http.zlib` until the namespace rewrite missed it, because it is the one
+-- require in the file that is not resolved at load: it reaches into the
+-- upstream rock we no longer depend on, so it silently answered "no zlib"
+-- for an installed copy of akkar and "upstream's zlib" for a development
+-- one. Two different behaviours from the same source is worse than either.
+local has_zlib, zlib = pcall(require, "akkar.vendor.http.zlib")
 
 --[[ Maximum amount of data to read during shutdown before giving up on a clean stream shutdown
 500KB seems is a round number that is:
