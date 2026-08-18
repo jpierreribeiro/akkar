@@ -290,8 +290,37 @@ after the 503 has gone out, and touches a connection already back in the pool.
 connection broken on a passed budget, so half the machinery exists. What does
 not exist is a test proving a late handler cannot touch a recycled connection.
 
-**Write that test first.** It is the gate on both of the two largest wins in
-this plan, and it is the only thing either of them is waiting for.
+**That test is written: `spec/abandoned_inertness_spec.lua`.** Five cases, and
+they are green today because inertness holds.
+
+**It was mutation-tested with the actual optimisation**, not with a stand-in:
+`with_deadline` was rewritten to run the handler on `cqueues.running()` with a
+bare number as the deadline — exactly what B1 proposes — and the gate went red
+with the message it exists to produce:
+
+```
+the abandoned handler touched a capability that had been released
+  recorded: "would corrupt somebody else's connection"
+```
+
+So the hazard is not theoretical and the gate is not decorative. Whoever
+attempts B1 or A2 will see this fail on the first run, which is the point.
+
+**One of the five is deliberately uncomfortable.** It asserts what is TRUE
+rather than what ought to be: after `release`, the object a handler captured
+in a local **still works**. There is no poisoning and none is cheap — the
+object may BE the pooled connection, so poisoning it would break whoever
+borrows it next. A real defence needs a per-execution handle or a generation
+check, and neither exists.
+
+**So the shape of the remaining work is now precise**, which it was not this
+morning:
+
+1. Give a released capability a way to refuse — a per-execution handle, or a
+   generation counter the pooled object checks. This is the actual blocker,
+   and it is a design problem rather than an optimisation.
+2. Then B1 and A2 are unblocked, and the test that guards them gets rewritten
+   to assert the new guarantee instead of the old accident.
 
 ### A3 — pre-grow the coroutine's stack  ·  new, and it has a precedent with numbers
 
