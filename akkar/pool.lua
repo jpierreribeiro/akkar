@@ -17,6 +17,7 @@ inside a transaction" means something to Postgres and nothing to Redis.
 ]]
 
 local condition = require "cqueues.condition"
+local execution = require "akkar.execution"
 local time      = require "akkar.time"
 
 local Pool = {}
@@ -83,8 +84,50 @@ function Pool:reap()
   return freed
 end
 
+--- Refuses a caller whose execution is already over.
+---
+--- THE HOLE F2 LEFT, and it cost an outage on the study box before anyone saw
+--- it. Removing the per-request controller made an abandoned handler wake
+--- instead of staying inert, and what was supposed to protect the next
+--- request is the budget -- `db.lua` and `redis.lua` both refuse a query when
+--- `execution.remaining()` has gone negative.
+---
+--- That covers the QUERY and not the ACQUISITION. A handler parked in
+--- `waiters:wait()` below when its deadline fires is not inside a query yet.
+--- It woke after the 503 had gone out, was handed the next free slot, and
+--- nothing ever returned it: the request's release ran at the 503, when the
+--- handler held nothing to release.
+---
+--- Measured, pool of 2, four fast clients and one slow, 120 s:
+---
+---     with the hole    224.7 ok/s, then 0.0 ok/s from t=10s, for ever
+---     without it      3195.4 ok/s, flat to the end
+---
+--- and afterwards, with no load running at all, `live=2 idle=0` and every
+--- probe answering 503. A permanent outage, not a slowdown.
+---
+--- Self-reinforcing, which is why it arrives as a cliff: each leaked slot
+--- lengthens the wait, and a longer wait abandons more handlers inside it.
+--- With slack it never starts -- a pool of 10 ran 935,510 requests with a
+--- `waited_max` of 16 ms and leaked nothing.
+---
+--- nil means NO budget, which is jobs, workers and `app:test`, and must read
+--- as "no limit" rather than "already over" -- the same trap `with_deadline`
+--- documents about `timeout = 0`.
+local function abandoned()
+  local left = execution.remaining()
+  return left ~= nil and left <= 0
+end
+
 function Pool:get()
   while true do
+    if abandoned() then
+      -- Hand the turn on rather than swallowing it: another waiter may still
+      -- have time, and this one is leaving.
+      self.waiters:signal(1)
+      error("pool: the request deadline passed while waiting for a slot", 0)
+    end
+
     local resource = table.remove(self.idle)
     if resource then
       resource.pool = self
@@ -142,6 +185,10 @@ function Pool:get()
       local started = time.monotime()
       self.waiters:wait()
       local waited = time.monotime() - started
+      -- Checked HERE as well as at the top of the loop, because this is the
+      -- moment that matters: the deadline may have passed during the wait,
+      -- and the next turn of the loop would take a slot for a caller that can
+      -- no longer give it back.
       self.waits = self.waits + 1
       self.waited = self.waited + waited
       if waited > self.waited_max then self.waited_max = waited end
