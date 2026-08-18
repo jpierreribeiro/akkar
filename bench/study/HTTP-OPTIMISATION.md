@@ -145,26 +145,194 @@ The lesson generalises: **in a header parser, almost every string is short, so
 "this allocates a copy" is usually false.** Optimisations that assume otherwise
 will measure nothing.
 
-## What is left, sized
+## The second pass: 14,610 -> 11,660 bytes, and where the estimates went wrong
 
-Not done, and each with its measured price so the next person can judge:
+Four changes, each measured on its own, byte-identical across three runs at
+every step. **20.2% of the allocation of a request, gone.**
+
+| | bytes/request | delta |
+|---|---:|---:|
+| before | 14,610 | |
+| two conditions nobody could wait on | 14,450 | −160 |
+| ten `nil` keys that were documentation | 14,070 | −380 |
+| header index holds an integer until a name repeats | 12,290 | **−1,780** |
+| header entry flattened into parallel arrays | 11,660 | −630 |
+
+### Two conditions nobody could wait on
+
+`headers_cond` and `chunk_cond` were created per stream — so per request, in
+HTTP/1.1 — and signalled in five places. **Nothing ever waited on either.**
+
+That is not something the vendoring broke. Upstream's own `h1_stream` signals
+them and never polls them; only `h2_stream` has real waiters
+(`cqueues.poll(self.chunk_cond, ...)`), and h2 went when this half was
+vendored. h1 does not need them by construction: a connection reads in one
+coroutine and its streams are served by that same coroutine, so there is no
+second party to wake. `get_next_chunk` looks in the fifo and, finding it
+empty, reads the socket itself.
+
+### Ten `nil` keys that were documentation
+
+`new_stream` wrote twenty-one fields and ten of them were `nil` — there to say
+what a stream may later hold. **Lua sizes the hash part of a table from the
+syntactic key count in the constructor**, so those ten reserved ten slots that
+held nothing and pushed the table from 16 to 32. Measured directly, 20,000
+tables each way:
+
+```
+9 real keys + 10 nil keys : 850 bytes
+9 real keys               : 466 bytes
+```
+
+They are comments now and say exactly the same thing.
+
+**The obvious objection, checked rather than argued:** presizing to 32 means
+later assignments never rehash, so removing the nils could have traded 384
+bytes for a rehash and come out behind. The nine that remain plus the seven a
+served request actually assigns come to sixteen, which is exactly what a
+16-slot hash holds — and the harness confirmed it, 14,450 → 14,070. A rehash
+would have shown up as no change, or as worse.
+
+### The header index, and an estimate that was wrong by six times
+
+The table above predicted **~270 bytes** for making `_index[name]` hold an
+integer until a name repeats. It was **1,780**.
+
+The prediction was not badly reasoned; it was reasoning about the wrong half.
+It priced the WRITES — one `{n=1, i}` table per distinct header name — and the
+cost was in the READS. `get` and `get_comma_separated` went through
+`get_as_sequence` unconditionally, so reading one header allocated a table to
+hold one string and threw it away, and `get_headers` alone reads
+`content-length`, `transfer-encoding`, `connection` and `expect` on the way
+through a single request. Both answer the single-occurrence case directly now.
+
+**The lesson is the same one this page opened with, pointing the other way:**
+the first pass over-estimated writes because "this allocates a copy" felt
+obviously true. This one under-estimated the total because nobody counted how
+many times a header is read per request. Both are answered by measuring, and
+neither by reading the code more carefully.
+
+### Flattening the entry
+
+`_data` was an array of `setmetatable({name=, value=}, entry_mt)`. Priced
+before the change, 50,000 of each:
+
+```
+entry table with metatable   125.0 bytes
+two parallel array slots      41.9 bytes
+```
+
+`_names` and `_values` are parallel arrays now. The entry object was never
+visible outside `headers.lua` — `each()` already handed back `name, value` and
+nothing anywhere reached into `_data` — so the risk was contained to one file
+even though the table above called it high.
+
+Two places needed real care and are commented where they live: `delete` now
+does two `table.remove` calls that must stay in step, and `sort` cannot hand
+parallel arrays to `table.sort` at all, because it would reorder one and leave
+the other, pairing every name with somebody else's value. **Neither failure
+raises. Both produce strings.** That is why `spec/vendor_headers_spec.lua`
+exists, with fourteen cases written so each fails against a reader that
+understands one shape and not the other — and mutation-checked: breaking the
+index promotion so the first occurrence is dropped turns it red.
+
+### The cost side, counted
+
+None of the above trades time for memory; the shapes got smaller and no loop
+got longer. The one change that could have — smaller socket buffers, below —
+was counted with `strace` rather than assumed.
+
+## What an idle connection costs, and where that memory actually was
+
+`bench/runtime/RESULTS.md` reports 19.50 KB of resident memory per idle
+keep-alive connection, the one dimension where akkar came last. `docs/PLAN.md`
+attributed ~15 KB to lua-http and ~4 KB to akkar, by subtracting Lapis's
+figure from akkar's on the study box.
+
+**That attribution was wrong.** Measured in-process instead of by subtraction,
+holding 200 idle connections:
+
+```
+Lua heap, bare cqueues socket server   2,568 bytes/connection
+Lua heap, akkar on vendored lua-http   3,415 bytes/connection
+```
+
+Everything akkar and lua-http hold above the cqueues floor is **847 bytes**.
+Optimising our own tables was never going to move that number.
+
+The memory is cqueues', and it is not on the Lua heap at all: every socket
+gets a 4096-byte input buffer and a 4096-byte output buffer, malloc'd
+**eagerly** at creation (`socket.c`, `lso_prepsocket` → `lso_adjbufs` →
+`fifo_realloc`). Eight kilobytes per connection whether or not it ever carries
+a byte, and invisible to `collectgarbage "count"` — which is why no allocation
+ceiling in this project ever saw it.
+
+`socket.setbufsiz(r, w)` with two arguments writes the prototype every later
+socket is copied from (`lso_newsocket`, socket.c:817-821); the buffers still
+grow on demand. Holding 800 connections against a server process of its own:
+
+| bufsiz | bytes/connection |
+|---:|---:|
+| 4096 | 14,582 |
+| 2048 | 10,977 |
+| 1024 | **9,175** |
+| 512 | 7,864 |
+| 256 | 7,864 |
+
+**And what it costs, counted rather than assumed.** A smaller buffer ought to
+mean more `read()` calls for the same bytes, so `strace -c` counted them at
+4096, 1024 and 512, over 300 requests, twice — a 13-byte JSON reply and a
+256 KB one:
+
+```
+small payload   read 2908, write 907   IDENTICAL at all three
+large payload   read 2617 / 2619 / 2621 -- four calls, over 76 MB
+```
+
+So the buffer bounds what is **preallocated**, not what a `read()` asks for.
+`app:run { socket_buffer = 1024 }` is the default; `false` leaves cqueues
+alone.
+
+**One warning about the instrument.** The first version of that measurement
+ran inside busted and answered ZERO bytes per connection at both buffer sizes.
+Not a wrong number — no number: the busted process already had spare pages, so
+three hundred more sockets fit in memory it already owned and VmRSS did not
+move. An instrument that cannot see the effect it is measuring reports "no
+difference", which reads exactly like a regression. The spec spawns its own
+server process now.
+
+## What is left, sized
 
 | opportunity | worth | risk |
 |---|---:|---|
-| lazy `chunk_fifo` / `chunk_cond` — a GET with no body never uses them | up to ~340 B | medium: they are read on paths that assume they exist |
-| lazy `_index` entry — one integer instead of `{n=1, i}` until a header repeats | ~270 B | medium: five readers must handle both shapes |
-| flatten the header entry — parallel arrays instead of a table + metatable per header | ~290 B/header | high: changes `:each`, `:modify`, `:clone` |
-| pool stream objects across requests on a connection | up to 1,496 B | **high, and probably refused**: the controller pool is the leading suspect in `docs/substrate/SEGFAULT.md`, and recycling objects that hold sockets is the same shape |
+| pool stream objects across requests on a connection | up to ~1,100 B | **high, and probably refused**: the controller pool is the leading suspect in `docs/substrate/SEGFAULT.md`, and recycling objects that hold sockets is the same shape |
+| a C tokeniser for the request line and header block | unmeasured | high; framing stays in Lua, see `docs/PLAN.md` F5a |
+| the remaining ~847 B per idle connection above the cqueues floor | ≤847 B | medium, and small |
 
-The last row is worth stating plainly: **the largest single win here is the one
-this project has the most reason to distrust.** Pooling gave the controller
-pool 719 bytes a request and is implicated in memory corruption. That does not
-prove stream pooling would be unsafe; it does mean it needs the same
-experiment, not the same enthusiasm.
+The first row is worth stating plainly: **the largest single win left is the
+one this project has the most reason to distrust.** Pooling gave the
+controller pool 719 bytes a request and is implicated in memory corruption.
+That does not prove stream pooling would be unsafe; it does mean it needs the
+same experiment, not the same enthusiasm.
+
+It is also worth 1,100 rather than the 1,496 first quoted: two conditions and
+ten hash slots have already left the stream object, so pooling it would
+recycle something smaller than it used to be.
+
+## What is still NOT measured
+
+**Throughput.** Every number on this page is allocation, syscalls, or resident
+memory. Not one is requests per second.
+
+Allocation is exact and needs no quiet machine, which is why it is the
+instrument here — but 20.2% less allocation does not imply 20.2% more
+throughput, and this project has refused to publish that inference before.
+`bench/study/regression.sh` on a reserved box is the only timing instrument it
+trusts.
 
 ## The rule this followed
 
 Measure, change one thing, measure again, keep the number. Every figure above
-is reproducible with the scripts this page describes, and the two that measured
-zero are written down with the same weight as the one that did not — because a
-negative result nobody records is a negative result somebody re-runs.
+is reproducible with the scripts this page describes, and the ones that
+measured zero are written down with the same weight as the ones that did not —
+because a negative result nobody records is a negative result somebody re-runs.

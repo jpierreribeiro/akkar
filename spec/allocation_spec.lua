@@ -235,8 +235,23 @@ describe("allocation per request, through a real socket", function()
     -- recycling stayed on and this number stayed where it was. The ceiling did
     -- its job twice: it refused the change quietly, and it made somebody go and
     -- find out what the change actually cost.
-    assert.is_true(bytes < 14900,
+    --
+    -- LOWERED, 14,900 -> 11,900, and lowering it is the point.
+    --
+    -- Four changes in `akkar/vendor/http/` took the figure from 14,610 to
+    -- 11,660, each measured on its own and byte-identical across three runs:
+    -- two conditions nobody could wait on, ten `nil` keys that were only
+    -- documentation, a header index that holds an integer until a name
+    -- repeats, and the header entry flattened into parallel arrays.
+    -- `bench/study/HTTP-OPTIMISATION.md` has each with its number.
+    --
+    -- A ceiling left at 14,900 would have let every one of those 2,950 bytes
+    -- come back without a single test going red. A ceiling only detects
+    -- regression while it sits close to the truth, so it follows the number
+    -- down -- with the same 240 bytes of headroom the paragraph above argued
+    -- for, and for the same reason.
+    assert.is_true(bytes < 11900,
       string.format("allocation through the real server regressed: " ..
-                    "%.0f bytes/request, ceiling 14900", bytes))
+                    "%.0f bytes/request, ceiling 11900", bytes))
   end)
 end)
