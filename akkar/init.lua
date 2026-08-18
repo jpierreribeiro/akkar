@@ -2121,36 +2121,33 @@ function App:run(config)
   -- is what the first scaling run on a c5.2xlarge actually did.
   -- ================================================== the descriptor ceiling
   --
-  -- Every in-flight request holds a `cqueues` controller for its deadline,
-  -- and a controller costs exactly two file descriptors. Measured, at the
-  -- concurrency that matters:
+  -- An in-flight request holds ONE descriptor: the connection it arrived on.
   --
-  --     concurrent      fds     per request
-  --     64              134            2.09
-  --     256             518            2.02
-  --     512            1030            2.01
+  -- It held three until F2, and the paragraph that used to stand here
+  -- described why -- a `cqueues` controller per request for the deadline, at
+  -- exactly two descriptors on epoll and three on kqueue, measured at 2.09,
+  -- 2.02 and 2.01 per request across 64, 256 and 512 concurrent. Against the
+  -- usual `ulimit -n 1024` that put the wall near 500, and hitting it was not
+  -- a clean failure: `accept` began failing, every socket operation began
+  -- failing, and a machine was lost that way during a 512-connection sweep.
   --
-  -- Against the common default of `ulimit -n 1024`, that puts the wall at
-  -- about 500 concurrent requests per process -- and hitting it does not
-  -- produce a clean error. `accept` starts failing, every socket operation
-  -- starts failing, and the process flails. A machine was lost this way
-  -- during a 512-connection sweep.
+  -- IT ALSO PREDICTED, WORD FOR WORD, THE BUG THAT REMOVING IT CAUSED:
   --
-  -- Pooling the controllers does not help here. The pool serves SEQUENTIAL
-  -- reuse; five hundred requests in flight at once need five hundred
-  -- controllers whatever its size.
+  --     "today an abandoned handler sits in an orphaned controller nothing
+  --      ever steps, so it is inert. Move it to the outer controller and it
+  --      keeps running, wakes after the 503, and touches a connection that
+  --      has already gone back to the pool"
   --
-  -- So the ceiling is declared to lua-http, which stops accepting beyond it
-  -- and lets the kernel queue instead. Backpressure rather than collapse:
+  -- That is precisely what happened, and it took an outage on the study box
+  -- to find -- a pool of two going to zero in ten seconds and never
+  -- recovering. The defence is in `akkar/pool.lua` and `akkar/db.lua` now:
+  -- a caller whose `execution.remaining()` has gone negative is refused, at
+  -- acquisition as well as at the query. The comment was right and nobody
+  -- read it as an instruction.
+  --
+  -- The ceiling is still declared to lua-http, which stops accepting beyond
+  -- it and lets the kernel queue instead. Backpressure rather than collapse:
   -- slow is a state a server can be in, out of descriptors is not.
-  --
-  -- The real fix is not to spend a controller per request at all -- a
-  -- `condition` costs zero descriptors and would do the same arbitration.
-  -- That is not a drop-in, and the reason is worth writing down: today an
-  -- abandoned handler sits in an orphaned controller nothing ever steps, so
-  -- it is inert. Move it to the outer controller and it keeps running, wakes
-  -- after the 503, and touches a connection that has already gone back to
-  -- the pool -- trading a descriptor leak for a data bug.
   local function descriptor_ceiling()
     local limits = io.open "/proc/self/limits"
     if not limits then return nil end

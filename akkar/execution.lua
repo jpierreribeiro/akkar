@@ -426,7 +426,7 @@ function M.with_deadline(seconds, fn)
   -- left is told it is over and refuses. `akkar/db.lua` and `akkar/redis.lua`
   -- both do, and `log` and `clock` hold nothing poolable.
   --
-  -- `spec/abandoned_inertness_spec.lua` is the file that argues this, and
+  -- `spec/abandoned_defence_spec.lua` is the file that argues this, and
   -- `spec/abandoned_spec.lua` checks the protocol half against real servers.
   -- THE CONDITION IS RECYCLED, and unlike the controller it replaced, that
   -- carries no descriptor risk: a condition holds none. Removing the
@@ -455,7 +455,13 @@ function M.with_deadline(seconds, fn)
     finished:signal()
   end)
 
+  -- NOT DEAD, despite looking it. `deadline` is read at the bottom of this
+  -- function, where an error raised after the budget passed is reclassified
+  -- as a TIMEOUT rather than reported as a 500. Removing it on a reading that
+  -- it was unused turned `spec/execution_spec.lua`'s "raises what the work
+  -- raised" red inside a minute.
   local deadline = time.monotime() + seconds
+
   -- A bare number IS the deadline. `finished` is signalled by the handler, so
   -- whichever comes first ends the wait.
   cqueues.poll(finished, seconds)
