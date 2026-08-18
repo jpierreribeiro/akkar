@@ -204,9 +204,17 @@ jobs:
       # That is the pinned build being deleted by the step after it. It has
       # been happening on Linux since this workflow was written, which means
       # `CQUEUES_COMMIT` has never been what CI tested -- the release tarball
-      # was. The pin exists because `akkar/substrate.lua` patches cqueues'
-      # internals, so testing a different cqueues than we pin is the one thing
-      # this step must not do.
+      # was. The pin exists because the vendored HTTP half reaches into
+      # cqueues' behaviour, so testing a different cqueues than we pin is the
+      # one thing this step must not do.
+      #
+      # WHY `http` IS STILL INSTALLED HERE, since akkar no longer requires it:
+      # the specs use it as an INDEPENDENT CLIENT. `spec/framing_spec.lua` and
+      # `spec/fuzz_spec.lua` speak to our server with somebody else's
+      # implementation, so a framing bug symmetric between our reader and our
+      # writer cannot pass its own tests. It is `test_dependencies` in the
+      # rockspec for exactly that reason. It also still drags cqueues in,
+      # which is why the pinned build goes in after it.
       - name: Install the rest of the dependencies
         run: |
           # luaossl needs to be pointed at Homebrew's OpenSSL on macOS; on
@@ -352,7 +360,9 @@ jobs:
           done
 
       # Last, over the cqueues that `http` just pulled in, and with the
-      # variable names cqueues actually reads. Same reasoning as the unit job.
+      # variable names cqueues actually reads. Same reasoning as the unit job,
+      # including why `http` is in that list at all: it is the specs'
+      # independent client, not a dependency of akkar.
       - name: Install the pinned cqueues, last, over the release rock
         run: |
           cd ~/cqueues-build
