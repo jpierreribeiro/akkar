@@ -384,24 +384,50 @@ end
 ---     empty file   read(0) -> nil, nil, nil          seek "end" -> 0
 ---     directory    read(0) -> nil, "Is a directory", 21
 ---                                                    seek "end" -> 2^63-1
+--- Runs `fn(handle)` and closes the handle afterwards, on every path.
+---
+--- This is `local file <close> = handle` written so LuaJIT can parse it. A
+--- to-be-closed variable is Lua 5.4 syntax and a SYNTAX ERROR on 5.1, which
+--- is what LuaJIT is -- so `static.lua` was the last of nine files that would
+--- not compile there. `docs/substrate/LUAJIT.md` has the inventory.
+---
+--- WHY A HELPER RATHER THAN AN EXPLICIT CLOSE BEFORE EACH RETURN: every one
+--- of these functions returns from more than one place, and one forgotten
+--- close is a leaked descriptor that only shows up under load. Avoiding
+--- exactly that is what `<close>` is for, so replacing it with discipline
+--- would be trading a compiler guarantee for a habit.
+---
+--- WHAT IT COSTS: one closure per call, on the file-serving path only. akkar's
+--- JSON routes never reach this module, and a request that reads a file from
+--- disk is not one where 80 bytes decide anything.
+---
+--- The raise is re-thrown at level 0 so the message keeps the position the
+--- caller gave it, exactly as an uncaught error would have.
+local function using(handle, fn)
+  local ok, a, b, c = pcall(fn, handle)
+  handle:close()
+  if not ok then error(a, 0) end
+  return a, b, c
+end
+
 local function stat_io(path)
   local handle = io.open(path, "rb")
   if not handle then return nil end
-  local file <close> = handle
+  return using(handle, function()
+    local _, failure = handle:read(0)
+    if failure then
+      return { kind = "directory", size = 0, mtime = nil }
+    end
 
-  local _, failure = handle:read(0)
-  if failure then
-    return { kind = "directory", size = 0, mtime = nil }
-  end
-
-  local size = handle:seek "end"
-  if not size or size == math.maxinteger then
-    return { kind = "other", size = 0, mtime = nil }
-  end
-  -- No mtime is available here at all, and the caller must cope rather than
-  -- invent one. `os.time()` would produce a Last-Modified of "now" on every
-  -- request, which is not a weaker validator -- it is a wrong one.
-  return { kind = "file", size = size, mtime = nil }
+    local size = handle:seek "end"
+    if not size or size == math.maxinteger then
+      return { kind = "other", size = 0, mtime = nil }
+    end
+    -- No mtime is available here at all, and the caller must cope rather than
+    -- invent one. `os.time()` would produce a Last-Modified of "now" on every
+    -- request, which is not a weaker validator -- it is a wrong one.
+    return { kind = "file", size = size, mtime = nil }
+  end)
 end
 
 local default_stat = lfs and stat_lfs or stat_io
@@ -537,9 +563,10 @@ local SAFE = { GET = true, HEAD = true }
 local function read_all(path, size)
   local handle = io.open(path, "rb")
   if not handle then return nil end
-  local file <close> = handle
-  if not size or size == 0 then return handle:read "a" end
-  return handle:read(size)
+  return using(handle, function()
+    if not size or size == 0 then return handle:read "a" end
+    return handle:read(size)
+  end)
 end
 
 --- The tag for a file, from its metadata. Hex, quoted, and nginx's exact
@@ -814,15 +841,16 @@ function M.new(options)
           -- only honest signal left once the 200 is on the wire.
           error("akkar.static: " .. absolute .. " vanished between stat and read", 0)
         end
-        local file <close> = handle
-        assert(handle:seek("set", first))
-        local remaining = length
-        while remaining > 0 do
-          local chunk = handle:read(math.min(chunk_size, remaining))
-          if not chunk or chunk == "" then break end
-          remaining = remaining - #chunk
-          write(chunk)
-        end
+        using(handle, function()
+          assert(handle:seek("set", first))
+          local remaining = length
+          while remaining > 0 do
+            local chunk = handle:read(math.min(chunk_size, remaining))
+            if not chunk or chunk == "" then break end
+            remaining = remaining - #chunk
+            write(chunk)
+          end
+        end)
       end, { status = status, headers = headers, content_type = content_type })
     end
 
@@ -830,9 +858,12 @@ function M.new(options)
     if range_state == "partial" then
       local handle = io.open(absolute, "rb")
       if not handle then return refuse(req, "unreadable") end
-      local file <close> = handle
-      if not handle:seek("set", first) then return refuse(req, "unseekable") end
-      bytes = handle:read(length) or ""
+      local seekable = using(handle, function()
+        if not handle:seek("set", first) then return false end
+        bytes = handle:read(length) or ""
+        return true
+      end)
+      if not seekable then return refuse(req, "unseekable") end
 
       -- The file can be rewritten between the stat and the read -- a deploy
       -- replacing an asset is the ordinary way it happens -- and a short read

@@ -40,7 +40,15 @@ for 5.1 compatibility, so the ~54% of a request that lives in
 
 ---
 
-## akkar does not. Nine of 59 files fail to PARSE.
+## akkar did not: nine of 59 files failed to PARSE. Now none do.
+
+**All 60 files compile under LuaJIT 2.1.** `akkar/bitwise.lua` supplies the
+operators as functions, and `static.lua`'s four `<close>` variables are a
+`using(handle, fn)` helper that closes on every path. The 5.4 suite stayed
+green throughout: 1,786 passing, 0 failures.
+
+What follows is the inventory as it was found, kept because the shape of the
+work is the useful part.
 
 ```
 akkar/config.lua:209     unexpected symbol near '/'
@@ -157,8 +165,9 @@ Now:
 
 1. **The substrate is free.** cqueues builds and runs; the vendored HTTP needs
    nothing. That was the risk and it is retired.
-2. **The syntactic work is enumerated and mechanical** — 5 + 14 + 4 = 23 edits
-   across 8 files, each a local rewrite with no design content.
+2. **The syntactic work is DONE.** 23 edits across 9 files, behind
+   `akkar/bitwise.lua` and a `using(handle, fn)` helper in `static.lua`. All
+   60 files parse under LuaJIT and the 5.4 suite is green: 1,786 passing.
 3. **The portability tax is 0.07% of a request**, measured, so it does not
    argue against doing the work.
 4. **The semantic blocker is unchanged and is a property of LuaJIT**, not of
@@ -172,6 +181,6 @@ throughput number that does not exist yet.
 
 **Still to do, and it needs the study box:** build LuaJIT-compatible
 `lua-cjson`, `lpeg`, `lpeg_patterns`, `basexx`, `binaryheap`, `fifo` and
-`luaossl`, apply the 23 syntactic edits behind a compatibility layer, and run
-`/ping`. Then apply the rule that was written in advance: **under 2×, refused
+`luaossl`, then run `/ping`. **The 23 syntactic edits are done and the 5.4
+suite is green with them in.** Then apply the rule that was written in advance: **under 2×, refused
 with a number.**
