@@ -177,6 +177,20 @@ akkar.defaults = {
   body_limit     = 1024 * 1024,   -- 1 MB
   timeout        = 30,            -- seconds of wall clock per request
   shutdown_grace = 10,            -- seconds to drain before saying so
+
+  -- INSTRUCTIONS A HANDLER MAY RUN WITHOUT RETURNING. `nil` is no ceiling,
+  -- which is what every akkar before this had and what a service that trusts
+  -- its own code wants.
+  --
+  -- The deadline above cannot do this job and says so: it is cooperative, and
+  -- fires only while the handler is yielding on I/O. `while true do end`
+  -- yields never, so no wall-clock budget in this runtime can interrupt it.
+  -- Until now the watchdog only WARNED about that, and warning is the right
+  -- answer when the code is yours.
+  --
+  -- It stops being the right answer when the code is somebody else's. Set
+  -- this and a handler that will not return is ended.
+  cpu_limit      = nil,           -- instructions, nil = unlimited
 }
 
 -- ================================================== capabilities and settings
@@ -230,6 +244,7 @@ local SETTINGS = {
   check_capabilities = true, reuseport = true, strict = true,
   max_concurrent = true, trusted_proxies = true,
   repair_substrate = true, socket_buffer = true, gc = true,
+  cpu_limit = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -605,9 +620,81 @@ local WATCHDOG_LIMIT        = 0.100   -- seconds of uninterrupted CPU
 --
 -- Recorded rather than quietly reverted, because the reasoning was sound and
 -- someone will have it again.
+--- The current ceiling, or nil. Set by `app:run`, module-level for the same
+--- reason `internal` is: the hook is installed per request and reading a
+--- config table through three frames to get one number is worse.
+local cpu_limit = nil
+
 local function install_watchdog(where)
   local cpu, last, warned = 0, time.monotime(), false
+
+  -- COUNTED IN THE HOOK THAT WAS ALREADY THERE, which is why the ceiling is
+  -- free. `debug.sethook` allows ONE hook per coroutine -- `akkar/vm.lua:331`
+  -- says so, and restores whatever it displaced precisely so this diagnostic
+  -- survives a sandboxed run. A second hook for the ceiling is not available
+  -- even in principle, so it rides this one.
+  --
+  -- The granularity is therefore WATCHDOG_INSTRUCTIONS, 200,000, and that is
+  -- the honest resolution of the limit: a ceiling of 1,000,000 ends the
+  -- handler somewhere in [1,000,000, 1,200,000). For a loop that never
+  -- returns the difference is microseconds; for a ceiling set close to what a
+  -- handler legitimately uses it is a reason to leave room.
+  -- TWO HOOKS, AND THE DUPLICATION IS THE POINT.
+  --
+  -- The counting version needs `limit` and `used` as upvalues, and a closure
+  -- pays for every upvalue it captures whether or not it reads them. Sharing
+  -- one closure across both cases cost 12 bytes a request with no ceiling
+  -- configured, and `spec/allocation_spec.lua`'s validated-route ceiling --
+  -- 3,650, exact rather than statistical -- refused it at 3,662.
+  --
+  -- That refusal is correct and worth keeping: a feature nobody turned on
+  -- must cost nothing. So the no-ceiling path below is byte-identical to what
+  -- shipped before this, and the counting path exists only when asked for.
+  if not cpu_limit then
+    debug.sethook(function()
+      local now = time.monotime()
+      local dt = now - last
+      last = now
+      if dt < 0.050 then cpu = cpu + dt else cpu = 0 end
+      if cpu > WATCHDOG_LIMIT and not warned then
+        warned = true
+        internal:warn("handler blocked the event loop without yielding", {
+          blocked_ms = math.floor(cpu * 1000),
+          at = where,
+          traceback = debug.traceback("", 2),
+          hint = "this stalls every request in this process",
+        })
+      end
+    end, "", WATCHDOG_INSTRUCTIONS)
+    return
+  end
+
+  local limit, used = cpu_limit, 0
+
   debug.sethook(function()
+    do
+      used = used + WATCHDOG_INSTRUCTIONS
+      if used > limit then
+        -- RAISED AS A RESPONSE, and `dispatch` already knows what to do with
+        -- one: "a deep layer can signal HTTP without threading a return value
+        -- back through every frame". So this needs no plumbing of its own and
+        -- cannot be confused with a handler that threw.
+        --
+        -- 503 rather than 500, for the reason the deadline uses it: 500 says
+        -- akkar has a bug, and this is the request being refused. The log
+        -- line names the ceiling so the operator can tell the two apart
+        -- without reading the source.
+        internal:error("handler exceeded its instruction ceiling", {
+          instructions = used,
+          ceiling = limit,
+          at = where,
+          traceback = debug.traceback("", 2),
+          hint = "the handler did not return; raise cpu_limit or fix the loop",
+        })
+        error(response(503, { error = "the request did not finish in time" }), 0)
+      end
+    end
+
     local now = time.monotime()
     local dt = now - last
     last = now
@@ -2188,6 +2275,19 @@ function App:run(config)
   local host = config.host or "127.0.0.1"
   local body_limit = config.body_limit or akkar.defaults.body_limit
   local timeout    = config.timeout    or akkar.defaults.timeout
+
+  -- `nil` is a legitimate value and means unlimited, so `or` is wrong here:
+  -- it would let the default resurrect a ceiling the caller cleared.
+  if config.cpu_limit ~= nil then
+    if config.cpu_limit ~= false and
+       (type(config.cpu_limit) ~= "number" or config.cpu_limit <= 0) then
+      error("akkar: cpu_limit must be a positive number of instructions, or " ..
+            "false for none", 2)
+    end
+    cpu_limit = config.cpu_limit or nil
+  else
+    cpu_limit = akkar.defaults.cpu_limit
+  end
   -- An app-supplied logger replaces the framework's own voice, so a service
   -- gets one stream in one format rather than two.
   --
@@ -2792,7 +2892,7 @@ end
 function App:test(config)
   config = config or {}
 
-  local allowed = { timeout = true, log = true,
+  local allowed = { timeout = true, log = true, cpu_limit = true,
                     peer = true, trusted_proxies = true }
   for k in pairs(CAPABILITIES) do allowed[k] = true end
   check_config(config, allowed, "app:test{}")
@@ -2803,6 +2903,15 @@ function App:test(config)
     return function(_, path, options)
       options = options or {}
       local p, qs = path:match "^([^?]*)%??(.*)$"
+
+      -- SET AROUND THE CALL AND PUT BACK, not set once when the client is
+      -- built. The ceiling is module-level, so a test client that raised it
+      -- and walked away would raise it for every later test in the same
+      -- process -- and the one test that asserts the default is nil would
+      -- pass or fail depending on file order.
+      local restore_cpu_limit = cpu_limit
+      if config.cpu_limit ~= nil then cpu_limit = config.cpu_limit or nil end
+
       local res, request_id, trace_parent = handle(self, {
         method = method, path = p,
         query = parse_query(qs),
@@ -2818,6 +2927,7 @@ function App:test(config)
         timeout = options.timeout or config.timeout,
         capabilities = config,
       })
+      cpu_limit = restore_cpu_limit
       -- A streamed body is produced here and handed back as `raw`, so a test
       -- asserts on what the client would have received rather than on the
       -- producer function.  The whole body lands in memory, which is the
