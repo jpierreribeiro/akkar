@@ -227,7 +227,7 @@ local SETTINGS = {
   body_limit = true, timeout = true, shutdown_grace = true,
   check_capabilities = true, reuseport = true, strict = true,
   max_concurrent = true, trusted_proxies = true,
-  repair_substrate = true, socket_buffer = true,
+  repair_substrate = true, socket_buffer = true, gc = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -2294,6 +2294,65 @@ function App:run(config)
   -- opened afterwards inherit it too -- `req.http` and any cqueues-backed
   -- database driver. That is intended (they grow on demand as well) and
   -- `socket_buffer = false` leaves cqueues entirely alone.
+  -- THE COLLECTOR MODE, WHICH THIS PROJECT MEASURED AND THEN NEVER SHIPPED.
+  --
+  -- `bench/study/gc-cost.sh` answered question 9 of the performance study on
+  -- 16 August 2026, across four settings on the same server:
+  --
+  --   stopping the collector entirely   +3.5%   <- the hard ceiling on any
+  --                                                collector tuning, and not
+  --                                                a configuration anyone can
+  --                                                ship: memory grows without
+  --                                                bound
+  --   generational                      +2.5%, and p99 7.50 ms -> 5.66 ms
+  --
+  -- So collector tuning is worth at most 3.5% of throughput, and generational
+  -- collects nearly all of it -- plus a quarter off the tail, which for a
+  -- service runtime is the number that matters.
+  --
+  -- That measurement was taken from OUTSIDE, by an environment variable in
+  -- `bench/study/apps/serve.lua`. akkar itself set the mode nowhere, so the
+  -- one thing the study found was better than the default was available to
+  -- the benchmark and to nobody running a server.
+  --
+  -- WHY GENERATIONAL SUITS THIS SHAPE: a request's garbage dies young.
+  -- Headers, the parsed body, the response table and the JSON string are all
+  -- unreachable by the time the connection is written to, and a generational
+  -- collector is built to sweep exactly that without walking the old
+  -- generation.
+  --
+  -- THE DEFAULT IS `nil` -- Lua's own incremental collector, untouched -- and
+  -- that is deliberate rather than timid. The numbers above predate this
+  -- session's HTTP work, which cut allocation per request by 21.6%; less
+  -- garbage means less for the collector to be good or bad at, so the 2.5%
+  -- may well have shrunk. Changing a shipped default on a measurement taken
+  -- against different code is the mistake `docs/PERFORMANCE-STUDY.md` rule 1
+  -- exists to prevent. `bench/study/gc-cost.sh` re-run at this revision is
+  -- what would move it.
+  --
+  --     app:run { gc = "generational" }   the mode the study preferred
+  --     app:run { gc = "incremental" }    Lua's default, said out loud
+  --     app:run { gc = { "incremental", 400, 400, 13 } }   tuned
+  --
+  -- NOT offered: stopping the collector. It is an instrument, not a setting,
+  -- and a server that ships it runs out of memory rather than slowly.
+  if config.gc ~= nil then
+    local mode = config.gc
+    if mode == "generational" then
+      collectgarbage "generational"
+    elseif mode == "incremental" then
+      collectgarbage "incremental"
+    elseif type(mode) == "table" and mode[1] == "incremental" then
+      collectgarbage("incremental", mode[2], mode[3], mode[4])
+    elseif type(mode) == "table" and mode[1] == "generational" then
+      collectgarbage "generational"
+    else
+      error("akkar: gc must be \"generational\", \"incremental\", or a table "
+        .. "like { \"incremental\", pause, stepmul, stepsize }; stopping the "
+        .. "collector is not a shipping configuration", 0)
+    end
+  end
+
   if config.socket_buffer ~= false then
     local buffer = config.socket_buffer or 1024
     if type(buffer) ~= "number" or buffer < 1 or buffer % 1 ~= 0 then
