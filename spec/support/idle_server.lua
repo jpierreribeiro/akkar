@@ -43,8 +43,23 @@ local hold = tonumber(os.getenv "AKKAR_HOLD") or 2
 -- io.open, NOT io.popen, to learn our own pid: popen forks, and /proc/self in
 -- the child is the shell. `spec/concurrency_spec.lua` documents that trap for
 -- descriptor counting and this is the same one.
+-- LINUX ONLY, AND IT SAYS SO RATHER THAN CRASHING.
+--
+-- Everything this file measures is read out of `/proc`: the descriptor count
+-- from `/proc/PID/fd`, and the controller count from the `eventpoll` links in
+-- it. macOS has neither -- no `/proc` at all, and kqueue instead of epoll, so
+-- there is nothing named eventpoll to count even in principle.
+--
+-- The first version asserted its way in and took the macOS CI job down with
+-- `/proc/self/stat: No such file or directory`, twice, from two different
+-- specs. A platform that cannot answer the question should say so, not fail
+-- as though the answer were bad news. The callers check for this line.
 local PID do
-  local f = assert(io.open "/proc/self/stat")
+  local f = io.open "/proc/self/stat"
+  if not f then
+    io.stderr:write("idle_server: needs /proc, which this platform does not have\n")
+    os.exit(3)
+  end
   PID = f:read("a"):match "^(%d+)"
   f:close()
 end

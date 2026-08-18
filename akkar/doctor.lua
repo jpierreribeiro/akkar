@@ -84,9 +84,25 @@ local function module_version(name, mod)
   return nil
 end
 
+-- `akkar.vendor.http.server`, NOT `http.server`.
+--
+-- akkar carries its own HTTP/1.1 half and has not required upstream lua-http
+-- at runtime since it was vendored -- `akkar-dev-1.rockspec` says so, and
+-- lists `http` under `test_dependencies` alone, because the specs use it as
+-- an INDEPENDENT client to check our framing against somebody else's.
+--
+-- The doctor was the last thing that had not been told. On a clean install
+-- from the rockspec it looked for a rock the rockspec deliberately does not
+-- pull, reported `FAIL lua-http: the HTTP server is missing`, and exited 1 --
+-- so `akkar doctor` failed on every correct installation. CI's `install` job
+-- is what finally said it out loud, and it had been saying it for a while.
+--
+-- Checking the vendored path also makes the check mean something again: it
+-- now answers "is the server akkar actually uses loadable", which is the
+-- question, rather than "is a rock we no longer use installed".
 local REQUIRED = {
   { name = "cqueues",   why = "the event loop" },
-  { name = "http.server", why = "the HTTP server", rock = "lua-http" },
+  { name = "akkar.vendor.http.server", why = "the HTTP server (vendored)" },
   { name = "cjson",     why = "JSON encoding", rock = "lua-cjson" },
 }
 

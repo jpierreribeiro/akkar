@@ -220,6 +220,17 @@ describe("the cost of an idle connection", function()
   end
 
   it("falls by kilobytes when the preallocation does", function()
+    -- SKIPPED WHERE THE INSTRUMENT DOES NOT EXIST, and named as that rather
+    -- than as a failure. Everything below reads `/proc`; macOS has none, and
+    -- uses kqueue rather than epoll, so there is not even an eventpoll to
+    -- count. A test that cannot be run on a platform is pending there, not
+    -- red -- red would say akkar is broken on macOS, which this does not
+    -- know.
+    if not io.open "/proc/self/stat" then
+      pending "descriptor counting needs /proc; this platform has none"
+      return
+    end
+
     local big   = cost_of_holding(4096)
     local small = cost_of_holding(1024)
 
