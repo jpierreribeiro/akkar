@@ -382,16 +382,47 @@ need a custom Lua allocator in C, which is a bigger instrument than the
 question deserves. **Ablation is what works here** — change one thing, measure
 end to end, keep the number — and it is what produced every figure above.
 
-## What is still NOT measured
+## Throughput, measured
 
-**Throughput.** Every number on this page is allocation, syscalls, or resident
-memory. Not one is requests per second.
+Allocation is not the claim. This is.
 
-Allocation is exact and needs no quiet machine, which is why it is the
-instrument here — but 20.2% less allocation does not imply 20.2% more
-throughput, and this project has refused to publish that inference before.
-`bench/study/regression.sh` on a reserved box is the only timing instrument it
-trusts.
+`bench/study/regression.sh` on a reserved c5.2xlarge — two server processes,
+pinned cores, generator on its own physical core, trees alternating, restarted
+between every repetition. `/ping`, baseline `38122ae` against `ed23e89`:
+
+| | req/s | p50 | p99 | spread | µs/req at 2.00 cores |
+|---|---:|---:|---:|---:|---:|
+| before | 20,192 | 5.32 ms | 6.38 ms | 0.8% | 99.0 |
+| **after** | **22,783** | 4.49 ms | **5.42 ms** | 3.3% | **87.8** |
+
+**+12.8%.** Run again from scratch on an independent invocation:
+
+| | req/s | p50 | p99 | spread | µs/req |
+|---|---:|---:|---:|---:|---:|
+| before | 20,255 | 4.58 ms | 6.30 ms | 0.4% | 98.7 |
+| **after** | **22,740** | 4.56 ms | **5.40 ms** | 1.9% | 88.0 |
+
+**+12.3%**, against a largest spread of 3.3% — about four times the noise
+floor, and it reproduced. CPU per request fell from 99.0 to 87.8 µs at a fixed
+2.00 cores, so this is work removed rather than queueing rearranged.
+
+A 15.9% cut in allocation yielding ~12.5% more throughput is a coherent ratio,
+and it is worth saying that the ratio was **not** predictable in advance: this
+project has refused that inference before, and was right to.
+
+### And the route where it is NOT a result
+
+`/users/42`, the same harness, same day:
+
+| | req/s | p50 | p99 | spread | µs/req |
+|---|---:|---:|---:|---:|---:|
+| before | 6,802 | 11.14 ms | 436.81 ms | 6.0% | 294.0 |
+| after | 7,102 | 10.61 ms | 346.66 ms | 6.5% | 281.6 |
+
++4.4% against a spread of 6.5%. **By this project's own Rule 3 that is not a
+result and is not reported as one.** It is directionally consistent — µs/req
+fell — but the database dominates that route at 294 µs against `/ping`'s 99,
+so a cut in the HTTP layer is diluted to below what the instrument can see.
 
 ## The rule this followed
 

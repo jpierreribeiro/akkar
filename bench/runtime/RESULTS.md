@@ -194,3 +194,114 @@ worse than a threshold picked after seeing it.
 4. **The akkar checkout on the box was at `063677e`** — before the platform
    matrix, before the substrate regression repair, before the 408 fix. Reset to
    `origin/main` before anything was measured.
+
+---
+
+# Second run — 18 August 2026, a new box, and one number withdrawn
+
+The box above became unreachable. This is a fresh c5.2xlarge, provisioned by
+`bench/runtime/provision.sh` — which needed four repairs before it could
+provision anything, because it had assumed docker, `wrk`, `m4` and akkar's own
+rocks would already be there. On the first box they were, from earlier
+sessions. On a genuinely empty one they were not, and the services `run.sh`
+starts were not in the repository at all: `rt-akkar-serve.lua` had been typed
+into a terminal on a machine that no longer exists, while Luvit's, Lapis's and
+OpenResty's were all versioned. That is now `bench/runtime/akkar/serve.lua`
+plus `bench/runtime/deploy.sh`.
+
+```
+akkar     : ed23e89 (worktree-soak-results)
+date      : 2026-08-18
+ulimit -n : 65536, RAISED FROM 1024 AND INHERITED BY ALL FOUR CANDIDATES
+```
+
+## The correction: "zero non-2xx responses anywhere" was never verified
+
+The section above says every candidate answered every request. **Nobody
+checked.** `parse_wrk` read `$4` of
+
+```
+Non-2xx or 3xx responses: 18640
+```
+
+which is the literal word `responses:` — a truthy string in the column where a
+count belongs. The gate printed `non2xx responses:` and read as a pass.
+
+On this box, with the field fixed, **akkar was answering 18,640 of 111,651
+requests with an error** at `wrk -c100`: `unable to initialize continuation
+queue: Too many open files`. One request in six. Its descriptor count went
+from 6 idle to 646 under load against `ulimit -n 1024`.
+
+Two causes, both now fixed and both in the commit history: `descriptor_ceiling`
+divided the limit by 2 when a request in flight costs 3 descriptors, and the
+harness could not report the errors that resulted. At `-c50` and `-c20` there
+are zero errors and throughput is flat (11,493 / 11,248 / 11,157 rps), so the
+wall costs correctness rather than speed — and errors being cheap to serve, a
+number taken through it flatters the candidate producing them.
+
+**So the 9,627 rps above is withdrawn as unverified**, along with the "zero
+non-2xx" sentence. It was measured on a run whose error gate could not fire.
+
+## D4 — throughput and tail on `/ping`, re-measured
+
+Taken with `ulimit -n 65536` set in the parent shell and inherited identically
+by all four candidates. That is a disclosed environment change, it disables no
+gate, and it is stated here rather than folded in.
+
+| candidate | mean req/s | spread | p50 | p99 |
+|---|---:|---:|---:|---:|
+| **OpenResty** | **104,330** | 2.51% | 0.94–0.96 ms | 1.03–1.05 ms |
+| Luvit | 12,866 | **10.49%** | 5.82–5.97 ms | 27.87–38.52 ms |
+| **akkar** | **11,112** | 8.70% | 8.59–8.93 ms | 10.53–54.46 ms |
+| Lapis | 8,477 | 0.34% | 11.57–11.61 ms | 13.97–14.38 ms |
+
+All `non2xx 0`, and this time that was read from the right field.
+
+**akkar against Lapis: +31.1%, against an 8.70% floor.** Same cqueues, same
+lua-http, same rock tree, so the delta is akkar. The margin was 16.8% on the
+old box at `ed23e89`'s ancestor; it is 31.1% here. Part of that is this
+session's HTTP work, which `bench/study/regression.sh` measured independently
+at +12.5% on `/ping` — the rest is a different machine and a different ulimit,
+and the two runs are not directly comparable.
+
+**akkar against Luvit does NOT clear the floor and is not reported as a
+result.** 11,112 against 12,866 is nominally +15.8% for Luvit over an 10.49%
+spread, but Luvit's individual repetitions ran 12,112 to 13,462 and akkar's
+10,562 to 11,529. Both are too loose to publish a 16% claim from. What does
+survive is the shape: Luvit's better p50 (5.9 ms against 8.7) comes with a p99
+of 28–39 ms against akkar's 10.5.
+
+## D3 — cost per idle keep-alive connection
+
+| candidate | fds/conn | KB/conn |
+|---|---:|---:|
+| OpenResty | 1.000 | **0.42** |
+| **akkar** | 1.000 | **6.96** |
+| Lapis | 1.000 | 15.24 |
+| Luvit | 1.000 | 15.52 |
+
+**akkar was the worst of the four here and is now the best of the three that
+run a Lua VM**, at less than half what Lapis pays on the identical substrate.
+That is `app:run { socket_buffer = 1024 }`: cqueues preallocates a 4 KB input
+and a 4 KB output buffer per socket, eagerly, in C where the Lua collector
+cannot see it. `bench/study/HTTP-OPTIMISATION.md` has the sweep and the
+syscall counts that show it costs nothing to shrink.
+
+Note also that every candidate holds **exactly one** descriptor per idle
+connection. The 2-descriptor controller is a cost of a request IN FLIGHT, not
+of a connection parked — which is precisely the distinction the ceiling bug
+above turned on.
+
+## D1 and D2
+
+| candidate | boot ms | idle RSS KB |
+|---|---:|---:|
+| akkar | 113 | 11,664 |
+| Luvit | 113 | 7,252 |
+| OpenResty | 113 | 17,516 |
+| Lapis | **536** | 12,884 |
+
+## Still not measured
+
+Tarantool remains installed and unmeasured. D5 (saturation) and D7 (dependency
+down) remain a second pass. `/users/:id` was not loaded in this run.
