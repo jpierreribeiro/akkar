@@ -18,6 +18,32 @@ package.path = "./?.lua;./?/init.lua;" .. package.path
 local random = require "akkar.random"
 
 describe("akkar.random", function()
+  it("produces the sequence the reference implementation does", function()
+    -- xoshiro128++ 1.0, Blackman and Vigna, from
+    -- <https://prng.di.unimi.it/xoshiro128plusplus.c>. These sixteen words
+    -- were produced by an INDEPENDENT implementation of the same algorithm
+    -- and the same seeding, written in another language for this purpose --
+    -- so a transcription error in the Lua, a wrong constant or a state
+    -- update in the wrong order, shows up here rather than as "random
+    -- numbers that look random".
+    --
+    -- The identical sixteen were then confirmed under Lua 5.4, Lua 5.5 AND
+    -- LuaJIT. That is the property `math.randomseed` cannot give at all --
+    -- it seeds an implementation the standard does not pin -- and it is the
+    -- reason this file exists rather than a call to it.
+    local expected = {
+      80372098, 2594957127, 2747729271, 1056900822,
+      541662558, 1111294658, 2386477819, 3443815176,
+      3593745235, 728031209, 2193223646, 2228668742,
+      793195240, 94894221, 118093377, 412197174,
+    }
+    local source = random.seeded(42)
+    for i = 1, #expected do
+      assert.equal(expected[i], math.floor(source.float() * 4294967296),
+        ("word %d of the reference sequence"):format(i))
+    end
+  end)
+
   it("gives the same sequence for the same seed", function()
     local a, b = random.seeded(42), random.seeded(42)
     for _ = 1, 100 do
