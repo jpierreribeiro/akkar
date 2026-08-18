@@ -165,4 +165,43 @@ describe("a handler abandoned while waiting for a pool slot", function()
     assert(cq:loop(5))
     assert.is_not_nil(got, "a waiter with no budget was refused a slot")
   end)
+
+  it("does not keep a connection whose deadline passed while it opened", function()
+    -- THE HOLE THE FIRST FIX MISSED, and the study box found it: the guard was
+    -- right and the frame was wrong.
+    --
+    -- `open` YIELDS -- it connects a socket, and on Postgres it authenticates
+    -- and sets `statement_timeout`. The budget can be positive when the loop
+    -- iteration begins and negative by the time the connection exists, so the
+    -- check at the top of the loop cannot see it. Measured on the box: 26
+    -- refusals fired on the wait path and ZERO at the entry, while every
+    -- leaked resource was tagged `budget=-0.0035` and handed out from this
+    -- branch.
+    local opened = 0
+    local pool = Pool.new(function()
+      opened = opened + 1
+      cqueues.sleep(0.20)          -- `open` takes longer than the budget
+      return { id = opened }
+    end, 4)
+
+    local cq = cqueues.new()
+    local got, why
+    cq:wrap(function()
+      execution.with_deadline(0.05, function()
+        local ok, res = pcall(pool.get, pool)
+        if ok then got = res else why = tostring(res) end
+      end)
+      cqueues.sleep(0.40)
+    end)
+    assert(cq:loop(5))
+
+    assert.is_nil(got,
+      "a connection opened past the deadline was handed to a handler that " ..
+      "had already answered 503; nothing will return it")
+    assert.is_truthy(why and why:find("deadline", 1, true),
+      "the refusal did not name the deadline: " .. tostring(why))
+    assert.equal(1, #pool.idle,
+      "the fresh connection was thrown away instead of parked; a contended " ..
+      "pool would reconnect on every abandonment")
+  end)
 end)

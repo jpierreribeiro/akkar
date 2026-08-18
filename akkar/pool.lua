@@ -167,6 +167,33 @@ function Pool:get()
       self.live = self.live + 1
       resource_or_err.pool = self
       resource_or_err.pooled = nil
+
+      -- AND CHECKED AGAIN HERE, WHICH IS THE HOLE THE FIRST FIX MISSED.
+      --
+      -- `open` YIELDS: it connects a socket, and on Postgres it authenticates
+      -- and sets `statement_timeout` besides. The deadline lands in there, and
+      -- the guard at the top of the loop cannot have seen it -- the budget was
+      -- still positive when this iteration began.
+      --
+      -- Measured on the study box after the wait-path guard shipped: the pool
+      -- still went to zero, and every leaked resource was tagged
+      -- `budget=-0.0035 @ pool.lua in akkar.pool.get`, handed out with the
+      -- budget ALREADY NEGATIVE, from this branch. The entry check caught
+      -- nothing at all -- `budget_over=0` across 21,691 acquisitions -- while
+      -- 26 refusals fired on the wait path. Right guard, wrong frame.
+      --
+      -- It is easy to reach precisely because an abandoned query discards its
+      -- connection, so `open` runs constantly under exactly the load that
+      -- abandons handlers.
+      --
+      -- `put` rather than `close`: the connection is fresh and perfectly good,
+      -- and parking it signals a waiter who may still have time. Throwing it
+      -- away would make a contended pool reconnect on every abandonment.
+      if abandoned() then
+        self:put(resource_or_err)
+        error("pool: the request deadline passed while the connection opened", 0)
+      end
+
       return resource_or_err
     end
 

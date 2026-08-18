@@ -501,6 +501,70 @@ descriptor wall lives in, and the box is up with every candidate installed.
 
 ---
 
+## F2 IS NOT MERGEABLE YET, and this is the record of why
+
+The descriptor win is real and confirmed on the box: eventpoll descriptors are
+**exactly 1** at every concurrency instead of 65–144 sawtoothing, sockets track
+offered load 1:1 to 601 where the old accept ceiling pinned at 226, the
+bistability is gone, and `/ping` throughput is unchanged.
+
+**Two things are still wrong, and one of them is unexplained.**
+
+### 1. The pool leak — believed closed, twice, and the second time counted
+
+An abandoned handler wakes on the connection's controller and takes a pool
+slot nothing will return, because the request's release already ran when the
+handler held nothing.
+
+**First fix, `a2cd488`:** refuse in `Pool:get` when `execution.remaining()` has
+gone negative — at the top of the loop and after `waiters:wait()`. It fires,
+and it is not enough: the box instrumented 21,691 acquisitions and found **26
+refusals on the wait path and ZERO at the entry**, while every leaked resource
+was tagged `budget=-0.0035 @ pool.lua in akkar.pool.get`. Right guard, wrong
+frame.
+
+**Second fix, here:** `open` **yields** — TCP connect, authentication,
+`set statement_timeout` — so the budget can be positive when the loop
+iteration begins and negative by the time the connection exists. The check now
+runs after `pcall(self.open)` too, and parks the fresh connection rather than
+discarding it. Validated in shape on the box before it was written: no
+collapse, and the guard fires 37 times over 120 seconds.
+
+`pool.lua`'s own comment had already marked that window — *"THE SLOT IS
+RESERVED, NOT SPENT, WHILE `open` RUNS"* — and its `reserved`/`reap` machinery
+handles the coroutine that **never comes back**. F2 created the one that
+**does**, which is the case neither covered.
+
+**Not yet re-measured on the box.** Believing a pool fix on the strength of a
+local spec is exactly what went wrong the first time.
+
+### 2. The `/users/42` tail — a SECOND problem, and it is not the leak
+
+| | p50 | p90 | p99 |
+|---|---:|---:|---:|
+| before F2 | 10.3 ms | 35 ms | **387 ms** |
+| after F2 | 4.6 ms | 0.4–2.6 s | **6.27 s** |
+
+Sixteen times worse at p99, and **p50 is better** — the median got faster by
+starving the tail. That is a fairness change, not a slowdown.
+
+**It is not the pool leak, and there are two independent reasons to say so.**
+On `/users/42` nothing is ever abandoned — the deadline is akkar's 30 s default
+and no request comes near it — so no slot can leak on that route at all, yet
+the tail is there in full. And with both leak holes closed in an instrumented
+tree, head at pool 2 was still 2.6× slower than base on the normal route.
+
+**The hypothesis, offered as one:** every handler now runs on the connection's
+own controller instead of a nested one of its own, so the server's controller
+holds roughly twice the coroutines it did. cqueues moves a ready coroutine
+with `LIST_INSERT_HEAD` — newest first — and a LIFO run order produces exactly
+this signature. The nested controllers previously spread wakeups through the
+outer loop's `epoll` instead.
+
+**Nobody has tested that.** Until the tail is explained, F2 does not merge —
+and a 16× p99 regression on the database route would not be worth 2 file
+descriptors even if the leak were fully closed.
+
 ## Track C — the collector
 
 **Mostly closed, and the closing is the useful part.** Stopping the collector
