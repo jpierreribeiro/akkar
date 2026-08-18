@@ -49,9 +49,19 @@ describe("allocation per request", function()
     --          that last 257 bytes measured +2.1% against a 3.4% noise floor
     -- The ceiling sits above the current figure with room for an honest
     -- change, and low enough that re-introducing either allocation breaks it.
+    --
+    -- LOWERED, 2,600 -> 2,350, and the reason is the second half of that
+    -- sentence rather than tidiness. The figure is 2,118 now: the execution
+    -- extraction took it to 2,105 and the header work in
+    -- `akkar/vendor/http/` gave a little back on the response side. At 2,600
+    -- the ceiling no longer did what it says -- re-introducing the 257-byte
+    -- watchdog closure would land at 2,375 and pass. It fails now.
+    --
+    -- Byte-identical across three runs, so 232 bytes of headroom is room for
+    -- a change somebody thought about and none for one nobody priced.
     local bytes = bytes_per_request(client, "/ping", 2000)
-    assert.is_true(bytes < 2600,
-      string.format("allocation regressed: %.0f bytes/request, ceiling 2600", bytes))
+    assert.is_true(bytes < 2350,
+      string.format("allocation regressed: %.0f bytes/request, ceiling 2350", bytes))
   end)
 
   it("is flat in the number of requests, so nothing accumulates", function()
@@ -119,13 +129,24 @@ describe("allocation on a route that validates", function()
   end)
 
   it("stays under the ceiling for a validated route", function()
-    -- 3,900 measured. The ceiling is deliberately BELOW 4,012 -- the figure
-    -- with `failures` allocated eagerly -- so that reintroducing that one
-    -- empty table per `validate` call fails here rather than passing as noise.
+    -- The ceiling is deliberately BELOW the figure with `failures` allocated
+    -- eagerly, so that reintroducing that one empty table per `validate` call
+    -- fails here rather than passing as noise.
+    --
+    -- LOWERED, 4,000 -> 3,650, to keep that property rather than to be tidy.
+    -- It was 3,900 when 4,000 was chosen and eager `failures` cost 112 bytes;
+    -- the figure is 3,550 now, so the regression would land at 3,662 and a
+    -- ceiling of 4,000 would wave it through. 3,650 refuses it.
+    --
+    -- 100 bytes of headroom is deliberately tight, and it is affordable
+    -- because this instrument has no socket in it: `app:test` runs in
+    -- process, and three consecutive runs give 3,550 exactly. If a legitimate
+    -- change needs more, raise it and say what it bought -- the number only
+    -- means something while somebody has to argue for each rise.
     local bytes = bytes_per_request(shorthand, PATH, 2000)
-    assert.is_true(bytes < 4000,
+    assert.is_true(bytes < 3650,
       string.format("validated-route allocation regressed: %.0f bytes/request, "
-                    .. "ceiling 4000", bytes))
+                    .. "ceiling 3650", bytes))
   end)
 end)
 
