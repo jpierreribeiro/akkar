@@ -140,11 +140,31 @@ wait_for_port() {   # port, seconds
 # seconds to boot changes deployment, autoscaling and how tests are written.
 # Nobody has measured akkar's.
 boot_ms() {   # port, start-command...
+  # ITS OWN POLL, AND NOT `wait_for_port`, WHICH SLEEPS A TENTH OF A SECOND.
+  #
+  # This used `wait_for_port`, whose loop is `sleep .1`. Any boot faster than
+  # that is reported as one poll interval: the first curl fails, the shell
+  # sleeps 100 ms, the second succeeds. So the published D1 table read
+  #
+  #     OpenResty 113 ms    Luvit 113 ms    akkar 114 ms
+  #
+  # and three different runtimes landing on the same number is the signature
+  # of a quantised measurement, not of three runtimes being equal. **It was
+  # measuring its own sleep.**
+  #
+  # Re-measured with the poll below, on the same box: an akkar app that
+  # requires db, redis, jobs, auth and metrics answers in 29 ms, and akkar
+  # alone in 21. `wait_for_port` keeps its 100 ms elsewhere, where it only
+  # gates readiness and the granularity costs nothing.
   local port=$1; shift
-  local t0 t1
+  local t0 t1 n=0
   t0=$(date +%s%N)
   "$@" >/dev/null 2>&1 &
-  wait_for_port "$port" 30 || { echo "-1"; return; }
+  while [ $n -lt 15000 ]; do
+    curl -s -m 1 -o /dev/null "http://127.0.0.1:$port/ping" && break
+    sleep 0.002; n=$((n + 1))
+  done
+  [ $n -ge 15000 ] && { echo "-1"; return; }
   t1=$(date +%s%N)
   echo $(( (t1 - t0) / 1000000 ))
 }

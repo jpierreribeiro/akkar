@@ -147,6 +147,8 @@ Two things follow, and they point in opposite directions, so both are stated:
 
 ## D1 — time to first response
 
+**THIS TABLE WAS MEASURING ITS OWN SLEEP AND IS WITHDRAWN.** It read:
+
 | candidate | boot to first 200 |
 |---|---:|
 | OpenResty | 113 ms |
@@ -154,8 +156,31 @@ Two things follow, and they point in opposite directions, so both are stated:
 | akkar | 114 ms |
 | Lapis | 221–327 ms |
 
-Nobody had ever measured akkar's. It is unremarkable, which is the useful
-answer: boot time is not a cost akkar is paying.
+`boot_ms` waited through `wait_for_port`, whose loop is `sleep .1`. Any boot
+faster than a tenth of a second is therefore reported AS a tenth of a second:
+the first curl fails, the shell sleeps 100 ms, the second succeeds. Three
+different runtimes landing on 113 is not three runtimes being equal — it is
+the signature of a quantised measurement, and it was there to be read.
+
+Re-measured on the same box with a 2 ms poll, five runs each, spread 1 ms:
+
+| what it loads | boot to first 200 |
+|---|---:|
+| `akkar` alone | **21 ms** |
+| `akkar` + `akkar.db` | 29 ms |
+| + redis | 29 ms |
+| + jobs, auth, metrics | **29 ms** |
+
+So a complete akkar application answers in **29 ms**, and the database stack
+is 8 ms of it while everything above costs nothing measurable. The old
+conclusion — "boot time is not a cost akkar is paying" — happens to survive,
+but it survived on a number that was four times too large and belonged to the
+harness.
+
+`boot_ms` now polls at 2 ms. `wait_for_port` keeps its 100 ms everywhere else,
+where it gates readiness and the granularity costs nothing. **Lapis at
+221–327 ms is the only row that was measuring the runtime**, and it needs
+re-running with the rest.
 
 ## D2 — resident memory, idle
 
