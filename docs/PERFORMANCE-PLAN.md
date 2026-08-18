@@ -190,11 +190,55 @@ this coroutine *is* the abandonment mechanism, and `spec/abandoned_spec.lua`
 and `spec/deadline_propagation_spec.lua` exist for it. Removing it is F2/B1,
 blocked on a per-task deadline that costs no descriptor.
 
-**But there is a third option nobody had, and it is cheap:** the coroutine's
-cost is set by the CALLER'S STACK DEPTH, so shortening the call chain between
-`onstream` and `cq:wrap` reduces the allocation without removing anything.
-Nobody has measured akkar's depth at that point. That measurement is an hour
-and it is the first thing to do in this track.
+**Shortening the call chain is NOT the lever, and that is measured.** akkar's
+stacks at the two `cq:wrap` sites are 6 and 8 frames — already short — and
+`bench/study/coroutine-depth.lua` prices a frame at **64 bytes** in that
+range, against a coroutine base cost of **1,216**. Removing two frames saves
+128 bytes of a 6,283-byte problem. The mechanism from the Lua source agrees:
+the initial stack is 45 slots (`BASIC_STACK_SIZE` 40 + `EXTRA_STACK` 5) at
+~720 bytes plus a `lua_State` at ~280, which is the ~1.2 KB measured, and the
+stack grows by **doubling** in 5.4 and by 1.5× in 5.5.
+
+### The third option, and it measures ZERO
+
+**Do not create a coroutine per request. Reuse one.**
+
+A dead coroutine cannot be resumed — confirmed, `cannot resume dead
+coroutine` — so there is no pooling of finished ones, and OpenResty-style
+reset pooling would not help anyway: `luaE_resetthread` **shrinks the stack**,
+so it saves the ~280-byte header and not the growth, which is the wrong half.
+
+A **suspended** coroutine can be resumed for ever. `bench/study/coroutine-reuse.lua`
+compares a coroutine per unit of work against one long-lived worker parked on
+a condition, running whatever it is handed and parking again:
+
+| | bytes per unit of work |
+|---|---:|
+| a coroutine per unit of work | 1,664 |
+| **one long-lived worker** | **0** |
+
+Not reduced. **Zero.** The worker's stack is allocated once at its high-water
+mark and never again, and the condition handoff allocates nothing.
+
+**So the 6,283 bytes — 55% of a request — are removable in principle rather
+than merely reducible.** That is the largest single item in this document by a
+wide margin.
+
+### And it is the same design problem as B1
+
+A worker pool and a deadline-without-a-controller need the identical thing:
+**a safe way to abandon work.** Today the per-request controller provides it
+by being throwable-away — the orphaned handler sits in a controller nothing
+steps, so it is inert. Remove the controller (B1) or reuse the coroutine (here)
+and an abandoned handler is running somewhere that outlives the request, wakes
+after the 503 has gone out, and touches a connection already back in the pool.
+
+`execution.release` is already idempotent and `db.lua` already marks a
+connection broken on a passed budget, so half the machinery exists. What does
+not exist is a test proving a late handler cannot touch a recycled connection.
+
+**Write that test first.** It is the gate on both of the two largest wins in
+this plan, and it is the only thing either of them is waiting for.
 
 ### A3 — the header write path
 
