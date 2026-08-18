@@ -125,3 +125,59 @@ load and run time — `math.type` (9 sites), `table.unpack` (14), `table.pack`
 (10), `utf8` (4), `rawlen` (1). And the failure mode was a fast, well-formed,
 empty-bodied 503 with no log line, which a load generator reports as forty
 thousand requests a second.
+
+---
+
+## What parsing costs, and why the benchmark was hiding it
+
+Measured in isolation, the actual patterns from `h1_connection.lua` against
+the actual lines a request carries, 2,000,000 iterations, twice:
+
+| | ns/call |
+|---|---:|
+| request line, `^(%w+) (%S+) HTTP/(1%.[01])\r\n$` | 921 |
+| header line, short (17 bytes) | 1,087 |
+| **header line, long (118 bytes)** | **6,401–7,151** |
+| `name:lower()` | 196–219 |
+| `headers:append` | 566–626 |
+
+**A header line six times longer cost six times more to parse.** The pattern
+was `^([^%s:]+):[ \t]*(.-)[ \t]*$`, and the lazy `(.-)` with an anchored
+trailing `[ \t]*$` makes Lua's matcher advance one character at a time and
+re-try the tail from every position — so the cost grew with the VALUE, not
+with finding the colon.
+
+Multiplied out against 83 µs of CPU per request:
+
+| request shape | parsing | share of CPU |
+|---|---:|---:|
+| this project's benchmark: 1 line + 3 short headers | 6.5–6.7 µs | **8%** |
+| production: 1 line + 8 headers, half of them long | 37–41 µs | **45–49%** |
+
+**Every measurement in this repository used three short identical headers.**
+A real browser request — `User-Agent`, `Cookie`, `Accept`, `Accept-Encoding` —
+costs five to six times more to parse than the benchmark suggests. The same
+warning already applied to allocation, because Lua interns strings of ≤40
+bytes and the benchmark repeats them; here it applies to CPU, and by more.
+
+**The fix was one line and needed no C.** A greedy `(.*)` with the trailing
+whitespace removed by byte:
+
+| line | old | new | |
+|---|---:|---:|---:|
+| 17 bytes | 1,186 ns | 717 ns | 1.65× |
+| 68 bytes, padded | 3,636 ns | 1,606 ns | 2.3× |
+| 113 bytes | 6,693 ns | 1,436 ns | **4.7×** |
+
+On a production-shaped request that is about **23 µs of 83, or 27% of the
+CPU**. On this project's benchmark it is worth about 1.7%, which is why nobody
+had found it.
+
+Equivalence was the whole claim and is pinned by
+`spec/vendor_header_parse_spec.lua`: the old pattern is kept there as the
+reference and the two are compared on 36 hand-written shapes and 200,000
+random byte strings, because a faster header parse that disagrees is a parser
+differential, and differentials between two implementations of one protocol
+are how request smuggling works.
+
+**Reproduce:** `lua5.4 bench/study/parse-cost.lua`.
