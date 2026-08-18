@@ -17,20 +17,24 @@ after the 503, and touches a connection that has already gone back to the
 pool -- trading a descriptor leak for a data bug."
 
 Both optimisations do precisely that. A shared controller steps the abandoned
-handler; a reused worker coroutine is by definition still being resumed. So
-whoever attempts either will need a defence that does not exist yet, and these
-tests are how they find out -- the first goes red the moment inertness stops
-holding.
+handler; a reused worker coroutine is by definition still being resumed. The
+tests below go red the moment inertness stops holding, which is how whoever
+attempts either will find out.
 
-The second test is the uncomfortable half, and it is the reason the first one
-is not enough on its own. It asserts what is TRUE today rather than what ought
-to be: after release, the object the handler is still holding **works**. There
-is no poisoning, no generation check, nothing. Inertness is the only thing
-standing between an abandoned handler and somebody else's connection.
+BUT INERTNESS IS NOT THE ONLY DEFENCE, and writing this file is what
+established that. An abandoned handler carries a NEGATIVE remaining budget --
+`begin` set the deadline inside the handler's own coroutine and `finish` never
+ran, because the handler never resumed. Measured on a forced resume:
+`remaining()` reads -0.55 s. So a capability that asks how long it has left
+gets an answer that says "you are over", and can refuse.
 
-If you are here because you added that defence: this second test should now
-fail, and the right response is to rewrite it to assert the new guarantee.
-That is a test doing its job, not a test being wrong.
+`akkar/db.lua` already did that. `akkar/redis.lua` did not, and now does --
+that gap was the finding. `log` and `clock` hold nothing poolable, so the
+closed capability set is covered.
+
+What is NOT covered, and the last case says so: a capability an application
+supplies itself, which need not consult the budget at all. For that one,
+inertness really is the only defence.
 ]]
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
@@ -145,21 +149,58 @@ describe("a handler abandoned by its deadline", function()
 end)
 
 describe("what stands between an abandoned handler and a recycled connection", function()
-  it("is ONLY inertness -- a released capability still works", function()
-    -- THE UNCOMFORTABLE ASSERTION, and it is deliberate.
+  it("is the BUDGET, for a capability that reads it", function()
+    -- THE DEFENCE, and it turned out to already exist for two of the three
+    -- releasable capabilities.
     --
-    -- This states what is true rather than what ought to be. `release` calls
-    -- `resource:release()` and drops the framework's own reference; it does
-    -- not poison the object, and it cannot cheaply -- the object may BE the
-    -- pooled connection, so poisoning it would break the next request that
-    -- borrows it. Any real defence needs a per-execution handle or a
-    -- generation check, and neither exists.
+    -- An abandoned handler carries a NEGATIVE remaining budget: `begin` set
+    -- the deadline inside the handler's own coroutine and `finish` never ran,
+    -- because the handler never resumed. So a capability that asks how much
+    -- time is left gets a negative answer and can refuse -- which is exactly
+    -- what `bound_by_execution` does in `akkar/db.lua` and, since the gate
+    -- was written, in `akkar/redis.lua` too.
     --
-    -- So the safety of every request in this runtime rests on one thing: the
-    -- abandoned handler is in a controller nobody steps. Remove that and this
-    -- is what is left.
+    -- This is a stronger position than inertness, because it survives the two
+    -- optimisations that would remove inertness.
+    local refused
+    local cq = cqueues.new()
+    cq:wrap(function()
+      local co
+      local inner = cqueues.new()
+      inner:wrap(function()
+        co = coroutine.running()
+        execution.begin(0.05)
+        cqueues.sleep(0.3)
+        -- The handler wakes, and asks what a budget-aware capability asks.
+        local left = execution.remaining()
+        refused = left ~= nil and left <= 0
+      end)
+      inner:step(0)
+      cqueues.sleep(0.2)      -- the budget passes while nothing steps it
+      inner:step(0)           -- and now it IS stepped: the handler wakes
+      cqueues.sleep(0.3)
+      inner:step(0)
+    end)
+    assert(cq:loop(5))
+
+    assert.is_true(refused,
+      "a resumed handler did not see a passed budget; every capability that " ..
+      "refuses on the budget -- db and redis -- would have served it")
+  end)
+
+  it("is ONLY inertness for a capability that ignores the budget", function()
+    -- AND THE GAP THAT REMAINS, stated rather than glossed.
     --
-    -- IF YOU ADDED THE DEFENCE, THIS TEST SHOULD NOW FAIL. Rewrite it to
+    -- `release` calls `resource:release()` and drops the framework's own
+    -- reference. It does not poison the object and it cannot cheaply: the
+    -- object may BE the pooled connection, so poisoning it would break
+    -- whoever borrows it next.
+    --
+    -- So a capability that never asks the budget -- an application's own,
+    -- passed to `app:run { cache = ... }` -- is protected by nothing but the
+    -- fact that its handler is in a controller nobody steps.
+    --
+    -- IF YOU ADD A GENERIC DEFENCE, THIS TEST SHOULD FAIL. Rewrite it to
     -- assert the new guarantee. That is the test doing its job.
     local resource = recorder()
     local record  = { capabilities = { db = function() return resource end } }
@@ -176,7 +217,7 @@ describe("what stands between an abandoned handler and a recycled connection", f
     held:touch "after release"
     assert.same({ "after release" }, resource.used,
       "a released capability refused to work -- if that is deliberate, this " ..
-      "test is out of date and the plan's B1 and A2 are unblocked")
+      "test is out of date")
   end)
 
   it("does not survive release for a handler that reads the carrier again", function()
