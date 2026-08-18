@@ -31,13 +31,60 @@ Lapis is the comparison that means something: identical cqueues, identical
 lua-http, identical rock tree. **akkar is 31% faster than it**, so the
 framework's own request path is not where the cost is.
 
-And the decomposition, measured this session:
+### The decomposition, corrected — the first version of this plan had it wrong
+
+An earlier reading said akkar was 18% of a request and the vendored HTTP 82%.
+**That was wrong, and the way it was wrong is instructive.** It came from
+subtracting `app:test`'s 2,118 bytes, and `app:test` runs outside a cqueues
+controller — so `with_deadline` takes its `not cqueues.running()` branch
+(`execution.lua:358`) and **never creates the per-request coroutine that
+production creates.** The instrument was measuring a different code path and
+saying so in a comment nobody connected to the arithmetic.
+
+Measured properly, by building a vendored-HTTP-only server that answers the
+same bytes and driving it with the same client:
 
 | | bytes/request | share |
 |---|---:|---:|
-| akkar's own chain (`app:test`, no socket) | 2,118 | 18% |
-| the client plus cqueues (bare socket echo) | 1 | ~0% |
-| **the vendored HTTP** | **~9,330** | **82%** |
+| bare cqueues socket server, same wire bytes | 1–2 | ~0% |
+| **the vendored HTTP** | **6,233** | **54%** |
+| **akkar** | **5,048** | **44%** |
+
+### And 55% of a request is two coroutines
+
+| | bytes/request | share |
+|---|---:|---:|
+| **lua-http's per-request coroutine** (`server.lua:476`) | **3,813** | 33.3% |
+| **akkar's `with_deadline` coroutine** (`execution.lua:391`) | **2,288** | 20.0% |
+| joint term of the two (nesting) | 182 | 1.6% |
+| the two request/response `headers` objects | 1,312 | 11.5% |
+| the `h1_stream` object | 737 | 6.4% |
+| **all request parsing** — request line, headers, framing | **152** | **1.3%** |
+| the whole write path, four short headers | 136 | 1.2% |
+| **the entire connection and accept plumbing** | **3** | **0.03%** |
+
+**The mechanism, measured:** a coroutine object is ~1.2 KB and the rest is Lua
+**stack reallocation as the coroutine descends**. 40 non-tail frames cost
+13,416 bytes; 200 frames cost 54,376. That is why the identical `cq:wrap` line
+costs 2,368 bytes in a minimal lua-http server and 3,813 in akkar — same
+allocation site, size set by the caller's call depth.
+
+**This re-ranks everything below, and two items lose most of their case:**
+
+- **A C tokeniser would be replacing 152 bytes.** Months of work, a new
+  optional rock, and a security-relevant boundary to get right, for 1.3% of a
+  request. Unless production-shaped headers change that number by an order of
+  magnitude (see D4), it is refused on this evidence.
+- **Coalescing the response write was already done by lua-http.** The write
+  path buffers: `xwrite(…, "f")` for the status line and each header, `"n"`
+  only at `write_headers_done` and the body. One `write()` for the header
+  block, one for the body. There are no small syscalls to merge.
+
+**The new first target is call depth**, which nothing in the previous plan
+mentioned, because nobody knew a coroutine's cost was set by its caller's
+stack.
+
+### And the system calls
 
 | | syscalls/request |
 |---|---:|
@@ -86,48 +133,68 @@ mistake this project actually made.
 
 ---
 
-## Track A — the 9,330 bytes in the vendored HTTP
+## Track A — where a request's bytes actually are
 
-The largest single target, and the one nobody can currently attribute.
+**The largest single target, and it is not what anyone expected.**
 
-**What is known:** it is 82% of a request's allocation, and the five cuts made
-this session came out of it. **What is not known: where inside it.**
+An instrument that would have attributed it was built and failed, and the
+failure is structural: wrapping each lua-http method to report
+`collectgarbage "count"` across itself attributed −944 bytes out of 11,636,
+because every one of those methods **yields** inside cqueues coroutines — the
+measurement window contains whatever other coroutines ran. There is no fix
+short of a custom Lua allocator in C.
 
-An instrument that would have said was built and failed, and the failure is
-structural: wrapping each lua-http method to report `collectgarbage "count"`
-across itself attributed −944 bytes out of 11,636, because every one of those
-methods **yields** inside cqueues coroutines — the measurement window contains
-whatever other coroutines ran. There is no fix short of a custom Lua allocator
-in C.
-
-**So the method is ablation**: change or stub one thing, measure end to end,
+**So the method was ablation**: change or stub one thing, measure end to end,
 restore, keep the number. Slow, and it is what produced every figure this
 project trusts.
 
-### A1 — the phase breakdown  ·  in progress
+### A1 — the phase breakdown  ·  **DONE**, and it re-ranked the whole plan
 
-Split the 9,330 by phase: reading the request line, reading and building the
-headers object, writing the status line and headers, writing the body, the
-stream object's lifetime, and teardown. Each measured by ablation.
+The table in "Where things actually stand" is its output. Three things came
+out of it that nothing in the previous plan anticipated:
 
-**Until this lands, everything below in Track A is a guess.** That is why it
-is first.
+1. **Two coroutines are 55% of a request.** Not parsing, not writing, not
+   header objects — the per-request coroutines themselves.
+2. **A coroutine's cost is set by its CALLER'S STACK DEPTH**, not by the
+   coroutine. The object is ~1.2 KB; the rest is stack reallocation as it
+   descends. 40 frames cost 13,416 bytes, 200 frames cost 54,376.
+3. **All request parsing is 152 bytes.** The thing everyone assumed was the
+   target is 1.3% of a request.
 
-### A2 — coalesce the response into one write  ·  sized, not yet measured
+**A trap for whoever repeats it**, and it is worth reading before trusting any
+follow-up number: with the per-request coroutine in place, ablation deltas are
+**not additive** — a residual of 128 bytes across the read/write split, and
+one change of two locals in `onstream` moved a reading by 1,267 bytes because
+a frame-size change crossed a stack-reallocation boundary. With the coroutine
+removed, the same ablations are additive to the byte. **Measure the ladder
+both ways.**
 
-`h1_connection` writes the status line and each header with cqueues'
-`xwrite(s, "f", …)` — buffered — and then `write_headers_done` uses `"n"`,
-which flushes. The body then flushes again. So a response leaves in **two**
-system calls where a JSON reply, whose body is fully known before the headers
-are written, could leave in one.
+### A2 — the two coroutines  ·  6,283 bytes, 55% of a request
 
-Worth roughly 1 of 9.84 syscalls per request. **It cannot be unconditional:**
-a streamed response must flush its headers before the body exists, which is
-the whole point of `akkar.stream`. So it is a flag on `write_headers`, set by
-the caller that knows the body is already in hand.
+**This is the whole of Track A now.** Everything else in it is rounding.
 
-Cheap to try, contained to two files, and `spec/stream_spec.lua` is the guard
-that says whether the streaming path still behaves.
+**lua-http's**, `server_methods:add_stream` (server.lua:475) — 3,813 bytes.
+The ablation is a one-line change: call `handle_stream` inline from
+`handle_socket`'s loop. It has been run: 108 specs across http, concurrency,
+stream, slow_body, framing, shed, limit, abandoned, lifetime and
+deadline_propagation pass. **Risk medium-high**, and the risks are nameable:
+pipelined requests serialise (arguably already true — `req_locked` serialises
+reads), a blocking handler stalls that connection's loop, CONNECT and upgrade
+streams meant to outlive the request break, and `conn:onidle` / `cond:wait()`
+at server.lua:171-173 becomes dead code that must be reasoned about rather
+than left. A hybrid — inline unless `self.pipeline:length() > 1` — keeps both
+properties.
+
+**akkar's**, `with_deadline` (execution.lua:358) — 2,288 bytes. **Risk high:**
+this coroutine *is* the abandonment mechanism, and `spec/abandoned_spec.lua`
+and `spec/deadline_propagation_spec.lua` exist for it. Removing it is F2/B1,
+blocked on a per-task deadline that costs no descriptor.
+
+**But there is a third option nobody had, and it is cheap:** the coroutine's
+cost is set by the CALLER'S STACK DEPTH, so shortening the call chain between
+`onstream` and `cq:wrap` reduces the allocation without removing anything.
+Nobody has measured akkar's depth at that point. That measurement is an hour
+and it is the first thing to do in this track.
 
 ### A3 — the header write path
 
@@ -139,7 +206,7 @@ requests, so every value is interned after the first: **every figure in
 
 Worth measuring with realistic header lengths before deciding it matters.
 
-### A4 — the C tokeniser  ·  F5a, months
+### A4 — the C tokeniser  ·  REFUSED ON EVIDENCE, pending D4
 
 picohttpparser tokenises the request line and header block; **framing stays in
 Lua**, where `spec/framing_spec.lua` (261 lines), `fuzz_spec.lua` (232) and
@@ -150,8 +217,18 @@ is where request smuggling lives, llhttp owns that logic and has the CVEs
 Same shape as `akkar.pq`: a separate, optional rock, so libpq — or here, a C
 compiler — never becomes a hard dependency of `luarocks install akkar`.
 
-**Do not start this before A1.** If A1 says header parsing is 1,200 bytes
-rather than 5,000, the calculus changes completely.
+**A1 answered this and the answer is no.** All request parsing — the request
+line, both headers, the framing decisions, the fifo push and pop — is **152
+bytes**, 1.3% of a request. A C tokeniser would be months of work and a
+security-relevant boundary to get right, in exchange for replacing 152 bytes.
+
+The one contained idea that survives: `read_headers` (h1_stream.lua:445) runs
+an lpeg `Connection:match` on every request, worth **72 bytes**. A two-string
+fast path for `keep-alive` and `close` before the lpeg call, with lpeg kept as
+the fallback, is an hour's work at low risk. Its only caller is `read_headers`.
+
+This stays open only against D4: if production-shaped headers move the parsing
+number by an order of magnitude, reopen it. Nothing else does.
 
 ### A5 — pooling stream objects  ·  962 bytes, measured, and probably refused
 
