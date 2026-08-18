@@ -317,6 +317,133 @@ end
 local condition_pool = {}
 local CONDITION_POOL_LIMIT = 64
 
+-- WORKERS, POOLED PER CONTROLLER.
+--
+-- `with_deadline` used `cq:wrap` and paid a fresh coroutine every request:
+-- measured through a real server on a real socket, three samples, the inline
+-- arm byte-identical in all three --
+--
+--     with the deadline coroutine   11,404 B/request
+--     handler inline, no wrap        9,036 B/request
+--     so the coroutine costs         2,368 B/request   (20.8%)
+--
+-- and a coroutine's cost is ~1,216 bytes plus 64 per frame of ITS OWN depth.
+-- A long-lived worker parked on a condition measured ZERO bytes per unit of
+-- work against 1,664 for a fresh one, which is the whole reason this is worth
+-- the machinery below: reuse does not shave the cost, it removes it.
+--
+-- Not `luaE_resetthread`-style recycling, which was measured earlier and
+-- saves only the ~280-byte header because the reset SHRINKS the stack. A
+-- worker that loops without ever being reset keeps its stack, so the second
+-- job on it allocates nothing at all.
+--
+-- KEYED BY CONTROLLER, weakly. A worker is `cq:wrap`ped onto one controller
+-- and can never run on another. `app:test`, jobs and the server each have
+-- their own, and a controller that goes away takes its workers with it
+-- instead of leaving them parked on a condition nobody will ever signal.
+local worker_pools = setmetatable({}, { __mode = "k" })
+local WORKER_POOL_LIMIT = 64
+
+-- HOW LONG AN IDLE WORKER WAITS BEFORE IT ENDS, and it is not a tuning knob:
+-- without it the pool does not work at all.
+--
+-- A worker parked on a condition for ever is an IMMORTAL COROUTINE, and
+-- `cq:loop()` returns only when every coroutine on the controller has
+-- finished. The first version waited with no timeout, and the whole suite
+-- hung -- `spec/akkar_spec.lua`'s "does not leak an abandoned handler into
+-- the next request" sat there until it was killed, because its controller
+-- could never drain. Every `app:test`, every `app:stop`, every spec that
+-- builds a controller and waits for it would have done the same.
+--
+-- So a worker is kept alive by demand and by nothing else, which is the same
+-- keepalive any thread pool has. Under load the next request always arrives
+-- first and the worker is never recreated; idle, it ends and the controller
+-- drains a tenth of a second later.
+local WORKER_IDLE = 0.1
+
+--- Runs `job` on a worker belonging to `cq`, filling `slot` and signalling
+--- `done` when it is over.
+---
+--- TWO RACES THIS SHAPE EXISTS TO AVOID, both of which a more obvious version
+--- has.
+---
+--- A cqueues condition wakes whoever is waiting AT THE MOMENT it is signalled
+--- and remembers nothing; a signal sent to a worker that has not reached its
+--- `wait()` yet is simply lost, and the request that sent it then waits out
+--- its whole deadline. So a fresh worker is created with its first job
+--- ALREADY IN HAND and never signalled, and a used one returns to the pool
+--- and waits with no yield between the two statements -- which is airtight,
+--- because Lua coroutines are cooperative and nothing else can run in
+--- between.
+---
+--- And results go in a per-call `slot` rather than on the worker. Writing
+--- them on the worker would let the next request, which may already hold it,
+--- overwrite an answer the previous caller has not read.
+local function run_on_worker(cq, job, slot, done)
+  local pool = worker_pools[cq]
+  if pool then
+    local worker = table.remove(pool)
+    if worker then
+      worker.job, worker.slot, worker.done = job, slot, done
+      worker.work:signal()
+      return
+    end
+  else
+    pool = {}
+    worker_pools[cq] = pool
+  end
+
+  local worker = { work = condition.new(), job = job, slot = slot, done = done }
+  cq:wrap(function()
+    while true do
+      local this_job, this_slot, this_done = worker.job, worker.slot, worker.done
+      worker.job, worker.slot, worker.done = nil, nil, nil
+
+      local ok, res = pcall(this_job)
+
+      -- `finished` before `done:signal()`, because the caller reads it the
+      -- instant it wakes and uses it to decide COMPLETION against TIMEOUT.
+      this_slot.ok, this_slot.res = ok, res
+      this_slot.finished = true
+      this_done:signal()
+
+      -- A WORKER IN THE POOL IS ALWAYS IDLE, and this line is the only
+      -- reason. A handler whose deadline passed while it was parked is still
+      -- inside `pcall` above and cannot reach here, so it cannot be offered
+      -- to anybody while it is still running -- no liveness test and no
+      -- bookkeeping, because the control flow already says it.
+      --
+      -- IT DOES COME BACK, though, and an earlier version of this comment
+      -- claimed otherwise. Since F2 removed the nested controller an
+      -- abandoned handler is no longer inert: it wakes on the shared
+      -- controller, finishes, and rejoins here. That is correct and wanted --
+      -- its stack has unwound, its slot belongs to a caller that has gone,
+      -- and the condition it signals was deliberately NOT recycled precisely
+      -- because the handler had not finished. `spec/worker_pool_spec.lua`
+      -- asserted the opposite on its first run and was wrong, not the code.
+      local p = worker_pools[cq]
+      if not p or #p >= WORKER_POOL_LIMIT then return end
+      p[#p + 1] = worker
+      cqueues.poll(worker.work, WORKER_IDLE)
+
+      -- `job` rather than what `poll` returned, because those two can both be
+      -- true: a caller may take this worker and hand it a job in the same
+      -- instant the idle timer fires. The handoff -- remove from the pool,
+      -- set the job, signal -- runs without yielding, so a job that is nil
+      -- here means no handoff is in flight and the worker can leave.
+      if worker.job == nil then
+        local pool = worker_pools[cq]
+        if pool then
+          for i = #pool, 1, -1 do
+            if pool[i] == worker then table.remove(pool, i); break end
+          end
+        end
+        return
+      end
+    end
+  end)
+end
+
 local controller_pool = {}
 
 -- RECYCLING IS ON, AND IT IS UNDER SUSPICION. Both halves matter, so both are
@@ -441,20 +568,21 @@ function M.with_deadline(seconds, fn)
     "akkar: with_deadline needs a controller; call it from inside one")
   local finished = table.remove(condition_pool) or condition.new()
   local winner, result
+  local slot = {}
 
-  cq:wrap(function()
+  run_on_worker(cq, function()
     -- The budget starts inside the coroutine that will do the work, because
     -- it is keyed by that coroutine. Every capability the handler touches can
     -- now read how long it has -- and, once the deadline passes, that it has
     -- none.
+    --
+    -- Set per job rather than once per worker, which is what makes a REUSED
+    -- coroutine safe here: the previous request's deadline is overwritten
+    -- before this one runs a line, so a worker never carries a budget from
+    -- the job before it.
     M.begin(seconds)
-    local ok, res = pcall(fn)
-    if winner == nil then              -- first arbitrating event wins
-      winner = ok and "COMPLETION" or "ERROR"
-      result = res
-    end
-    finished:signal()
-  end)
+    return fn()
+  end, slot, finished)
 
   -- NOT DEAD, despite looking it. `deadline` is read at the bottom of this
   -- function, where an error raised after the budget passed is reclassified
@@ -463,9 +591,19 @@ function M.with_deadline(seconds, fn)
   -- raised" red inside a minute.
   local deadline = time.monotime() + seconds
 
-  -- A bare number IS the deadline. `finished` is signalled by the handler, so
+  -- A bare number IS the deadline. `finished` is signalled by the worker, so
   -- whichever comes first ends the wait.
   cqueues.poll(finished, seconds)
+
+  -- FIRST ARBITRATING EVENT WINS, and `slot.finished` is how that is read now
+  -- that the work happens on a coroutine this function did not create. It is
+  -- exactly the old `winner == nil` test: the worker fills the slot and
+  -- signals without yielding in between, so a filled slot at this point means
+  -- the handler beat the deadline.
+  if slot.finished then
+    winner = slot.ok and "COMPLETION" or "ERROR"
+    result = slot.res
+  end
 
   -- Back to the pool ONLY IF THE HANDLER FINISHED, which `winner ~= nil`
   -- says: the handler sets it and signals immediately after, without
