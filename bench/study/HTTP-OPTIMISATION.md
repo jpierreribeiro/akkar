@@ -98,6 +98,19 @@ By phase, probing at the boundaries the code already has:
 akkar's own handler is 2,452 of that third row (measured separately through
 `app:test`), so **header parsing is roughly 4,700 bytes**.
 
+**Those figures are from the first pass and are kept for the method, not for
+the numbers.** After the second pass below, the same three instruments over
+`/ping` say:
+
+| | bytes/request |
+|---|---:|
+| akkar's own chain, through `app:test` | 2,105 |
+| the client plus cqueues, against a bare socket echo | 1 |
+| everything, over a real socket | 11,450 |
+
+so what is left in the vendored HTTP is about **9,344 bytes**, and akkar is
+18% of a request rather than the 26.7% the profile above reported.
+
 ### What one stream costs to exist
 
 `new_stream` runs once per request in HTTP/1.1. Priced piece by piece:
@@ -157,6 +170,7 @@ every step. **20.2% of the allocation of a request, gone.**
 | ten `nil` keys that were documentation | 14,070 | −380 |
 | header index holds an integer until a name repeats | 12,290 | **−1,780** |
 | header entry flattened into parallel arrays | 11,660 | −630 |
+| `chunk_fifo` built on the first chunk read ahead | 11,450 | −210 |
 
 ### Two conditions nobody could wait on
 
@@ -236,6 +250,35 @@ exists, with fourteen cases written so each fails against a reader that
 understands one shape and not the other — and mutation-checked: breaking the
 index promotion so the first occurrence is dropped turns it red.
 
+### A queue for chunks that a GET never has
+
+`new_stream` built two fifos. `headers_fifo` is used by every request — `step`
+pushes the main headers into it and `read_headers` pops them — and stays
+eager, because making it lazy would trade an allocation for a branch and save
+nothing. `chunk_fifo` holds body data read ahead of the reader, which for a
+GET with no body never happens.
+
+It is built by `queue_chunk` now, on the first chunk that is actually queued.
+
+**The reason this needed its own spec, rather than the suite it already had:**
+the two paths that create it are the two paths nothing else exercises.
+`stream_common`'s `get_body_chars` and `get_body_until` read whole chunks and
+`unget` the surplus, and neither is on akkar's own request path — akkar asks
+for the whole body. The suite would have stayed green with `chunk_fifo` nil
+and an `attempt to index a nil value` waiting for the first application that
+streams a request body. `spec/vendor_stream_body_spec.lua` drives the vendored
+client against the vendored server to reach them, and is mutation-checked.
+
+### What a stream object costs now
+
+| | bytes |
+|---|---:|
+| before this pass | 1,496 |
+| **after** | **962** |
+| — of which two fifos | 530 |
+| — of which one condition | 106 |
+| — the table itself | ~326 |
+
 ### The cost side, counted
 
 None of the above trades time for memory; the shapes got smaller and no loop
@@ -305,7 +348,7 @@ server process now.
 
 | opportunity | worth | risk |
 |---|---:|---|
-| pool stream objects across requests on a connection | up to ~1,100 B | **high, and probably refused**: the controller pool is the leading suspect in `docs/substrate/SEGFAULT.md`, and recycling objects that hold sockets is the same shape |
+| pool stream objects across requests on a connection | up to **962 B**, measured | **high, and probably refused**: the controller pool is the leading suspect in `docs/substrate/SEGFAULT.md`, and recycling objects that hold sockets is the same shape |
 | a C tokeniser for the request line and header block | unmeasured | high; framing stays in Lua, see `docs/PLAN.md` F5a |
 | the remaining ~847 B per idle connection above the cqueues floor | ≤847 B | medium, and small |
 
@@ -315,9 +358,29 @@ controller pool 719 bytes a request and is implicated in memory corruption.
 That does not prove stream pooling would be unsafe; it does mean it needs the
 same experiment, not the same enthusiasm.
 
-It is also worth 1,100 rather than the 1,496 first quoted: two conditions and
-ten hash slots have already left the stream object, so pooling it would
-recycle something smaller than it used to be.
+It is also worth 962 rather than the 1,496 first quoted, and that is measured
+rather than deduced: two conditions, ten hash slots and one fifo have already
+left the stream object, so pooling it would recycle something smaller than it
+used to be — and the case for taking the risk is smaller with it.
+
+## An instrument that did not work, written down so nobody builds it twice
+
+The obvious way to find the remaining 9,554 bytes is to wrap every lua-http
+method and have each report `collectgarbage "count"` across itself, with the
+collector stopped and nesting attributed to the outermost frame only. That was
+built. It reported **−944 bytes attributed** out of 11,636 measured.
+
+The reason is structural and applies to any version of it: **every one of
+those methods yields.** They are cqueues coroutines doing socket I/O, so the
+window between the two `collectgarbage "count"` readings contains whatever
+other coroutines ran in between — the client in the same process, other
+connections, the accept loop. The `depth` counter that suppresses nesting is a
+single variable shared across coroutines, so it is wrong for the same reason.
+
+There is no fix that keeps the shape. A per-coroutine allocation counter would
+need a custom Lua allocator in C, which is a bigger instrument than the
+question deserves. **Ablation is what works here** — change one thing, measure
+end to end, keep the number — and it is what produced every figure above.
 
 ## What is still NOT measured
 

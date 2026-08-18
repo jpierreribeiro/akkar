@@ -97,7 +97,15 @@ local function new_stream(connection)
 
 		has_main_headers = false;
 		headers_fifo = new_fifo();
-		chunk_fifo = new_fifo();
+		-- `chunk_fifo` IS NOT HERE. It is built by `queue_chunk` below, on the
+		-- first chunk that is actually read ahead -- which for a GET with no
+		-- body never happens, and a GET with no body is what this runtime
+		-- mostly serves. Measured: a fifo is 265 bytes.
+		--
+		-- `headers_fifo` stays eager because every request uses it: `step`
+		-- pushes the main headers into it and `read_headers` pops them, on
+		-- the ordinary path, so making it lazy would trade an allocation for
+		-- a branch and save nothing.
 
 		-- THE FIELDS THAT USED TO BE HERE SET TO nil ARE DOCUMENTED BELOW
 		-- INSTEAD, and the difference is 384 bytes on every request.
@@ -304,7 +312,7 @@ function stream_methods:step(timeout)
 				end
 				return nil, err, errno
 			end
-			self.chunk_fifo:push(chunk)
+			self:queue_chunk(chunk)
 			return true
 		end
 		if self.body_read_type == "chunked" then
@@ -974,15 +982,36 @@ function stream_methods:read_next_chunk(timeout)
 	return chunk, err, errno
 end
 
+--- Puts a chunk into the read-ahead queue, building the queue if this is the
+--- first one.
+---
+--- The ONE place that creates `chunk_fifo`, so `get_next_chunk` has one
+--- condition to check and there is no path that assumes the field exists.
+--- `at_front` is `unget`'s case: a chunk handed back, which must be read
+--- before anything already queued.
+function stream_methods:queue_chunk(chunk, at_front)
+	local queued = self.chunk_fifo
+	if not queued then
+		queued = new_fifo()
+		self.chunk_fifo = queued
+	end
+	if at_front then
+		queued:insert(1, chunk)
+	else
+		queued:push(chunk)
+	end
+end
+
 function stream_methods:get_next_chunk(timeout)
-	if self.chunk_fifo:length() > 0 then
-		return self.chunk_fifo:pop()
+	local queued = self.chunk_fifo
+	if queued and queued:length() > 0 then
+		return queued:pop()
 	end
 	return self:read_next_chunk(timeout)
 end
 
 function stream_methods:unget(str)
-	self.chunk_fifo:insert(1, str)
+	self:queue_chunk(str, true)
 	return true
 end
 
