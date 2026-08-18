@@ -258,6 +258,34 @@ function M.open_fds(pid)
   return nil
 end
 
+--- Resident kilobytes of a process, or nil where nothing here can answer.
+---
+--- Two spellings for the same fact, and the fallback is not hypothetical:
+--- `akkar/metrics.lua` reported RSS 0 on macOS for exactly this reason until
+--- it learned the second one.
+---
+--- Like `open_fds`, this is a DELTA instrument. The absolute number carries
+--- the interpreter, the rock tree and every mapped library; the difference
+--- between two readings of the same process carries only what happened in
+--- between.
+function M.rss_kb(pid)
+  pid = pid or M.pid
+  if not pid then return nil end
+  if HAVE_PROC then
+    local f = io.open(("/proc/%d/status"):format(pid), "r")
+    if f then
+      local kb = tonumber((f:read "a"):match "VmRSS:%s*(%d+)")
+      f:close()
+      if kb then return kb end
+    end
+  end
+  local pipe = io.popen(("ps -o rss= -p %d 2>/dev/null"):format(pid))
+  if not pipe then return nil end
+  local kb = tonumber((pipe:read "l" or ""):match "%d+")
+  pipe:close()
+  return kb
+end
+
 --- What `uname -s` says, or nil.
 ---
 --- Everything else in this file refuses to branch on the OS name, and this is

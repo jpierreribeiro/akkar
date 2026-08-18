@@ -227,7 +227,7 @@ local SETTINGS = {
   body_limit = true, timeout = true, shutdown_grace = true,
   check_capabilities = true, reuseport = true, strict = true,
   max_concurrent = true, trusted_proxies = true,
-  repair_substrate = true,
+  repair_substrate = true, socket_buffer = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -2223,6 +2223,55 @@ function App:run(config)
       error("akkar: could not build the TLS context: " .. tostring(context), 0)
     end
     tls_ctx = context
+  end
+
+  -- WHAT AN IDLE CONNECTION COSTS, and the one line that changes it.
+  --
+  -- cqueues gives every socket an input and an output buffer of LSO_BUFSIZ
+  -- (4096) bytes each, malloc'd EAGERLY at creation (`socket.c`,
+  -- `lso_prepsocket` -> `lso_adjbufs`). Eight kilobytes per connection, held
+  -- whether or not the connection ever carries a byte, and invisible to the
+  -- Lua collector because it is C memory -- which is why the number never
+  -- showed up in this project's allocation ceilings.
+  --
+  -- `socket.setbufsiz(r, w)` with two arguments writes the PROTOTYPE that
+  -- every later socket is copied from (`lso_newsocket`, socket.c:817-821).
+  -- The buffers still grow on demand; only the eager preallocation goes.
+  --
+  -- MEASURED, holding 800 idle keep-alive connections and reading VmRSS from
+  -- inside the server process:
+  --
+  --     bufsiz 4096  14,582 bytes/connection   <- the default
+  --     bufsiz 2048  10,977
+  --     bufsiz 1024   9,175                    <- what akkar picks
+  --     bufsiz  512   7,864
+  --     bufsiz  256   7,864                    <- floor; nothing left to win
+  --
+  -- AND WHAT IT COSTS, counted rather than assumed. A smaller buffer ought to
+  -- mean more read() calls for the same bytes, so `strace -c` counted them at
+  -- 4096, 1024 and 512 over 300 requests, twice: a 13-byte JSON reply and a
+  -- 256 KB one.
+  --
+  --     small payload   read 2908, write 907   IDENTICAL at all three
+  --     large payload   read 2617 / 2619 / 2621 -- four calls over 300
+  --                     requests carrying 76 MB
+  --
+  -- So the buffer bounds what is PREALLOCATED, not what a read() asks for.
+  -- 1024 rather than 512 because the last 1.3 KB buys nothing the curve does
+  -- not already flatten on, and a larger buffer is the more conservative
+  -- side of a knob whose throughput has not been measured on the study box.
+  --
+  -- PROCESS-WIDE, stated plainly: this is a prototype, so outbound sockets
+  -- opened afterwards inherit it too -- `req.http` and any cqueues-backed
+  -- database driver. That is intended (they grow on demand as well) and
+  -- `socket_buffer = false` leaves cqueues entirely alone.
+  if config.socket_buffer ~= false then
+    local buffer = config.socket_buffer or 1024
+    if type(buffer) ~= "number" or buffer < 1 or buffer % 1 ~= 0 then
+      error("akkar: socket_buffer must be a positive integer of bytes, or "
+        .. "false to leave cqueues' default alone", 0)
+    end
+    require("cqueues.socket").setbufsiz(buffer, buffer)
   end
 
   local s = assert(server.listen {
