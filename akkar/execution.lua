@@ -37,7 +37,8 @@ HTTP layer keeps its own metatable which handles `ip`, `trace` and `user` and
 then delegates here. This module never learns what a header is.
 ]]
 
-local cqueues = require "cqueues"
+local cqueues   = require "cqueues"
+local condition = require "cqueues.condition"
 local time    = require "akkar.time"
 
 local M = {}
@@ -308,6 +309,13 @@ end
 -- HONEST LIMIT: this is cooperative.  It can only fire while the handler is
 -- yielding on I/O.  A handler burning CPU in a tight loop is not interrupted
 -- by the deadline; that is what the watchdog reports instead.
+-- Conditions are recycled where controllers used to be. A condition costs 93
+-- bytes and NO descriptor, which is the whole difference: the controller pool
+-- traded allocation against a hard operating-system limit, and this one only
+-- trades allocation.
+local condition_pool = {}
+local CONDITION_POOL_LIMIT = 64
+
 local controller_pool = {}
 
 -- RECYCLING IS ON, AND IT IS UNDER SUSPICION. Both halves matter, so both are
@@ -348,7 +356,10 @@ local controller_pool = {}
 -- 0.15 s budget that must answer 503. `sleep` goes through no akkar adapter,
 -- so only a controller can cut it off.
 --
--- `AKKAR_CONTROLLER_POOL=0` turns recycling off. Read once, at load.
+-- RETIRED WITH THE CONTROLLER ITSELF. `AKKAR_CONTROLLER_POOL` selected how
+-- many nested controllers to recycle; there are no nested controllers now, so
+-- it selects nothing. Kept as a no-op read rather than deleted outright so an
+-- environment that still sets it does not look like it is doing something.
 local POOL_LIMIT = tonumber(os.getenv "AKKAR_CONTROLLER_POOL") or 64
 
 --- Runs `fn` under a wall-clock budget. Returns the outcome and the result:
@@ -371,100 +382,97 @@ function M.with_deadline(seconds, fn)
     return "COMPLETION", fn()
   end
 
-  -- Controllers are pooled, and speed is only one of three reasons.
+  -- NO CONTROLLER. The deadline is a number, and cqueues already knows how
+  -- to wait on one.
   --
-  -- Three separate investigations landed on this object.  A fresh
-  -- `cqueues.new()` per request cost 25 us of akkar's 34.7 us total overhead;
-  -- it contributed to the 2,814 bytes of garbage a trivial request produced;
-  -- and each controller holds **exactly 2.00 file descriptors** on epoll,
-  -- confirmed at three different limits:
+  -- This used to allocate a nested `cqueues.new()` per request -- pooled, but
+  -- still one per in-flight request -- purely to arbitrate a deadline. It cost
+  -- 25 us of akkar's 34.7 us of overhead, about 592 bytes a request, and
+  -- **exactly 2.00 file descriptors** on epoll (3.00 on kqueue), confirmed at
+  -- three limits: 126 controllers at ulimit 256, 510 at 1024, 2046 at 4096.
   --
-  --     ulimit -n 256   ->  126 controllers   (2.03 each)
-  --     ulimit -n 1024  ->  510 controllers   (2.01 each)
-  --     ulimit -n 4096  -> 2046 controllers   (2.00 each)
+  -- `cqueues.poll` takes a bare number in its argument list AS A DEADLINE.
+  -- The manual is explicit -- "A number value is interpreted as a simple
+  -- timeout, not a file descriptor" -- and `object_getinfo` in cqueues.c has
+  -- an `/* optimize simple timeout */` branch that never touches the
+  -- descriptor path. The deadline lands in a `struct timer` EMBEDDED in
+  -- `struct thread`, on an LLRB tree, and is handed straight to epoll_wait's
+  -- own timeout. No malloc, no descriptor, no userdata.
   --
-  -- and THREE on kqueue, which the platform matrix found on macOS.
+  -- So this was paying for a whole nested epoll instance to duplicate a
+  -- red-black tree node the loop we are already inside keeps for free.
   --
-  -- Those descriptors came back only when the collector ran, which quietly
-  -- tied a hard operating-system limit to the pace of the garbage collector.
-  -- Nothing declared that, and no profile would have shown it.
-  local cq = table.remove(controller_pool) or cqueues.new()
+  -- MEASURED, `bench/study/deadline-without-controller.lua`, same three
+  -- outcomes from both:
+  --
+  --     a controller per request   fds 8 -> 30 over 200 calls   2,216 B/call
+  --     a bare number in poll      fds 6 ->  6                  1,624 B/call
+  --
+  -- The descriptor growth is not reduced but ABSENT, which matters more than
+  -- the bytes: a Lua number is not a GC object, so there is nothing for the
+  -- collector to be late about. The failure this runtime hit under load --
+  -- 97,912 of 706,563 requests answered `Too many open files`, because dead
+  -- controllers outran the collector -- becomes categorically impossible
+  -- rather than bounded.
+  --
+  -- WHAT THIS GIVES UP, and it is the reason it took this long. The nested
+  -- controller made an abandoned handler INERT: nothing stepped it, so it
+  -- never woke. On the controller we are already in, it wakes.
+  --
+  -- What replaces inertness is the budget itself. A handler abandoned by its
+  -- deadline carries a NEGATIVE remaining budget -- `M.begin` set the deadline
+  -- inside the handler's own coroutine and `M.finish` never ran, because the
+  -- handler never resumed -- so every capability that asks how long it has
+  -- left is told it is over and refuses. `akkar/db.lua` and `akkar/redis.lua`
+  -- both do, and `log` and `clock` hold nothing poolable.
+  --
+  -- `spec/abandoned_inertness_spec.lua` is the file that argues this, and
+  -- `spec/abandoned_spec.lua` checks the protocol half against real servers.
+  -- THE CONDITION IS RECYCLED, and unlike the controller it replaced, that
+  -- carries no descriptor risk: a condition holds none. Removing the
+  -- controller cost 95 bytes a request in exchange for two descriptors, and
+  -- this is how the 95 come back -- a condition is 93 bytes, measured.
+  --
+  -- Safe to reuse because it is returned only after the wait has ended, so it
+  -- has no waiter left; and it is dropped rather than pooled if anything is
+  -- still waiting on it, which is the same rule the controller pool used.
+  local cq = assert(cqueues.running(),
+    "akkar: with_deadline needs a controller; call it from inside one")
+  local finished = table.remove(condition_pool) or condition.new()
   local winner, result
 
   cq:wrap(function()
     -- The budget starts inside the coroutine that will do the work, because
     -- it is keyed by that coroutine. Every capability the handler touches can
-    -- now read how long it has.
+    -- now read how long it has -- and, once the deadline passes, that it has
+    -- none.
     M.begin(seconds)
     local ok, res = pcall(fn)
     if winner == nil then              -- first arbitrating event wins
       winner = ok and "COMPLETION" or "ERROR"
       result = res
     end
+    finished:signal()
   end)
 
-  -- Step before polling.  `wrap` only queues the coroutine, so the handler has
-  -- not started yet; polling first made every synchronous request wait on a
-  -- descriptor for work that was already ready to run.
-  cq:step(0)
-
   local deadline = time.monotime() + seconds
-  while winner == nil do
-    local remaining = deadline - time.monotime()
-    if remaining <= 0 then break end
-    cqueues.poll(cq, remaining)        -- yields to the outer controller
-    cq:step(0)
-  end
+  -- A bare number IS the deadline. `finished` is signalled by the handler, so
+  -- whichever comes first ends the wait.
+  cqueues.poll(finished, seconds)
 
-  -- Only an empty controller goes back.  A handler abandoned by the deadline
-  -- is still running inside its controller, and reusing that would hand the
-  -- next request someone else's unfinished work -- the same class of bug as a
-  -- pooled database connection with a transaction still open.
+  -- Back to the pool ONLY IF THE HANDLER FINISHED, which `winner ~= nil`
+  -- says: the handler sets it and signals immediately after, without
+  -- yielding in between, so by the time this line runs the signal has landed
+  -- and nothing will ever signal this condition again.
   --
-  -- AND ONE THAT DOES NOT FIT THE POOL IS CLOSED, NOT DROPPED.
-  --
-  -- Dropping it was the defect. The comment above `cqueues.new()` already
-  -- says the descriptors "came back only when the collector ran, which
-  -- quietly tied a hard operating-system limit to the pace of the garbage
-  -- collector" -- and treated the pool as the answer. The pool has a ceiling;
-  -- past it, every completed request handed two descriptors to the collector
-  -- and hoped.
-  --
-  -- MEASURED, on the study box at `wrk -t4 -c100` with `ulimit -n 1024`:
-  -- 101 sockets open and **460 eventpoll descriptors** live -- nine per
-  -- connection, not three. 460 is not a design number: it is exactly
-  -- (1024 - 101 - 3) / 2, which is to say "whatever the descriptor table
-  -- allowed". Resident memory stayed flat throughout, so nothing leaked;
-  -- the backlog of dead-but-uncollected controllers simply outran the
-  -- collector. The server answered 97,912 of 706,563 requests with
-  -- `unable to initialize continuation queue: Too many open files`.
-  --
-  -- It is a RACE, not a threshold, which is why it looked bistable: two
-  -- identical 60-second runs at -c100 gave 705 errors with the backlog at 460
-  -- and zero errors with it at 62, and a process that entered the bad regime
-  -- stayed in it. Locally, at a third of that request rate, the same
-  -- experiment with recycling off shows the backlog sawtoothing between 50
-  -- and 140 and never running away -- the collector keeps up. Rate decides.
-  --
-  -- `close` runs the same `cqueue_destroy` the `__gc` metamethod does
-  -- (cqueues.c:1497 and :1511 are two calls to one function), so this is not
-  -- a different teardown, only a punctual one. It refuses if the controller
-  -- is running, hence the pcall: an empty controller is not running, and a
-  -- refusal here must not take the request down with it.
-  --
-  -- WHAT THIS DOES NOT FIX, stated because it is the same shape: a handler
-  -- abandoned by its deadline leaves a NON-empty controller, and that one is
-  -- still left to the collector. Under a storm of timeouts the same backlog
-  -- could build. It is not what was measured -- every request in that run
-  -- completed -- and closing a controller with a live coroutine inside it is
-  -- a separate decision with its own risk, so it is named rather than
-  -- guessed at.
-  if cq:empty() then
-    if #controller_pool < POOL_LIMIT then
-      controller_pool[#controller_pool + 1] = cq
-    else
-      pcall(cq.close, cq)
-    end
+  -- An abandoned handler is still inside `pcall(fn)` and WILL signal when it
+  -- eventually returns. Recycling that condition would wake the next request
+  -- early, and `poll` returning with its own `winner` still nil means it
+  -- would be reported as a TIMEOUT -- a fast request told it was too slow.
+  -- cqueues offers no `has_waiters`, so this is the test that is available
+  -- and it happens to be the exact one required.
+  if winner ~= nil and #condition_pool < CONDITION_POOL_LIMIT then
+    condition_pool[#condition_pool + 1] = finished
   end
 
   if winner == nil then winner = "TIMEOUT" end

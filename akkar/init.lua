@@ -2161,8 +2161,20 @@ function App:run(config)
     limits:close()
     if not soft then return nil end
 
-    -- THREE PER IN-FLIGHT REQUEST, MEASURED. This said two, and two was the
-    -- controller alone -- it forgot the connection's own socket.
+    -- ONE PER IN-FLIGHT REQUEST, MEASURED -- the connection's own socket, and
+    -- nothing else.
+    --
+    -- It was three until the deadline stopped needing a controller: the
+    -- socket plus two descriptors for the nested `cqueues.new()` that
+    -- arbitrated the deadline. `with_deadline` uses a bare number in
+    -- `cqueues.poll` now, which allocates no descriptor at all, and
+    -- `spec/concurrency_spec.lua` counts 1.00 where it counted 3.00.
+    --
+    -- The consequence is the whole of F2: on the usual `ulimit -n 1024` this
+    -- promised 225 concurrent requests and now promises 675.
+    --
+    -- The history below is kept because the arithmetic was wrong twice, in
+    -- opposite directions, and both mistakes are instructive.
     --
     -- Counted from inside a server process of its own, sampling /proc while N
     -- requests were held in a sleeping handler:
@@ -2188,12 +2200,13 @@ function App:run(config)
     -- Nobody saw it because that harness read the wrong awk field for the
     -- error count.
     --
-    -- ON DARWIN THIS IS STILL WRONG, and says so rather than guessing: a
-    -- controller costs three descriptors on kqueue, so a request costs four
-    -- there. The function reads /proc and so returns nil off Linux, which
-    -- means no ceiling is derived at all -- an honest nothing rather than a
-    -- confident 225. `docs/PLATFORMS.md` carries it.
-    local ceiling = math.floor(tonumber(soft) * 0.66 / 3)
+    -- AND DARWIN IS NO LONGER A SPECIAL CASE, which is the quiet second win.
+    -- The kqueue difference was entirely the controller's -- three
+    -- descriptors there against two on epoll. A socket is a socket on both,
+    -- so the number is now one everywhere. The function still reads /proc and
+    -- still returns nil off Linux, so no ceiling is derived there; that is a
+    -- separate gap, recorded in `docs/PLATFORMS.md`.
+    local ceiling = math.floor(tonumber(soft) * 0.66 / 1)
     return math.max(ceiling, 16)
   end
 

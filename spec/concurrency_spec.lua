@@ -282,9 +282,9 @@ describe("the concurrency ceiling", function()
     limits:close()
     assert.is_truthy(soft, "this platform does not expose the limit")
 
-    -- THREE descriptors per in-flight request -- the connection's socket, and
-    -- two for the controller that carries its deadline -- with a third of the
-    -- budget left for the listener, the database pool and the log sink.
+    -- ONE descriptor per in-flight request -- the connection's socket -- with
+    -- a third of the budget left for the listener, the database pool and the
+    -- log sink. It was three until the deadline stopped needing a controller.
     --
     -- THIS ASSERTION USED TO RE-DERIVE THE FORMULA AND THEN CHECK NOTHING.
     -- It computed `expected` with the same arithmetic as `init.lua`, divisor
@@ -295,7 +295,7 @@ describe("the concurrency ceiling", function()
     --
     -- It compares against what akkar actually decided now, and the case below
     -- goes and counts the descriptors rather than trusting either copy.
-    local expected = math.max(math.floor(tonumber(soft) * 0.66 / 3), 16)
+    local expected = math.max(math.floor(tonumber(soft) * 0.66 / 1), 16)
     local app = akkar.new()
     app:get("/ping", function() return { pong = true } end)
     -- `App:run` computes it, and `app:test` never calls `App:run`, so the
@@ -310,7 +310,7 @@ describe("the concurrency ceiling", function()
         :format(got, soft, expected))
   end)
 
-  it("costs three descriptors per request in flight, counted", function()
+  it("costs one descriptor per request in flight, counted", function()
     -- THE NUMBER THE CEILING DIVIDES BY, MEASURED RATHER THAN ASSERTED.
     --
     -- `descriptor_ceiling` divided by two for as long as it existed, and two
@@ -332,11 +332,15 @@ describe("the concurrency ceiling", function()
       pending "no /proc here: descriptors per request are not counted"
       return
     end
-    -- Exactly 3.00 at 50, 100 and 200 in flight on Linux. Asserted as a range
-    -- because a future change might legitimately add one -- but a change that
-    -- adds one and does not touch the divisor is what this refuses.
-    assert.is_true(per >= 2.9 and per <= 3.1,
-      ("%.2f descriptors per in-flight request; the ceiling divides by 3")
+    -- ONE, and it was three until `with_deadline` stopped allocating a
+    -- controller for the deadline. The socket is all that is left.
+    --
+    -- Asserted as a range because a future change might legitimately add one
+    -- -- but a change that adds one and does not touch the divisor is exactly
+    -- what this refuses, and that is not hypothetical: the divisor has been
+    -- wrong twice, once too small and once too large.
+    assert.is_true(per >= 0.9 and per <= 1.1,
+      ("%.2f descriptors per in-flight request; the ceiling divides by 1")
         :format(per))
   end)
 

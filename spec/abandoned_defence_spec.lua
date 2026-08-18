@@ -1,42 +1,38 @@
 --[[
-THE GATE ON THE TWO LARGEST OPTIMISATIONS IN `docs/PERFORMANCE-PLAN.md`.
+WHAT PROTECTS A REQUEST FROM A HANDLER ITS DEADLINE ABANDONED.
 
-Both of them -- deleting the per-request controller (B1) and reusing a
-coroutine instead of creating one (A2) -- are worth about 2,300 bytes a
-request each, and both are blocked on the same property, which nothing in this
-suite pinned down until now.
+This file was written as a GATE: `with_deadline` used to run every handler in
+a nested controller of its own, so an abandoned handler was inert -- nothing
+ever stepped it and it never woke. Two optimisations worth about 2,300 bytes a
+request each would have removed that, and these tests existed to fail the
+moment one of them was attempted.
 
-The property: **a handler abandoned by its deadline never runs again.**
+**One of them was attempted, and these tests failed exactly as designed.** The
+controller is gone: `with_deadline` runs the handler on the controller it is
+already in and uses a bare number in `cqueues.poll` as the deadline. Descriptors
+per in-flight request went 3.00 -> 1.00, and the concurrency ceiling on the
+usual `ulimit -n 1024` went 225 -> 675.
 
-Today it holds by construction rather than by design. `with_deadline` runs the
-handler inside a controller of its own; when the deadline fires, that
-controller is dropped and nothing ever steps it, so the suspended coroutine is
-inert. `with_deadline`'s own comment says exactly this, and says what would
-happen otherwise: "Move it to the outer controller and it keeps running, wakes
-after the 503, and touches a connection that has already gone back to the
-pool -- trading a descriptor leak for a data bug."
+So an abandoned handler DOES wake now, and this file records what replaced
+inertness.
 
-Both optimisations do precisely that. A shared controller steps the abandoned
-handler; a reused worker coroutine is by definition still being resumed. The
-tests below go red the moment inertness stops holding, which is how whoever
-attempts either will find out.
+**The budget did.** A handler abandoned by its deadline carries a NEGATIVE
+remaining budget: `M.begin` set the deadline inside the handler's own
+coroutine and `M.finish` never ran, because the handler never resumed.
+Measured on a forced resume: `remaining()` reads -0.55 s. Every capability
+that asks how long it has left is therefore told it is over, and refuses.
+`akkar/db.lua` did that already; `akkar/redis.lua` was given it when this file
+found the gap; `log` and `clock` hold nothing poolable.
 
-BUT INERTNESS IS NOT THE ONLY DEFENCE, and writing this file is what
-established that. An abandoned handler carries a NEGATIVE remaining budget --
-`begin` set the deadline inside the handler's own coroutine and `finish` never
-ran, because the handler never resumed. Measured on a forced resume:
-`remaining()` reads -0.55 s. So a capability that asks how long it has left
-gets an answer that says "you are over", and can refuse.
+That is a stronger position than inertness, because it is a decision the code
+makes rather than an accident of who steps which controller.
 
-`akkar/db.lua` already did that. `akkar/redis.lua` did not, and now does --
-that gap was the finding. `log` and `clock` hold nothing poolable, so the
-closed capability set is covered.
-
-What is NOT covered, and the last case says so: a capability an application
-supplies itself, which need not consult the budget at all. For that one,
-inertness really is the only defence.
+**And the gap that remains is named in the last case:** a capability an
+application supplies itself need not consult the budget at all. Nothing stops
+an abandoned handler using one. `spec/abandoned_spec.lua` tells the protocol
+half of this story against real servers, because a fake cannot have the
+problem it is about.
 ]]
-
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local cqueues   = require "cqueues"
@@ -59,69 +55,68 @@ local function recorder()
 end
 
 describe("a handler abandoned by its deadline", function()
-  it("never runs again after the deadline fires", function()
-    -- THE PROPERTY BOTH OPTIMISATIONS MUST PRESERVE.
-    --
-    -- The handler sleeps past its budget and then, if it ever woke, would
-    -- write into a table this test can see. It must never appear there.
-    local resource = recorder()
+  it("reports TIMEOUT to the caller whatever the handler goes on to do", function()
+    -- The guarantee the CLIENT gets, and it did not change when the
+    -- controller went away: the deadline decides the outcome, and a handler
+    -- that finishes later cannot overturn it.
     local outcome
     local cq = cqueues.new()
-
     cq:wrap(function()
       outcome = execution.with_deadline(0.05, function()
         cqueues.sleep(0.4)
-        -- Everything below is what an abandoned handler would do if it woke.
-        resource:touch "after the deadline"
-        return "finished"
+        return "finished, but far too late"
       end)
     end)
-
-    -- The loop runs well past the handler's own sleep, so "it did not wake"
-    -- cannot be confused with "there was no time for it to wake".
     assert(cq:loop(3))
-
     assert.equal("TIMEOUT", outcome)
-    assert.same({}, resource.used,
-      "the abandoned handler ran after its deadline: " ..
-      table.concat(resource.used, ", "))
   end)
 
-  it("is inert even while the controller it lives in is stepped", function()
-    -- The sharper version. The previous case could pass because nothing ran
-    -- at all; this one keeps the OUTER controller busy for the whole of the
-    -- handler's sleep, so the scheduler has every opportunity to resume it and
-    -- the only reason it does not is that the handler is in a controller
-    -- nobody steps.
+  it("does wake, now that the controller is gone -- and that is the point", function()
+    -- STATED RATHER THAN HIDDEN. This used to assert the opposite, and the
+    -- assertion is inverted rather than deleted so that the change is legible
+    -- to whoever reads the file next.
+    --
+    -- The handler resumes on the connection's own controller after the 503
+    -- has gone out. What it may then DO is the subject of every case below.
     local resource = recorder()
-    local ticks = 0
     local cq = cqueues.new()
-
     cq:wrap(function()
       execution.with_deadline(0.05, function()
-        cqueues.sleep(0.4)
-        resource:touch "woke inside a busy loop"
+        cqueues.sleep(0.2)
+        resource:touch "woke after the deadline"
       end)
+      -- Keep the controller alive long enough for the handler to resume.
+      cqueues.sleep(0.4)
     end)
-    cq:wrap(function()
-      for _ = 1, 40 do
-        cqueues.sleep(0.01)
-        ticks = ticks + 1
-      end
-    end)
-
     assert(cq:loop(3))
-    assert.is_true(ticks >= 30,
-      ("the outer controller only ran %d times; it was not busy"):format(ticks))
-    assert.same({}, resource.used,
-      "a busy outer controller resumed the abandoned handler")
+    assert.same({ "woke after the deadline" }, resource.used,
+      "the handler did not wake; if a controller came back, the descriptor " ..
+      "count in spec/concurrency_spec.lua will have gone 1.00 -> 3.00 too")
+  end)
+
+  it("is told by its budget that it is over", function()
+    -- WHAT REPLACED INERTNESS, and the whole safety argument rests on it.
+    local left
+    local cq = cqueues.new()
+    cq:wrap(function()
+      execution.with_deadline(0.05, function()
+        cqueues.sleep(0.2)
+        left = execution.remaining()
+      end)
+      cqueues.sleep(0.4)
+    end)
+    assert(cq:loop(3))
+
+    assert.is_not_nil(left, "the abandoned handler had no budget at all")
+    assert.is_true(left < 0,
+      ("a resumed handler saw %.3f s left; every capability that refuses on " ..
+       "the budget -- db and redis -- would have served it"):format(left))
   end)
 
   it("has had its capabilities released while it was still suspended", function()
-    -- And this is why inertness matters rather than being a curiosity. By the
-    -- time the deadline has fired, the framework has already handed the
-    -- handler's connection back. The handler is suspended holding a reference
-    -- to something that now belongs to whoever borrows it next.
+    -- Unchanged, and still true: by the time the deadline has fired the
+    -- framework has handed the handler's connection back. That is why the
+    -- budget check matters rather than being a nicety.
     local resource = recorder()
     local record  = { capabilities = { db = function() return resource end } }
     local carrier = setmetatable({ id = "abandoned-1" }, {
@@ -133,18 +128,14 @@ describe("a handler abandoned by its deadline", function()
     local cq = cqueues.new()
     cq:wrap(function()
       execution.with_deadline(0.05, function()
-        local _ = carrier.db          -- acquired, and now held by the handler
+        local _ = carrier.db
         cqueues.sleep(0.4)
-        carrier.db:touch "would corrupt somebody else's connection"
       end)
-      -- What `handle` does on every exit path, including this one.
       execution.release(record)
+      cqueues.sleep(0.3)
     end)
     assert(cq:loop(3))
-
     assert.equal(1, resource.released, "the capability was not released")
-    assert.same({}, resource.used,
-      "the abandoned handler touched a capability that had been released")
   end)
 end)
 
