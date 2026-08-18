@@ -15,11 +15,16 @@ in a framework that exists:
 
 local cqueues = require "cqueues"
 local time    = require "akkar.time"
-local server  = require "http.server"
-local headers = require "http.headers"
+local server  = require "akkar.vendor.http.server"
+local headers = require "akkar.vendor.http.headers"
 local cjson   = require "akkar.json"
 local log     = require "akkar.log"
 local multipart = require "akkar.multipart"
+-- The execution machinery, with no HTTP in it. `akkar.execution` requires only
+-- `cqueues` and `akkar.time`, so there is no cycle back to this file.
+local execution = require "akkar.execution"
+local bitwise = require "akkar.bitwise"
+local text = require "akkar.text"
 
 local akkar = {}
 
@@ -172,6 +177,20 @@ akkar.defaults = {
   body_limit     = 1024 * 1024,   -- 1 MB
   timeout        = 30,            -- seconds of wall clock per request
   shutdown_grace = 10,            -- seconds to drain before saying so
+
+  -- INSTRUCTIONS A HANDLER MAY RUN WITHOUT RETURNING. `nil` is no ceiling,
+  -- which is what every akkar before this had and what a service that trusts
+  -- its own code wants.
+  --
+  -- The deadline above cannot do this job and says so: it is cooperative, and
+  -- fires only while the handler is yielding on I/O. `while true do end`
+  -- yields never, so no wall-clock budget in this runtime can interrupt it.
+  -- Until now the watchdog only WARNED about that, and warning is the right
+  -- answer when the code is yours.
+  --
+  -- It stops being the right answer when the code is somebody else's. Set
+  -- this and a handler that will not return is ended.
+  cpu_limit      = nil,           -- instructions, nil = unlimited
 }
 
 -- ================================================== capabilities and settings
@@ -187,15 +206,10 @@ akkar.defaults = {
 --   capabilities   db, cache, log, clock
 --                  infrastructure injected from app:run{}
 --
--- A capability is infrastructure the framework knows how to inject, guard and
--- fake.  Anything belonging to the application -- a mailer, a payment gateway,
--- a recommendation service -- does not qualify and must be closed over by the
--- handler instead.  Without an admission rule this table grows forever, and
--- every entry becomes permanent: moving `req.db` to `ctx.db` later would force
--- an edit to every handler ever written, which is exactly what the complexity
--- ladder forbids.
-local CAPABILITIES = { db = true, cache = true, log = true, clock = true,
-                       http = true }
+-- The closed set now lives in `akkar/execution.lua`, because it is a property
+-- of an execution and not of a request. Aliased as a local so every use below
+-- reads exactly as it did.
+local CAPABILITIES = execution.CAPABILITIES
 
 -- What each capability must be able to do.  Checked once at startup, so a
 -- misconfigured adapter fails at boot the way a duplicate route already does,
@@ -214,6 +228,11 @@ local CONTRACTS = {
 -- The framework's own voice.  Replaced by `app:run { log = ... }`, but present
 -- so nothing has to be configured for diagnostics to appear.
 local internal = log.new { level = "info", format = "text" }
+-- Told to `akkar.execution` at load, not only when `App:run` reassigns it.
+-- `App:test` never calls `App:run`, so without this the test client's
+-- `req.log` would index a nil -- and the test client is the path most of this
+-- suite takes.
+execution.default_log(internal)
 
 
 -- Everything else app:run{} accepts.  Listed so that a typo is an error rather
@@ -224,7 +243,8 @@ local SETTINGS = {
   body_limit = true, timeout = true, shutdown_grace = true,
   check_capabilities = true, reuseport = true, strict = true,
   max_concurrent = true, trusted_proxies = true,
-  repair_substrate = true,
+  repair_substrate = true, socket_buffer = true, gc = true,
+  cpu_limit = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -253,7 +273,7 @@ local function nearest(word, candidates)
       best, best_distance = candidate, previous[#candidate]
     end
   end
-  if best_distance <= math.max(2, #word // 3) then return best end
+  if best_distance <= math.max(2, bitwise.idiv(#word, 3)) then return best end
 end
 
 local function check_config(config, allowed, what)
@@ -301,7 +321,10 @@ local function warn_unbounded_statements(instance, config)
     log_to:warn("db has no statement_timeout, so a request deadline does " ..
                   "not stop the query", {
       request_deadline_s = config.timeout or akkar.defaults.timeout,
-      consequence = "an abandoned query keeps a backend busy after the 503",
+      consequence = "an abandoned query keeps a backend busy after the 503, " ..
+                    "and akkar discards the connection rather than reading a " ..
+                    "reply it can no longer place -- so every timed-out query " ..
+                    "also costs a reconnect",
       fix = "db.connect { statement_timeout = <seconds> }, matching the deadline",
     })
   end
@@ -458,6 +481,46 @@ local function expand(rule)
   return { kind = kind, optional = optional }
 end
 
+--- Expands every shorthand rule in a schema, once, at route registration.
+---
+--- `expand` above returns a table rule untouched and ALLOCATES for a string
+--- one. So `{ id = "integer", cursor = "string?" }` built two tables on every
+--- request, for ever, while the identical schema written with `v.integer{}`
+--- built none. Measured on a route with four shorthand rules: 4,428
+--- bytes/request against 4,012 for the `v.*` form -- 416 bytes, ~104 per rule,
+--- bought back by doing this at boot.
+---
+--- A NEW TABLE, not a mutation of the caller's. Two routes may share one
+--- schema table, and rewriting it under them would work by luck rather than by
+--- design.
+---
+--- After this, `expand` inside `validate` finds a table and returns it
+--- untouched -- so `validate` needs no change, and `akkar.validate` keeps
+--- accepting raw schemas from callers who never registered a route.
+---
+--- One deliberate consequence: a bad rule now raises where the route is
+--- DECLARED instead of when it is first served. That matches what this file
+--- already does with a misspelled constraint and with a duplicate route, and
+--- a schema that can never validate anything is worth failing the boot for.
+local function expand_schema(schema, what)
+  if type(schema) ~= "table" then
+    error(("%s must be a table of rules; got %s"):format(what, type(schema)), 0)
+  end
+  local out = {}
+  for field, rule in pairs(schema) do
+    local ok, expanded = pcall(expand, rule)
+    if not ok then
+      -- Name the field. `unknown schema type: 'strng'` with no field is a
+      -- message that sends the reader looking through every rule they wrote.
+      error(("%s.%s: %s"):format(what, tostring(field), tostring(expanded)), 0)
+    end
+    out[field] = expanded
+  end
+  return out
+end
+
+local SCHEMA_SLOTS = { "params", "query", "body", "response" }
+
 local function check_one(value, rule, coerce)
   if value == nil then
     if rule.optional then return nil, nil end
@@ -516,16 +579,27 @@ local function validate(input, schema, coerce)
   -- Defensive: anything that is not a table is treated as absent, so a
   -- surprising body shape becomes a field-level error rather than a 500.
   if type(input) ~= "table" then input = {} end
-  local cleaned, failures, any = {}, {}, false
+  -- `failures` is built only when something fails, and the happy path is the
+  -- overwhelming majority. It used to be allocated unconditionally, and a
+  -- request declaring `params` and `query` pays for `validate` twice (three
+  -- times with a body), so that was up to three empty tables per request
+  -- representing nothing having gone wrong.
+  --
+  -- `any` is gone with it: `failures ~= nil` already carries that fact.
+  local cleaned, failures = {}, nil
   for field, rule in pairs(schema) do
     local expanded = expand(rule)
     local value = input[field]
     if value == nil and expanded.default ~= nil then value = expanded.default end
     local got, err = check_one(value, expanded, coerce)
-    if err then failures[field] = err any = true
-    else cleaned[field] = got end
+    if err then
+      failures = failures or {}
+      failures[field] = err
+    else
+      cleaned[field] = got
+    end
   end
-  if any then return nil, failures end
+  if failures then return nil, failures end
   return cleaned, nil
 end
 akkar.validate = validate
@@ -546,9 +620,81 @@ local WATCHDOG_LIMIT        = 0.100   -- seconds of uninterrupted CPU
 --
 -- Recorded rather than quietly reverted, because the reasoning was sound and
 -- someone will have it again.
+--- The current ceiling, or nil. Set by `app:run`, module-level for the same
+--- reason `internal` is: the hook is installed per request and reading a
+--- config table through three frames to get one number is worse.
+local cpu_limit = nil
+
 local function install_watchdog(where)
   local cpu, last, warned = 0, time.monotime(), false
+
+  -- COUNTED IN THE HOOK THAT WAS ALREADY THERE, which is why the ceiling is
+  -- free. `debug.sethook` allows ONE hook per coroutine -- `akkar/vm.lua:331`
+  -- says so, and restores whatever it displaced precisely so this diagnostic
+  -- survives a sandboxed run. A second hook for the ceiling is not available
+  -- even in principle, so it rides this one.
+  --
+  -- The granularity is therefore WATCHDOG_INSTRUCTIONS, 200,000, and that is
+  -- the honest resolution of the limit: a ceiling of 1,000,000 ends the
+  -- handler somewhere in [1,000,000, 1,200,000). For a loop that never
+  -- returns the difference is microseconds; for a ceiling set close to what a
+  -- handler legitimately uses it is a reason to leave room.
+  -- TWO HOOKS, AND THE DUPLICATION IS THE POINT.
+  --
+  -- The counting version needs `limit` and `used` as upvalues, and a closure
+  -- pays for every upvalue it captures whether or not it reads them. Sharing
+  -- one closure across both cases cost 12 bytes a request with no ceiling
+  -- configured, and `spec/allocation_spec.lua`'s validated-route ceiling --
+  -- 3,650, exact rather than statistical -- refused it at 3,662.
+  --
+  -- That refusal is correct and worth keeping: a feature nobody turned on
+  -- must cost nothing. So the no-ceiling path below is byte-identical to what
+  -- shipped before this, and the counting path exists only when asked for.
+  if not cpu_limit then
+    debug.sethook(function()
+      local now = time.monotime()
+      local dt = now - last
+      last = now
+      if dt < 0.050 then cpu = cpu + dt else cpu = 0 end
+      if cpu > WATCHDOG_LIMIT and not warned then
+        warned = true
+        internal:warn("handler blocked the event loop without yielding", {
+          blocked_ms = math.floor(cpu * 1000),
+          at = where,
+          traceback = debug.traceback("", 2),
+          hint = "this stalls every request in this process",
+        })
+      end
+    end, "", WATCHDOG_INSTRUCTIONS)
+    return
+  end
+
+  local limit, used = cpu_limit, 0
+
   debug.sethook(function()
+    do
+      used = used + WATCHDOG_INSTRUCTIONS
+      if used > limit then
+        -- RAISED AS A RESPONSE, and `dispatch` already knows what to do with
+        -- one: "a deep layer can signal HTTP without threading a return value
+        -- back through every frame". So this needs no plumbing of its own and
+        -- cannot be confused with a handler that threw.
+        --
+        -- 503 rather than 500, for the reason the deadline uses it: 500 says
+        -- akkar has a bug, and this is the request being refused. The log
+        -- line names the ceiling so the operator can tell the two apart
+        -- without reading the source.
+        internal:error("handler exceeded its instruction ceiling", {
+          instructions = used,
+          ceiling = limit,
+          at = where,
+          traceback = debug.traceback("", 2),
+          hint = "the handler did not return; raise cpu_limit or fix the loop",
+        })
+        error(response(503, { error = "the request did not finish in time" }), 0)
+      end
+    end
+
     local now = time.monotime()
     local dt = now - last
     last = now
@@ -570,106 +716,18 @@ local function remove_watchdog()
 end
 
 -- ================================================================== deadline
--- Wall-clock budget for one request.
---
--- Arbitration follows one rule, learned the expensive way on an earlier
--- project: THE WINNER IS DECIDED BY THE FIRST ARBITRATING EVENT AND A LATE
--- EVENT NEVER OVERTURNS IT.  A handler that finishes at 4.99 s against a 5 s
--- deadline has completed; reporting that as a timeout would discard work that
--- actually happened, which is how this goes wrong silently.
---
--- A nested controller is stepped through `cqueues.poll`, never `loop`, because
--- calling loop() from inside the server's controller would block every other
--- request -- exactly the failure this is meant to prevent.
---
--- HONEST LIMIT: this is cooperative.  It can only fire while the handler is
--- yielding on I/O.  A handler burning CPU in a tight loop is not interrupted
--- by the deadline; that is what the watchdog below reports instead.
-local controller_pool = {}
-local POOL_LIMIT = 64
+-- Moved to `akkar/execution.lua` whole, comments included: a wall-clock budget
+-- is a property of an execution, not of an HTTP request. Aliased as a local so
+-- every call site below is unchanged.
+local with_deadline = execution.with_deadline
 
-local function with_deadline(seconds, fn)
-  if not seconds or seconds <= 0 or not cqueues.running() then
-    return "COMPLETION", fn()          -- no budget, or no controller to yield to
-  end
-
-  -- Controllers are pooled, and speed is only one of three reasons.
-  --
-  -- Three separate investigations landed on this object.  A fresh
-  -- `cqueues.new()` per request cost 25 us of akkar's 34.7 us total overhead;
-  -- it contributed to the 2,814 bytes of garbage a trivial request produced;
-  -- and each controller holds **exactly 2.00 file descriptors**, confirmed at
-  -- three different limits:
-  --
-  --     ulimit -n 256   ->  126 controllers   (2.03 each)
-  --     ulimit -n 1024  ->  510 controllers   (2.01 each)
-  --     ulimit -n 4096  -> 2046 controllers   (2.00 each)
-  --
-  -- Those descriptors came back only when the collector ran, which quietly
-  -- tied a hard operating-system limit to the pace of the garbage collector.
-  -- Nothing declared that, and no profile would have shown it.
-  local cq = table.remove(controller_pool) or cqueues.new()
-  local winner, result
-
-  cq:wrap(function()
-    local ok, res = pcall(fn)
-    if winner == nil then              -- first arbitrating event wins
-      winner = ok and "COMPLETION" or "ERROR"
-      result = res
-    end
-  end)
-
-  -- Step before polling.  `wrap` only queues the coroutine, so the handler has
-  -- not started yet; polling first made every synchronous request wait on a
-  -- descriptor for work that was already ready to run.
-  cq:step(0)
-
-  local deadline = time.monotime() + seconds
-  while winner == nil do
-    local remaining = deadline - time.monotime()
-    if remaining <= 0 then break end
-    cqueues.poll(cq, remaining)        -- yields to the outer controller
-    cq:step(0)
-  end
-
-  -- Only an empty controller goes back.  A handler abandoned by the deadline
-  -- is still running inside its controller, and reusing that would hand the
-  -- next request someone else's unfinished work -- the same class of bug as a
-  -- pooled database connection with a transaction still open.
-  if cq:empty() and #controller_pool < POOL_LIMIT then
-    controller_pool[#controller_pool + 1] = cq
-  end
-
-  if winner == nil then winner = "TIMEOUT" end
-  if winner == "ERROR" then error(result, 0) end
-  return winner, result
-end
 
 -- ==================================================================== guards
--- Invariant: reading something that was never configured gives a useful
--- message, not "attempt to index a nil value".
--- A guard is immutable and its identity carries no meaning, so one per name
--- is built once and shared.  Every request was allocating a table, a
--- metatable and three closures to represent the same nothing.
---
--- `__newindex` is what makes sharing safe: without it, `req.user.id = 1` on
--- an unauthenticated request would silently write into an object every other
--- request also holds.  With it, that line says what is actually wrong.
-local guards = {}
-local function guard(name, hint)
-  local existing = guards[name]
-  if existing then return existing end
+-- Moved to `akkar/execution.lua`: a guard is what an unconfigured capability
+-- reads as, and capabilities are an execution concern. Aliased so the call
+-- sites below are unchanged.
+local guard = execution.guard
 
-  local fail = function() error(hint, 2) end
-  local g = setmetatable({}, {
-    __index = fail,
-    __call = fail,
-    __newindex = fail,
-    __tostring = function() return "<" .. name .. " missing>" end,
-  })
-  guards[name] = g
-  return g
-end
 
 local function unescape(s)
   return (s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
@@ -715,6 +773,29 @@ for _, method in ipairs { "get", "post", "put", "patch", "delete" } do
       if r.method == verb and r.path == path then
         error(string.format("duplicate route: %s %s\n  already registered at %s\n  duplicated at %s",
                             verb, path, r.where, where), 2)
+      end
+    end
+
+    -- Every schema this route declares is expanded HERE, once, rather than
+    -- rebuilt on every request inside `validate`. See `expand_schema`.
+    --
+    -- `opts` is copied before being written to: the table belongs to the
+    -- caller, who may be reusing it for another route or reading it back.
+    if opts then
+      local copied = false
+      for _, slot in ipairs(SCHEMA_SLOTS) do
+        if opts[slot] ~= nil then
+          if not copied then
+            local fresh = {}
+            for k, val in pairs(opts) do fresh[k] = val end
+            opts, copied = fresh, true
+          end
+          local ok, expanded = pcall(expand_schema, opts[slot], slot)
+          if not ok then
+            error(("%s %s: %s"):format(verb, path, tostring(expanded)), 2)
+          end
+          opts[slot] = expanded
+        end
       end
     end
 
@@ -1291,6 +1372,24 @@ local function dispatch(app, req)
     -- Response-as-error: a deep layer can signal HTTP without threading a
     -- return value back through every frame.
     if is_response(result) then return result end
+
+    -- A FAILURE AFTER THE BUDGET PASSED IS THE DEADLINE, NOT A BUG.
+    --
+    -- Now that capabilities bound their own I/O by the execution's budget, the
+    -- deadline usually arrives as a raised socket timeout rather than as the
+    -- controller giving up -- and this pcall catches it before `with_deadline`
+    -- ever sees it, so the request would answer 500.
+    --
+    -- 500 says "akkar has a bug"; 503 says "this took too long". Getting that
+    -- backwards sends whoever reads the log hunting for a defect that is not
+    -- there, and it is what `spec/abandoned_spec.lua` caught the moment the
+    -- database started honouring the budget: it asserted 503 and got 500.
+    --
+    -- The raise is still logged by the caller, so the cause is not lost.
+    local left = execution.remaining()
+    if left and left <= 0 then
+      return response(503, { error = "request deadline exceeded" })
+    end
     -- THE ONE ERROR THAT DID NOT NAME ITS FIX.
     --
     -- Writing the beginner guide surfaced it. A handler doing `req.body.title`
@@ -1371,18 +1470,42 @@ end
 -- across services, generated otherwise.  Not a UUID: this only has to be
 -- unique enough to correlate lines within a window, and pulling in a UUID
 -- library for that would be a dependency bought with nothing.
--- A random prefix chosen once per process, then a counter.  Two RNG calls per
--- request bought nothing: within a process a counter cannot collide at all,
--- which is strictly better than hoping two 48-bit draws differ, and across
--- processes the prefix separates them.
-local ID_PREFIX = string.format("%08x", math.random(0, 0xffffffff))
-local id_counter = 0
+-- The generating half moved to `akkar/execution.lua`: every execution has an
+-- identity, and only HTTP has an opinion about honouring a caller's header.
+-- That split is deliberate -- `execution.id()` cannot be handed a header,
+-- because trusting one is a transport decision and belongs here.
+--- One header out of whatever shape the transport handed us.
+---
+--- `request_id` and nothing else needs a header BEFORE `req` exists, and it
+--- needs exactly one. Normalising all of them to answer that was most of what
+--- made a browser-shaped request expensive: 12% of its CPU spent copying
+--- headers, on the overwhelming majority of requests that never read one.
+---
+--- Two shapes, because `app:test` passes a plain table and the server passes a
+--- lua-http headers object, and `normalize_headers` has always handled both.
+local function one_header(source, name)
+  if not source then return nil end
+  if type(source.get) == "function" then return source:get(name) end
+  for key, value in pairs(source) do
+    if key:lower() == name then return value end
+  end
+  return nil
+end
 
 local function request_id(headers)
   local given = headers and headers["x-request-id"]
   if given and #given > 0 and #given <= 200 then return given end
-  id_counter = id_counter + 1
-  return ID_PREFIX .. string.format("%06x", id_counter & 0xffffff)
+  return execution.id()
+end
+
+--- The same rule, against raw transport headers rather than a normalised copy.
+---
+--- Kept separate rather than folded into `request_id`, because `request_id` is
+--- exported and `spec/` calls it with a plain normalised table.
+local function request_id_from(source)
+  local given = one_header(source, "x-request-id")
+  if type(given) == "string" and #given > 0 and #given <= 200 then return given end
+  return execution.id()
 end
 
 -- W3C Trace Context, which is the same idea as `x-request-id` with a format
@@ -1415,7 +1538,7 @@ local function trace_context(headers)
     traceparent = given,
     trace_id = trace_id,
     span_id = span_id,
-    sampled = tonumber(flags, 16) & 0x01 == 1,
+    sampled = bitwise.band(tonumber(flags, 16), 0x01) == 1,
     tracestate = headers["tracestate"],
   }
 end
@@ -1474,8 +1597,8 @@ local function in_cidr(address, cidr)
   local a, b = ipv4_to_int(address), ipv4_to_int(base)
   if not a or not b or not bits or bits < 0 or bits > 32 then return false end
   if bits == 0 then return true end
-  local mask = (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF
-  return (a & mask) == (b & mask)
+  local mask = bitwise.band(bitwise.lshift(0xFFFFFFFF, 32 - bits), 0xFFFFFFFF)
+  return bitwise.band(a, mask) == bitwise.band(b, mask)
 end
 akkar.in_cidr = in_cidr
 
@@ -1499,7 +1622,11 @@ local function client_ip(peer, forwarded, trusted)
 
   local hops = {}
   for hop in tostring(forwarded):gmatch "[^,]+" do
-    hops[#hops + 1] = hop:match "^%s*(.-)%s*$"
+    -- `text.trim`, not `^%s*(.-)%s*$`: this trims a hop out of a header
+    -- THE CLIENT SENT, and the pattern's cost tracked the string's
+    -- length rather than the whitespace. Ten kilobytes in one
+    -- `X-Forwarded-For` cost 515 us against 83 us for a whole request.
+    hops[#hops + 1] = text.trim(hop)
   end
 
   for i = #hops, 1, -1 do
@@ -1540,6 +1667,78 @@ akkar.etag_of = require("akkar.etag").of
 
 -- Builds `req` and runs the chain.  Shared by the server and the test client,
 -- so both travel exactly the same path.
+-- The carrier's metatable, built ONCE at load rather than per request.
+--
+-- It used to be constructed inside `handle`: a table, a closure and the
+-- closure's upvalues, on every request -- including every request that reads
+-- no capability at all. Hoisting it is what pays for the extraction.
+--
+-- The closure captured `input`; this reaches it through `req.__input`, which
+-- is why `user` left the constructor to make room for that key.
+--
+-- WHAT STAYS HERE AND WHY: `ip`, `trace` and `user` are HTTP's, not an
+-- execution's. `akkar.execution` owns the closed capability set and would
+-- have to learn what a header is to own these -- which is the boundary the
+-- whole split exists to draw.
+local REQUEST_MT = {
+    __index = function(self, key)
+      -- Parsed on first read, like a capability, and for the same kind of
+      -- reason: putting it in the constructor added a ninth field to `req`,
+      -- which grew the table's hash part and cost 191 bytes on EVERY request
+      -- including the overwhelming majority that carry no trace at all. The
+      -- allocation ceiling test caught it.
+      --
+      -- Only cached when there is something to cache: a nil result leaves the
+      -- table exactly as it was, so a request without the header stays free.
+      -- Read from the closure over `input` rather than from fields on `req`.
+      -- Putting the peer and the proxy list in the constructor added two
+      -- fields, grew the table's hash part and cost 392 bytes on EVERY
+      -- request -- the same trap `trace` fell into, caught by the same
+      -- allocation ceiling.
+      -- The normalised copy, built once and cached, or built and thrown away
+      -- if nobody keeps it. `rawset` so a handler that reads `req.headers`
+      -- twice pays once.
+      if key == "headers" then
+        local built = normalize_headers(rawget(self, "__input").headers)
+        rawset(self, "headers", built)
+        return built
+      end
+
+      if key == "ip" then
+        -- `capabilities` IS the config table, so the proxy list is already
+        -- reachable without adding a field to anything. Two extra keys on the
+        -- test client's input table alone cost 200 bytes a request.
+        local input = rawget(self, "__input")
+        local settings = input.capabilities or {}
+        local address = client_ip(input.peer or settings.peer,
+                                  self.headers["x-forwarded-for"],
+                                  settings.trusted_proxies)
+        if address then rawset(self, "ip", address) end
+        return address
+      end
+
+      if key == "trace" then
+        local parsed = trace_context(self.headers)
+        if parsed then rawset(self, "trace", parsed) end
+        return parsed
+      end
+
+      -- `user` is resolved here rather than written into the constructor,
+      -- and deliberately WITHOUT `rawset`: caching it would add a ninth key
+      -- to `req` and cost the 192 bytes the constructor note describes.
+      -- `guard` returns one shared object per name, so every read gets the
+      -- same table the constructor used to hold.
+      if key == "user" then
+        return guard("req.user",
+          "req.user is not set; this route is missing the authentication middleware")
+      end
+
+      -- The closed capability set, acquired and tracked for release by the
+      -- module. Anything outside it reads nil, exactly as before.
+      return execution.acquire(self, rawget(self, "__input"), key)
+    end,
+}
+
 local function handle(app, input)
   -- Before the chains are built, because the selected app has its own.
   local requested_host = input.host
@@ -1569,7 +1768,16 @@ local function handle(app, input)
   end
 
   -- Request data.
-  local request_headers = normalize_headers(input.headers)
+  --
+  -- `headers` IS NOT BUILT HERE. `normalize_headers` copies every header into
+  -- a fresh table with a `safe_text` per value, and measured on a browser's
+  -- eight headers that is 9,988 ns and 328 bytes -- **12% of a request's
+  -- CPU** -- for something most handlers never read. akkar's own `/ping` does
+  -- not. It is built on first read by `REQUEST_MT`, the same way `trace` and
+  -- `ip` already are, and for the reason recorded there.
+  --
+  -- The one thing that needed a header before `req` existed was the request
+  -- id, and it needs exactly one: `one_header` fetches it directly.
   local req = {
     method  = input.method,
     path    = normalize_path(input.path),
@@ -1593,10 +1801,23 @@ local function handle(app, input)
     -- request instead of becoming garbage after the decode. That is bounded by
     -- `body_limit` times the requests in flight, and it is smaller than the
     -- decoded table it sits beside.
-    headers = request_headers,
+
     host    = normalize_host(requested_host),
-    id      = request_id(request_headers),
-    user    = guard("req.user", "req.user is not set; this route is missing the authentication middleware"),
+    id      = request_id_from(input.headers),
+    -- THE EXECUTION RECORD, and it is here instead of `user` rather than as
+    -- well as it.
+    --
+    -- `req` is EXACTLY EIGHT KEYS and the ninth costs 192 measured bytes: a
+    -- Lua table constructor sizes its hash part by key count, and nine crosses
+    -- a power-of-two boundary. So hoisting the metatable out of `handle` --
+    -- which is what pays for this whole refactor -- had to buy its link back
+    -- to `input` with a key, and `user` is the one that can leave.
+    --
+    -- It can leave because `guard` returns ONE SHARED object per name, so
+    -- resolving `user` lazily in `__index` returns the identical table this
+    -- line did. `akkar/limit.lua` reads `req.user` and documents that it is
+    -- never nil; that stays true.
+    __input = input,
   }
 
   -- ASSIGNED AFTER THE CONSTRUCTOR, and only when there is one.
@@ -1624,73 +1845,8 @@ local function handle(app, input)
   --
   -- A capability that was never configured reads as a guard, so the error
   -- says what is missing instead of indexing a nil.
-  local to_release = {}
-  setmetatable(req, {
-    __index = function(self, key)
-      -- Parsed on first read, like a capability, and for the same kind of
-      -- reason: putting it in the constructor added a ninth field to `req`,
-      -- which grew the table's hash part and cost 191 bytes on EVERY request
-      -- including the overwhelming majority that carry no trace at all. The
-      -- allocation ceiling test caught it.
-      --
-      -- Only cached when there is something to cache: a nil result leaves the
-      -- table exactly as it was, so a request without the header stays free.
-      -- Read from the closure over `input` rather than from fields on `req`.
-      -- Putting the peer and the proxy list in the constructor added two
-      -- fields, grew the table's hash part and cost 392 bytes on EVERY
-      -- request -- the same trap `trace` fell into, caught by the same
-      -- allocation ceiling.
-      if key == "ip" then
-        -- `capabilities` IS the config table, so the proxy list is already
-        -- reachable without adding a field to anything. Two extra keys on the
-        -- test client's input table alone cost 200 bytes a request.
-        local settings = input.capabilities or {}
-        local address = client_ip(input.peer or settings.peer,
-                                  rawget(self, "headers")["x-forwarded-for"],
-                                  settings.trusted_proxies)
-        if address then rawset(self, "ip", address) end
-        return address
-      end
 
-      if key == "trace" then
-        local parsed = trace_context(rawget(self, "headers"))
-        if parsed then rawset(self, "trace", parsed) end
-        return parsed
-      end
-
-      if not CAPABILITIES[key] then return nil end
-      local provided = input.capabilities and input.capabilities[key]
-      local value
-      if key == "log" then
-        -- `log` is the one capability with a default, because diagnostics
-        -- that need configuring before they appear are diagnostics nobody
-        -- sees.  Bound to the request id here, so a handler writing
-        -- `req.log:info(...)` correlates without doing anything.
-        value = (provided or internal):with { request_id = self.id }
-      elseif provided == nil then
-        value = guard("req." .. key,
-                      "req." .. key .. " is not configured; pass " ..
-                      key .. " = ... to app:run{}")
-      elseif callable(provided) then
-        value = provided()
-        if type(value) == "table" and type(value.release) == "function" then
-          to_release[#to_release + 1] = value
-        end
-      else
-        value = provided
-      end
-      rawset(self, key, value)      -- acquired once per request, not per read
-      return value
-    end,
-  })
-
-  -- Releasing is the framework's job, not the handler's.  It happens on every
-  -- exit -- normal return, thrown response, handler error, deadline -- because
-  -- a connection that leaks on the error path leaks exactly when load is
-  -- highest.
-  local function release_all()
-    for _, resource in ipairs(to_release) do pcall(function() resource:release() end) end
-  end
+  setmetatable(req, REQUEST_MT)
 
   -- A request that failed to parse still traverses the chain, so logging
   -- middleware sees the 400.  Middleware returning garbage cannot escape
@@ -1699,6 +1855,11 @@ local function handle(app, input)
   if input.short then req.__short = input.short end
 
   local ok, res = pcall(function()
+    -- `with_deadline` publishes the budget to the coroutine it runs this in,
+    -- so every capability the handler touches can read how long it has left.
+    -- That is what stops `req.http` from calling the service below with a
+    -- fresh ten seconds while this request has milliseconds, and what lets
+    -- `req.db` bound its own wire call by the same number.
     local winner, value = with_deadline(input.timeout, function()
       return normalize(chain(app, req))
     end)
@@ -1745,14 +1906,11 @@ local function handle(app, input)
     streamed.raw = res.raw
     -- Composed, not overwritten: middleware may already have deferred work of
     -- its own onto the response, and the concurrency limiter does exactly that.
-    local deferred = res.release
-    streamed.release = function()
-      if deferred then pcall(deferred) end
-      release_all()
-    end
+    -- The composition lives in `akkar.execution` so there is one of it.
+    streamed.release = execution.deferred(input, res.release)
     res = streamed
   else
-    release_all()
+    execution.release(input)
   end
 
   -- Beside the response, never on it. See the note at the stamp site above.
@@ -1867,6 +2025,56 @@ local function read_body(stream, request_headers, limit, budget)
   -- request, including a GET carrying no body to read. An app configured the
   -- documented way served nothing at all.
   local deadline = budget and budget > 0 and (time.monotime() + budget) or nil
+
+  -- THE BUFFER IS NOT GROWN HERE, AND THE CODE THAT DID IT HAS BEEN REMOVED.
+  --
+  -- It used to call `sock:setbufsiz(content_length)` before reading the body,
+  -- on the reasoning that `socket_buffer` defaults to 1024 and a larger body
+  -- would then be read in buffer-sized pieces, each one a trip through the
+  -- event loop. The table that justified it read:
+  --
+  --     buffer   read   write   sendto   epoll_wait   epoll_ctl
+  --       1024   6513    2254     1800         5410        1808
+  --       4096   4266    1356     1350         4063         910
+  --
+  -- **Both halves of that were wrong.** The counts came from a harness where
+  -- client and server shared one process, and `socket_buffer` writes the
+  -- socket PROTOTYPE -- so the server was being charged for the test client's
+  -- syscalls too. Re-counted with the server alone in its own process, over
+  -- ~16,300 requests per run and three repetitions, every figure landing
+  -- within 0.001 of the last:
+  --
+  --                          read   write   sendto   epoll_wait   epoll_ctl
+  --     keep-alive    1024   4.00    1.00     2.00         4.00        2.00
+  --     keep-alive    4096   4.00    1.00     2.00         4.00        2.00
+  --     new conn      1024   7.00    1.00     2.00         5.00        0
+  --     new conn      4096   4.00    1.00     2.00         5.00        0
+  --
+  -- Only reads move, and only on a connection that has not been used before.
+  -- Under keep-alive the difference is EXACTLY ZERO, because cqueues' fifo
+  -- only ever grows: the first request on a connection grows it past the
+  -- body and every later request reads in one go. `socket_buffer` is a
+  -- per-connection cost, not a per-request one. The writes, `sendto` and
+  -- `epoll_ctl` differences were entirely the client's.
+  --
+  -- And the fix did not fix it. Counted with it and without it, in both
+  -- shapes, the reads are byte-identical:
+  --
+  --     read(6, ..., 1024) = 1024   read(6, ..., 134) = 134
+  --     read(6, ..., 1024) = 1024   read(6, ..., 2048) = 2
+  --
+  -- The call fires and succeeds -- instrumented, it prints
+  -- `want=2048 ok=true` and `setbufsiz` returns the previous size -- and the
+  -- reads that follow do not change. The likely reason, untested: the fifo's
+  -- already-allocated block bounds each read, and raising the minimum size
+  -- mid-stream does not repack it.
+  --
+  -- So it was three lines that looked like they were doing something and were
+  -- not, which is worse than nothing. WHAT WOULD ACTUALLY WORK, if the
+  -- connection-per-request shape ever matters: a larger `socket_buffer`, or
+  -- growing the buffer when the connection is accepted rather than when a
+  -- body is about to be read. Measured under strace, 1024 costs about 8% of
+  -- throughput in that shape and nothing at all under keep-alive.
 
   local parts, total = {}, 0
   while true do
@@ -2067,9 +2275,29 @@ function App:run(config)
   local host = config.host or "127.0.0.1"
   local body_limit = config.body_limit or akkar.defaults.body_limit
   local timeout    = config.timeout    or akkar.defaults.timeout
+
+  -- `nil` is a legitimate value and means unlimited, so `or` is wrong here:
+  -- it would let the default resurrect a ceiling the caller cleared.
+  if config.cpu_limit ~= nil then
+    if config.cpu_limit ~= false and
+       (type(config.cpu_limit) ~= "number" or config.cpu_limit <= 0) then
+      error("akkar: cpu_limit must be a positive number of instructions, or " ..
+            "false for none", 2)
+    end
+    cpu_limit = config.cpu_limit or nil
+  else
+    cpu_limit = akkar.defaults.cpu_limit
+  end
   -- An app-supplied logger replaces the framework's own voice, so a service
   -- gets one stream in one format rather than two.
+  --
+  -- TOLD TO `akkar.execution` TOO, and forgetting to would be silent. That
+  -- module supplies `req.log` when no `log` capability was passed, so a
+  -- service that configured a logger here and nowhere else would keep getting
+  -- akkar's default voice inside handlers -- correct-looking output in the
+  -- wrong format, on one path only.
   if config.log then internal = config.log end
+  execution.default_log(internal)
   self.shutdown_grace = config.shutdown_grace or akkar.defaults.shutdown_grace
   self.state, self.in_flight, self.closers = "RUNNING", 0, {}
 
@@ -2095,36 +2323,33 @@ function App:run(config)
   -- is what the first scaling run on a c5.2xlarge actually did.
   -- ================================================== the descriptor ceiling
   --
-  -- Every in-flight request holds a `cqueues` controller for its deadline,
-  -- and a controller costs exactly two file descriptors. Measured, at the
-  -- concurrency that matters:
+  -- An in-flight request holds ONE descriptor: the connection it arrived on.
   --
-  --     concurrent      fds     per request
-  --     64              134            2.09
-  --     256             518            2.02
-  --     512            1030            2.01
+  -- It held three until F2, and the paragraph that used to stand here
+  -- described why -- a `cqueues` controller per request for the deadline, at
+  -- exactly two descriptors on epoll and three on kqueue, measured at 2.09,
+  -- 2.02 and 2.01 per request across 64, 256 and 512 concurrent. Against the
+  -- usual `ulimit -n 1024` that put the wall near 500, and hitting it was not
+  -- a clean failure: `accept` began failing, every socket operation began
+  -- failing, and a machine was lost that way during a 512-connection sweep.
   --
-  -- Against the common default of `ulimit -n 1024`, that puts the wall at
-  -- about 500 concurrent requests per process -- and hitting it does not
-  -- produce a clean error. `accept` starts failing, every socket operation
-  -- starts failing, and the process flails. A machine was lost this way
-  -- during a 512-connection sweep.
+  -- IT ALSO PREDICTED, WORD FOR WORD, THE BUG THAT REMOVING IT CAUSED:
   --
-  -- Pooling the controllers does not help here. The pool serves SEQUENTIAL
-  -- reuse; five hundred requests in flight at once need five hundred
-  -- controllers whatever its size.
+  --     "today an abandoned handler sits in an orphaned controller nothing
+  --      ever steps, so it is inert. Move it to the outer controller and it
+  --      keeps running, wakes after the 503, and touches a connection that
+  --      has already gone back to the pool"
   --
-  -- So the ceiling is declared to lua-http, which stops accepting beyond it
-  -- and lets the kernel queue instead. Backpressure rather than collapse:
+  -- That is precisely what happened, and it took an outage on the study box
+  -- to find -- a pool of two going to zero in ten seconds and never
+  -- recovering. The defence is in `akkar/pool.lua` and `akkar/db.lua` now:
+  -- a caller whose `execution.remaining()` has gone negative is refused, at
+  -- acquisition as well as at the query. The comment was right and nobody
+  -- read it as an instruction.
+  --
+  -- The ceiling is still declared to lua-http, which stops accepting beyond
+  -- it and lets the kernel queue instead. Backpressure rather than collapse:
   -- slow is a state a server can be in, out of descriptors is not.
-  --
-  -- The real fix is not to spend a controller per request at all -- a
-  -- `condition` costs zero descriptors and would do the same arbitration.
-  -- That is not a drop-in, and the reason is worth writing down: today an
-  -- abandoned handler sits in an orphaned controller nothing ever steps, so
-  -- it is inert. Move it to the outer controller and it keeps running, wakes
-  -- after the 503, and touches a connection that has already gone back to
-  -- the pool -- trading a descriptor leak for a data bug.
   local function descriptor_ceiling()
     local limits = io.open "/proc/self/limits"
     if not limits then return nil end
@@ -2135,10 +2360,52 @@ function App:run(config)
     limits:close()
     if not soft then return nil end
 
-    -- Two per in-flight request, and leave a third of the budget for the
-    -- listening socket, the database pool, the log sink and whatever else
-    -- the application opens.
-    local ceiling = math.floor(tonumber(soft) * 0.66 / 2)
+    -- ONE PER IN-FLIGHT REQUEST, MEASURED -- the connection's own socket, and
+    -- nothing else.
+    --
+    -- It was three until the deadline stopped needing a controller: the
+    -- socket plus two descriptors for the nested `cqueues.new()` that
+    -- arbitrated the deadline. `with_deadline` uses a bare number in
+    -- `cqueues.poll` now, which allocates no descriptor at all, and
+    -- `spec/concurrency_spec.lua` counts 1.00 where it counted 3.00.
+    --
+    -- The consequence is the whole of F2: on the usual `ulimit -n 1024` this
+    -- promised 225 concurrent requests and now promises 675.
+    --
+    -- The history below is kept because the arithmetic was wrong twice, in
+    -- opposite directions, and both mistakes are instructive.
+    --
+    -- Counted from inside a server process of its own, sampling /proc while N
+    -- requests were held in a sleeping handler:
+    --
+    --     50 in flight    150 descriptors    3.00 each
+    --    100 in flight    300 descriptors    3.00 each
+    --    200 in flight    600 descriptors    3.00 each
+    --
+    -- Dead flat, which is what a per-request cost looks like. The controller
+    -- is two of the three on epoll (`spec/support/portable.lua` measured that
+    -- separately, and three on kqueue); the socket is the third.
+    --
+    -- The consequence of dividing by two was a ceiling FIFTY PERCENT HIGHER
+    -- than the box could serve. On a machine with the usual `ulimit -n 1024`
+    -- this promised 337 concurrent requests, which would need 1,011
+    -- descriptors -- more than the whole limit, never mind the third held
+    -- back. It now promises 225, which fits.
+    --
+    -- This is not hypothetical. `bench/runtime/run.sh` at 100 connections had
+    -- akkar answering 18,640 of 111,651 requests with
+    -- `unable to initialize continuation queue: Too many open files` -- one
+    -- request in six, on the run that produced a published throughput number.
+    -- Nobody saw it because that harness read the wrong awk field for the
+    -- error count.
+    --
+    -- AND DARWIN IS NO LONGER A SPECIAL CASE, which is the quiet second win.
+    -- The kqueue difference was entirely the controller's -- three
+    -- descriptors there against two on epoll. A socket is a socket on both,
+    -- so the number is now one everywhere. The function still reads /proc and
+    -- still returns nil off Linux, so no ceiling is derived there; that is a
+    -- separate gap, recorded in `docs/PLATFORMS.md`.
+    local ceiling = math.floor(tonumber(soft) * 0.66 / 1)
     return math.max(ceiling, 16)
   end
 
@@ -2197,6 +2464,114 @@ function App:run(config)
       error("akkar: could not build the TLS context: " .. tostring(context), 0)
     end
     tls_ctx = context
+  end
+
+  -- WHAT AN IDLE CONNECTION COSTS, and the one line that changes it.
+  --
+  -- cqueues gives every socket an input and an output buffer of LSO_BUFSIZ
+  -- (4096) bytes each, malloc'd EAGERLY at creation (`socket.c`,
+  -- `lso_prepsocket` -> `lso_adjbufs`). Eight kilobytes per connection, held
+  -- whether or not the connection ever carries a byte, and invisible to the
+  -- Lua collector because it is C memory -- which is why the number never
+  -- showed up in this project's allocation ceilings.
+  --
+  -- `socket.setbufsiz(r, w)` with two arguments writes the PROTOTYPE that
+  -- every later socket is copied from (`lso_newsocket`, socket.c:817-821).
+  -- The buffers still grow on demand; only the eager preallocation goes.
+  --
+  -- MEASURED, holding 800 idle keep-alive connections and reading VmRSS from
+  -- inside the server process:
+  --
+  --     bufsiz 4096  14,582 bytes/connection   <- the default
+  --     bufsiz 2048  10,977
+  --     bufsiz 1024   9,175                    <- what akkar picks
+  --     bufsiz  512   7,864
+  --     bufsiz  256   7,864                    <- floor; nothing left to win
+  --
+  -- AND WHAT IT COSTS, counted rather than assumed. A smaller buffer ought to
+  -- mean more read() calls for the same bytes, so `strace -c` counted them at
+  -- 4096, 1024 and 512 over 300 requests, twice: a 13-byte JSON reply and a
+  -- 256 KB one.
+  --
+  --     small payload   read 2908, write 907   IDENTICAL at all three
+  --     large payload   read 2617 / 2619 / 2621 -- four calls over 300
+  --                     requests carrying 76 MB
+  --
+  -- So the buffer bounds what is PREALLOCATED, not what a read() asks for.
+  -- 1024 rather than 512 because the last 1.3 KB buys nothing the curve does
+  -- not already flatten on, and a larger buffer is the more conservative
+  -- side of a knob whose throughput has not been measured on the study box.
+  --
+  -- PROCESS-WIDE, stated plainly: this is a prototype, so outbound sockets
+  -- opened afterwards inherit it too -- `req.http` and any cqueues-backed
+  -- database driver. That is intended (they grow on demand as well) and
+  -- `socket_buffer = false` leaves cqueues entirely alone.
+  -- THE COLLECTOR MODE, WHICH THIS PROJECT MEASURED AND THEN NEVER SHIPPED.
+  --
+  -- `bench/study/gc-cost.sh` answered question 9 of the performance study on
+  -- 16 August 2026, across four settings on the same server:
+  --
+  --   stopping the collector entirely   +3.5%   <- the hard ceiling on any
+  --                                                collector tuning, and not
+  --                                                a configuration anyone can
+  --                                                ship: memory grows without
+  --                                                bound
+  --   generational                      +2.5%, and p99 7.50 ms -> 5.66 ms
+  --
+  -- So collector tuning is worth at most 3.5% of throughput, and generational
+  -- collects nearly all of it -- plus a quarter off the tail, which for a
+  -- service runtime is the number that matters.
+  --
+  -- That measurement was taken from OUTSIDE, by an environment variable in
+  -- `bench/study/apps/serve.lua`. akkar itself set the mode nowhere, so the
+  -- one thing the study found was better than the default was available to
+  -- the benchmark and to nobody running a server.
+  --
+  -- WHY GENERATIONAL SUITS THIS SHAPE: a request's garbage dies young.
+  -- Headers, the parsed body, the response table and the JSON string are all
+  -- unreachable by the time the connection is written to, and a generational
+  -- collector is built to sweep exactly that without walking the old
+  -- generation.
+  --
+  -- THE DEFAULT IS `nil` -- Lua's own incremental collector, untouched -- and
+  -- that is deliberate rather than timid. The numbers above predate this
+  -- session's HTTP work, which cut allocation per request by 21.6%; less
+  -- garbage means less for the collector to be good or bad at, so the 2.5%
+  -- may well have shrunk. Changing a shipped default on a measurement taken
+  -- against different code is the mistake `docs/PERFORMANCE-STUDY.md` rule 1
+  -- exists to prevent. `bench/study/gc-cost.sh` re-run at this revision is
+  -- what would move it.
+  --
+  --     app:run { gc = "generational" }   the mode the study preferred
+  --     app:run { gc = "incremental" }    Lua's default, said out loud
+  --     app:run { gc = { "incremental", 400, 400, 13 } }   tuned
+  --
+  -- NOT offered: stopping the collector. It is an instrument, not a setting,
+  -- and a server that ships it runs out of memory rather than slowly.
+  if config.gc ~= nil then
+    local mode = config.gc
+    if mode == "generational" then
+      collectgarbage "generational"
+    elseif mode == "incremental" then
+      collectgarbage "incremental"
+    elseif type(mode) == "table" and mode[1] == "incremental" then
+      collectgarbage("incremental", mode[2], mode[3], mode[4])
+    elseif type(mode) == "table" and mode[1] == "generational" then
+      collectgarbage "generational"
+    else
+      error("akkar: gc must be \"generational\", \"incremental\", or a table "
+        .. "like { \"incremental\", pause, stepmul, stepsize }; stopping the "
+        .. "collector is not a shipping configuration", 0)
+    end
+  end
+
+  if config.socket_buffer ~= false then
+    local buffer = config.socket_buffer or 1024
+    if type(buffer) ~= "number" or buffer < 1 or buffer % 1 ~= 0 then
+      error("akkar: socket_buffer must be a positive integer of bytes, or "
+        .. "false to leave cqueues' default alone", 0)
+    end
+    require("cqueues.socket").setbufsiz(buffer, buffer)
   end
 
   local s = assert(server.listen {
@@ -2258,10 +2633,28 @@ function App:run(config)
         local h = headers_or_why
         -- The socket's own idea of who connected. Everything else about the
         -- client's identity is something the client typed.
+        --
+        -- CACHED ON THE CONNECTION, because it cannot change on one and a
+        -- keep-alive connection carries many requests. Asking the socket per
+        -- request cost a `getpeername` SYSCALL per request -- measured at
+        -- exactly 1.00 with `strace -c` against a server straced alone, out
+        -- of 10.87 syscalls per request in total. Nearly a tenth of the
+        -- server's system-call budget, spent re-reading a constant.
+        --
+        -- `false` rather than nil for "asked and the socket would not say":
+        -- nil would look like "not asked yet" and buy the failing call back
+        -- on every request of a connection that has already refused once.
         local peer
         do
-          local ok_peer, _, address = pcall(function() return stream:peername() end)
-          if ok_peer then peer = address end
+          local conn = stream.connection
+          local cached = conn and conn.akkar_peer
+          if cached == nil then
+            local ok_peer, _, address = pcall(function() return stream:peername() end)
+            if ok_peer then peer = address end
+            if conn then conn.akkar_peer = peer or false end
+          elseif cached ~= false then
+            peer = cached
+          end
         end
         local target = h:get ":path" or "/"
         local path, qs = target:match "^([^?]*)%??(.*)$"
@@ -2292,7 +2685,7 @@ function App:run(config)
           short = short, stripped = true,
         })
         -- Nil for anything that is not a stream: dispatch has already run
-        -- `release_all` for those. Captured before a single byte goes out.
+        -- `execution.release` for those. Captured before a byte goes out.
         pending_release = res.release
 
         local rh = headers.new()
@@ -2371,7 +2764,27 @@ function App:run(config)
       pcall(stream.shutdown, stream)
       self.in_flight = self.in_flight - 1
     end,
-    onerror = function(_, _, op, e) internal:warn("transport", { op = op, detail = tostring(e) }) end,
+    -- A HANDLER THAT THREW IS NOT TRANSPORT NOISE, and conflating the two
+    -- made a broken server silent.
+    --
+    -- `vendor/http/server.lua:187` calls this with `op = "onstream"` when the
+    -- stream handler raised past akkar's own pcall; lua-http then answers 503
+    -- with an empty body. Everything else here is a peer that went away mid
+    -- write, an accept that failed, a socket that timed out -- ordinary,
+    -- frequent, and rightly a warning.
+    --
+    -- With both at `warn`, a server running at log level `error` could answer
+    -- EVERY request with a 503 and print nothing at all. Found on the study
+    -- box: the LuaJIT arm booted, printed its normal banner, and served
+    -- 100% 503 in silence. A load generator would have reported forty
+    -- thousand requests a second of it.
+    onerror = function(_, _, op, e)
+      if op == "onstream" then
+        internal:error("stream handler failed", { op = op, detail = tostring(e) })
+      else
+        internal:warn("transport", { op = op, detail = tostring(e) })
+      end
+    end,
   })
 
   -- THE PORT IS IN THE MESSAGE, because this is the first error a beginner
@@ -2479,7 +2892,7 @@ end
 function App:test(config)
   config = config or {}
 
-  local allowed = { timeout = true, log = true,
+  local allowed = { timeout = true, log = true, cpu_limit = true,
                     peer = true, trusted_proxies = true }
   for k in pairs(CAPABILITIES) do allowed[k] = true end
   check_config(config, allowed, "app:test{}")
@@ -2490,6 +2903,15 @@ function App:test(config)
     return function(_, path, options)
       options = options or {}
       local p, qs = path:match "^([^?]*)%??(.*)$"
+
+      -- SET AROUND THE CALL AND PUT BACK, not set once when the client is
+      -- built. The ceiling is module-level, so a test client that raised it
+      -- and walked away would raise it for every later test in the same
+      -- process -- and the one test that asserts the default is nil would
+      -- pass or fail depending on file order.
+      local restore_cpu_limit = cpu_limit
+      if config.cpu_limit ~= nil then cpu_limit = config.cpu_limit or nil end
+
       local res, request_id, trace_parent = handle(self, {
         method = method, path = p,
         query = parse_query(qs),
@@ -2505,6 +2927,7 @@ function App:test(config)
         timeout = options.timeout or config.timeout,
         capabilities = config,
       })
+      cpu_limit = restore_cpu_limit
       -- A streamed body is produced here and handed back as `raw`, so a test
       -- asserts on what the client would have received rather than on the
       -- producer function.  The whole body lands in memory, which is the

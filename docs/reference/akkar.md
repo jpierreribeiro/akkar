@@ -697,6 +697,11 @@ failure strings: `"required"`, `"expected integer"`, `"min length 3"`,
 five types, and `invalid schema rule: number` when a rule is neither a string
 nor a table.
 
+A schema attached to a route never reaches this function in that state: routes
+expand their schemas once, where they are declared, so the same mistake fails at
+`app:get(...)` with the route and the field named — `GET /users/:id: params.id:
+unknown schema type: 'strng'` — rather than on the first request to it.
+
 ```lua
 local akkar = require "akkar"
 

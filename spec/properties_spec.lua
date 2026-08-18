@@ -30,12 +30,30 @@ local cqueues = require "cqueues"
 --- A generator this file owns, so seeding it cannot reach any other spec.
 --- `spec/fuzz_spec.lua` learned that the hard way: seeding the global one made
 --- three later files deterministic and broke their key isolation.
+---
+--- NOW `akkar.random.seeded`, WHICH IS AN OBJECT AND NOT A GLOBAL, so that
+--- property survives -- `random.set` is the thing that would reach other
+--- specs, and nothing here calls it. What changes is that the project has one
+--- generator instead of two, and that a seed printed by a failure here means
+--- the same sequence on every interpreter.
+---
+--- AND THE ONE IT REPLACES WAS NOT CHOOSING. `(state * 1103515245 + 12345)
+--- % 2^31` is a textbook LCG, and bit k of one has period 2^(k+1) -- so its
+--- lowest bit alternates. `% n` reads the low bits. Measured, seed 7919:
+---
+---     old, n = 2:   1 2 1 2 1 2 1 2 1 2 1 2
+---     new, n = 2:   2 1 2 2 2 2 1 1 2 2 2 1
+---
+--- Every binary decision these schedules made was ALTERNATING, not random.
+--- The file's own opening argues that an example test "encodes a schedule
+--- somebody imagined" -- and a schedule that alternates is one of those. The
+--- defects it found were real; the space it searched was a fraction of what
+--- it looked like.
+local akkar_random = require "akkar.random"
+
 local function generator(seed)
-  local state = seed
-  return function(n)
-    state = (state * 1103515245 + 12345) % 2147483648
-    return (state % n) + 1
-  end
+  local source = akkar_random.seeded(seed)
+  return function(n) return source.integer(1, n) end
 end
 
 -- ============================================================== the pool

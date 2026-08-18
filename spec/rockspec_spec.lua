@@ -121,6 +121,72 @@ describe("the rockspec", function()
     assert.is_truthy(lua:find "5.6", "5.5 is excluded: " .. lua)
   end)
 
+  -- THE TEST THIS FILE EXISTED WITHOUT, AND THE ONE IT MOST NEEDED.
+  --
+  -- The test above asserts the rockspec allows Lua 5.5. It asserted that for
+  -- months while CI ran three jobs, all of them 5.4. A version range nothing
+  -- exercises is a promise, not a fact -- and this repository has now found
+  -- the same shape four separate times: a claim written down, locked by an
+  -- assertion about the WRITING, and never once measured.
+  --
+  -- So the assertion is moved down a level. It is no longer "the rockspec
+  -- says 5.5"; it is "something runs 5.5". Declaring support and testing it
+  -- are now one commit or neither.
+  --
+  -- Deliberately coarse. It greps a YAML file rather than parsing it, because
+  -- what it protects against is a version being DROPPED FROM CI ENTIRELY, and
+  -- no amount of parsing precision helps with that. A change subtle enough to
+  -- fool this grep is a change somebody made on purpose.
+  it("runs every Lua version it claims to support", function()
+    local workflow = read(".github/workflows/ci.yml")
+
+    local claimed = {}
+    for _, entry in ipairs(spec.dependencies) do
+      if entry:match "^lua " then
+        -- `lua >= 5.4, < 5.6` means 5.4 and 5.5. The bound is exclusive, so
+        -- the last supported minor is the one below it.
+        local lo = entry:match ">=%s*5%.(%d)"
+        local hi = entry:match "<%s*5%.(%d)"
+        assert.is_truthy(lo and hi, "cannot read the lua bound: " .. entry)
+        for minor = tonumber(lo), tonumber(hi) - 1 do
+          claimed[#claimed + 1] = "5." .. minor
+        end
+      end
+    end
+    assert.is_true(#claimed > 0, "the rockspec declares no Lua version")
+
+    for _, version in ipairs(claimed) do
+      -- Either the matrix carries it or a job of its own does. Both shapes
+      -- are legitimate: 5.4 rides the platform matrix, 5.5 needs its whole
+      -- stack built from source and cannot.
+      local in_matrix = workflow:find('lua: "' .. version .. '"', 1, true)
+      local own_job   = workflow:find("\n  lua" .. version:gsub("%.", "") .. ":", 1, true)
+      assert.is_truthy(in_matrix or own_job,
+        "the rockspec supports Lua " .. version .. " and CI never runs it. "
+        .. "Either add it to the matrix, give it a job, or narrow the "
+        .. "rockspec bound -- but do not claim it untested.")
+    end
+  end)
+
+  -- The recipe is documentation and CI input at once, and that is the only
+  -- reason the page describing it cannot go stale. If CI stops running it,
+  -- the file becomes prose again and nothing says so.
+  it("builds the 5.5 stack from the recipe it documents", function()
+    local workflow = read(".github/workflows/ci.yml")
+    assert.is_truthy(workflow:find("docs/runtime/lua55-stack.sh", 1, true),
+      "CI does not run docs/runtime/lua55-stack.sh: the documented recipe "
+      .. "and the built one are free to diverge again")
+
+    local recipe = read("docs/runtime/lua55-stack.sh")
+    -- The pinned commit lives in three places and all three must agree.
+    -- `spec/substrate_spec.lua` guards the rockspec-to-CI half; this is the
+    -- half that would otherwise build 5.5 against a cqueues nobody chose.
+    local pinned = workflow:match "CQUEUES_COMMIT:%s*(%x+)"
+    assert.is_truthy(pinned, "CI has no CQUEUES_COMMIT")
+    assert.is_truthy(recipe:find(pinned, 1, true),
+      "the 5.5 recipe pins a different cqueues than CI does")
+  end)
+
   it("keeps the CLI runnable by whatever Lua is installed", function()
     -- `#!/usr/bin/env lua5.4` is the Debian binary name. On a source build,
     -- on Homebrew, and under 5.5 it is simply not there.

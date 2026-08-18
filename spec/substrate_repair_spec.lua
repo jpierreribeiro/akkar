@@ -99,8 +99,23 @@ describe("substrate repair", function()
   describe("without the repair", function()
     it("is exactly what the repair is preventing", function()
       -- The control. Without it, the four tests above prove only that the
-      -- server survives today, not that this module is why.
-      local stop, port = raw.start(8420, "repair_substrate = false,")
+      -- server survives today, not that akkar's copy of h1_stream is why.
+      --
+      -- IT USED TO BE `repair_substrate = false`, which turned off a runtime
+      -- monkey-patch. The repairs now live in the source of
+      -- `akkar/vendor/http/h1_stream.lua`, so there is no flag to turn off --
+      -- and this test failed exactly as its own error message said it would,
+      -- which is the spec noticing its premise had moved.
+      --
+      -- The replacement is a stronger control than the flag ever was: it
+      -- swaps OUR h1_stream for the upstream rock's, still installed, and
+      -- shows that one wedges where ours does not. Before, the comparison was
+      -- against a configuration; now it is against the real library.
+      local stop, port = raw.start(8420, "", [[
+package.preload["akkar.vendor.http.h1_stream"] = function()
+  return require "http.h1_stream"
+end
+]])
 
       -- CLEANUP IN `finally`, AND THE FIRST VERSION PUT IT ON THE LAST LINE.
       --

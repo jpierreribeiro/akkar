@@ -19,7 +19,16 @@
 
 set -uo pipefail
 export PATH=$HOME/.local/bin:$PATH
-eval "$(luarocks path --bin)" 2>/dev/null
+# --lua-version 5.4, AND IT IS NOT A PREFERENCE. On a box whose default
+# luarocks is 5.1 -- which is Ubuntu's -- the bare form exports a LUA_PATH and
+# LUA_CPATH pointing at 5.1 trees, and those OVERRIDE lua5.4's own defaults.
+# The line is worse than a no-op there: it breaks a working interpreter, and
+# nothing in this harness runs at all --
+#
+#     module 'cqueues' not found ... no file '~/.luarocks/lib/lua/5.1/cqueues.so'
+#
+# `bench/runtime/provision.sh` already spells it this way and says why.
+eval "$(luarocks --local --lua-version 5.4 path --bin)" 2>/dev/null
 
 # ------------------------------------------------------------------ topology
 # c5.2xlarge is 4 physical cores x 2 threads.  Two hyperthreads of one core are
@@ -145,6 +154,41 @@ probe_body() {
 # Returns "rps p50 p99" or the empty string when the run was invalid.
 # Non-2xx or socket errors invalidate: a server answering 500 quickly looks
 # fast.
+# ---------------------------------------------------------- the request shape
+#
+# THE FIXTURE IS PART OF THE MEASUREMENT, and until 18 August 2026 this one was
+# a lie by omission: `wrk` sends `Host` and nothing else, so every number this
+# project has published described a request with two short headers, no body and
+# a 13-byte reply.
+#
+# That hid a header parse whose cost grew with the value's length -- 8% of a
+# request's CPU on this shape and 45% on a browser's. It was found by accident.
+# Measured afterwards, one variable at a time, against the shape below:
+#
+#     + 6 browser headers                    1.17x
+#     a validated route with those headers    1.64x
+#     a POST with a 2 KB JSON body            2.47x
+#     a new connection per request            1.88x
+#     a 64 KB JSON response                   5.26x
+#
+# So the default now carries headers a browser actually sends. `SHAPE=bare`
+# restores the old two-header form for comparison with numbers taken before
+# this date -- and NUMBERS FROM THE TWO SHAPES ARE NOT COMPARABLE, which is why
+# the shape is printed with every run rather than left to be remembered.
+SHAPE=${SHAPE:-browser}
+case "$SHAPE" in
+  bare)     WRK_HEADERS=() ;;
+  browser)  WRK_HEADERS=(
+              -H "user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+              -H "accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+              -H "accept-language: en-GB,en;q=0.9,pt-BR;q=0.8"
+              -H "accept-encoding: gzip, deflate, br"
+              -H "cookie: session=8f3a9c2e1b7d4f6a0e5c3b8d2f7a1e9c; consent=1; theme=dark"
+              -H "referer: https://example.com/previous/page?utm_source=x"
+            ) ;;
+  *) echo "SHAPE must be 'browser' or 'bare', not '$SHAPE'" >&2; exit 1 ;;
+esac
+
 run_wrk() {
   local url=$1 duration=$2 conns=$3 threads=$4 script=${5:-}
   # wrk gives up on a socket after 2 s by default, and a heavy route under
@@ -152,7 +196,7 @@ run_wrk() {
   # than measuring it.  Ten seconds, applied identically to every framework,
   # so it advantages none of them.  A request that needs longer than ten
   # seconds is a failure worth reporting as one.
-  local args=(-t"$threads" -c"$conns" -d"$duration" --timeout 10s --latency)
+  local args=("${WRK_HEADERS[@]}" -t"$threads" -c"$conns" -d"$duration" --timeout 10s --latency)
   [ -n "$script" ] && args+=(-s "$script")
 
   local out; out=$(taskset -c "$GENERATOR" wrk "${args[@]}" "$url" 2>/dev/null)

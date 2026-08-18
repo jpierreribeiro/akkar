@@ -39,6 +39,7 @@ the app declares one **is**, because the server would refuse to boot anyway.
     lua -e 'require("akkar.doctor").cli{ json = true }'
 ]]
 
+local bitwise = require "akkar.bitwise"
 local M = {}
 
 -- ==================================================================== findings
@@ -83,9 +84,25 @@ local function module_version(name, mod)
   return nil
 end
 
+-- `akkar.vendor.http.server`, NOT `http.server`.
+--
+-- akkar carries its own HTTP/1.1 half and has not required upstream lua-http
+-- at runtime since it was vendored -- `akkar-dev-1.rockspec` says so, and
+-- lists `http` under `test_dependencies` alone, because the specs use it as
+-- an INDEPENDENT client to check our framing against somebody else's.
+--
+-- The doctor was the last thing that had not been told. On a clean install
+-- from the rockspec it looked for a rock the rockspec deliberately does not
+-- pull, reported `FAIL lua-http: the HTTP server is missing`, and exited 1 --
+-- so `akkar doctor` failed on every correct installation. CI's `install` job
+-- is what finally said it out loud, and it had been saying it for a while.
+--
+-- Checking the vendored path also makes the check mean something again: it
+-- now answers "is the server akkar actually uses loadable", which is the
+-- question, rather than "is a rock we no longer use installed".
 local REQUIRED = {
   { name = "cqueues",   why = "the event loop" },
-  { name = "http.server", why = "the HTTP server", rock = "lua-http" },
+  { name = "akkar.vendor.http.server", why = "the HTTP server (vendored)" },
   { name = "cjson",     why = "JSON encoding", rock = "lua-cjson" },
 }
 
@@ -107,13 +124,28 @@ end
 function M.check_environment(report)
   report = report or new_report()
 
-  -- The Lua version, and the pin that makes it non-negotiable.
+  -- The Lua version.
+  --
+  -- 5.4 and 5.5 both, and the second one is recent enough to explain. This
+  -- used to fail anything but 5.4, with the reason "cqueues pins it exactly
+  -- and has had no release since 2020" -- which stopped being true: cqueues
+  -- gained 5.5 support upstream in March 2026, in the commit akkar pins, and
+  -- the whole suite has since been run under 5.5.
+  --
+  -- 5.5 is NOT yet the recommended version, and `docs/substrate/LUA-55.md`
+  -- says why -- it needs a luaossl built by hand and a cqueues whose vendored
+  -- compat shim has been updated, neither of which luarocks will do for you.
+  -- So it passes with a note rather than silently, because somebody on 5.5
+  -- has done something deliberate and should be told the ground is newer.
   local version = _VERSION
   if version == "Lua 5.4" then
-    report:ok("runtime", version, "cqueues pins lua == 5.4, so this is the only supported one")
+    report:ok("runtime", version, "the version akkar ships and tests against")
+  elseif version == "Lua 5.5" then
+    report:ok("runtime", version,
+      "supported; needs luaossl and cqueues built for 5.5 -- see docs/substrate/LUA-55.md")
   else
     report:fail("runtime", version,
-      "akkar runs on Lua 5.4; cqueues pins it exactly and has had no release since 2020",
+      "akkar runs on Lua 5.4 or 5.5",
       "install Lua 5.4 and rebuild the rocks against it")
   end
 
@@ -172,9 +204,9 @@ function M.check_environment(report)
     -- luaossl returns OPENSSL_VERSION_NUMBER, a packed integer.  Printing it
     -- raw ("805306576") is a doctor telling you a true fact you cannot use.
     if ok and type(raw) == "number" then
-      local major = (raw >> 28) & 0xFF
-      local minor = (raw >> 20) & 0xFF
-      local patch = (raw >> 4)  & 0xFF
+      local major = bitwise.band(bitwise.rshift(raw, 28), 0xFF)
+      local minor = bitwise.band(bitwise.rshift(raw, 20), 0xFF)
+      local patch = bitwise.band(bitwise.rshift(raw, 4),  0xFF)
       report:ok("optional", "openssl runtime",
                 ("%d.%d.%d (0x%08x)"):format(major, minor, patch, raw))
     elseif ok and raw then

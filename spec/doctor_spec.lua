@@ -39,8 +39,15 @@ describe("the environment check", function()
   end)
 
   it("names every required library with its version", function()
+    -- `akkar.vendor.http.server` rather than `lua-http`, and the change is
+    -- the point: akkar stopped depending on upstream lua-http at runtime when
+    -- it vendored the HTTP/1.1 half, and the rockspec lists `http` under
+    -- `test_dependencies` alone. The doctor was the last thing still looking
+    -- for the rock, so `akkar doctor` FAILED on every correct installation
+    -- from the rockspec -- caught by CI's `install` job, which is the only
+    -- thing that installs the way a user does.
     local report = doctor.check_environment()
-    for _, rock in ipairs { "cqueues", "lua-http", "lua-cjson" } do
+    for _, rock in ipairs { "cqueues", "akkar.vendor.http.server", "lua-cjson" } do
       assert.is_truthy(find(report, rock), rock .. " was not reported")
     end
   end)

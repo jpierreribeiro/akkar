@@ -18,8 +18,9 @@ libraries implement it" stops being a slogan: the pool it uses is the same
 `akkar.pool` the Postgres adapter uses, and neither knows about the other.
 ]]
 
-local socket = require "cqueues.socket"
-local Pool   = require "akkar.pool"
+local socket    = require "cqueues.socket"
+local Pool      = require "akkar.pool"
+local execution = require "akkar.execution"
 
 local Redis = {}
 Redis.__index = Redis
@@ -105,8 +106,36 @@ Redis._read_reply = read_reply
 --
 -- `in_flight` stays set because the coroutine is abandoned before the line
 -- that clears it, which is exactly what makes the state visible to the pool.
+--- Refuses when the execution that borrowed this connection is over, and
+--- bounds the socket by whatever the execution has left.
+---
+--- `akkar/db.lua` has had this since the deadline became a budget; `cache`
+--- did not, and it is the only releasable capability that did not. That gap
+--- is exactly the one `spec/abandoned_inertness_spec.lua` was written to
+--- expose: a handler abandoned by its deadline still holds its cache, and if
+--- it ever woke -- which is what removing the per-request controller would
+--- allow -- it would write into a connection already lent to somebody else.
+---
+--- A handler abandoned mid-`sleep` carries a NEGATIVE remaining budget, which
+--- is what makes this check work at all: `execution.begin` set the deadline
+--- inside the handler's own coroutine and `execution.finish` never ran,
+--- because the handler never resumed. Measured: a forced resume reads
+--- `remaining()` of -0.55 s.
+local function bound_by_execution(self)
+  local left = execution.remaining()
+  if not left then return end
+  if left <= 0 then
+    -- Refusing rather than sending, for the same reason db.lua gives: a
+    -- command dispatched with no time to read its reply is the exact shape
+    -- that poisons a pool slot, and Redis does the work either way.
+    error("redis: the request deadline passed before the command was sent", 0)
+  end
+  if self.sock then pcall(self.sock.settimeout, self.sock, left) end
+end
+
 function Redis:command(...)
   if not self.sock then error("redis: connection is closed", 0) end
+  bound_by_execution(self)
   -- Marked BEFORE the write, not after.
   --
   -- `sock:write` yields whenever the send buffer fills, so a deadline landing

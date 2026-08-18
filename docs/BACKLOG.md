@@ -533,37 +533,40 @@ the milestone everything else was clearing the way for is still the milestone.
   match is 33 µs at 50 routes and 95 µs at 200, against roughly 4000 µs for one
   Postgres query. A prefix tree would buy 0.8% of a request. Revisit past ~500
   dynamic routes; until then this is optimising noise.
-- **Lua 5.5 — still blocked, but not by what this file used to say.** The old
-  entry read "`cqueues` pins `lua == 5.4` and has had no release since 2020.
-  Supporting 5.5 would mean building Lua 5.5, forking `cqueues`, possibly
-  adapting its C to 5.5 API changes, and repeating for `luaossl`." Every clause
-  of that has now been tested, and most of it is wrong.
+- **Lua 5.5 — done, and this entry was wrong twice on the way there.** akkar's
+  whole suite passes under Lua 5.5: **1763 passing, 0 failures, 0 errors**,
+  against 1801 on 5.4. The 38-test difference is tooling, measured rather than
+  assumed: 32 are `akkar.pq`'s half, which skips because one `pq_native.so`
+  path serves two Lua ABIs, and 6 are `teal_spec`, which skips because `tl` is
+  not installed in the 5.5 tree. Nothing in akkar had to change for any of it.
 
-  Measured, reproducibly, by `docs/runtime/lua55-probe.sh`:
+  Two named blockers, both innocent. The first version of this entry said
+  "`cqueues` pins `lua == 5.4`… supporting 5.5 would mean forking it". The
+  second said the fork was unnecessary but **"the real blocker is `luaossl`",**
+  on the evidence that its makefile declares `KNOWN_APIS = 5.1 5.2 5.3 5.4`.
 
-  | | |
-  |---|---|
-  | Lua 5.5.1 | builds |
-  | `cqueues` at master | **builds and runs an event loop under 5.5** |
-  | `lua-cjson` | builds, encodes and decodes |
-  | `lpeg` | builds |
-  | `luaossl` 20250929 | **no 5.5 target at all** |
-  | akkar itself | does not load: `lua-http` needs `openssl.rand` |
+  That was reading a build system and calling it a compiler. luaossl's C
+  compiles against Lua 5.5 with zero errors and zero warnings:
 
-  The rock pins 5.4; **master does not** — it has commits through March 2026.
-  But its `KNOWN_APIS` listing 5.5 is not the same as building for it: the
-  build fails out of the box because cqueues vendors `lua-compat-5.3` **v0.9**,
-  whose header refuses anything past 5.04. Dropping in the current upstream
-  (0.15.1, which allows `< 5.6`) is sufficient — one stale vendored file, and
-  no fork of cqueues, no adaptation of its C.
+      cc -O2 -std=gnu99 -fPIC -shared -o _openssl.so \
+         -I$PREFIX/include src/openssl.c -lssl -lcrypto
 
-  **The real blocker is `luaossl`**, whose makefile declares
-  `KNOWN_APIS = 5.1 5.2 5.3 5.4` and has no 5.5 target to invoke. That is the
-  one to watch, and it is not the library anyone assumed.
+  One translation unit, no makefile, no patch. **The library was never the
+  problem; its `KNOWN_APIS` ladder was.** cqueues was the same shape one level
+  down: the 5.5 target exists, in the very commit akkar pins, and the compile
+  still fails because the `lua-compat-5.3` it vendors is v0.9, whose header
+  hard-errors past 5.04. Refreshing that one file to v0.15.1 is the whole fix.
 
-  So the honest position: 5.5 is one upstream compat bump and one luaossl
-  release away, neither of which is akkar's to write, and both of which akkar
-  can now detect the moment they land.
+  **The lesson worth keeping is not about Lua.** Twice, a dependency was
+  declared blocking because a version list did not mention us. A list is a
+  claim about what upstream tests, not about what compiles, and the two were
+  never checked against each other until someone ran `cc`.
+
+  What remains is genuinely packaging, and it is not akkar's to write: no
+  distribution ships Lua 5.5, so `luarocks install akkar` cannot reach it. 5.4
+  stays the default for that reason and no other.
+  `docs/runtime/lua55-stack.sh` builds the stack from source into a prefix,
+  and CI runs that same script so this entry cannot go stale a third time.
 
 ---
 

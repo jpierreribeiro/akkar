@@ -217,11 +217,32 @@ end
 --- should not mutate a third-party library as a side effect, and a test that
 --- wants the unpatched behaviour -- `spec/substrate_spec.lua` has one -- must
 --- be able to have it.
+--- RETIRED, and reporting that rather than pretending.
+---
+--- The repair this module existed for now lives in the source of
+--- `akkar/vendor/http/h1_stream.lua`, inside the drain loop it protects.
+--- Folding it in is most of why lua-http was vendored: sixty lines of
+--- instance overrides, `rawset` juggling and defensive shape checks became
+--- eight lines in the loop, and they can no longer silently stop applying
+--- when upstream changes shape.
+---
+--- Keeping this as a no-op rather than deleting the file, for two reasons.
+--- The header above is the only written account of the wedge and how it was
+--- found, and `akkar.doctor` reports what the substrate applied -- a function
+--- that vanished would be a harder read than one that says it retired.
+---
+--- `fix_h1_shutdown_spin` is still callable and still works. It patches the
+--- UPSTREAM `http.h1_stream`, which akkar no longer loads, so calling it now
+--- repairs a module nothing here uses. That is exactly why `apply` stopped
+--- calling it: a repair that reports "applied" while doing nothing for the
+--- running server is worse than no repair at all.
 function M.apply()
-  local report = {}
-  local ok, why = M.fix_h1_shutdown_spin()
-  report.h1_shutdown_spin = { applied = ok, reason = why }
-  return report
+  return {
+    h1_shutdown_spin = {
+      applied = false,
+      reason = "folded into akkar/vendor/http/h1_stream.lua; no patch needed",
+    },
+  }
 end
 
 return M

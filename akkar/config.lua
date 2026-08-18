@@ -80,6 +80,7 @@ reads `DATABASE_URL` -- and an explicit `env = "PGURL"` wins over the
 derivation. `env = false` means this value never comes from the environment.
 ]]
 
+local bitwise = require "akkar.bitwise"
 local M = {}
 
 local REDACTED = "[redacted]"
@@ -206,7 +207,7 @@ local function nearest(word, candidates)
       best, best_distance = candidate, previous[#candidate]
     end
   end
-  if best_distance <= math.max(2, #word // 3) then return best end
+  if best_distance <= math.max(2, bitwise.idiv(#word, 3)) then return best end
 end
 
 -- =============================================================== the container

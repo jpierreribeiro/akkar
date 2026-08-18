@@ -562,5 +562,21 @@ int luaopen_akkar_pq_native(lua_State *L) {
   luaL_setfuncs(L, pq_functions, 0);
   lua_pushstring(L, "akkar.pq 0.1");
   lua_setfield(L, -2, "VERSION");
+
+  /* The Lua this was COMPILED against, so the Lua half can refuse a mismatch.
+   *
+   * Loading a C module built for a different Lua is not a clean failure. A
+   * module built for 5.4 loads into 5.5 without complaint -- the symbol
+   * `luaopen_akkar_pq_native` resolves, the table comes back, its fields read
+   * correctly -- and then the first real call dumps core, because the two
+   * versions do not lay out a lua_State the same way.
+   *
+   * Found porting akkar to Lua 5.5: `spec/db_spec.lua` adds `./?.so` to
+   * cpath, picked up the 5.4 build sitting in the tree, and segfaulted the
+   * whole suite before printing a single line. Three sessions of that would
+   * look like "Lua 5.5 is unstable" and it is nothing of the kind.
+   */
+  lua_pushinteger(L, LUA_VERSION_NUM);
+  lua_setfield(L, -2, "LUA_VERSION_NUM");
   return 1;
 }

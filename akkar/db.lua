@@ -26,6 +26,9 @@ is not the same thing as a named prepared statement.
 local pgmoon = require "pgmoon"
 local Pool   = require "akkar.pool"
 local Scope  = require "akkar.scope"
+-- For the execution's remaining budget. Requires only cqueues and akkar.time,
+-- so no cycle back to here.
+local execution = require "akkar.execution"
 
 local Db = {}
 Db.__index = Db
@@ -113,6 +116,37 @@ local function statement(sql, ...)
   return sql, ...
 end
 
+--- Bounds the next wire call by whatever the execution has left.
+---
+--- Until this existed, a request deadline did not stop a query. It abandoned
+--- the coroutine waiting for the reply while the database kept working --
+--- which `warn_unbounded_statements` warns about at boot, in those words, and
+--- which is why `statement_timeout` had to be configured separately and by
+--- hand to mean anything.
+---
+--- pgmoon's cqueues socket takes MILLISECONDS and divides by a thousand
+--- before handing seconds to cqueues, so the conversion happens here rather
+--- than being rediscovered at each call site.
+---
+--- Nothing happens when there is no budget: the connection keeps whatever
+--- timeout it was configured with, and an application that never sets
+--- `app:run { timeout = ... }` sees no change at all.
+---
+--- Returns true when a deadline was actually imposed on the socket, which is
+--- what tells a transport failure from a plain query error afterwards.
+local function bound_by_execution(self)
+  local left = execution.remaining()
+  if not left then return false end
+  if left <= 0 then
+    -- Refusing here rather than sending. A query dispatched with no time to
+    -- read its reply is the exact shape that poisons a pool slot, and the
+    -- database would do the work regardless of whether anyone reads it.
+    error("db: the request deadline passed before the query was sent", 0)
+  end
+  pcall(self.pg.settimeout, self.pg, left * 1000)
+  return true
+end
+
 -- `in_flight` is what makes an abandoned query detectable, and the placement
 -- of the two assignments is the entire mechanism.
 --
@@ -133,6 +167,7 @@ end
 -- still open". The defence was built for the controller and not for the
 -- connection it holds.
 function Db:query(sql, ...)
+  local bounded = bound_by_execution(self)
   self.in_flight = true
   local ok, res, err = pcall(self.pg.query, self.pg, statement(sql, ...))
   self.in_flight = false
@@ -148,7 +183,38 @@ function Db:query(sql, ...)
   -- sets this when a query timed out with its result still in flight; pgmoon
   -- has no equivalent and the flag is simply absent there.
   if self.pg and self.pg.spoiled then self.broken = true end
-  if not res then error("db: " .. tostring(err), 0) end
+
+  -- TWO FAILURES THAT LOOK ALIKE AND MUST NOT BE TREATED ALIKE.
+  --
+  -- Postgres answering `ERROR: canceling statement due to statement timeout`
+  -- is a QUERY error: the reply was read in full and the connection is clean.
+  -- `spec/db_spec.lua` states the consequence of getting this wrong -- "if a
+  -- cancelled query cost a reconnect, every slow query would pay for one and
+  -- the pool would stop being a pool".
+  --
+  -- Our own socket timing out is a TRANSPORT error: the reply is still coming,
+  -- the protocol is at an unknown offset, and the connection is finished. It
+  -- surfaces as `receive_message: failed to get type: 110` -- errno 110 is
+  -- ETIMEDOUT.
+  --
+  -- The discriminator is the budget, not the message text. We only ever set a
+  -- socket timeout because the execution had a deadline, so a failure caused
+  -- by that timeout cannot happen before the deadline. Matching on a driver's
+  -- internal wording would work today and break on the next pgmoon release.
+  --
+  -- Why this matters now: while the only way to lose a query was the deadline
+  -- abandoning the coroutine, `in_flight` stayed set and the pool rejected the
+  -- connection on its own. Once the socket started honouring the budget the
+  -- failure began arriving as a RETURN -- `in_flight` cleared on the way out,
+  -- the connection looked fit, and it went back to the pool with an unread
+  -- reply on the wire. Caught by `spec/abandoned_spec.lua`, which is the test
+  -- written for the first door this defect came through.
+  if not res then
+    if bounded and execution.remaining() and execution.remaining() <= 0 then
+      self.broken = true
+    end
+    error("db: " .. tostring(err), 0)
+  end
   return res
 end
 

@@ -1,0 +1,57 @@
+# What GitHub should count as akkar, and what it should not.
+#
+# The language bar was reading Lua 89%, Shell 7.5%, C 1.3%, Dockerfile 0.9%,
+# Teal 0.8%, Go 0.3%, Python 0.2% -- which describes the repository and
+# misdescribes the project. Two of those entries are measurement apparatus for
+# OTHER frameworks, and the Lua figure silently included five thousand lines of
+# somebody else's library.
+#
+# Every rule below is a factual claim about who wrote the code, not an attempt
+# to flatter the chart. Nothing is hidden that akkar is responsible for.
+
+# ---------------------------------------------------------------- vendored
+
+# lua-http's HTTP/1.1 half, copied in and modified. Ours to maintain, NOT ours
+# to claim: it is 5,488 lines by daurnimator and contributors, MIT, and
+# counting it as akkar's own Lua overstates the project by about a third.
+#
+# `docs/substrate/` and the header of each file record what was taken, what was
+# cut and what was changed.
+akkar/vendor/** linguist-vendored
+
+# The Gin and FastAPI services exist so `bench/compare/` can measure akkar
+# against them. They are fixtures -- deliberately written to answer the same
+# routes with the same bytes -- and they are Go and Python because the
+# frameworks being compared are.
+#
+# `bench/compare/METHOD.md` rule 1 is why they exist at all: every candidate
+# must do the same work, proven by diffing real responses.
+bench/compare/gin/**     linguist-vendored
+bench/compare/fastapi/** linguist-vendored
+bench/study/apps/*.go    linguist-vendored
+bench/study/apps/*.py    linguist-vendored
+
+# ------------------------------------------------------------ documentation
+
+# Type declarations, consumed by `tl check` and by editors. They describe the
+# API rather than implement it, and `spec/teal_spec.lua` treats them as an
+# assertion about the docs rather than as code that runs.
+types/*.d.tl        linguist-documentation
+
+# Teaching examples, including one that is deliberately wrong so the type
+# checker has something to catch.
+examples/**         linguist-documentation
+
+# ----------------------------------------------------------------- counted
+
+# NOT marked, on purpose, because akkar is responsible for them:
+#
+#   src/akkar_pq.c    the Postgres driver. C is a real part of this project's
+#                     answer -- "C where the mechanical work is, Lua
+#                     everywhere else" -- and hiding it would misdescribe the
+#                     architecture rather than tidy it.
+#
+#   bench/**/*.sh     the measurement harness. Written here, and the reason
+#                     the numbers in `bench/` mean anything.
+#
+#   Dockerfile*       real deployment artefacts, tested by `docs/DEPLOY.md`.

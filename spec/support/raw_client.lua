@@ -29,7 +29,7 @@ local M = {}
 local SERVER = [==[
 package.path = "%s"
 package.cpath = "%s"
-
+%s
 local akkar = require "akkar"
 local app = akkar.new()
 app:get("/users", function() return { users = {} } end)
@@ -43,14 +43,22 @@ app:run { port = %d, check_capabilities = false, timeout = 1,
 ]==]
 
 --- True when a Lua interpreter can be spawned at all.
+---
+--- It asks `portable.lua`, which resolves the interpreter RUNNING THIS SUITE
+--- rather than the first plausible name on PATH. That distinction is not
+--- theoretical: this function used to try `lua5.4` first, and under Lua 5.5 it
+--- found one -- correctly, it was installed -- and handed it 5.5's `LUA_PATH`.
+--- Every spawned server then died on its first `require`, and twenty-two
+--- framing cases reported protocol failures that were nothing of the kind.
+---
+--- A spawned server inherits this process's module paths, so it has to be this
+--- process's Lua.
 function M.available()
-  for _, binary in ipairs { "lua5.4", "lua" } do
-    local pipe = io.popen(binary .. " -v 2>&1")
-    if pipe then
-      local out = pipe:read "a"
-      pipe:close()
-      if out and out:find "Lua" then M.binary = binary return true end
-    end
+  local pipe = io.popen(("%q -v 2>&1"):format(portable.lua))
+  if pipe then
+    local out = pipe:read "a"
+    pipe:close()
+    if out and out:find "Lua" then M.binary = portable.lua return true end
   end
   return false
 end
@@ -69,9 +77,13 @@ end
 --- a server configured differently -- `repair_substrate = false`, say, which
 --- is how `spec/substrate_repair_spec.lua` shows that the repair is what
 --- keeps the server alive rather than something else in the stack.
-function M.start(first_port, extra)
+--- `prelude` is Lua that runs BEFORE `require "akkar"`, which is the only
+--- place a `package.preload` override can be installed and still be seen.
+--- `spec/substrate_repair_spec.lua` uses it to swap one vendored module for
+--- its upstream original, so a control can prove which copy is load-bearing.
+function M.start(first_port, extra, prelude)
   for attempt = 0, 40 do
-    local stop, why = M.start_on((first_port or 8300) + attempt, extra)
+    local stop, why = M.start_on((first_port or 8300) + attempt, extra, prelude)
     if stop then return stop, (first_port or 8300) + attempt end
     if not tostring(why):find("Address already in use", 1, true) then
       return nil, why
@@ -80,11 +92,12 @@ function M.start(first_port, extra)
   return nil, "no free port in forty tries"
 end
 
-function M.start_on(port, extra)
+function M.start_on(port, extra, prelude)
   local path = os.tmpname() .. ".lua"
   local file = assert(io.open(path, "w"))
   file:write(SERVER:format(package.path:gsub("%%", "%%%%"),
-                           package.cpath:gsub("%%", "%%%%"), port,
+                           package.cpath:gsub("%%", "%%%%"),
+                           (prelude or ""):gsub("%%", "%%%%"), port,
                            extra or ""))
   file:close()
 
@@ -98,7 +111,7 @@ function M.start_on(port, extra)
   -- a plain `&`, which detaches enough here because `os.execute`'s `sh` exits
   -- immediately and the child is reparented rather than killed.
   os.execute(portable.detached(
-    ("%s %q"):format(M.binary or portable.lua, path), log))
+    ("%q %q"):format(M.binary or portable.lua, path), log))
 
   -- Wait for the port rather than sleeping a guessed amount: a fixed sleep is
   -- either too short on a loaded machine or wasted on an idle one.

@@ -53,6 +53,8 @@ which is what almost every JSON API has today.
 ]]
 
 local cjson = require "akkar.json"
+local bitwise = require "akkar.bitwise"
+local text = require "akkar.text"
 
 local M = {}
 
@@ -69,7 +71,7 @@ local FNV_PRIME  = 0x100000001b3
 local function fnv1a(s)
   local hash = FNV_OFFSET
   for i = 1, #s do
-    hash = hash ~ s:byte(i)
+    hash = bitwise.bxor(hash, s:byte(i))
     hash = hash * FNV_PRIME
   end
   return string.format("%016x", hash)
@@ -120,8 +122,12 @@ end
 --- `If-Match: "a", "b"` is a list, and `*` means "any current version".
 local function matches(header, tag)
   if header == "*" then return true end
-  for candidate in header:gmatch '[^,]+' do
-    candidate = candidate:match "^%s*(.-)%s*$"
+  for raw in header:gmatch '[^,]+' do
+    -- Trimmed into a SEPARATE local rather than back over the loop variable.
+    -- Lua 5.5 makes a for-loop control variable const, so the old
+    -- `candidate = candidate:match(...)` is a compile error there -- one of
+    -- exactly two in the whole tree.
+    local candidate = text.trim(raw)
     -- A weak validator (W/"x") is not usable for a conditional WRITE, per
     -- RFC 7232: it promises semantic equivalence, not byte equality.
     if candidate == tag then return true end

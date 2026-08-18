@@ -10,11 +10,12 @@
 # Gin came back within 0.2% of its published number and FastAPI within 0.1%.
 # The machine reproduced. akkar did not.
 #
-# So this alternates two trees on /ping, same process count, same cores, same
-# generator, restarting between every repetition so drift cannot be attributed
-# to one of them.
+# So this alternates two trees on one route, same process count, same cores,
+# same generator, restarting between every repetition so drift cannot be
+# attributed to one of them.
 #
 #   usage: regression.sh <baseline-ref> [head-ref]
+#          ROUTE=/users/42 regression.sh ...   # see ROUTE below
 #
 # Trees are prepared as separate clones under ~/study rather than by checking
 # out in place, because a shared tree means whichever ran last is what both
@@ -25,7 +26,17 @@ verify_reservation || exit 1
 
 BASE_REF=${1:?usage: regression.sh <baseline-ref> [head-ref]}
 HEAD_REF=${2:-HEAD}
-ROOT=${ROOT:-$HOME/akkar}
+# RESOLVED, NOT TAKEN AS GIVEN. On the benchmark box `$HOME/akkar` is a
+# SYMLINK to the working checkout, and `cp -a` faithfully copies a symlink --
+# so `tree-base` and `tree-head` both became links to the same repository,
+# `git checkout --detach` ran against the working repo itself, and this script
+# spent months comparing one tree with itself. The clean-tree gate below did
+# not catch it: a detached checkout of the same repo IS clean.
+#
+# Every number this script produced with the default ROOT compared a tree to
+# itself, which is why it kept reporting "100.5% of baseline".
+ROOT=$(readlink -f "${ROOT:-$HOME/akkar}")
+[ -d "$ROOT/.git" ] || { echo "REFUSING: $ROOT is not a git checkout"; exit 1; }
 APPS=${APPS:-$HOME/study/apps}
 PORT=${PORT:-8500}
 DURATION=${DURATION:-10s}
@@ -33,7 +44,29 @@ REPS=${REPS:-5}
 CONNS=${CONNS:-100}
 THREADS=${THREADS:-4}
 PROCS=${PROCS:-2}
+
+# The route to alternate on. `/ping` is the default because it is the framework
+# path with no database in it, and every published figure used it.
+#
+# It is a variable because `/ping` cannot see everything. It declares no schema,
+# so it never calls `validate` -- a change to the validation path is invisible
+# here, and that path is now under its own allocation ceiling precisely because
+# nothing else was watching it. A phase that touches validation should measure
+# `ROUTE=/users/42`, which does.
+#
+#     ROUTE=/users/42 bash bench/study/regression.sh origin/main HEAD
+ROUTE=${ROUTE:-/ping}
+
+# The request shape lives in `lib.sh`, because that is where the MEASURED wrk
+# call is -- `run_wrk`. Setting it here would have dressed the warm-up and left
+# the measurement bare, which is exactly the class of mistake the shape exists
+# to stop. `SHAPE=bare` restores the pre-18-August form.
 HZ=$(getconf CLK_TCK)
+
+# Printed, not remembered: a run under one shape is not comparable with a run
+# under another, and the only defence against comparing them by accident is
+# that both say which they were.
+echo "request shape: ${SHAPE:-browser}"
 
 BASE_TREE=$HOME/study/tree-base
 HEAD_TREE=$HOME/study/tree-head
@@ -42,7 +75,11 @@ prepare() {   # ref, destination
   local ref=$1 dest=$2
   rm -rf "$dest"
   git -C "$ROOT" worktree prune 2>/dev/null
-  cp -a "$ROOT" "$dest"
+  # `-L` as well as the resolved ROOT: belt and braces, because the failure
+  # this guards against is silent and cost every measurement taken with it.
+  cp -aL "$ROOT" "$dest"
+  [ -L "$dest" ] && { echo "REFUSING: $dest is a symlink, not a copy"; return 1; }
+  [ "$dest" -ef "$ROOT" ] && { echo "REFUSING: $dest is the same directory as $ROOT"; return 1; }
   # `-f`, because the copy may carry edits shipped to the box by hand, and a
   # checkout that silently keeps them would measure neither ref.
   git -C "$dest" checkout -q -f --detach "$ref" 2>/dev/null || {
@@ -64,6 +101,30 @@ prepare() {   # ref, destination
 echo "preparing trees"
 prepare "$BASE_REF" "$BASE_TREE" || exit 1
 prepare "$HEAD_REF" "$HEAD_TREE" || exit 1
+
+# RE-VERIFIED AFTER BOTH, WHICH IS THE CHECK THAT WOULD HAVE CAUGHT IT.
+#
+# Checking a tree right after preparing it proves nothing about the state it
+# will be measured in. When the two trees were the same directory, preparing
+# head silently moved base as well -- and each `prepare` had already printed
+# its own reassuring line by then. So the refs are confirmed here, once both
+# exist, which is the only moment that corresponds to the measurement.
+[ "$BASE_TREE" -ef "$HEAD_TREE" ] && {
+  echo "REFUSING: the two trees are the same directory"; exit 1; }
+base_at=$(git -C "$BASE_TREE" rev-parse HEAD)
+head_at=$(git -C "$HEAD_TREE" rev-parse HEAD)
+base_want=$(git -C "$ROOT" rev-parse "$BASE_REF^{commit}")
+head_want=$(git -C "$ROOT" rev-parse "$HEAD_REF^{commit}")
+[ "$base_at" = "$base_want" ] || {
+  echo "REFUSING: base tree is at $base_at, $BASE_REF is $base_want"; exit 1; }
+[ "$head_at" = "$head_want" ] || {
+  echo "REFUSING: head tree is at $head_at, $HEAD_REF is $head_want"; exit 1; }
+if [ "$base_at" = "$head_at" ]; then
+  echo "REFUSING: $BASE_REF and $HEAD_REF are the same commit ($base_at)."
+  echo "There is nothing to compare, and a run that reports ~100% of baseline"
+  echo "from two identical trees is the failure this line exists to name."
+  exit 1
+fi
 echo
 
 stop_all() { pkill -f "study/apps/serve[.]lua" 2>/dev/null; sleep 2; }
@@ -100,13 +161,13 @@ for rep in $(seq 1 "$REPS"); do
     [ "$variant" = head ] && local_tree=$HEAD_TREE
     start_tree "$local_tree" || exit 1
     [ "$rep" -eq 1 ] && {
-      probe_body "http://127.0.0.1:$PORT/ping" >/dev/null || {
+      probe_body "http://127.0.0.1:$PORT$ROUTE" >/dev/null || {
         echo "REFUSING: $variant did not answer"; exit 1; }
-      taskset -c "$GENERATOR" wrk -t"$THREADS" -c"$CONNS" -d3s \
-        "http://127.0.0.1:$PORT/ping" >/dev/null 2>&1
+      taskset -c "$GENERATOR" wrk "${WRK_HEADERS[@]}" -t"$THREADS" -c"$CONNS" -d3s \
+        "http://127.0.0.1:$PORT$ROUTE" >/dev/null 2>&1
     }
     b=$(cpu_ticks); ws=$(date +%s.%N)
-    line=$(run_wrk "http://127.0.0.1:$PORT/ping" "$DURATION" "$CONNS" "$THREADS") || exit 1
+    line=$(run_wrk "http://127.0.0.1:$PORT$ROUTE" "$DURATION" "$CONNS" "$THREADS") || exit 1
     we=$(date +%s.%N); a=$(cpu_ticks)
     c=$(awk -v x="$b" -v y="$a" -v hz="$HZ" -v s="$ws" -v e="$we" \
       'BEGIN{printf "%.2f", ((y-x)/hz)/(e-s)}')

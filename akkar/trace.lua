@@ -102,6 +102,7 @@ alternative is a protobuf runtime for a payload with eight fields in it.
 
 local crypto = require "akkar.crypto"
 local time   = require "akkar.time"
+local bitwise = require "akkar.bitwise"
 
 local M = {}
 
@@ -174,7 +175,7 @@ end
 local function nanoseconds(seconds)
   local whole = math.floor(seconds)
   local fraction = seconds - whole
-  return string.format("%d", (whole | 0) * 1000000000 +
+  return string.format("%d", bitwise.bor(whole, 0) * 1000000000 +
                              math.floor(fraction * 1e9 + 0.5))
 end
 

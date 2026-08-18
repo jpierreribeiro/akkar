@@ -76,9 +76,39 @@ rock is not.
 | macOS (kqueue) | **3.00** |
 
 akkar spends one controller per in-flight request for its deadline, so this
-number *is* the concurrency ceiling. `descriptor_ceiling()` in
-`akkar/init.lua` divides the descriptor limit by 2 — right on Linux, and it
-would over-promise by half on a Mac.
+number is most of the concurrency ceiling — and the word is *most*, because
+the request also holds its own socket.
+
+**`descriptor_ceiling()` divided the limit by 2, and 2 was the controller
+alone.** A request in flight costs **three** descriptors on Linux, counted
+from inside a server process of its own while N were held in a sleeping
+handler:
+
+| in flight | descriptors | per request |
+|---:|---:|---:|
+| 50 | 150 | 3.00 |
+| 100 | 300 | 3.00 |
+| 200 | 600 | 3.00 |
+
+Dead flat, which is what a per-request cost looks like. So the ceiling was
+**fifty percent higher than the box could serve**: on the usual `ulimit -n
+1024` it promised 337 concurrent requests, which need 1,011 descriptors —
+more than the whole limit, never mind the third it holds back. It divides by 3
+now and promises 225.
+
+That was not hypothetical when it was found. `bench/runtime/run.sh` at 100
+connections had akkar answering 18,640 of 111,651 requests with `unable to
+initialize continuation queue: Too many open files` — one request in six, on a
+run that published a throughput number. Nobody saw it because that harness
+read the wrong `awk` field for the error count. Both are fixed, and
+`spec/concurrency_spec.lua` now **counts** the descriptors rather than
+re-deriving the formula: its old assertion computed `expected` with the same
+arithmetic as `init.lua`, divisor and all, and then asserted `expected >= 16`
+— true for any divisor on any box. A test that agrees with the code because it
+*is* the code cannot report that the code is wrong.
+
+**On a Mac the number is four**, not three: a controller costs three
+descriptors on kqueue and the socket is the fourth.
 
 Today that is **latent**: the same function reads `/proc/self/limits`, so off
 Linux it derives nothing at all and `max_concurrent` stays unset. A Mac has no
