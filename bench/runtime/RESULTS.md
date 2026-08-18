@@ -305,3 +305,48 @@ above turned on.
 
 Tarantool remains installed and unmeasured. D5 (saturation) and D7 (dependency
 down) remain a second pass. `/users/:id` was not loaded in this run.
+
+---
+
+## The descriptor wall, closed — 18 August 2026, `bd567d1`
+
+The errors above were not the accept ceiling. They were **completed** requests
+whose cqueues controllers the Lua collector had not reached: the pool held 64
+and everything past it was dropped, so under load a backlog of dead
+controllers outran the collector and took the descriptor table with it. It is
+a race between discard rate and collector pace, which is why it presented as
+bistable rather than as a threshold.
+
+A controller that does not fit the pool is closed deterministically now.
+Re-measured at `ulimit -n` **1024**, akkar alone:
+
+| | requests | non-2xx | fd peak | eventpoll peak | sockets |
+|---|---:|---:|---:|---:|---:|
+| `-c100`, 60 s, fresh | 710,617 | **0** | 232 | 64 | 101 |
+| `-c200`, 60 s, fresh | 657,500 | **0** | 482 | 139 | 201 |
+| `-c400`, 60 s, fresh | 671,957 | **0** | 459 | 115 | 226 |
+
+Sixty consecutive one-second samples at `-c100` read 232 descriptors and 64
+eventpoll, **identical every time**. The same trace before the fix pinned at
+1024 and 460 from the first second.
+
+**The bound is now arithmetic and it holds exactly**, `fd = sockets +
+2 × eventpoll + 3` in every sample of every run. Peak descriptors anywhere:
+482, under half the limit.
+
+**And the bistability is gone.** Three `-c100` runs on the same server gave
+**0, 0, 0** errors, against 0 / 5,721 / 5,826 before. The bad regime is not
+reachable.
+
+**It costs nothing measurable.** `regression.sh` twice across the range, and a
+third run isolated to the single commit where only `akkar/execution.lua`
+differs: +0.1% against a 1.2% floor, −0.3% against 1.8%, −0.3% against 2.7%.
+None clears. µs/req at a fixed 2.00 cores moved 84.5→84.4 and 84.4→84.7 —
+noise in both directions.
+
+An estimate of mine was wrong and the trace says why: I expected a third of
+requests at `-c100` to exceed the pool and pay a close. eventpoll sat flat at
+exactly 64 for the whole run, meaning the pool was full and recycling
+continuously rather than overflowing, so the fraction paying a close is far
+below a third. **`-c200` peaks at 139 eventpoll, well past the pool, and the
+cost at that concurrency is unmeasured.**

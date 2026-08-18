@@ -264,11 +264,30 @@ done
 say "Rule 3 — the spread each candidate showed, as its noise floor"
 # A difference smaller than the larger of two floors is not a result. Printed
 # rather than left for someone to eyeball a column of numbers.
-awk '{ n[$2]++; s[$2]+=$3
+# FIELD 6 IS THE ERROR COUNT AND THIS USED TO IGNORE IT.
+#
+# `parse_wrk` was fixed to read the right awk field, and this summariser was
+# left reading only $2 and $3 -- so a repetition that failed 16,529 of its
+# requests was averaged into the mean like any other, with the evidence
+# printed on the line above it and nothing acting on it. Half a gate is not a
+# gate: the harness went on publishing a number from a failing server, just
+# more legibly.
+#
+# A candidate with ANY failing repetition is now reported as such and its mean
+# is refused, because a mean over a server that was erroring is not slower or
+# faster, it is not a measurement. Errors are cheap to serve, so such a number
+# flatters the candidate producing them.
+awk '{ n[$2]++; s[$2]+=$3; bad[$2] += $6
        if (!(($2) in mx) || $3 > mx[$2]) mx[$2] = $3
        if (!(($2) in mn) || $3 < mn[$2]) mn[$2] = $3 }
-     END { for (c in n) printf "%-10s mean %10.0f rps   spread %.2f%%\n",
-             c, s[c]/n[c], 100*(mx[c]-mn[c])/(s[c]/n[c]) }' "$OUT/d4-ping.txt" | sort
+     END { for (c in n) {
+             if (bad[c] > 0)
+               printf "%-10s REFUSED -- %d non-2xx across %d reps; a mean over a failing server is not a measurement\n",
+                 c, bad[c], n[c]
+             else
+               printf "%-10s mean %10.0f rps   spread %.2f%%\n",
+                 c, s[c]/n[c], 100*(mx[c]-mn[c])/(s[c]/n[c])
+           } }' "$OUT/d4-ping.txt" | sort
 
 say "D6 — the artefact you deploy"
 echo "measured separately; akkar's is 5.08 MB via \`akkar build\` (docs/RUNTIME.md)"

@@ -256,23 +256,70 @@ requests whose controllers the collector had not reached. 101 sockets, 460
 eventpoll descriptors, resident memory flat. `max_concurrent` cannot bound
 that, and no divisor can.
 
-Controllers that do not fit the pool are closed deterministically now. **What
-that costs is unmeasured** and is on the box.
+Controllers that do not fit the pool are closed deterministically now, and
+**that is measured: the wall is gone and it costs nothing.** Zero non-2xx at
+`-c100`, `-c200` and `-c400` on the default `ulimit -n 1024`, descriptors
+bounded exactly by `sockets + 2 × eventpoll + 3` with a peak of 482, and the
+bistability that gave 0 / 5,721 / 5,826 errors on three identical runs now
+gives 0 / 0 / 0. Three `regression.sh` runs, one of them isolated to the
+single commit, put the cost at +0.1%, −0.3% and −0.3%, none clearing its
+floor.
 
-### B1 — remove the controller from the request path  ·  F2, blocked
+**Still true, and it is why B1 below is not cancelled:** this bounds the
+backlog rather than removing the thing that creates it. Each in-flight request
+still costs three descriptors, so the ~225-concurrent ceiling stands.
 
-The real fix: 3 descriptors per request down to 1, and 225 concurrent becomes
-675.
+### B1 — remove the controller from the request path  ·  **the single best item in this plan**
 
-**It is blocked for a stated reason.** `spec/akkar_spec.lua` has a handler
-calling `cqueues.sleep(2)` against a 0.15 s budget that must answer 503, and
-`sleep` goes through no adapter. Capability-bounded I/O covers everything
-akkar mediates and nothing it does not.
+**cqueues already gives a per-coroutine deadline for nothing, and akkar has
+been paying an entire nested epoll instance to duplicate it.**
 
-What would unblock it is a per-task deadline that costs no descriptor — a
-timer heap or a hierarchical timing wheel, which is what every other
-cooperative scheduler uses. `timeout.c` is William Ahern's, MIT, O(1), the
-same author as cqueues, and cqueues does not embed it.
+`cqueues.poll` accepts a bare number in its argument list as a deadline. The
+manual says so ("A number value is interpreted as a simple timeout, **not** a
+file descriptor") and `src/cqueues.c`'s `object_getinfo` has an explicit
+`/* optimize simple timeout */` branch that never touches the descriptor path.
+The deadline lands in a `struct timer` **embedded in `struct thread`**, on an
+LLRB tree, and is fed straight to `epoll_wait`'s own timeout: no malloc, no
+descriptor, no userdata. It is the same structure Go, libuv, libev and asyncio
+all use — one loop timeout plus one sorted structure keyed by task.
+
+Verified here, against the current implementation, same three outcomes
+(completes / overruns / raises) from both:
+
+| | descriptors after 200 calls | bytes per call |
+|---|---:|---:|
+| a controller per request, today | 8 → **30** | 2,216 |
+| a bare number in `poll` | 6 → **6** | **1,624** |
+
+**−592 bytes a request, and the descriptor growth is not reduced but gone.**
+`cqueues.running()` returns the controller the connection is already in, so
+the handler is wrapped onto that rather than onto a fresh one, and the
+deadline is a Lua number — which is not a GC object at all, so there is
+nothing for the collector to be late about. **That makes the failure in Track
+B's opening paragraph categorically impossible rather than mitigated**, which
+is strictly better than the deterministic `close` that ships today.
+
+Prior art in this exact stack, and it is a measurement rather than an
+assertion: lua-http issue #32 is the same defect, diagnosed by its maintainer,
+with `/proc/PID/fd` showing `anon_inode:[eventpoll]` and `anon_inode:[eventfd]`
+held by a nested controller the collector had not reached.
+
+**One blocker remains, and it is the one akkar's own comment named**: an
+abandoned handler moved to the shared controller keeps running, wakes after
+the 503 has gone out, and touches a connection already returned to the pool —
+trading a descriptor leak for a data bug. That is a real design problem and it
+is now the ONLY thing between this plan and its largest win. `execution.release`
+is already idempotent and `db.lua` already marks a connection broken on a
+passed budget, so the pieces exist; what does not exist is a test that proves a
+late handler cannot touch a recycled connection.
+
+**Not `timeout.c`.** Two reasons, both checked. cqueues does not embed it and
+does not need it — `src/cqueues.c` includes `lib/llrb.h` and no `timeout.h`,
+and at n ≈ 225 in-flight a red-black tree is eight comparisons. And
+`timeout.c`'s own page offers no benchmark at all, only "preliminary
+benchmarking … very promising" from 2014. A timing wheel beats a tree at 10^5
+timers, not at 225. **F6 is refused on this evidence** for the request path;
+it stays open only for jobs and cron, where the counts might justify it.
 
 ### B2 — the abandoned controller
 

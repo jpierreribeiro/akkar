@@ -280,3 +280,45 @@ addr2line -f -C -e ~/.luarocks/lib/lua/5.4/_cqueues.so <offset>
 
 And record the offset here. Two data points are a pattern; one is an anecdote,
 and this page currently has one address seen once.
+
+---
+
+## What the pool is actually worth — 18 August 2026
+
+The controller pool is the leading suspect on this page, and the argument for
+keeping it has always been its price: turning recycling off cost 6.9% of
+throughput and a 37% worse p99, which was judged too much to pay against
+evidence at p ≈ 0.09.
+
+That number has been re-taken, and the shape of the trade is now known in both
+directions. `AKKAR_CONTROLLER_POOL` swept at `-c100`, default `ulimit`, five
+alternating repetitions, **run twice on different revisions**:
+
+| pool | median req/s | spread | fd peak | eventpoll peak |
+|---:|---:|---:|---:|---:|
+| 0 | 11,006 | 2.2% | 272 | 61 |
+| **64** (default) | 11,837 | 4.0% | 284 | 90 |
+| 128 | 12,106 | 2.4% | 284 | 90 |
+| 256 | 12,007 | 1.8% | 284 | 90 |
+
+**Turning it off costs 7.6–8.4%** — consistent across both sweeps, and the
+only comparison here that clears its floor. So the earlier 6.9% stands, if
+anything understated.
+
+**And raising it above 64 buys nothing.** 64 → 128 is +2.2% and +2.3% against
+floors of 4.2% and 4.0% — **not a result** by rule 3, independently in both
+sweeps. 128 → 256 is −0.1% and −0.8%, also not a result. The curve is flat
+from 64 upward.
+
+**Nor does a bigger pool buy descriptors.** fd and eventpoll peaks are
+identical at 64, 128 and 256. At this concurrency the binding term is requests
+in flight, not the pool ceiling — the pool is never the thing that fills.
+
+So the exposure this page describes cannot be reduced by shrinking the pool
+without paying about 8%, and cannot be traded for anything by growing it.
+**64 is the only defensible position, and it is where it already is.**
+
+The real escape is not a pool size at all: `bench/study/deadline-without-controller.lua`
+shows a per-request deadline that creates no controller, using a bare number
+in `cqueues.poll`. No controller means nothing to recycle and nothing to
+suspect. See `docs/PERFORMANCE-PLAN.md` B1.
