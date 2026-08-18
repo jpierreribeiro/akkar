@@ -309,6 +309,39 @@ function M.check_app(app, config, report)
       "touches it rather than at boot",
       "leave it on unless this service must come up degraded")
   end
+  -- WHICH HTTP VERSIONS THIS SERVER WILL ACTUALLY SPEAK.
+  --
+  -- This check exists because of a failure that reports nothing. akkar builds
+  -- its own TLS context when given `certificate` and `key`, and a context
+  -- without an ALPN callback advertises no h2 -- so a browser negotiates
+  -- HTTP/1.1 against a server that speaks HTTP/2 perfectly well, the
+  -- handshake succeeds, the request is answered, and the multiplexing simply
+  -- never happens. Nothing in a log, nothing in a metric.
+  --
+  -- akkar sets ALPN on the contexts it builds. It cannot set it on one handed
+  -- over through `ctx`, and it will not silently reach into a context the
+  -- application configured -- so that case is a warning rather than a claim.
+  if config.ctx then
+    report:warn("settings", "HTTP/2 over TLS cannot be confirmed",
+      "the TLS context came from `ctx`, so akkar did not install the ALPN " ..
+      "callback and cannot tell whether h2 is on offer; without it a browser " ..
+      "silently falls back to HTTP/1.1",
+      "call ctx:setAlpnSelect(require('akkar.vendor.http.server').alpn_select) " ..
+      "on it, or pass `tls = { certificate = ..., key = ... }` and let akkar " ..
+      "build the context")
+  elseif config.tls then
+    report:ok("settings", "HTTP/1.1 and HTTP/2",
+      "h2 is negotiated by ALPN; a client that does not ask for it gets h1")
+  elseif config.h2c then
+    report:ok("settings", "HTTP/1.1 and cleartext HTTP/2",
+      "h2c costs one read per connection to sniff the preface, h1 " ..
+      "connections included")
+  else
+    report:ok("settings", "HTTP/1.1 only",
+      "no TLS, so there is no ALPN to negotiate h2 with; `h2c = true` " ..
+      "enables cleartext h2 for a proxy or a gRPC client")
+  end
+
   if config.reuseport then
     report:ok("settings", "reuseport is on",
               "several processes can share the port; capacity is processes")

@@ -547,6 +547,34 @@ One Lua VM is one core, so capacity is processes. `reuseport = true` in
 them — no proxy in front. With systemd that is a templated unit and
 `systemctl start akkar@{1..4}`. Also not verified here.
 
+### HTTP/2, and whether you still want a proxy
+
+akkar speaks HTTP/1.1 and HTTP/2. Over TLS the version is settled by ALPN with
+no configuration: serve `tls = { certificate = ..., key = ... }` and a browser
+gets h2. Cleartext h2 is `h2c = true`, and it is opt-in because without TLS the
+only way to detect h2 is to sniff the connection preface — one read on **every**
+connection, h1 ones included. Browsers never speak cleartext h2; what wants it
+is a proxy or a gRPC client on a private network.
+
+**One case cannot be checked automatically.** If you hand akkar a TLS context
+through `ctx` rather than `certificate` and `key`, akkar does not install the
+ALPN callback on it and will not reach into a context you configured. Without
+that callback the context advertises no h2, and the failure is completely
+silent: the handshake succeeds, the request is answered, and multiplexing
+never happens. `akkar doctor` reports this case as a warning rather than
+guessing. Either call
+
+```lua
+ctx:setAlpnSelect(require("akkar.vendor.http.server").alpn_select)
+```
+
+on your context, or let akkar build it.
+
+**What a proxy is still for.** HTTP/3 — akkar has no QUIC, and h3 is
+terminated at the edge in practice anyway. Beyond that: certificate rotation,
+multiple hostnames on one address, and static assets, all of which a proxy
+does well and akkar does not claim to.
+
 ---
 
 ## Containers generally
