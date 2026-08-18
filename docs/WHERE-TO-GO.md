@@ -232,10 +232,21 @@ of people making it fast.
    roughly 2–2.3×; on becoming OpenResty, the full 8.4× at the cost of being a
    different product.
 
-## The recommendation
+## The decision, taken 18 August 2026
 
-**A now, D as a decision to take deliberately later, B refused, C and E not
-this project.**
+**A now. D as a deliberate later decision. B refused with a number. C and E
+not this project.**
+
+`docs/LUARESTY.md` works through the four ways to take nginx's 5.8× -- akkar
+as an OpenResty library, forking OpenResty, a C core inside akkar, and staying
+pure Lua -- with what each keeps and loses of akkar's identity. The short
+version of why C and E are refused: 78% of the gap is nginx being a
+twenty-year-old C server, so competing with it means becoming one, and the
+first invariant -- all I/O through adapters akkar owns -- stops being a
+structural fact and becomes a rule people can break.
+
+WHAT COMES FIRST, and it is not performance: F2 left an unexplained 16x p99
+regression on `/users/42`. Correctness before speed.
 
 A is weeks, measurable at every step, and worth perhaps +40% on its own — most
 of what pure Lua has left. It also happens to be the work that makes D
