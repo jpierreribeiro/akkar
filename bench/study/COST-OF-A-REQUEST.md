@@ -181,3 +181,64 @@ differential, and differentials between two implementations of one protocol
 are how request smuggling works.
 
 **Reproduce:** `lua5.4 bench/study/parse-cost.lua`.
+
+---
+
+## The fixture itself, audited
+
+The header-parse finding above arrived **by accident**, which makes the
+fixture that hid it the thing under suspicion rather than the parser. Every
+measurement in this repository has used one shape: three short headers,
+identical on every request, a 13-byte response, no request body, one
+keep-alive connection, no TLS, and a route with no schema.
+
+Each of those choices is a hypothesis that something is hidden. So the same
+server was measured under shapes that differ from it one at a time. On a
+laptop, so the absolutes are inflated and only the **ratios** are the finding.
+
+| shape | µs/req | bytes/req | vs the usual fixture |
+|---|---:|---:|---:|
+| the usual fixture: 3 short headers, `/ping` | 315.6 | 11,743 | 1.00× |
+| + 6 browser headers | 370.6 | 14,225 | 1.17× |
+| + headers unique per request | 375.2 | 15,099 | 1.19× |
+| a validated route, `/users/42` | 347.2 | 13,380 | 1.10× |
+| a validated route **with** browser headers | 517.4 | 15,885 | **1.64×** |
+| a 4 KB JSON response | 418.6 | 17,752 | 1.33× |
+| **a 64 KB JSON response** | 1,659.5 | 104,958 | **5.26×** |
+| **a POST with a 2 KB JSON body** | 780.2 | 20,420 | **2.47×** |
+| **a new connection per request** | 593.1 | 16,049 | **1.88×** |
+
+### Three areas no benchmark in this project has ever touched
+
+**Reading a request body costs 2.47×.** Every benchmark here is a GET. A POST
+with a 2 KB JSON body more than doubles the cost of a request, and the body
+path — `read_body`, `decode_body`, the content-type dispatch, the body limit —
+has never appeared in a number.
+
+**Opening a connection costs 1.88×.** Every benchmark uses one keep-alive
+connection for the whole run. Real clients open connections, and what that
+costs was invisible.
+
+**A large response costs 5.26× and allocates 105 KB.** The largest response
+ever measured here was 13 bytes. The write path and the JSON encoder scale
+worse than linearly in a way nothing was watching.
+
+### Two smaller things worth recording
+
+**Browser headers cost only +17% here because the parse fix is already in.**
+The same measurement taken before it would have been much worse — this is the
+instrument that would have found that defect had it existed.
+
+**Validation and headers interact superlinearly.** The validated route alone
+is 1.10× and browser headers alone are 1.17×; independent effects would
+predict 1.29×, and together they measure **1.64×**.
+
+### What this means for every number on this page
+
+The figures above this section were taken with the usual fixture, so they
+describe **the cheapest request akkar can serve**. They are not wrong — the
+comparisons in them are like-for-like — but "83 µs per request" is a best
+case, and a production request is somewhere between 1.6× and 5× of it
+depending on shape.
+
+**Reproduce:** `lua5.4 bench/study/request-shapes.lua`.
