@@ -2563,7 +2563,27 @@ function App:run(config)
       pcall(stream.shutdown, stream)
       self.in_flight = self.in_flight - 1
     end,
-    onerror = function(_, _, op, e) internal:warn("transport", { op = op, detail = tostring(e) }) end,
+    -- A HANDLER THAT THREW IS NOT TRANSPORT NOISE, and conflating the two
+    -- made a broken server silent.
+    --
+    -- `vendor/http/server.lua:187` calls this with `op = "onstream"` when the
+    -- stream handler raised past akkar's own pcall; lua-http then answers 503
+    -- with an empty body. Everything else here is a peer that went away mid
+    -- write, an accept that failed, a socket that timed out -- ordinary,
+    -- frequent, and rightly a warning.
+    --
+    -- With both at `warn`, a server running at log level `error` could answer
+    -- EVERY request with a 503 and print nothing at all. Found on the study
+    -- box: the LuaJIT arm booted, printed its normal banner, and served
+    -- 100% 503 in silence. A load generator would have reported forty
+    -- thousand requests a second of it.
+    onerror = function(_, _, op, e)
+      if op == "onstream" then
+        internal:error("stream handler failed", { op = op, detail = tostring(e) })
+      else
+        internal:warn("transport", { op = op, detail = tostring(e) })
+      end
+    end,
   })
 
   -- THE PORT IS IN THE MESSAGE, because this is the first error a beginner

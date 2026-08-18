@@ -40,15 +40,51 @@ for 5.1 compatibility, so the ~54% of a request that lives in
 
 ---
 
-## akkar did not: nine of 59 files failed to PARSE. Now none do.
+## THE ANSWER: 1.62×, REFUSED
 
-**All 60 files compile under LuaJIT 2.1.** `akkar/bitwise.lua` supplies the
-operators as functions, and `static.lua`'s four `<close>` variables are a
-`using(handle, fn)` helper that closes on every path. The 5.4 suite stayed
-green throughout: 1,786 passing, 0 failures.
+Measured on the study box, both arms the same tree and the same rock versions,
+alternating repetitions, zero non-2xx:
 
-What follows is the inventory as it was found, kept because the shape of the
-work is the useful part.
+| | req/s | spread | p99 | µs/req |
+|---|---:|---:|---:|---:|
+| Lua 5.4, one process | 12,083 | 1.9% | 9.75 ms | 82.8 |
+| LuaJIT, one process | 19,603 | 2.1% | 6.65 ms | 51.0 |
+| Lua 5.4, two processes | 24,122 | 3.5% | 4.60 ms | 82.9 |
+| LuaJIT, two processes | 39,736 | 4.1% | 3.98 ms | 50.3 |
+
+The rule written in advance asked for 2×. **It is 1.62×, so LuaJIT is refused
+and this is the number.** `docs/WHERE-TO-GO.md` has what that implies for the
+other options; the short version is that 22% of the gap to OpenResty is the
+language and 78% is nginx being C.
+
+## "All 60 files parse" was NOT "akkar runs", and that is the lesson here
+
+Nine files were fixed for syntax and the sweep went clean. Then running it
+found five more modules broken at LOAD and RUN time, none of which a parse
+census can see:
+
+    math.type        9 sites
+    table.unpack    14 sites
+    table.pack      10 sites
+    utf8.len/offset  4 sites, in `safe_text`, on the per-header path
+    rawlen           1 site
+
+**And the failure mode was the dangerous kind.** At log level `error` — which
+is what a benchmark uses — the server booted, printed its normal banner, and
+answered every request `503` with an empty body and no log line at all,
+because akkar's `onerror` only `warn`s. `wrk` would have reported roughly
+40,000 req/s of that quite happily. Rule 1's equivalence gate and `run_wrk`'s
+non-2xx check are the only two things between that and a published number.
+
+The measurement above therefore required a 31-line compatibility shim,
+preloaded into the LuaJIT arm only, using the C `luautf8` rock rather than a
+Lua reimplementation so the shim could not fake a win. **It contains exactly
+the lie this page predicted:** `math.type` returning `"integer"` for whole
+doubles, because `db.lua:57` needs it to keep binding `int8`. Without the lie
+`/users/42` does not answer; with it, the 3.91× fix is advisory.
+
+What follows is the syntactic inventory as it was found, kept because the
+shape of the work is the useful part.
 
 ```
 akkar/config.lua:209     unexpected symbol near '/'

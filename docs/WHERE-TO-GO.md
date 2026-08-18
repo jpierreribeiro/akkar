@@ -44,6 +44,24 @@ The port is **done**: all 60 akkar files parse under LuaJIT 2.1, every rock
 builds (cqueues, luaossl, lpeg, lua-cjson, lpeg_patterns, basexx, binaryheap,
 fifo), and akkar loads and answers `{"pong":true}`.
 
+**Measured on the study box**, same tree, same service file, same rock
+versions and the same pinned cqueues commit in both arms, alternating
+repetitions, servers restarted between each, zero non-2xx anywhere:
+
+| | req/s | spread | p50 | p99 | µs/req at fixed cores |
+|---|---:|---:|---:|---:|---:|
+| Lua 5.4, one process | 12,083 | 1.9% | 8.09 ms | 9.75 ms | 82.8 |
+| **LuaJIT, one process** | **19,603** | 2.1% | 4.57 ms | 6.65 ms | **51.0** |
+| Lua 5.4, two processes | 24,122 | 3.5% | 4.07 ms | 4.60 ms | 82.9 |
+| **LuaJIT, two processes** | **39,736** | 4.1% | 2.32 ms | 3.98 ms | **50.3** |
+
+**1.62× to 1.65×**, against a largest spread of 4.1%, and the tail moves with
+it — p99 9.75 → 6.65 ms — so it is not a mean-only win. The cleanest way to
+state it is **82.8 → 51.0 µs per request at fixed cores, −38%**, which
+reproduced within 0.7% across two independent topologies.
+
+Where the gain is, by shape:
+
 | workload | Lua 5.4 | LuaJIT | gain |
 |---|---:|---:|---:|
 | numeric loop | 0.252 s | 0.033 s | **7.6×** |
@@ -51,15 +69,17 @@ fifo), and akkar loads and answers `{"pong":true}`.
 | `string.format` | 0.180 s | 0.091 s | 2.0× |
 | table constructor, 4 keys | 0.143 s | 0.077 s | 1.9× |
 | `string.match` on a header line | 0.400 s | 0.297 s | **1.35×** |
-| **akkar's own request chain** | **20.6 µs** | **17.8 µs** | **1.15×** |
+| akkar's own chain through `app:test` | 20.6 µs | 17.8 µs | 1.15× |
 
-**LuaJIT is excellent at what this runtime does not do.** A JIT pays on
-numeric loops; a request is pattern matching, table churn and C calls into
-cjson and OpenSSL. Header parsing — the single biggest piece of the biggest
-piece — gains 1.35×.
+**AN EARLIER VERSION OF THIS PAGE REPORTED 1.15× AND IT WAS WRONG.** That
+figure came from `app:test`, which skips the HTTP layer entirely — and the
+HTTP layer is two thirds of the CPU. Measuring the least JIT-friendly third
+and calling it the answer understated the gain by 40%. The in-process
+instrument is fine for allocation, where it agrees with the socket, and it is
+not fine for CPU.
 
 `docs/PLAN.md` F3 fixed the rule in advance: **under 2× on `/ping`, LuaJIT is
-refused with a number.** 1.15× is the number.
+refused with a number.** 1.62× is the number.
 
 ---
 
@@ -94,35 +114,44 @@ machine.
 
 ### B — LuaJIT
 
-**Refused, with the number.** 1.15× on akkar's chain against a rule that asked
-for 2×.
+**Refused, with the number: 1.62× against a rule that asked for 2×.**
 
-And the cost is not only the gain being small:
+38% of the CPU is real and it is not nothing. What it costs:
 
 - **LuaJIT has no integer subtype.** `db.lua:57` chooses `int8` over `float8`
-  from `math.type` — what `DECISIONS.md` calls the 3.91× fix — and a shim
-  returning `"integer"` for an integral float makes `doctor.lua` pass while
-  that line silently picks the wrong type. `v.integer` becomes advisory.
-- **No `utf8` library.** `init.lua`'s `safe_text` uses it on every query
-  string. Found at runtime, after the parse sweep was clean.
+  from `math.type` — what `DECISIONS.md` calls the 3.91× fix. The measurement
+  above exists **only because a shim was installed that lies**, returning
+  `"integer"` for whole doubles, exactly as this project predicted it would
+  have to. Without it `/users/42` does not answer at all; with it the 3.91×
+  fix is silently advisory and `v.integer` becomes a comment.
+- **The port is less done than "all 60 files parse" suggested.** A parse
+  census cannot see a missing function. Running it found five more modules
+  broken at load and run time: `math.type` (9 sites), `table.unpack` (14),
+  `table.pack` (10), `utf8.len`/`utf8.offset` (4, in `safe_text`, on the
+  per-header path) and `rawlen` (1). The remaining work is roughly the same
+  shape and size as the work already done.
 - LuaJIT 2.1 has been nominally beta since 2015.
 
 **What the port bought anyway, and it should be kept:** `akkar/bitwise.lua`
 and the `using(handle, fn)` helper are portable spellings that cost the
 primary target 0.04% of a request, measured. They make akkar 5.1-compatible at
-the syntax level for free, which is worth having whether or not LuaJIT is ever
-adopted.
+the syntax level for free, whether or not LuaJIT is ever adopted.
 
-**Time already spent:** one day. **Time to a final answer on the box:** one
-more day, and the box is running it now.
+**Time spent: two days, and it is finished.** The answer is a number and the
+rule was applied to it.
 
 ---
 
 ### C — OpenResty: akkar becomes a library
 
-**What it buys.** nginx's C event loop, C HTTP parsing, C connection handling
-and LuaJIT. That is the whole 8.4×, because it is literally the thing being
-compared against.
+**What it buys, and now the split is measured.** The gap to OpenResty is 9.4×.
+LuaJIT is **1.62×** of it, so nginx's C event loop and C HTTP parsing are
+**5.8×** — and in absolute throughput it is more lopsided still: of the
+~92,000 req/s difference, the language recovers ~7,500 (**8%**) and the C
+server accounts for ~84,700 (**92%**).
+
+An akkar that were entirely LuaJIT would land near 19,600 req/s and OpenResty
+would still be **5.3× ahead**. **The gap is nginx, not PUC Lua.**
 
 **What it costs, and this is the real number.** It is not a port, it is a
 change of product:
@@ -190,8 +219,10 @@ of people making it fast.
 
 ## What the numbers say, put plainly
 
-1. **LuaJIT is refused.** 1.15×, measured, against a rule that asked for 2×,
-   and it costs the integer subtype.
+1. **LuaJIT is refused.** 1.62×, measured on the study box, against a rule
+   that asked for 2× — and it costs the integer subtype, with the lying shim
+   in place for the measurement to happen at all.
+   **22% of the OpenResty gap is the language; 78% is C.**
 2. **Two thirds of the CPU is HTTP in Lua.** Anything that does not address
    that cannot be worth more than about 1.5×.
 3. **akkar's own chain is one third**, and its largest single item — 55% of a
