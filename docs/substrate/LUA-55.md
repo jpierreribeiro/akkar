@@ -142,9 +142,48 @@ Lua 5.4    1,710 successes / 0 failures / 0 errors / 0 pending
 Lua 5.5    1,672 successes / 0 failures / 0 errors / 2 pending
 ```
 
-The 38-test gap is fully accounted for: `pq_spec` and `db_spec`'s C-driver half
-skip because `pq_native.so` is not built for 5.5, and `teal_spec` skips because
-`tl` is not installed there. Nothing fails.
+The 38-test gap was fully accounted for: `pq_spec` and `db_spec`'s C-driver
+half skipped because `pq_native.so` was not built for 5.5, and `teal_spec`
+skipped because `tl` is not installed there.
+
+### Then it was built for 5.5, and the gap closed
+
+```
+Lua 5.4    1,756 successes / 0 failures / 0 errors / 0 pending
+Lua 5.5    1,750 successes / 0 failures / 0 errors / 1 pending
+```
+
+The remaining pending is `teal_spec`, and it is a linter that is not installed
+rather than anything about Lua 5.5. **The C driver runs, against a real
+Postgres, under 5.5.**
+
+Building it needed no root and no `libpq-dev` install, which `src/build.sh`
+already documented and nobody had used:
+
+```sh
+apt-get download libpq-dev
+dpkg -x libpq-dev_*.deb /tmp/libpq
+PQ_INC=/tmp/libpq/usr/include/postgresql \
+LUA_CFLAGS=-I$HOME/lua55/include \
+OUT=/tmp/pq_native_55.so ./src/build.sh
+```
+
+Only the HEADER was missing. The runtime is the system's `libpq.so.5`, which
+any machine that talks to Postgres already has, and the script links against
+the versioned `.so` directly rather than the unversioned symlink that only
+ships with the dev package.
+
+The new module reports `LUA_VERSION_NUM = 505`, so the guard below now has
+something to check rather than a build with no marker to wave through.
+
+**What is still awkward, stated rather than hidden:** there is ONE
+`akkar/pq_native.so` path in the source tree and two Lua ABIs that might want
+it. `spec/db_spec.lua` puts `./?.so` on `package.cpath`, so whichever build is
+sitting there is the one both interpreters load. The file is gitignored — it
+is a build artefact, not a tracked one — so nothing is committed wrong; but
+running both suites on one checkout means rebuilding, or swapping, between
+them. An installed rock does not have this problem: LuaRocks keeps
+`lib/lua/5.4/` and `lib/lua/5.5/` apart.
 
 ## The guard this produced
 
