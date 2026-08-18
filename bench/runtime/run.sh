@@ -167,6 +167,27 @@ rss_kb() {   # port
 # descriptors on epoll and 3 on kqueue, which puts a hard wall near 500
 # concurrent requests against ulimit -n 1024. No other candidate has ever been
 # asked this question.
+# MEDIDO EM DOIS TAMANHOS, E A DIVISAO SIMPLES ESTAVA ERRADA.
+#
+# `(rss1 - rss0) / n` nao e o custo por conexao. O delta tem uma parte FIXA --
+# o processo cruzando uma fronteira de arena do alocador enquanto atende as
+# primeiras conexoes -- e essa parte fixa era dividida por n e publicada como
+# se fosse marginal. Medido no akkar, mesmo binario, mesma maquina:
+#
+#     n=200    10,24 KB/conexao    delta total 2.048 KB
+#     n=800     6,40 KB/conexao    delta total 5.120 KB
+#
+# O numero cai 38% so por segurar mais conexoes. Resolvendo as duas equacoes:
+# marginal 5,12 KB por conexao, fixo 1.024 KB. A 200 conexoes o fixo sozinho
+# contribui 5,12 -- exatamente metade do que era publicado.
+#
+# Isso fez uma "regressao de 54% no custo por conexao ociosa" aparecer entre
+# duas execucoes do bench quando o custo marginal nao tinha mudado: o que
+# mudou foi o degrau fixo, num commit cujo heap Lua e IDENTICO (1.677,5 contra
+# 1.677,3 KB) e cujo modulo isolado custa ZERO. Fronteira de malloc, nao codigo.
+#
+# O marginal e o numero que preve o que 10.000 conexoes custam. O fixo e real
+# e vale reportar, mas e por PROCESSO e nao por conexao. Os dois, separados.
 idle_conn_cost() {   # port, how many
   local port=$1 n=${2:-200}
   local pids fd0 fd1 rss0 rss1
@@ -199,7 +220,31 @@ PY
   wait $holder 2>/dev/null
 
   awk -v f0="$fd0" -v f1="$fd1" -v r0="$rss0" -v r1="$rss1" -v n="$n" \
-    'BEGIN { printf "%d %.3f %.2f", f1-f0, (f1-f0)/n, (r1-r0)/n }'
+    'BEGIN { printf "%d %.3f %d", f1-f0, (f1-f0)/n, r1-r0 }'
+}
+
+# O marginal, resolvido a partir de dois tamanhos.
+#
+#     delta(n) = fixo + marginal * n
+#
+# Duas medicoes bastam. Reportar so uma e reportar `fixo/n + marginal` e
+# chamar de marginal, que e exatamente o defeito que este bloco existe para
+# nao repetir.
+idle_conn_marginal() {   # port
+  local port=$1 small=200 large=800
+  local d_small d_large
+  d_small=$(idle_conn_cost "$port" $small | awk '{print $3}')
+  d_large=$(idle_conn_cost "$port" $large | awk '{print $3}')
+  if [ -z "$d_small" ] || [ -z "$d_large" ]; then echo "- -"; return; fi
+
+  awk -v ds="$d_small" -v dl="$d_large" -v s="$small" -v l="$large" 'BEGIN {
+    marginal = (dl - ds) / (l - s)
+    fixo     = ds - marginal * s
+    # Um marginal negativo significa que o degrau engoliu o sinal. Dizer isso
+    # e melhor que publicar um numero com o sinal invertido.
+    if (marginal < 0) printf "INVERTIDO %.0f", fixo
+    else              printf "%.2f %.0f", marginal, fixo
+  }'
 }
 
 # D4: throughput and the tail. No mean -- a mean hides the tail, and the tail
@@ -280,10 +325,14 @@ for c in $CANDIDATES; do
 done
 
 say "D3 — cost per idle keep-alive connection"
-printf '%-10s %8s %10s %10s\n' candidate fds fds/conn KB/conn
+echo "KB/conn is the MARGINAL cost, solved from n=200 and n=800. The fixed"
+echo "step is per PROCESS and is reported beside it rather than divided by n."
+printf '%-10s %8s %10s %10s %10s\n' candidate fds fds/conn KB/conn fixed_KB
 for c in $CANDIDATES; do
   p=$(port_of "$c")
-  printf '%-10s %8s %10s %10s\n' "$c" $(idle_conn_cost "$p" 200)
+  fds_part=$(idle_conn_cost "$p" 200 | awk '{print $1" "$2}')
+  marg_part=$(idle_conn_marginal "$p")
+  printf '%-10s %8s %10s %10s %10s\n' "$c" $fds_part $marg_part
 done
 
 say "D4 — throughput and tail on /ping, ${REPS} reps, alternating order"
