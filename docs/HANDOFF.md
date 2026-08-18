@@ -1,270 +1,232 @@
-# Handoff — 16 August 2026
+# Handoff — 17 August 2026
 
-For whoever picks this up next, including you in a week. It says what is
-waiting, what changed, what was learned, and what to do — in that order,
-because the first one has a deadline and the rest do not.
+For whoever picks this up, including you next week. What is waiting, what is
+now known, what the vendoring left half-done, and where the programme actually
+stands — in that order, because the first has a cost per hour and the rest do
+not.
 
-Rewritten rather than appended to. The previous version had grown four layers
-of correction blocks over sections that were no longer true, which is
-archaeology and not a handoff. The corrections live in the documents that carry
-the measurements, where somebody reading a number will meet them.
+Rewritten rather than appended to. The previous version described a tree from
+before lua-http was vendored and before Lua 5.5 ran.
 
 ---
 
 ## Waiting on you
 
-**1. Merge PR #3** — https://github.com/jpierreribeiro/akkar/pull/3 — twelve
-commits, MERGEABLE, 1,696 tests passing. This session does not merge to `main`.
+**1. The benchmark box is unreachable.** `100.48.219.220` answered at 13:30 and
+stopped by 18:00 — no SSH, no ping. There is no AWS CLI configured here, so
+this needs the console. If the instance is not on an Elastic IP, a stop/start
+changed its public address and the scripts need the new one.
 
-**2. Sync your checkout.** It is on `main` at `d1e5d45`; `origin/main` is at
-`f15d6fa`.
+Until it is back, **`bench/study/regression.sh` cannot run**, and that is the
+only timing instrument this project trusts. Everything below that carries a
+throughput number was measured before it went; everything that does not, says
+so.
 
-```sh
-cd ~/Desktop/akkar && git pull --ff-only origin main
-```
+**2. PR #6 is open** — https://github.com/jpierreribeiro/akkar/pull/6 — and
+nineteen commits have landed on the branch since. This session does not merge.
 
-**3. akkar has never been published.** It is not on luarocks.org, so the README
-tells people to install from a rockspec URL — which works, and was tested, but
-is not what anyone expects to type. `luarocks upload` is a release step nobody
-has taken; there is no technical obstacle and no CI job for it either.
-
-**4. Two things are billing.** The `c5.2xlarge` at `100.48.219.220` has been up
-27 hours and is idle. The Railway service `akkar-deploy-test` is still live from
-an earlier session. Neither is in use.
+**3. Two things bill.** The EC2 above, and the Railway service
+`akkar-deploy-test` from an earlier session.
 
 ---
 
-## Where the project stands
+## What we know now that we did not
 
-**1,696 tests, 0 failures, 0 pending**, verified on a shell with `LUA_PATH` and
-`LUA_CPATH` unset — the shape that catches path assumptions.
+### akkar is faster than the nearest comparable Lua framework
 
-`main` is `0.1.0`. The framework works; what the last two days changed is how
-much of it is *known* rather than believed.
+First measurement ever taken against the neighbours akkar actually has.
+`bench/runtime/` — method written before any service existed.
 
-### The runtime has a first minute
+| | req/s | spread | p99 |
+|---|---:|---:|---:|
+| OpenResty | 107,478 | 2.2% | 1.02 ms |
+| Luvit | 11,831 | **25.6%** | 27–51 ms |
+| **akkar** | **9,627** | 1.2% | 13.1 ms |
+| Lapis | 8,244 | 1.6% | 15.2 ms |
 
-```sh
-akkar new my-api
-cd my-api
-akkar run
-curl localhost:8080/health     # {"ok":true}
-```
+**akkar is 16.8% faster than Lapis on the same substrate** — same cqueues, same
+lua-http, same rocks. The prediction written in advance said Lapis would win.
+It did not, and the decision rule had no row for that, which is recorded.
 
-`new`, `run` and `test` joined `doctor`, `watch`, `build`, `archive` and
-`version`. All of them read one shape: a file that **returns** the app,
-optionally with its config. `spec/cli_spec.lua` spawns the real CLI, because
-the value of a scaffold is entirely in whether the thing it emits runs.
+Luvit is faster in the middle and 2–4× worse in the tail, at 25.6% spread. For
+a service runtime the tail is the number that matters. `akkar-substrate-luv`
+stays parked, now on evidence rather than taste.
 
-### The C driver has no objection left against it
+**The unfavourable number:** akkar costs **19.50 KB per idle keep-alive
+connection**, the worst of the four. OpenResty is 46× cheaper.
 
-`akkar.pq` is **1.27x on a single row, 2.79x on a thousand**, with p99 under
-saturation falling from 1.3 s to 475 ms. It returns byte-identical rows.
-
-The consistency objection that kept it off has been **withdrawn** — see
-"What was wrong" below. The default is still pgmoon, for a packaging reason
-nobody had stated: the C half is a separate rock, so a default of `pq` would
-fail at the first query for anyone who installed only `akkar`.
-
-```sh
-luarocks install akkar-pq PQ_INCDIR=$(pg_config --includedir)
-```
-
-Install it, pass `driver = "pq"`, and use it.
-
-### The gap against Gin is attributed, not quoted
-
-All at two cores, same 13 bytes:
-
-| layer | req/s | µs of CPU per request |
-|---|---:|---:|
-| cqueues, no parsing | 169,960 | 11.5 |
-| **a real HTTP server in pure Lua** | **171,330** | **11.7** |
-| lua-http | 34,173 | 58.5 |
-| akkar `/ping` | 19,408 | 103.0 |
-| Gin, same CPU | 101,584 | 19.7 |
-
-**It is not the language.** A hand-written HTTP server in PUC Lua 5.4 runs at
-1.69x Gin. akkar's 103 µs is cqueues 11%, **lua-http 46%**, akkar's own code
-43% — and the collector is at most 3.5% of it.
-
-`bench/study/WHERE-THE-GAP-IS.md`.
-
----
-
-## What was wrong, and is not any more
-
-Nine defects, and the ones that matter were not found by reading.
-
-| what | how it was found |
-|---|---|
-| **`app:mount` discarded the mounted app's middleware** — a protected route answered 200 with no credential | porting a real service |
-| **Webhook signatures were impossible** — the raw body was decoded and thrown away | porting a real service |
-| `timeout = 0` answered **408 to every request**, including a GET with no body | a benchmark gate refusing to publish a number |
-| A misspelled schema constraint validated **nothing**, silently | porting a real service |
-| `v.integer` returned a float from JSON and an integer from a query string | porting a real service |
-| The retry schedule every webhook system uses could not be expressed | porting a real service |
-| Sub-second retry delays did not exist, quantising the jitter that prevents a thundering herd | a probe misbehaving |
-| A 4% throughput regression, from three allocations added to a hot path | a peer framework reproducing to 0.2% in the same table |
-| Invalid UTF-8 echoed into JSON responses | pointing hostile bytes at it |
-
-Two of those are security defects and both were sitting in the open-items list
-wearing the label "ergonomic".
-
-### And two things this session believed and had to withdraw
-
-**The C driver is less consistent than pgmoon.** It is not. Re-measured at the
-configuration the claim came from, it is 1.8% spread with zero anomalous
-windows against a published 21.4% and two. The raggedness that does reproduce
-is `SO_REUSEPORT` splitting few connections across processes, and it hits
-**pgmoon harder**. `bench/driver/ANOMALY.md` carries all four experiments,
-including the checkpoint hypothesis that looked decisive at n=1 and died when
-it was forced.
-
-**A run was discarded for being taken on a busy machine.** It was not busy.
-`/proc/loadavg` on that box reads 2.3 while `vmstat` reports the CPU 100% idle;
-the load average does not decay there. The gate now asks `vmstat`.
-
----
-
-## What to do next
-
-The direction is `docs/RUNTIME-1.0.md`: a small, predictable backend runtime
-whose application language is Lua, not a framework chasing Gin. Ordered by risk
-removed rather than by architectural appeal.
-
-**1. The platform, which is the next piece of work.** `akkar new/run/test` is
-the first mile. What is missing between that and a distribution: automatic
-recipes for native dependencies, cross-compilation and a platform matrix, and
-an `akkar version` that prints the whole lock — Lua, cqueues commit, OpenSSL,
-cjson, driver, target. The product is "Akkar Runtime 1.3 is the supported
-platform", which moves an entire class of issue from the user to release
-engineering.
-
-**2. The LuaJIT spike — one week, decision rule already written.** 91.6 of
-akkar's 103 µs per request is interpreted Lua, and a JIT is the only single
-change that touches all of it while requiring nobody to own anything. The
-port cost is audited: `<close>` in four places, `//` in twelve, `math.type` in
-nine, `table.pack` in ten, `utf8` in three. It comes **before** writing an HTTP
-parser, because its answer decides whether that parser is worth owning.
-
-**3. Keep porting.** Three slices done — invoice API, inbound webhook, outbound
-dispatcher — and they produced six of the nine defects above. Untouched: the
-reconciliation cron, disputes, KYC, the IP-allowlisted admin surface. And the
-dispatcher ran against a **fake** HTTP client, so the queue and the retry
-schedule are proved and the transport is not.
-
-**4. Do not rewrite lua-http for speed.** It is 46% of `/ping` and replacing it
-would take akkar from 0.19x of Gin to about 0.35x — but on a route that touches
-a database a request already costs ~570 µs, so the whole substrate saving is
-worth at most 8%. Rewrite it when the reason is maintenance and
-denial-of-service surface: no release since September 2024, and akkar already
-carries two repairs for it. Speed is the bonus, not the case.
-
----
-
-## Instruments nobody has pointed yet
-
-From `docs/UNKNOWNS.md`, and the list is shorter than it was:
-
-- **Platform.** CI is `ubuntu-24.04` and nothing else. This matters more now
-  that the project calls itself a runtime: the promise of a runtime *is* the
-  combination that works, and akkar cannot yet say where it works.
-- **Adversarial security review.** Of the nine defects, two were security
-  failures found by accident. Somebody trying would find more.
-- Infrastructure failure injection, resource exhaustion at the ceiling, scale
-  of *shape* (ten thousand routes, a one-megabyte header), dependency movement,
-  and observability during an incident.
-
-Closed since it was written: correctness over time, hostile encodings, the
-clock, and — started — porting a real application.
-
----
-
-## Reproducing anything here
-
-The `c5.2xlarge` has everything: rocks for Lua 5.4, the compiled
-`pq_native.so`, `wrk`, Postgres seeded with 10,000 users and 2,000 bench rows,
-Gin built and a FastAPI venv.
-
-```sh
-ssh -i ~/Downloads/colossus.pem ubuntu@100.48.219.220
-eval "$(luarocks --local --lua-version 5.4 path)"
-cd ~/akkar
-
-bash bench/study/floors.sh          # where the Gin gap is
-bash bench/study/run.sh compare     # akkar, Gin, FastAPI, both drivers
-bash bench/driver/end-to-end.sh     # pgmoon against akkar.pq
-bash bench/driver/distribution.sh   # why the "inconsistency" was the harness
-bash bench/study/regression.sh <ref> HEAD   # did akkar get slower?
-```
-
-Three ways to waste a run, each of which cost one:
-
-- **`luarocks` on Ubuntu defaults to Lua 5.1.** Rocks installed without
-  `--lua-version 5.4` build against 5.1 and die on `luaL_register`.
-- **Never measure on the laptop.** It runs at load 4 from an ordinary browser
-  session, and a contaminated benchmark does not fail — it produces a clean
-  curve of wrong numbers.
-- **`/proc/loadavg` is not an instrument on the study box.** Ask `vmstat`.
-
----
-
-## Teaching akkar, and why it is also an instrument
-
-`~/Desktop/akkar-exercise-spike/` — a spike answering one question: can a
-backend exercise in akkar be graded inside the constraints `dalivim-runner`
-imposes on Lua? Isolated mode, one entry file, no network, a hard `RLIMIT_AS`.
-
-**Yes, comfortably.** Two exercises, twelve submissions, **12.8 MB peak RSS
-against a 256 MB address-space cap, 40–100 ms per grading, no network at all.**
-
-`app:test()` is what makes it possible: a request goes through routing,
-validation, middleware and the handler **without opening a socket**, so a
-backend exercise becomes a deterministic function call — the only shape an
-isolated jail runs.
-
-The runner's `-E` decides the design. It ignores `LUA_INIT`, `LUA_PATH` and
-`LUA_CPATH`, so akkar cannot arrive through the environment. Either it lives in
-the image's system path, or the interpreter is not `lua5.4` at all: it is the
-single binary `akkar build` produces, which carries akkar and 46 native modules
-and hosts code it never embedded.
-
-### And it is an instrument for akkar
-
-Writing **one** exercise against `akkar.db.memory` surfaced five API surprises,
-none of which any test in this repository would have caught:
+### akkar runs on Lua 5.5
 
 | | |
-|---|---|
-| `check_capabilities` is not an `app:test{}` option | akkar refused it by name, which is right |
-| the query log records values as `args`, not `params` | documented, and easy to assume wrong |
-| `:on(pattern, {})` is **one empty row**, not zero | zero rows needs a function returning nil |
-| `Memory:reset()` does **not** clear programmed responses | and `find` returns the first match, so re-programming never wins |
-| an unprogrammed query **raises** | which is the right default, and not obvious |
+|---|---:|
+| Lua 5.4 | 1,731 passing, 0 failures |
+| Lua 5.5 | 1,672 passing, 0 failures, 2 pending |
 
-Only the third is arguably a defect: an empty table is what anyone reaches for
-to mean "no rows", and a row with no columns has no use. It was **not changed**
-— five specs depend on the current behaviour, and changing an API on a
-preference in the middle of other work is how a framework acquires surprises
-rather than loses them. It is documented instead.
+The gap is fully accounted for: `pq_spec` and `db_spec`'s C-driver half skip
+because `pq_native.so` is not built for 5.5, and `teal_spec` skips because `tl`
+is not installed there. **Nothing fails.**
 
-That is the argument for the teaching idea as engineering rather than as a
-product: exercises are miniature ports, a grader running learner code is a
-fuzzer for the API surface and the error messages, and a hundred learners would
-be the largest source of *found by use* this project could have.
+akkar itself needed **two lines** — Lua 5.5 makes for-loop control variables
+const, and `etag.lua` and `static.lua` both reassigned one.
 
-### The lesson that cost two distractors
+What is left is packaging, not code: luaossl's makefile does not list 5.5
+(issue #221 open, and its C compiles clean), and cqueues vendors a
+`lua-compat-5.3` from 2020 that stops at 5.4. One patch each, upstream.
+`docs/substrate/LUA-55.md` has the whole account.
 
-A distractor only teaches if it is genuinely wrong, and the only way to know is
-to run it. Two were written as traps and passed, correctly — a float path that
-`math.ceil` makes integral, and a "returns the whole row" that a fixture with
-exactly the right columns cannot catch. **Failing somebody for being right is
-the worst defect an exercise platform can have.**
+### The suite segfaults, and it is not ours to fix yet
 
-## The port lives outside this repository
+Every recorded crash lands on one instruction: `table_LLRB_FIND` in cqueues,
+walking a pollset's file-descriptor tree. **It predates every change made this
+week.**
 
-`~/Desktop/escrow-akkar/` — three slices of a private escrow service, ported to
-akkar. It stays out of the public repo because the business logic is somebody's
-and akkar is public. What comes back here is the defects, in
-`docs/PORT-FINDINGS.md` and `spec/port_findings_spec.lua`.
+A controlled experiment implicated the controller pool: 3 crashes in 6 runs
+with recycling on, 0 in 6 with it off. Then the fix was priced — **−6.9%
+throughput and a 37% worse p99** — and put back, because p ≈ 0.09 does not buy
+that. `docs/substrate/SEGFAULT.md` has the reasoning, and what would change the
+answer: twenty runs an arm, or the actual defect.
+
+### Where a request's bytes go
+
+`bench/study/HTTP-OPTIMISATION.md`, measured rather than read:
+
+| | |
+|---|---:|
+| one extra request header | +268 bytes |
+| one extra response header | +292 bytes |
+| one byte of body | +2.0 bytes |
+| **fixed per-request overhead** | **~13,200 bytes** |
+| — of which one stream object | 1,496 (3 conditions, 2 fifos, a 22-key table) |
+
+**A warning about that instrument:** the benchmark sends identical requests,
+and Lua interns strings of 40 bytes or less, so every header is interned after
+the first request. Real traffic has varying cookies and user agents. **Every
+figure there is a lower bound.**
+
+---
+
+## What the vendoring left pending
+
+`akkar/vendor/http/` is 5,523 lines of lua-http's HTTP/1.1 half, with h2,
+hpack, websocket and socks cut. Three things it did not finish:
+
+### 1. The rockspec declares the wrong dependencies — latent, not broken
+
+The vendored code requires **`basexx`, `binaryheap`, `fifo`, `lpeg`,
+`lpeg_patterns`, `zlib`**. The rockspec declares **none of them**. They arrive
+transitively because `http >= 0.4` is still declared.
+
+So `luarocks install akkar` works today, and breaks the moment somebody acts on
+the obvious thought — "we vendor http, so drop the dependency". The fix is to
+declare those six directly and demote `http` to what it now is: **a test-only
+dependency**, used by the specs as an independent client so a symmetric framing
+bug cannot pass its own tests.
+
+### 2. `pq_native.so` is still a Lua 5.4 build
+
+It is in the tree, and `spec/db_spec.lua` puts `./?.so` on `package.cpath`.
+Under 5.5 it loads, reads its fields correctly, and core dumps on first use —
+which is what the whole "Lua 5.5 is unstable" story turned out to be.
+
+`src/akkar_pq.c` now stamps `LUA_VERSION_NUM` and `akkar/pq.lua` refuses a
+mismatch, so this is an error rather than a segfault **for builds made from
+here on**. The `.so` in the tree predates the marker and is allowed through.
+Rebuilding it needs `libpq-dev`, which is not installed here.
+
+### 3. The CI still installs upstream `http` and says why in a stale comment
+
+`.github/workflows/ci.yml` explains the install order in terms of `http`
+pulling in cqueues. Still true, still needed — the specs use upstream `http` —
+but the comment reads as though akkar depends on it, and akkar does not.
+
+---
+
+## Where F2 to F6 actually stand
+
+Honest reassessment. Two of them moved for reasons that were not in the plan.
+
+### F2 — deadline as budget · **half done, half blocked**
+
+**Done:** the deadline is a number the whole execution can read, keyed by
+coroutine, and `req.http` bounds outbound calls by what is left. That closed a
+cascading-failure defect that was in the tree: `http.lua` opened every call
+with a fresh 10 seconds regardless of the caller's budget.
+
+**Done:** `req.db` now bounds its wire call too, so a deadline actually stops
+the query. That change alone surfaced three defects, each caught by an existing
+test, and the third is the interesting one: the obvious fix — mark the
+connection broken on any query failure — is **wrong**, and `spec/db_spec.lua`
+says why in its own name.
+
+**Blocked:** removing the controller. The plan assumed capability-bounded I/O
+made it redundant. It does not — `spec/akkar_spec.lua` has a handler calling
+`cqueues.sleep(2)` against a 0.15 s budget that must answer 503, and `sleep`
+goes through no adapter. Capability bounds cover everything akkar mediates and
+nothing it does not. **So the ~500-concurrent-request wall stands.**
+
+### F3 — LuaJIT spike · **partly answered for free**
+
+The Lua 5.5 work priced most of what the spike was for. LuaJIT's blockers are
+semantic, not syntactic: `math.type` is load-bearing in five modules, the
+compat shim's version **lies** (returns `"integer"` for integral floats), and
+`<close>` appears four times in `static.lua`. Still worth a timeboxed run for
+the throughput number, but the cost side is now known without spending a week.
+
+### F4 — validator codegen · **unchanged, and cheaper than it was**
+
+F0 already pre-expands schemas at route registration, which is the same
+insertion point codegen needs. The hard constraint stands: `akkar.from_spec`
+passes schemas that came from **data**, so a generator must never interpolate a
+field name into source.
+
+### F5 — the HTTP frontier · **the vendoring was its prerequisite, and it is done**
+
+The C tokenizer is now an edit to our own code rather than a patch on somebody
+else's. `bench/study/HTTP-OPTIMISATION.md` sizes four remaining wins and flags
+the largest as the one to distrust: pooling stream objects is worth up to 1,496
+bytes and is the same shape as the controller pool implicated in the segfault.
+
+The 19.50 KB per idle connection is still unattacked. ~15 KB of it is lua-http
+(Lapis pays the same) and ~4 KB is akkar.
+
+### F6 — timing wheel · **unchanged, and still downstream of F2**
+
+`timeout.c` is William Ahern's, MIT, O(1), same author as cqueues, and cqueues
+does not embed it. For jobs, cron and idle-connection reaping — not the request
+path, where the deadline is arithmetic now.
+
+---
+
+## What is done
+
+- **F0** schema pre-expansion — −528 bytes/request, and the two spellings of a
+  schema now cost the same
+- **F1** Execution Scope, all four steps — −317 bytes/request, and
+  `spec/execution_spec.lua` exercises the module with no `akkar` require
+  anywhere, which is what proves the separation is real
+- **Platform matrix** — Linux x86-64, Linux arm64, macOS arm64, all green
+- **lua-http vendored**, both DoS repairs folded into the source, monkey-patch
+  retired
+- **Lua 5.5** runs the suite
+- **`.gitattributes`** — the language bar counted 5,523 lines of lua-http as
+  akkar's own
+
+---
+
+## If you have an hour
+
+Rebuild `pq_native.so` (needs `libpq-dev`) and re-run the 5.5 suite. It is the
+only thing between "1,672 passing with 2 pending" and a clean 5.5 story.
+
+## If you have a day
+
+Fix the rockspec dependencies. It is a latent break, it is well understood, and
+it is the difference between `luarocks install akkar` working by accident and
+working by design.
+
+## If you have a week
+
+Get the box back and run `bench/runtime/run.sh` again. Four of this session's
+measurements have no throughput number beside them, and the 16.8% Lapis margin
+is now the most sensitive regression detector this project has — it compares
+akkar against the same substrate, so a hot-path regression shows there first.
