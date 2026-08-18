@@ -46,6 +46,25 @@ akkar 44%), which is expected: parsing is cheap in bytes and expensive in CPU.
 `bench/study/HTTP-OPTIMISATION.md` has the full account. The summary, after
 this session's cuts took a request from 14,610 to 11,450 bytes:
 
+**BOTH PER-REQUEST COROUTINES ARE GONE**, and the table below is the state
+they were measured in. What replaced it:
+
+| | bytes/request |
+|---|---:|
+| when this table was taken | 11,450 |
+| deadline wrap → pooled worker | 9,151 |
+| stream wrap → inline for HTTP/1.1 | **5,376** |
+
+A request now allocates 5,376 bytes against the 14,610 this study opened with,
+and the two coroutines that were 55% of it are 5.7% between them. Measured on
+the box across five alternating repetitions, twice, the inline change alone is
+**+5.7% and +4.5% throughput** against spreads of 1.6% and 3.4%.
+
+The p99 rose 22% in the first of those runs and 5% in the second, which is one
+sample per tree per run and no spread to judge it against. **It is not
+established**, and it is recorded here because it was suspected, tested, and
+did not hold -- not because it did.
+
 | | bytes/request | share |
 |---|---:|---:|
 | the two per-request coroutines | 6,283 | **55%** |
