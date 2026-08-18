@@ -420,8 +420,51 @@ function M.with_deadline(seconds, fn)
   -- is still running inside its controller, and reusing that would hand the
   -- next request someone else's unfinished work -- the same class of bug as a
   -- pooled database connection with a transaction still open.
-  if cq:empty() and #controller_pool < POOL_LIMIT then
-    controller_pool[#controller_pool + 1] = cq
+  --
+  -- AND ONE THAT DOES NOT FIT THE POOL IS CLOSED, NOT DROPPED.
+  --
+  -- Dropping it was the defect. The comment above `cqueues.new()` already
+  -- says the descriptors "came back only when the collector ran, which
+  -- quietly tied a hard operating-system limit to the pace of the garbage
+  -- collector" -- and treated the pool as the answer. The pool has a ceiling;
+  -- past it, every completed request handed two descriptors to the collector
+  -- and hoped.
+  --
+  -- MEASURED, on the study box at `wrk -t4 -c100` with `ulimit -n 1024`:
+  -- 101 sockets open and **460 eventpoll descriptors** live -- nine per
+  -- connection, not three. 460 is not a design number: it is exactly
+  -- (1024 - 101 - 3) / 2, which is to say "whatever the descriptor table
+  -- allowed". Resident memory stayed flat throughout, so nothing leaked;
+  -- the backlog of dead-but-uncollected controllers simply outran the
+  -- collector. The server answered 97,912 of 706,563 requests with
+  -- `unable to initialize continuation queue: Too many open files`.
+  --
+  -- It is a RACE, not a threshold, which is why it looked bistable: two
+  -- identical 60-second runs at -c100 gave 705 errors with the backlog at 460
+  -- and zero errors with it at 62, and a process that entered the bad regime
+  -- stayed in it. Locally, at a third of that request rate, the same
+  -- experiment with recycling off shows the backlog sawtoothing between 50
+  -- and 140 and never running away -- the collector keeps up. Rate decides.
+  --
+  -- `close` runs the same `cqueue_destroy` the `__gc` metamethod does
+  -- (cqueues.c:1497 and :1511 are two calls to one function), so this is not
+  -- a different teardown, only a punctual one. It refuses if the controller
+  -- is running, hence the pcall: an empty controller is not running, and a
+  -- refusal here must not take the request down with it.
+  --
+  -- WHAT THIS DOES NOT FIX, stated because it is the same shape: a handler
+  -- abandoned by its deadline leaves a NON-empty controller, and that one is
+  -- still left to the collector. Under a storm of timeouts the same backlog
+  -- could build. It is not what was measured -- every request in that run
+  -- completed -- and closing a controller with a live coroutine inside it is
+  -- a separate decision with its own risk, so it is named rather than
+  -- guessed at.
+  if cq:empty() then
+    if #controller_pool < POOL_LIMIT then
+      controller_pool[#controller_pool + 1] = cq
+    else
+      pcall(cq.close, cq)
+    end
   end
 
   if winner == nil then winner = "TIMEOUT" end

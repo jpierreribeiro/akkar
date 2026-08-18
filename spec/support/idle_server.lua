@@ -61,8 +61,19 @@ local cqueues = require "cqueues"
 local app = akkar.new()
 app:get("/ping", function() return { pong = true } end)
 app:get("/hold", function() cqueues.sleep(hold) return { held = true } end)
+-- `controllers` counts eventpoll descriptors specifically, which is what a
+-- cqueues controller opens. The total descriptor count cannot separate a
+-- controller from a connection; this can.
+local function eventpoll_count()
+  local p = io.popen(("ls -l /proc/%s/fd 2>/dev/null | grep -c eventpoll"):format(PID))
+  local n = tonumber(p:read "l") or 0
+  p:close()
+  return n
+end
+
 app:get("/fds",  function()
-  return { fds = fd_count(), max_concurrent = app.max_concurrent }
+  return { fds = fd_count(), controllers = eventpoll_count(),
+           max_concurrent = app.max_concurrent }
 end)
 
 app:run {
