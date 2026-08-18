@@ -126,6 +126,10 @@ local function server_loop(self)
 	end
 end
 
+-- Declarado antes porque `handle_socket` passou a chama-lo direto; a definicao
+-- continua onde estava, logo abaixo.
+local handle_stream
+
 local function handle_socket(self, socket)
 	local error_operation, error_context
 	local conn, err, errno = wrap_socket(self, socket, self.connection_setup_timeout)
@@ -164,7 +168,32 @@ local function handle_socket(self, socket)
 			else
 				idle = false
 				deadline = nil
-				self:add_stream(stream)
+
+				-- HTTP/1.1 RODA O STREAM AQUI MESMO, SEM CORROTINA PROPRIA.
+				--
+				-- `add_stream` faz `cq:wrap(handle_stream, ...)`, uma corrotina
+				-- por REQUISICAO, e ela custa ~3.900 bytes -- 43% da alocacao de
+				-- uma requisicao depois que a outra corrotina por requisicao, a
+				-- do prazo do akkar, virou worker reusado.
+				--
+				-- E em h1 ela nao compra concorrencia nenhuma. Este laco fica
+				-- parado dentro de `get_next_incoming_stream` enquanto o stream
+				-- roda, porque h1 e serial: uma conexao nao produz o proximo
+				-- stream antes do atual terminar. As duas corrotinas se revezam
+				-- e nunca correm juntas. O wrap existe porque o lua-http de
+				-- upstream fala HTTP/2, onde os streams de uma conexao SAO
+				-- concorrentes -- e o h2 saiu quando esta metade foi vendorizada.
+				--
+				-- CONDICIONADO, E NAO INCONDICIONAL, e isso e deliberado. Sem a
+				-- condicao, "so h1 por enquanto" viraria "so h1
+				-- estruturalmente", e quem for reintroduzir h2 nao teria como
+				-- saber que esta linha e a que precisa voltar. `add_stream`
+				-- continua sendo o caminho concorrente e continua exportado.
+				if conn.version and conn.version < 2 then
+					handle_stream(self, stream)
+				else
+					self:add_stream(stream)
+				end
 			end
 		end
 		-- wait for streams to complete
@@ -180,7 +209,7 @@ local function handle_socket(self, socket)
 	end
 end
 
-local function handle_stream(self, stream)
+function handle_stream(self, stream)
 	local ok, err = http_util.yieldable_pcall(self.onstream, self, stream)
 	stream:shutdown()
 	if not ok then

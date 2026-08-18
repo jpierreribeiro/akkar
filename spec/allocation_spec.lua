@@ -286,8 +286,24 @@ describe("allocation per request, through a real socket", function()
     -- a handler parked outside a capability is still answered TIMEOUT at the
     -- budget. `spec/worker_pool_spec.lua` pins the reuse and the one rule
     -- that makes reuse safe.
-    assert.is_true(bytes < 9400,
+    -- LOWERED AGAIN, 9,400 -> 5,600, and this is the last of the two
+    -- per-request coroutines.
+    --
+    -- `akkar/vendor/http/server.lua` ran the stream handler on a coroutine of
+    -- its own, one per REQUEST. In HTTP/1.1 it bought no concurrency: the
+    -- connection loop parks inside `get_next_incoming_stream` while the stream
+    -- runs, because h1 is serial, so the two never ran together. The wrap is
+    -- there for HTTP/2, which left when this half was vendored -- and it stays
+    -- reachable behind `conn.version < 2` so reintroducing h2 does not have to
+    -- rediscover which line to restore.
+    --
+    --     with the stream coroutine   9,151 B/request
+    --     inline for h1               5,376 B/request
+    --
+    -- Together with the deadline worker pool, a request now allocates 5,376
+    -- bytes against the 14,610 this study started from.
+    assert.is_true(bytes < 5600,
       string.format("allocation through the real server regressed: " ..
-                    "%.0f bytes/request, ceiling 9400", bytes))
+                    "%.0f bytes/request, ceiling 5600", bytes))
   end)
 end)
