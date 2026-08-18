@@ -15,11 +15,23 @@ touching neither the system Lua 5.4 nor `~/.luarocks`.
 | luaossl's C | **compiles against 5.5 with zero errors** |
 | cqueues | **builds and runs an event loop** — after one fix, below |
 | the nine pure-Lua rocks | install unchanged |
-| akkar: routing, validation, schemas | **works** — 190/190 logic specs pass |
-| akkar: sockets and event loops | **crashes** |
+| akkar, the whole suite | **1763 successes / 0 failures / 0 errors / 2 pending** |
+| the same suite on Lua 5.4 | 1801 successes / 0 failures / 0 errors / 0 pending |
+| 32 of the 38-test difference | `akkar.pq`'s half — one `pq_native.so`, two ABIs; see below |
+| the other 6 | `teal_spec` — `tl` is not installed in the 5.5 tree |
+| so, of the difference | none of it is Lua 5.5. Both halves are tooling that was never installed twice |
 
-So: **akkar's own semantics are compatible with Lua 5.5.** Its socket layer is
-not yet, and that is where the work is.
+So: **akkar runs on Lua 5.5.** Not one line of akkar changed for it.
+
+This table used to end at "routing and validation work, sockets crash", and
+the sections below are the record of walking that back to here — the crash
+diagnosed, the C driver built, the gap closed. The summary is left mid-story
+in no version of this page but the one you are reading, because a reader who
+stops at the first table should not come away with yesterday's answer.
+
+What remains is packaging rather than portability, and `docs/runtime/lua55-stack.sh`
+is that packaging, written down and executable. **CI runs that same script**,
+so this page cannot quietly drift from the build again.
 
 ## The correction this page owes
 
@@ -213,15 +225,43 @@ runtime
 The rockspec already allowed `lua >= 5.4, < 5.6`; the doctor was the only
 thing hardcoding 5.4, with a reason that had stopped being true.
 
-What still stands between 5.5 and "recommended" is packaging, not code: a
-luaossl whose makefile lists 5.5, and a cqueues whose vendored compat shim is
-current. Both are one patch each, upstream, and neither is akkar's to merge.
+What stands between 5.5 and "recommended" is packaging, not code — and the
+packaging that is missing is **not akkar's**. No distribution ships Lua 5.5
+yet, so `luarocks install akkar` has nowhere to land. Upstream of that: a
+luaossl whose makefile has a 5.5 rung (its C already compiles, so this is a
+list, not a port), and a cqueues whose vendored compat shim is current.
+Neither is akkar's to merge.
+
+Until then 5.5 is a from-source proposition, which is a real cost to a user
+and the honest reason 5.4 stays the default.
 
 ## Reproducing this
 
-Scripts are not committed — they build into `~/lua55` and are a spike, not
-infrastructure. The order was: Lua 5.5.1 from source with `-fPIC`, luarocks
-from git configured against it, luaossl's `openssl.c` compiled by hand,
-cqueues at the pinned commit with `vendor/compat53/c-api/compat-5.3.h` replaced
-by v0.15.1's, then `luarocks install` for lpeg, lpeg_patterns, fifo,
-binaryheap, basexx, lua-cjson, compat53, luasocket and busted.
+**`docs/runtime/lua55-stack.sh`**, and it is the same file CI runs:
+
+```sh
+LUA55_PREFIX=~/lua55 bash docs/runtime/lua55-stack.sh
+```
+
+Lua 5.5.1 from source with `-fPIC`, luarocks from git configured against it,
+luaossl's `openssl.c` compiled directly, cqueues at the pinned commit with
+`vendor/compat53/c-api/compat-5.3.h` replaced by v0.15.1's, then `luarocks
+install` for lpeg, lpeg_patterns, fifo, binaryheap, basexx, lua-cjson,
+compat53, luasocket, luafilesystem and busted. Everything lands in the prefix;
+the system Lua and `~/.luarocks` are untouched, and discarding it is `rm -rf`.
+
+An earlier version of this section said the scripts were "a spike, not
+infrastructure" and left them uncommitted. That was the wrong call for a
+reason worth stating: it made this page the only record of how to get here,
+and a page is not runnable. The rockspecs declare `lua >= 5.4, < 5.6` and
+`spec/rockspec_spec.lua` asserts that bound — so the upper half of a
+**tested-and-declared** range was resting on prose. Now it rests on a job.
+
+One step of the recipe is easy to get wrong by hand and is worth naming.
+luaossl stores its Lua modules **flat and dot-named** — `src/openssl.ssl.context.lua`
+— and it is the makefile that turns each name into a directory path. Compile
+directly and you inherit that translation. Copying the files as they are
+leaves `openssl.ssl.context.lua` somewhere `require` will never look, and the
+failure surfaces far away, as lua-http not finding `openssl.rand`. The script
+does the rename and then asserts `openssl/rand.lua` exists, because that is
+the specific thing that goes silently wrong.

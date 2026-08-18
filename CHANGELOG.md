@@ -140,6 +140,18 @@ because a corrected number is worth more than a quiet edit.
   move.
 - **`akkar build` could not support Lua 5.5 "because cqueues needs a fork"** —
   false; the blocker is luaossl having no 5.5 target.
+- **And then: "the blocker is luaossl"** — also false, and this file said it
+  above before the line was ever tested. luaossl has no 5.5 *target*; its C
+  compiles against 5.5 with zero changes and zero warnings, which one `cc`
+  shows. Built that way, with `cqueues`'s vendored compat shim refreshed, the
+  **entire suite passes under Lua 5.5: 1763 passing, 0 failures**, against
+  1801 on 5.4. The 38-test difference is tooling and not the language: 32 are
+  the C driver, which skips until its `.so` is rebuilt for the other ABI, and 6
+  are the Teal declarations, which skip because `tl` is not installed there.
+  Twice this project
+  named a blocker by reading a build system instead of running a compiler, and
+  both times the named library was innocent. `docs/runtime/lua55-stack.sh` is
+  the recipe, and CI runs that same script so the claim cannot go stale again.
 
 ### Known limitations
 
@@ -151,7 +163,9 @@ Stated rather than discovered:
   environment and adding a C dependency for it was refused; the encoder is
   supplied by the application, and a compressor-less configuration fails at
   registration rather than silently not compressing.
-- **Lua 5.5 is blocked** on luaossl.
+- **Lua 5.5 runs, but nothing packages it.** The suite passes complete under
+  5.5; `luarocks install akkar` still cannot get you there, because the C layer
+  needs building from source. 5.4 remains what a user gets by default.
 - **One core per process.** akkar answers more CPU with more processes and
   `SO_REUSEPORT`, measured linear across physical cores.
 - **`akkar.pq` is opt-in**; pgmoon remains the default until a soak says

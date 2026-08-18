@@ -307,6 +307,113 @@ jobs:
       - name: Doctor
         run: $LUA_BIN bin/akkar doctor --no-probe
 
+  # ------------------------------------------------------------- lua 5.5
+  # THE ROCKSPECS SAY `lua >= 5.4, < 5.6`. Until this job existed, nothing
+  # tested the second half of that range.
+  #
+  # That is the failure mode this project keeps finding in itself: a claim
+  # nobody re-measured. `spec/rockspec_spec.lua` even asserts the `< 5.6`
+  # bound, so the declaration was locked down while the thing it declared was
+  # never run. A version range CI does not exercise is a promise, not a fact.
+  #
+  # It is also how the macOS job broke on its first run: Homebrew's `lua`
+  # formula had quietly become 5.5, the job became an accidental 5.5 probe,
+  # and it failed on the vendored compat shim -- the same wall this job
+  # deliberately walks through.
+  #
+  # WHY THIS RUNS A SCRIPT FROM `docs/` RATHER THAN INLINE STEPS. The recipe
+  # is documentation and CI at once, on purpose. A documented build that CI
+  # does not execute rots silently; an inline CI build that the docs merely
+  # describe drifts the same way from the other side. One file, run by both,
+  # cannot.
+  #
+  # NOT `continue-on-error`. A job allowed to fail is a job whose failure
+  # nobody reads, which is the unverified claim again wearing a green tick.
+  # If Lua 5.5 support breaks, this should stop the build and say so.
+  #
+  # First runs may well be red, and that is the point rather than a defect in
+  # this file -- the same stance the matrix above takes with macOS. Every step
+  # echoes what it resolved, so a break is diagnosable from the log.
+  lua55:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git curl unzip libssl-dev libreadline-dev
+
+      # Every layer is compiled from source, so this is minutes without a
+      # cache and seconds with one. Keyed on the recipe itself: change the
+      # script or the pinned commit and the cache is correctly abandoned.
+      - name: Cache the 5.5 stack
+        uses: actions/cache@v4
+        with:
+          path: ~/lua55
+          key: lua55-${{ runner.os }}-${{ hashFiles('docs/runtime/lua55-stack.sh') }}-${{ env.CQUEUES_COMMIT }}
+
+      - name: Build the Lua 5.5 stack
+        run: LUA55_PREFIX=$HOME/lua55 bash docs/runtime/lua55-stack.sh
+
+      - name: Point the environment at the prefix
+        run: |
+          echo "prefix : $HOME/lua55"
+          echo "lua    : $HOME/lua55/bin/lua5.5"
+          echo "path   : $PWD/?.lua;$HOME/lua55/share/lua/5.5/?.lua;;"
+          echo "cpath  : $HOME/lua55/lib/lua/5.5/?.so;;"
+          echo "LUA55=$HOME/lua55/bin/lua5.5" >> "$GITHUB_ENV"
+          echo "LUA_PATH=$PWD/?.lua;$PWD/?/init.lua;$HOME/lua55/share/lua/5.5/?.lua;$HOME/lua55/share/lua/5.5/?/init.lua;;" >> "$GITHUB_ENV"
+          echo "LUA_CPATH=$HOME/lua55/lib/lua/5.5/?.so;;" >> "$GITHUB_ENV"
+          echo "$HOME/lua55/bin" >> "$GITHUB_PATH"
+
+      # The assertion that keeps this job honest. Without it, a PATH that
+      # happened to find the system Lua 5.4 would make this a duplicate of
+      # `unit` reporting itself as 5.5 coverage -- exactly the accident the
+      # macOS job had, in reverse.
+      - name: It really is 5.5, and it really is the pinned cqueues
+        run: |
+          lua5.5 -v
+          lua5.5 -e 'assert(_VERSION == "Lua 5.5", "got " .. _VERSION)'
+          lua5.5 -e 'print("cqueues  " .. (require("cqueues").VERSION or "?"))'
+          lua5.5 -e 'print("openssl  " .. require("openssl").version())'
+          lua5.5 -e '
+            local want = os.getenv("CQUEUES_COMMIT")
+            local got  = require("cqueues").COMMIT
+            assert(got, "cqueues has no COMMIT field: not the pinned build")
+            assert(got == want, "cqueues is " .. got .. ", pinned is " .. want)
+            print("commit   " .. got .. "  (pinned)")'
+
+      # PARITY WITH THE `unit` JOB, which installs it the same best-effort way.
+      #
+      # Without this the 5.5 job runs six fewer tests than `unit` and the two
+      # scoreboards differ for a reason that has nothing to do with Lua. Making
+      # them run the same set means any difference between them IS a finding.
+      # Neither job builds `pq_native.so`, so the C driver skips in both.
+      - name: Teal, best effort
+        run: |
+          luarocks --tree="$HOME/lua55" install tl \
+            || echo "tl unavailable; spec/teal_spec.lua will report pending"
+
+      - name: The suite, under Lua 5.5
+        run: busted
+
+      # 5.4 and 5.5 do not have to allocate identically, and if they diverge
+      # the ceiling is where it shows. `spec/allocation_spec.lua` is exact
+      # rather than statistical, so a difference here is a real difference.
+      - name: Allocation ceiling
+        run: busted spec/allocation_spec.lua
+
+      - name: The substrate contract
+        run: busted spec/substrate_spec.lua
+
+      # `doctor` has a 5.5 branch of its own -- it passes with a note rather
+      # than silently, because a 5.5 user did something deliberate. This is
+      # the only place that branch is ever executed.
+      - name: Doctor
+        run: lua5.5 bin/akkar doctor --no-probe
+
   # --------------------------------------------------------- integration
   # The same suite with the backends up, so the specs that skip themselves on
   # a laptop actually run somewhere.

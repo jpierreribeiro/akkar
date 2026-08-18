@@ -29,18 +29,17 @@ return app
 
 ## Status
 
-**Under construction, and used in earnest only by its author.** 1,696 tests,
-zero failures. The substrate is proven, the ergonomics are settled, and the
+**Under construction, and used in earnest only by its author.** 1,801 tests
+and zero failures on Lua 5.4; 1,763 and zero on Lua 5.5, which CI now runs as
+its own job. The substrate is proven, the ergonomics are settled, and the
 production shape is in — body limits, deadlines, pooling, graceful shutdown,
 structured logs, metrics, tracing, OpenAPI, migrations, jobs, sessions, an
 in-memory adapter for every capability, Teal declarations, and a strict mode
 that turns an accidental global into an error.
 
-**What it is not yet.** CI runs `ubuntu-24.04` and nothing else: ARM64 has been
-measured once by hand and macOS never, which matters more for something calling
-itself a runtime than it would for a library. Nobody outside this repository has
-put a request through it. No adversarial security review has happened, and the
-last two security defects were found by accident while building something else.
+**What it is not yet.** Nobody outside this repository has put a request
+through it. No adversarial security review has happened, and the last two
+security defects were found by accident while building something else.
 `docs/UNKNOWNS.md` is the honest list.
 
 **And it is not published.** akkar is not on luarocks.org, so installing means
@@ -861,7 +860,7 @@ JSON API has today, which is nothing.
 | `akkar.cache.memory` is per-process | two processes have two caches, and akkar's answer to more CPU is more processes |
 | Teal does not check schemas against handler output | schemas are runtime values; validation is what checks those |
 | Linear scan for dynamic routes | measured: 33 µs worst case at 50 routes against ~4000 µs for one query. Revisit past ~500 dynamic routes |
-| Runs on Lua 5.4, not yet 5.5 | The blocker is **`luaossl`**, whose makefile has no 5.5 target. `cqueues` master builds and runs an event loop under 5.5 once its vendored `lua-compat-5.3` is updated from v0.9; the published rock is what pins 5.4. Measured by `docs/runtime/lua55-probe.sh` |
+| Lua 5.5 works, but you build the stack yourself | The suite passes under 5.5 — **1763 passing, 0 failures**, against **1801** on 5.4. The 38-test difference is entirely tooling: 32 are the C driver, skipped because `akkar/pq_native.so` is one path that two Lua ABIs want, and 6 are the Teal declarations, skipped because `tl` is not installed in the 5.5 tree. What is missing is packaging, not portability: no distribution ships Lua 5.5 yet, `luaossl`'s makefile has no 5.5 rung (its C compiles clean — one `cc`), and `cqueues` needs the `lua-compat-5.3` it vendors refreshed from v0.9. `docs/runtime/lua55-stack.sh` does all of it into a prefix; 5.4 stays the default because `luarocks install akkar` cannot |
 | `akkar.vm` is a sandbox, not an isolated VM | Lua 5.4 cannot make a separate state from Lua. Real within its stated limits; against hostile code, use a separate process |
 | Streaming holds its capabilities open | a slow client reading a streamed export keeps a pool slot for as long as it reads |
 | The database path is pgmoon **by default** | decoding rows in the interpreter is 55% of a thousand-row query. `akkar-pq` moves it — 2.79x on a thousand rows — and is a separate rock so libpq stays optional |
