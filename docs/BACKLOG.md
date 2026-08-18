@@ -819,6 +819,127 @@ and the README promising a watchdog that cannot see a C call.
   the same shape as the skip guard this project once shipped that never
   checked anything.
 
+## 12. Open after HTTP/2, and after the CI it turned red
+
+Recorded on 2026-08-18, in the order they cost. Nothing here is a decision
+deferred for comfort; each one names what would settle it.
+
+### 12.1 The pool leak the simulation found, and could not reproduce
+
+**Status: open, and the sharpest thing on this list.**
+
+`spec/simulation_spec.lua` — the machine-checked invariant from L1 — went red
+on CI twice on the same assertion: `live=4 idle=1` on seed 19 on a Linux
+runner, `live=4 idle=3` on seed 16 on macOS. Resources checked out of the pool
+that never came back, which is the exact defect class the file was built to
+hunt, and the exact shape `akkar/pool.lua` records from the study box:
+`live=2 idle=0` and a permanent outage.
+
+**It does not reproduce here.** Thirty runs of seed 19; deadline budgets from
+20 ms down to 0.1 ms; pool sizes 4, 2 and 1 with up to 48 requests; the
+collector stopped outright so no finalizer could run. Every one clean, with
+`live=4 idle=4` before `reap` was even called.
+
+What the investigation established, which is worth more than the guesses it
+killed:
+
+- **`Pool:reap()` did nothing in any of those runs.** It returns 0 immediately
+  when `reserved()` is zero, and after a drain it always is — so the two
+  collections it performs, the ones its own comment says are what "finally
+  drops the coroutine", are skipped precisely when an abandoned handler's
+  release might be waiting on a finalizer. Measured, not inferred.
+- **The spec could not tell a slow machine from a broken pool.**
+  `cq:loop(30)` returns truthy whether it drained or ran out of time, and a
+  timed-out loop leaves coroutines still holding resources. That reads as a
+  leak and is not one.
+- **The spec measured before the last releases could happen.** Its comment
+  claimed everything in flight "has had its chance"; nothing in the code gave
+  it one, because anything scheduled after `cq:loop` returned never ran.
+
+All three are fixed: the spec now asserts `cq:empty()` separately with its own
+message, collects unconditionally, and runs the loop once more before reading
+stats. **Whether that makes CI green is not yet known**, and if it goes red
+again the message will now say which of the two things happened.
+
+**What would settle it:** a Linux box slow enough to reproduce, or an
+instrumented `Pool` that records who holds each resource and when the holder
+died. The second is more work and answers the question directly.
+
+**And a live suspicion, not yet a finding:** `reap`'s short-circuit may be
+wrong in production too. Its job is to turn abandoned reservations into free
+slots; a pool full of abandoned *resources* with zero reservations gets a 0
+and no collection. Changing it means collecting on a path that runs when the
+pool looks full, so it needs measuring before it is touched.
+
+### 12.2 Determinism is established on epoll, not on kqueue
+
+**Status: narrowed, with the narrowing in the assertion.**
+
+`spec/determinism_spec.lua` claimed forty concurrent requests reproduce byte
+for byte. On macOS CI they did not — two traces differed, with gaps in the id
+sequence. The order a cooperative scheduler resumes coroutines in comes from
+the kernel's polling mechanism, and `spec/support/portable.lua` already
+records that kqueue and epoll differ enough for one cqueues controller to cost
+two descriptors on one and three on the other.
+
+The test is now `pending` off Linux with that reason, and the file's own claim
+says "on epoll". **Establishing it on kqueue is real work**: it means either a
+scheduler of akkar's own on top of cqueues, or accepting that replay is a
+Linux property. L1's value — a seed makes a counterexample re-runnable — is
+intact on the machine the simulation runs on.
+
+### 12.3 HTTP/2 has no fuzz suite
+
+`spec/fuzz_spec.lua` covers h1 framing, which is where request smuggling
+lives. h2's framing layer is upstream lua-http 0.4's, unmodified, and akkar
+has not fuzzed it. The h1 fuzzer goes through a client, so it cannot express a
+frame this wrong; h2 needs its own, driving frames directly at
+`h2_connection`. Named in the README's known gaps rather than left implicit.
+
+### 12.4 The historical benchmarks are still unrepeated
+
+Every number published before 2026-08-17 came from `bench/study/regression.sh`
+while it was comparing a tree with itself — `ROOT` resolved into a symlink and
+`cp -a` copied the symlink. The harness is fixed and re-verifies its refs after
+both prepares. **The numbers have not been re-taken**, and the D4 table
+against the neighbours is the one that matters.
+
+Blocked on access rather than on work: the study box answers on port 22 and
+refuses this machine's key.
+
+### 12.5 WebSocket, and HTTP/3
+
+Both absent, both now written down where somebody evaluating akkar reads.
+
+WebSocket is lifecycle work, not protocol work — lua-http has an
+implementation, and what is missing is a capability and a shutdown story for a
+connection that outlives the request and response model.
+
+HTTP/3 is the exclusion that the argument actually fits: QUIC is a UDP
+transport with its own congestion control and TLS integration, neither cqueues
+nor lua-http has it, and there is no half of anything on disk to vendor.
+Terminated at the edge in practice.
+
+### 12.6 Isolation against hostile code is a decision about product shape
+
+Not an akkar defect, and the inventory says so: `akkar/vm.lua` states in its
+own header that a sandbox inside one Lua state is not a security boundary, and
+`spec/vm_spec.lua` covers every escape it does claim — bytecode, the unhooked
+coroutine, the pcall that swallows the budget, the single allocation that
+outruns the sampler, the shared string metatable.
+
+So what decides it is the price of a process per tenant, and that is measured:
+**28 ms to first response, 12.8 MB resident idle** — 1.22 GB for a hundred
+idle exercises, 6.09 GB for five hundred. Cheap, and the only option that *is*
+a boundary. `akkar.vm` keeps the smaller case: a hook published inside an
+application that is otherwise trusted.
+
+### 12.7 LAB L2–L5
+
+Structured concurrency, adaptive CoDel, and a profiler. GC tuning already came
+back measured at ≤3.5% and is refused. These are the only items on this page
+that are optional.
+
 ## What is deliberately not being built
 
 Written down because the list keeps trying to grow.
