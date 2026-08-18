@@ -65,9 +65,30 @@ same bytes and driving it with the same client:
 
 **The mechanism, measured:** a coroutine object is ~1.2 KB and the rest is Lua
 **stack reallocation as the coroutine descends**. 40 non-tail frames cost
-13,416 bytes; 200 frames cost 54,376. That is why the identical `cq:wrap` line
-costs 2,368 bytes in a minimal lua-http server and 3,813 in akkar — same
-allocation site, size set by the caller's call depth.
+13,416 bytes; 200 frames cost 54,376.
+
+**A correction, because an earlier version of this document got the direction
+wrong.** It said the size was set by the CALLER'S call depth. It is not:
+measured, 200 levels of caller depth cost **15 bytes**. A new coroutine gets a
+clean 45-slot stack whoever creates it, and the size is set by the depth **it
+itself** reaches. So the 2,368 → 3,813 gap between a minimal lua-http server
+and akkar is what akkar's handler does INSIDE the coroutine — `with_deadline`,
+the nested `pcall(function() … end)` closures in `init.lua`, the router, the
+JSON — not the call site.
+
+That matters because it changes what to optimise: not where the coroutine is
+created, but how deep the work inside it goes. And **`return next(ctx)` uses
+no stack space at all** (manual §3.4.10) — a middleware chain written as tail
+calls stays at the initial 40 slots and never calls `luaD_growstack`. Nothing
+is published about that anywhere, in Lua or in any language.
+
+Two further corrections to the same paragraph's arithmetic. The doubling base
+is `stack_last - stack` = **40**, not 45, and the allocated vector is
+`newsize + EXTRA_STACK`, so what `lua_Alloc` actually sees is
+`(5 + 40·2^k)·16`: **720 → 1,360 → 2,640 → 5,200 → 10,320**. And the per-frame
+cost is **not a constant** — it is the function's `maxstacksize`. Independent
+measurements give ~110 B/frame and ~335 B/frame for different functions; both
+are right, for different functions.
 
 **This re-ranks everything below, and two items lose most of their case:**
 
@@ -173,17 +194,49 @@ both ways.**
 
 **This is the whole of Track A now.** Everything else in it is rounding.
 
-**lua-http's**, `server_methods:add_stream` (server.lua:475) — 3,813 bytes.
-The ablation is a one-line change: call `handle_stream` inline from
-`handle_socket`'s loop. It has been run: 108 specs across http, concurrency,
-stream, slow_body, framing, shed, limit, abandoned, lifetime and
-deadline_propagation pass. **Risk medium-high**, and the risks are nameable:
-pipelined requests serialise (arguably already true — `req_locked` serialises
-reads), a blocking handler stalls that connection's loop, CONNECT and upgrade
-streams meant to outlive the request break, and `conn:onidle` / `cond:wait()`
-at server.lua:171-173 becomes dead code that must be reasoned about rather
-than left. A hybrid — inline unless `self.pipeline:length() > 1` — keeps both
-properties.
+**lua-http's**, `server_methods:add_stream` (server.lua:471) — 3,813 bytes,
+and **the upstream reason for it does not apply to this build.**
+
+The author went back and forth on exactly this line. `959dd1f` (2016-10-04),
+*"http/server: Use a pcall instead of starting a new thread for each stream"*;
+then `cbcac36` (2016-10-16), *"Start a new thread for each stream as it comes
+in"*, whose body says *"HTTP1 requests will now be pipelined for servers.
+Fixes #44"*. And on that issue, in the author's words: *"for http 1 this may
+be preferred, as it makes pipelining optional. **However for http 2 this is
+bad**: http2 clients often make dummy streams for arranging priorities."*
+
+**HTTP/2 is the whole reason, and h2 is exactly what the vendoring deleted.**
+The only diff against upstream in `server.lua` is the h2 removal;
+`handle_stream`, `add_stream` and the `cq:wrap` are untouched.
+
+Measured, by loading the vendored `server.lua` in memory with that one line
+replaced, 400 keep-alive requests after 50 of warm-up, collector stopped:
+
+| trial | `cq:wrap` | inline | saved |
+|---|---:|---:|---:|
+| 1 | 4,291 | 1,921 | 2,371 |
+| 2 | 4,289 | 1,921 | 2,368 |
+| 3 | 4,289 | 1,921 | 2,368 |
+
+**2,368 bytes**, and it agrees byte-for-byte with the figure already measured
+for a minimal lua-http server — two instruments landing on one number.
+
+**Concurrency BETWEEN connections is preserved, and that was measured** rather
+than argued: a 300 ms `/slow` on one connection and a `/fast` on another,
+`/fast` finished first in both variants. Each connection keeps its own
+coroutine in `handle_socket`. What is lost is pipelining WITHIN a connection.
+
+**The one gap that must close before this ships:** no A/B against a client
+that actually pipelines was achieved — the test client failed in both
+variants, so the effect on such a client is *undetermined*. "No mainstream
+browser pipelines" is an assertion, not a measurement. 108 specs pass across
+http, concurrency, stream, slow_body, framing, shed, limit, abandoned,
+lifetime and deadline_propagation, which is necessary and not sufficient.
+
+Also still to reason about rather than leave: CONNECT and upgrade streams
+meant to outlive the request, and `conn:onidle` / `cond:wait()` at
+server.lua:171-173 becoming dead code. A hybrid — inline unless
+`self.pipeline:length() > 1` — keeps both properties.
 
 **akkar's**, `with_deadline` (execution.lua:358) — 2,288 bytes. **Risk high:**
 this coroutine *is* the abandonment mechanism, and `spec/abandoned_spec.lua`
@@ -239,6 +292,47 @@ not exist is a test proving a late handler cannot touch a recycled connection.
 
 **Write that test first.** It is the gate on both of the two largest wins in
 this plan, and it is the only thing either of them is waiting for.
+
+### A3 — pre-grow the coroutine's stack  ·  new, and it has a precedent with numbers
+
+If a coroutine's cost is the doubling chain `720 → 1,360 → 2,640 → 5,200`,
+then asking for the final size once collapses the chain to one allocation —
+and, more importantly, to **one pointer-fixup pass**. Every `luaD_growstack`
+runs `correctstack`, which rewrites every pointer on the stack.
+
+**Go did exactly this, automatically, and measured it.** golang/go#18138,
+reported by CockroachDB: *"The expensive part of `runtime.morestack` is the
+adjustment of existing pointers on the stack… I can see the stack growing in 4
+steps from 2 KB to 32 KB."* Pre-growing at goroutine entry gave −17.1%, −10.4%
+and −9.0% on three of their benchmarks, and the version that shipped in Go
+1.19 carries `benchstat` with variance: `95.3µs ±0% → 67.3µs ±13%, −29.35%
+(p=0.000 n=9+10)`. Go now computes the starting size from the mean of stacks
+scanned in the previous GC.
+
+In Lua the lever is `lua_checkstack(co, N)` from C, or from pure Lua
+`table.unpack(EMPTY, 1, N)` — `ltablib.c:194` calls `lua_checkstack` before
+pushing.
+
+**Cost: an hour to try.** Nothing is published about this in Lua, in any
+version, by anyone.
+
+### A4 — swap the allocator  ·  ten minutes, and the cheapest experiment here
+
+Lua 5.4 routes every GC object through `lua_Alloc` → `realloc`. If the runtime
+is allocation-bound — the 0.75 coupling says it is — the allocator is on the
+critical path of the thing it is bound by, and it has never been varied.
+
+`LD_PRELOAD=libmimalloc.so` against the existing benchmark, which has a known
+1.16% noise floor, so the result is interpretable either way. The only
+published number for swapping Lua 5.4's allocator: Eduardo Bart, lua-l 2020,
+1.071 s → 0.864 s, **−19.3%** — method stated (Lua 5.4, GCC 10, x86_64, mean
+of 10 runs) but one workload, no variance, no noise floor. Directional only.
+
+If it moves, a size-class pool in `lua_Alloc` over `{720, 1360, 2640, 5200,
+10320}` becomes priced and evidence-backed — and the contract favours it: Lua
+hands `osize` exactly on both realloc and free, so the free-list lookup is
+O(1) **with no per-block header**, which a general-purpose allocator cannot
+do. Proposed on lua-l in 2005 and 2016, never built, never measured.
 
 ### A3 — the header write path
 
