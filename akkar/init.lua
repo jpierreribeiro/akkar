@@ -1893,6 +1893,38 @@ local function read_body(stream, request_headers, limit, budget)
   -- documented way served nothing at all.
   local deadline = budget and budget > 0 and (time.monotime() + budget) or nil
 
+  -- GROW THE SOCKET'S READ BUFFER TO FIT THE BODY, ONCE, BEFORE READING IT.
+  --
+  -- `socket_buffer` defaults to 1024, which gives back 5.4 KB per idle
+  -- connection. That default was chosen from a syscall count taken on a
+  -- 13-byte reply and a request with NO BODY, and it was wrong for anything
+  -- larger. Counted with `strace -c` over 400 POSTs carrying a 2 KB JSON
+  -- body, against the same run at 4096:
+  --
+  --     buffer   read   write   sendto   epoll_wait   epoll_ctl
+  --       1024   6513    2254     1800         5410        1808
+  --       4096   4266    1356     1350         4063         910
+  --
+  -- +53% reads, +66% writes and +99% epoll_ctl, because a body larger than
+  -- the buffer is read in buffer-sized pieces and each piece is a trip
+  -- through the event loop.
+  --
+  -- The fix is not a bigger default -- a bigger default pays on every idle
+  -- connection for a body most requests do not have, and whatever number is
+  -- picked, a body one byte larger costs the same again. akkar knows
+  -- `content-length` HERE, before a byte of body is read, and cqueues' buffer
+  -- can only ever grow (`fifo_realloc` refuses to shrink), so the buffer is
+  -- sized for this request and stays sized for the connection.
+  --
+  -- Bounded by `limit`, which is already the body limit: a client cannot make
+  -- the server allocate a buffer for a body it will not be allowed to send.
+  if declared and declared > 0 then
+    local want = declared < limit and declared or limit
+    local connection = stream.connection
+    local sock = connection and connection.socket
+    if sock then pcall(sock.setbufsiz, sock, want) end
+  end
+
   local parts, total = {}, 0
   while true do
     local remaining
