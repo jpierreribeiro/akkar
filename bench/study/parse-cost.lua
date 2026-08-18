@@ -33,11 +33,40 @@ local SHORT = "host: example.com"
 local LONG  = "user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " ..
               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-local hs = per_call("header line, short (17 B): match", function()
-  return SHORT:match "^([^%s:]+):[ \t]*(.-)[ \t]*$"
+-- THE PATTERN THE CODE ACTUALLY USES, WHICH IS NOT WHAT THIS FILE MEASURED.
+--
+-- It measured `^([^%s:]+):[ \t]*(.-)[ \t]*$` -- the form `h1_connection.lua`
+-- carried until 18 August 2026. A lazy `(.-)` with an anchored tail makes the
+-- cost track the string's LENGTH rather than its work, and the 118-byte header
+-- read 6,698 ns/call because of it.
+--
+-- That pattern is gone. `read_header` now matches `(.*)$` and walks back over
+-- trailing spaces and tabs in bytes, which took the same header from 6,693 to
+-- 1,436 ns -- 4.7x. Measuring the old form here priced a cost that no longer
+-- exists, and it did so in the file whose whole purpose is deciding whether to
+-- write a C tokeniser. It would have argued for one on 46.6% of CPU that had
+-- already been removed in Lua.
+--
+-- Both halves are timed, because the trailing walk is part of the price.
+local function read_header_as_shipped(line)
+  local key, val = line:match "^([^%s:]+):[ \t]*(.*)$"
+  if key then
+    local last = #val
+    while last > 0 do
+      local c = val:byte(last)
+      if c ~= 32 and c ~= 9 then break end
+      last = last - 1
+    end
+    if last ~= #val then val = val:sub(1, last) end
+  end
+  return key, val
+end
+
+local hs = per_call("header line, short (17 B): as shipped", function()
+  return read_header_as_shipped(SHORT)
 end)
-local hl = per_call("header line, long (118 B): match", function()
-  return LONG:match "^([^%s:]+):[ \t]*(.-)[ \t]*$"
+local hl = per_call("header line, long (118 B): as shipped", function()
+  return read_header_as_shipped(LONG)
 end)
 
 -- `read_header` lowercases the name before it becomes a key.
