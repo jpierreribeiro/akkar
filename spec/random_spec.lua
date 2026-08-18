@@ -127,13 +127,16 @@ describe("akkar.random", function()
   end)
 
   it("is what the execution id prefix is drawn from", function()
-    -- The prefix is per-process and computed at load, so this asserts the
-    -- CALL rather than the value: reloading `akkar.execution` under a seeded
-    -- generator twice must produce the same prefix.
+    -- No `package.loaded` surgery. The first version of this test cleared the
+    -- module and required it again, because the prefix was drawn at LOAD --
+    -- which meant `random.set` could never reach it, and the workaround was
+    -- hiding that. `execution.reset_id_prefix` exists because a seam usable
+    -- only by reloading the module is not a seam.
+    local execution = require "akkar.execution"
+
     local function prefix_under(seed)
       local restore = random.set(random.seeded(seed))
-      package.loaded["akkar.execution"] = nil
-      local execution = require "akkar.execution"
+      execution.reset_id_prefix()
       local id = execution.id()
       restore()
       return id:sub(1, 8)
@@ -146,9 +149,8 @@ describe("akkar.random", function()
     assert.equal(a, b)
     assert.are_not.equal(a, c, "the seed did not reach the id prefix")
 
-    -- Left as the real module found it, so no later spec inherits a seeded
-    -- prefix from this one.
-    package.loaded["akkar.execution"] = nil
-    require "akkar.execution"
+    -- Back to a prefix from the real generator, so no later spec inherits a
+    -- seeded one.
+    execution.reset_id_prefix()
   end)
 end)

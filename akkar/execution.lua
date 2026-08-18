@@ -94,15 +94,38 @@ end
 -- separates processes and nothing more: `akkar/trace.lua:144` is explicit
 -- that an id which must be unguessable comes from `akkar.crypto` instead, and
 -- this one never had to be.
-local ID_PREFIX = string.format("%08x", random.integer(0, 0xffffffff))
+--
+-- DRAWN ON FIRST USE, NOT AT LOAD, and the difference is the whole point of
+-- routing it through `akkar.random` at all. Drawn at load it is drawn before
+-- any caller can install a generator -- `require` happens first, always -- so
+-- the seam existed and could not be reached. Measured: two processes with the
+-- same seed produced identical traces of forty concurrent requests in every
+-- respect EXCEPT this prefix, which differed because `random.set` had come
+-- too late to matter.
+--
+-- The first version of `spec/random_spec.lua` worked around it by clearing
+-- `package.loaded` and requiring the module again. A seam that can only be
+-- used by reloading the module is not a seam.
+local ID_PREFIX
 local id_counter = 0
 
 --- The next execution id. Callers that accept a caller-supplied id -- the HTTP
 --- layer honours `x-request-id` -- decide that themselves and only fall back
 --- here, because "trust a header" is a transport question.
 function M.id()
+  ID_PREFIX = ID_PREFIX or string.format("%08x", random.integer(0, 0xffffffff))
   id_counter = id_counter + 1
   return ID_PREFIX .. string.format("%06x", bitwise.band(id_counter, 0xffffff))
+end
+
+--- Forgets the prefix, so the next id draws a new one.
+---
+--- For a replay harness and for tests, which are the only callers that want
+--- two runs in one process to look like two processes. Not exported through
+--- `akkar` itself: an application has no reason to renumber its own requests.
+function M.reset_id_prefix()
+  ID_PREFIX = nil
+  id_counter = 0
 end
 
 -- ============================================================== the lifetime
