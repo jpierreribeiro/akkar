@@ -244,7 +244,7 @@ local SETTINGS = {
   check_capabilities = true, reuseport = true, strict = true,
   max_concurrent = true, trusted_proxies = true,
   repair_substrate = true, socket_buffer = true, gc = true,
-  cpu_limit = true,
+  cpu_limit = true, h2c = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -2458,6 +2458,17 @@ function App:run(config)
       local ctx = openssl_ctx.new(config.tls.protocol or "TLS", true)
       ctx:setCertificate(x509.new(pem(certificate)))
       ctx:setPrivateKey(pkey.new(pem(key)))
+
+      -- ALPN, WITHOUT WHICH HTTP/2 IS UNREACHABLE OVER TLS AND NOTHING SAYS
+      -- SO. A browser only ever speaks h2 after ALPN offers it; a context
+      -- built without the callback advertises nothing, the client falls back
+      -- to HTTP/1.1, the handshake succeeds and the request is answered. The
+      -- failure is silent by construction -- it was measured here as
+      -- `negotiated=HTTP/1.1` against a server that speaks h2 fine.
+      local http_tls = require "akkar.vendor.http.tls"
+      if http_tls.has_alpn then
+        ctx:setAlpnSelect(server.alpn_select, nil)
+      end
       return ctx
     end)
     if not ok then
@@ -2576,6 +2587,11 @@ function App:run(config)
 
   local s = assert(server.listen {
     host = host, port = port, tls = tls_on, ctx = tls_ctx,
+    -- HTTP/2 OVER TLS NEEDS NOTHING HERE: ALPN settles it, and a client that
+    -- does not ask for h2 never pays for its being on offer. CLEARTEXT h2 is
+    -- `h2c = true` because the preface sniff it needs is a read on every
+    -- connection, h1 ones included. See `akkar/vendor/http/server.lua`.
+    h2c = config.h2c,
     reuseport = config.reuseport,
     max_concurrent = max_concurrent,
     onstream = function(_, stream)

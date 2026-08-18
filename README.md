@@ -2,7 +2,10 @@
 
 **An application runtime for backend services in Lua 5.4**, on `cqueues` and
 `lua-http`. One coroutine per request, one thread per process, no nginx in
-front.
+front. **HTTP/1.1 and HTTP/2**, the second negotiated by ALPN over TLS with no
+configuration, or `h2c = true` for cleartext. See
+[what akkar does not do](docs/why/what-akkar-does-not-do.md) for the rest of
+the boundary; HTTP/3 is not there.
 
 **akkar turns common server mistakes into impossible states or explicit
 errors.** Handlers return, so a double response cannot happen. I/O goes through
@@ -29,8 +32,8 @@ return app
 
 ## Status
 
-**Under construction, and used in earnest only by its author.** 1,801 tests
-and zero failures on Lua 5.4; 1,763 and zero on Lua 5.5, which CI now runs as
+**Under construction, and used in earnest only by its author.** 1,830 tests
+and zero failures on Lua 5.4; 1,792 and zero on Lua 5.5, which CI now runs as
 its own job. The substrate is proven, the ergonomics are settled, and the
 production shape is in — body limits, deadlines, pooling, graceful shutdown,
 structured logs, metrics, tracing, OpenAPI, migrations, jobs, sessions, an
@@ -431,6 +434,26 @@ assignment to undeclared global 'total' at handlers/cart.lua:14
 akkar itself measures clean — zero global writes across every module, checked
 in the bytecode — and the whole test suite runs under strict mode so that stays
 true.
+
+**HTTP/2, negotiated rather than configured.** Serve TLS and a browser gets
+h2 by ALPN; there is no option to turn on and no second listener:
+
+```lua
+app:run { port = 443, tls = { certificate = "cert.pem", key = "key.pem" } }
+```
+
+Cleartext h2 — a gRPC client, or a proxy on a private network — is opt-in,
+because without TLS the only way to detect it is to sniff the connection
+preface, and that is a read on **every** connection including h1 ones:
+
+```lua
+app:run { port = 8080, h2c = true }
+```
+
+Measured here, six 0.5 s requests over one connection: **552 ms over h2 against
+3,071 ms over h1**. That is multiplexing, and it is the reason h2 exists — the
+same handlers, the same routes, nothing in the application changes. HTTP/3 is
+not here.
 
 **Several processes, one port.** One Lua VM is one core, so capacity is
 processes. `SO_REUSEPORT` lets them share a port with no proxy in front:
@@ -856,11 +879,14 @@ JSON API has today, which is nothing.
 
 | | |
 |---|---|
+| No HTTP/3 | HTTP/1.1 and HTTP/2 are both here; QUIC is a UDP transport with its own congestion control and TLS integration, and neither cqueues nor lua-http has it. Behind a proxy this costs nothing, which is where h3 is terminated in practice |
+| No WebSocket | a long-lived connection outside the request/response model needs its own capability and its own shutdown story. lua-http has an implementation; the lifecycle is the work |
+| HTTP/2 has no fuzz suite of its own yet | `spec/fuzz_spec.lua` covers h1 framing, where request smuggling lives. h2's framing layer is upstream lua-http 0.4's, unmodified, but akkar has not fuzzed it |
 | Uploads are buffered, not streamed | a multipart body is held in memory under `body_limit` |
 | `akkar.cache.memory` is per-process | two processes have two caches, and akkar's answer to more CPU is more processes |
 | Teal does not check schemas against handler output | schemas are runtime values; validation is what checks those |
 | Linear scan for dynamic routes | measured: 33 µs worst case at 50 routes against ~4000 µs for one query. Revisit past ~500 dynamic routes |
-| Lua 5.5 works, but you build the stack yourself | The suite passes under 5.5 — **1763 passing, 0 failures**, against **1801** on 5.4. The 38-test difference is entirely tooling: 32 are the C driver, skipped because `akkar/pq_native.so` is one path that two Lua ABIs want, and 6 are the Teal declarations, skipped because `tl` is not installed in the 5.5 tree. What is missing is packaging, not portability: no distribution ships Lua 5.5 yet, `luaossl`'s makefile has no 5.5 rung (its C compiles clean — one `cc`), and `cqueues` needs the `lua-compat-5.3` it vendors refreshed from v0.9. `docs/runtime/lua55-stack.sh` does all of it into a prefix; 5.4 stays the default because `luarocks install akkar` cannot |
+| Lua 5.5 works, but you build the stack yourself | The suite passes under 5.5 — **1792 passing, 0 failures**, against **1830** on 5.4. The 38-test difference is entirely tooling: 32 are the C driver, skipped because `akkar/pq_native.so` is one path that two Lua ABIs want, and 6 are the Teal declarations, skipped because `tl` is not installed in the 5.5 tree. What is missing is packaging, not portability: no distribution ships Lua 5.5 yet, `luaossl`'s makefile has no 5.5 rung (its C compiles clean — one `cc`), and `cqueues` needs the `lua-compat-5.3` it vendors refreshed from v0.9. `docs/runtime/lua55-stack.sh` does all of it into a prefix; 5.4 stays the default because `luarocks install akkar` cannot |
 | `akkar.vm` is a sandbox, not an isolated VM | Lua 5.4 cannot make a separate state from Lua. Real within its stated limits; against hostile code, use a separate process |
 | Streaming holds its capabilities open | a slow client reading a streamed export keeps a pool slot for as long as it reads |
 | The database path is pgmoon **by default** | decoding rows in the interpreter is 55% of a thousand-row query. `akkar-pq` moves it — 2.79x on a thousand rows — and is a separate rock so libpq stays optional |

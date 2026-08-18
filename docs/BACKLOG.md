@@ -534,8 +534,8 @@ the milestone everything else was clearing the way for is still the milestone.
   Postgres query. A prefix tree would buy 0.8% of a request. Revisit past ~500
   dynamic routes; until then this is optimising noise.
 - **Lua 5.5 — done, and this entry was wrong twice on the way there.** akkar's
-  whole suite passes under Lua 5.5: **1763 passing, 0 failures, 0 errors**,
-  against 1801 on 5.4. The 38-test difference is tooling, measured rather than
+  whole suite passes under Lua 5.5: **1792 passing, 0 failures**,
+  against 1830 on 5.4. The 38-test difference is tooling, measured rather than
   assumed: 32 are `akkar.pq`'s half, which skips because one `pq_native.so`
   path serves two Lua ABIs, and 6 are `teal_spec`, which skips because `tl` is
   not installed in the 5.5 tree. Nothing in akkar had to change for any of it.
