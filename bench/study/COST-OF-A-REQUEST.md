@@ -242,3 +242,18 @@ case, and a production request is somewhere between 1.6× and 5× of it
 depending on shape.
 
 **Reproduce:** `lua5.4 bench/study/request-shapes.lua`.
+
+### And the harnesses were changed, not just the report
+
+Finding that the fixture hides between 1.6× and 5× and leaving the benchmarks
+measuring the old shape would be half the work. `bench/study/lib.sh` and
+`bench/runtime/run.sh` now default to `SHAPE=browser` -- six headers a browser
+actually sends -- and both **print the shape with every run**, because a run
+under one shape is not comparable with a run under another and the only
+defence against comparing them by accident is that both say which they were.
+
+`SHAPE=bare` restores the two-header form, for comparison with anything
+published before 18 August 2026.
+
+**Everything above this section was taken with `bare`.** They are the cheapest
+request akkar can serve, and they stay on this page as that.

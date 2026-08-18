@@ -46,7 +46,17 @@ PROCS=${PROCS:-2}
 #
 #     ROUTE=/users/42 bash bench/study/regression.sh origin/main HEAD
 ROUTE=${ROUTE:-/ping}
+
+# The request shape lives in `lib.sh`, because that is where the MEASURED wrk
+# call is -- `run_wrk`. Setting it here would have dressed the warm-up and left
+# the measurement bare, which is exactly the class of mistake the shape exists
+# to stop. `SHAPE=bare` restores the pre-18-August form.
 HZ=$(getconf CLK_TCK)
+
+# Printed, not remembered: a run under one shape is not comparable with a run
+# under another, and the only defence against comparing them by accident is
+# that both say which they were.
+echo "request shape: ${SHAPE:-browser}"
 
 BASE_TREE=$HOME/study/tree-base
 HEAD_TREE=$HOME/study/tree-head
@@ -115,7 +125,7 @@ for rep in $(seq 1 "$REPS"); do
     [ "$rep" -eq 1 ] && {
       probe_body "http://127.0.0.1:$PORT$ROUTE" >/dev/null || {
         echo "REFUSING: $variant did not answer"; exit 1; }
-      taskset -c "$GENERATOR" wrk -t"$THREADS" -c"$CONNS" -d3s \
+      taskset -c "$GENERATOR" wrk "${WRK_HEADERS[@]}" -t"$THREADS" -c"$CONNS" -d3s \
         "http://127.0.0.1:$PORT$ROUTE" >/dev/null 2>&1
     }
     b=$(cpu_ticks); ws=$(date +%s.%N)
