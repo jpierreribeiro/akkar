@@ -24,7 +24,13 @@ where noted.
 |---|---:|---:|---:|---:|
 | req/s | ~11,800 | ~8,400 | ~12,500 | ~101,000 |
 | p99 | 10–13 ms | 14 ms | 28–39 ms | 1.0 ms |
-| KB per idle connection | 6.96 | 15.24 | 15.52 | 0.42 |
+| KB per idle connection | **withdrawn** | withdrawn | withdrawn | withdrawn |
+
+**The idle-connection row is withdrawn, all four of it.** `(rss1-rss0)/n` was
+dividing a fixed allocator step by the connection count and publishing it as a
+marginal cost; measured at two sizes, akkar's figure falls from 10.24 to 6.40
+KB purely by holding more connections. `bench/runtime/RESULTS.md` §D3 has the
+arithmetic and the corrected method. The throughput and tail rows above stand.
 
 Lapis is the comparison that means something: identical cqueues, identical
 lua-http, identical rock tree. **akkar is 31% faster than it**, so the

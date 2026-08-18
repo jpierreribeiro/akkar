@@ -29,15 +29,64 @@ Versions, resolved rather than assumed:
 
 ## D4 — throughput and tail on `/ping`
 
+**RE-MEASURED 18 August 2026 under the browser request shape.** The table
+below replaces one taken with the bare two-header fixture, against an akkar
+1.34× slower. Numbers from the two shapes are not comparable, which is why the
+harness now prints which shape it used.
+
 | candidate | mean req/s | spread | p50 | p99 | vs akkar |
 |---|---:|---:|---:|---:|---:|
-| **OpenResty** | **107,478** | 2.22% | 0.92 ms | 1.02 ms | **11.2×** |
-| Luvit | 11,831 | **25.60%** | ~6.2 ms | 27–51 ms | 1.23× |
-| **akkar** | **9,627** | 1.16% | 10.1 ms | ~13.1 ms | — |
-| Lapis | 8,244 | 1.58% | 11.8 ms | ~15.2 ms | 0.86× |
+| **OpenResty** | **91,829** | 0.79% | 1.08 ms | ~1.21 ms | **9.15×** |
+| Luvit | 10,907 | 5.43% | ~7.1 ms | 30–41 ms | 1.09× |
+| **akkar** | **10,038** | 0.52% | 9.78 ms | ~11.8 ms | — |
+| Lapis | 6,826 | 1.31% | 14.4 ms | ~17.5 ms | 0.68× |
 
 Zero non-2xx responses anywhere. Rule 1's equivalence gate passed for all four
 before the clock started.
+
+**The gap to OpenResty is 9.15×, not the 11.2× this file used to say**, and the
+margin over Lapis — the candidate on the identical substrate, same cqueues,
+same vendored lua-http, same rocks — went from 1.17× to **1.47×**.
+
+**Luvit is the reason a mean is not enough.** It is 1.09× ahead on throughput
+and 2.5–3.5× behind on the tail, with a spread five to twenty times akkar's
+across runs. A table with only the first column would report it as the faster
+runtime.
+
+### These latencies are queueing, and the arithmetic says so
+
+Every candidate here is measured at 100 connections, and three of the four sit
+exactly on Little's law — latency = concurrency / throughput:
+
+| candidate | 100 / req/s | p50 measured |
+|---|---:|---:|
+| OpenResty | 1.09 ms | 1.08 ms |
+| akkar | 9.96 ms | 9.78 ms |
+| Lapis | 14.6 ms | 14.4 ms |
+
+Measured against concurrency, akkar's own service time is **117 µs**:
+
+| connections | req/s | p50 | p99 | 100 / req/s |
+|---:|---:|---:|---:|---:|
+| 1 | 7,948 | **117 µs** | 321 µs | 0.13 ms |
+| 4 | 9,757 | 383 µs | 681 µs | 0.41 ms |
+| 16 | 10,290 | 1.45 ms | 2.01 ms | 1.55 ms |
+| 100 | 10,417 | 9.49 ms | 11.51 ms | 9.60 ms |
+
+Throughput saturates by sixteen connections; everything above that is queue.
+At a hundred the p50 is **81× the service time**.
+
+**So the tail is not a separate axis from throughput here — it is throughput in
+other units.** 91,829/10,038 is 9.15×, and 9.78/1.08 is 9.06×: the same number.
+A plan that treats "close the latency gap" as a different project from "close
+the throughput gap" is counting one thing twice.
+
+What this does NOT say is that tail defects do not exist. One was found and
+fixed the same week: a pool that woke every waiter and let a running coroutine
+take the connection produced a p99 of 5.42 s against a p50 of 5.9 ms — a ratio
+of 900, which is nothing like a queue. The ratios above are 1.2 to 2.7. That is
+what a healthy queue looks like, and it is the evidence that no such defect is
+left at this load.
 
 ### The result that matters most, and it contradicts the prediction
 
@@ -273,15 +322,45 @@ of 28–39 ms against akkar's 10.5.
 
 ## D3 — cost per idle keep-alive connection
 
-| candidate | fds/conn | KB/conn |
-|---|---:|---:|
-| OpenResty | 1.000 | **0.42** |
-| **akkar** | 1.000 | **6.96** |
-| Lapis | 1.000 | 15.24 |
-| Luvit | 1.000 | 15.52 |
+**EVERY NUMBER THAT USED TO BE IN THIS SECTION IS WITHDRAWN.** It read
+`akkar 6.96, OpenResty 0.42, Lapis 15.24, Luvit 15.52` and none of those is a
+per-connection cost.
 
-**akkar was the worst of the four here and is now the best of the three that
-run a Lua VM**, at less than half what Lapis pays on the identical substrate.
+`(rss1 - rss0) / n` divides a delta that has a FIXED part in it — the process
+crossing a malloc arena boundary while it serves the first connections — by the
+number of connections, and publishes the result as marginal. Measured on akkar,
+one binary, one machine:
+
+    n=200    10.24 KB/connection    total delta 2,048 KB
+    n=800     6.40 KB/connection    total delta 5,120 KB
+
+The figure falls 38% purely by holding more connections. Solving the two gives
+a marginal of 5.12 KB and a fixed step of 1,024 KB — at n=200 the step alone
+contributes half the published number.
+
+It was found because akkar appeared to regress 6.96 → 10.70 between two runs
+while the other three moved by less than 0.3%. Bisected, the step appears at
+the commit that added `akkar/bitwise.lua` — and the Lua heap after
+`require "akkar"` is IDENTICAL across that boundary, 1,677.5 KB against
+1,677.3, while `require "akkar.bitwise"` on its own costs zero. Ninety-five
+lines of Lua do not buy 1.3 MB. It is where the allocator's boundary fell.
+
+`run.sh` now solves for the marginal from two sizes and reports the fixed step
+separately, per process. The first run of the corrected form gives:
+
+| candidate | fds/conn | marginal KB/conn | fixed KB |
+|---|---:|---:|---:|
+| OpenResty | 1.000 | 0.51 | −103 |
+| **akkar** | 1.000 | **0.73** | 315 |
+| Luvit | 1.000 | 4.64 | 1,432 |
+| Lapis | 1.000 | 8.59 | −1,089 |
+
+**And these are not published either.** Two of the four solve to a NEGATIVE
+fixed step, which is physically impossible and says the two-point fit is too
+crude for them. What is established is that the marginal is far below what this
+file used to claim, and that akkar sits near OpenResty rather than 16× away
+from it. What it is exactly needs a third size and control over when the
+collector runs.
 That is `app:run { socket_buffer = 1024 }`: cqueues preallocates a 4 KB input
 and a 4 KB output buffer per socket, eagerly, in C where the Lua collector
 cannot see it. `bench/study/HTTP-OPTIMISATION.md` has the sweep and the

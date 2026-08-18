@@ -111,8 +111,15 @@ small payload, four calls different over 76 MB on the large one. The buffer
 bounds what is preallocated, not what a read asks for.
 
 Result on the box: akkar went from **worst of four** on that dimension to best
-of the three that run a Lua VM — 6.96 KB per idle connection against Lapis's
-15.24 on the identical substrate.
+of the three that run a Lua VM.
+
+**The 6.96 KB figure that used to be quoted here is withdrawn**, along with the
+15.24 it was compared against. Neither is a per-connection cost: the instrument
+divided a fixed per-process allocator step by the connection count. Re-measured
+at two sizes, the same binary reports 10.24 KB at 200 connections and 6.40 at
+800. `bench/runtime/RESULTS.md` §D3 carries the correction. The direction of
+the result survives — the eager 4 KB buffers were real and shrinking them was
+real — but the number does not.
 
 ### Lua 5.5 is done, C driver included
 
