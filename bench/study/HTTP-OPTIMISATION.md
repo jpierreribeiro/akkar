@@ -344,6 +344,36 @@ move. An instrument that cannot see the effect it is measuring reports "no
 difference", which reads exactly like a regression. The spec spawns its own
 server process now.
 
+## Two more that measured ZERO, and one of them cancels a planned phase
+
+**Validation allocates nothing above its own output.** F4 in the plan proposes
+compiling a specialised validator per schema. Measured first, 20,000
+iterations, collector stopped:
+
+```
+validate, 4 fields, all present    152.0 bytes
+just the cleaned output table      152.0 bytes
+```
+
+Identical. F0 -- pre-expanding schemas at route registration -- already removed
+every allocation validation used to make, and what is left is the table the
+caller asked for. **Codegen would save zero bytes.** Its remaining case is CPU:
+removing the `pairs(schema)` walk and the per-field dispatch in `check_one`.
+That is a real cost and it is not measurable with this instrument, so F4 now
+needs a CPU measurement on the study box before it is worth building rather
+than before it is worth shipping.
+
+**A lazy header index saves 7 bytes.** `new_headers` allocates four tables and
+one of them is `_index`; building it on first read instead of incrementally in
+`append` looked like a free table for any headers object that is only written
+and walked. It is not: `get_headers` reads `content-length`,
+`transfer-encoding`, `connection` and `expect` from the request headers, and
+`write_headers` reads `:status` from the response headers. Both objects are
+read, so laziness defers the table rather than avoiding it.
+
+Reverted. The change added an `index_of` indirection to six readers for seven
+bytes, and a slower reader for no memory is the wrong side of the trade.
+
 ## What is left, sized
 
 | opportunity | worth | risk |
