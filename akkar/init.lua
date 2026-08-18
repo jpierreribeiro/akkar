@@ -1387,9 +1387,37 @@ end
 -- identity, and only HTTP has an opinion about honouring a caller's header.
 -- That split is deliberate -- `execution.id()` cannot be handed a header,
 -- because trusting one is a transport decision and belongs here.
+--- One header out of whatever shape the transport handed us.
+---
+--- `request_id` and nothing else needs a header BEFORE `req` exists, and it
+--- needs exactly one. Normalising all of them to answer that was most of what
+--- made a browser-shaped request expensive: 12% of its CPU spent copying
+--- headers, on the overwhelming majority of requests that never read one.
+---
+--- Two shapes, because `app:test` passes a plain table and the server passes a
+--- lua-http headers object, and `normalize_headers` has always handled both.
+local function one_header(source, name)
+  if not source then return nil end
+  if type(source.get) == "function" then return source:get(name) end
+  for key, value in pairs(source) do
+    if key:lower() == name then return value end
+  end
+  return nil
+end
+
 local function request_id(headers)
   local given = headers and headers["x-request-id"]
   if given and #given > 0 and #given <= 200 then return given end
+  return execution.id()
+end
+
+--- The same rule, against raw transport headers rather than a normalised copy.
+---
+--- Kept separate rather than folded into `request_id`, because `request_id` is
+--- exported and `spec/` calls it with a plain normalised table.
+local function request_id_from(source)
+  local given = one_header(source, "x-request-id")
+  if type(given) == "string" and #given > 0 and #given <= 200 then return given end
   return execution.id()
 end
 
@@ -1580,6 +1608,15 @@ local REQUEST_MT = {
       -- fields, grew the table's hash part and cost 392 bytes on EVERY
       -- request -- the same trap `trace` fell into, caught by the same
       -- allocation ceiling.
+      -- The normalised copy, built once and cached, or built and thrown away
+      -- if nobody keeps it. `rawset` so a handler that reads `req.headers`
+      -- twice pays once.
+      if key == "headers" then
+        local built = normalize_headers(rawget(self, "__input").headers)
+        rawset(self, "headers", built)
+        return built
+      end
+
       if key == "ip" then
         -- `capabilities` IS the config table, so the proxy list is already
         -- reachable without adding a field to anything. Two extra keys on the
@@ -1587,14 +1624,14 @@ local REQUEST_MT = {
         local input = rawget(self, "__input")
         local settings = input.capabilities or {}
         local address = client_ip(input.peer or settings.peer,
-                                  rawget(self, "headers")["x-forwarded-for"],
+                                  self.headers["x-forwarded-for"],
                                   settings.trusted_proxies)
         if address then rawset(self, "ip", address) end
         return address
       end
 
       if key == "trace" then
-        local parsed = trace_context(rawget(self, "headers"))
+        local parsed = trace_context(self.headers)
         if parsed then rawset(self, "trace", parsed) end
         return parsed
       end
@@ -1644,7 +1681,16 @@ local function handle(app, input)
   end
 
   -- Request data.
-  local request_headers = normalize_headers(input.headers)
+  --
+  -- `headers` IS NOT BUILT HERE. `normalize_headers` copies every header into
+  -- a fresh table with a `safe_text` per value, and measured on a browser's
+  -- eight headers that is 9,988 ns and 328 bytes -- **12% of a request's
+  -- CPU** -- for something most handlers never read. akkar's own `/ping` does
+  -- not. It is built on first read by `REQUEST_MT`, the same way `trace` and
+  -- `ip` already are, and for the reason recorded there.
+  --
+  -- The one thing that needed a header before `req` existed was the request
+  -- id, and it needs exactly one: `one_header` fetches it directly.
   local req = {
     method  = input.method,
     path    = normalize_path(input.path),
@@ -1668,9 +1714,9 @@ local function handle(app, input)
     -- request instead of becoming garbage after the decode. That is bounded by
     -- `body_limit` times the requests in flight, and it is smaller than the
     -- decoded table it sits beside.
-    headers = request_headers,
+
     host    = normalize_host(requested_host),
-    id      = request_id(request_headers),
+    id      = request_id_from(input.headers),
     -- THE EXECUTION RECORD, and it is here instead of `user` rather than as
     -- well as it.
     --
