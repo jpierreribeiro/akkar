@@ -31,7 +31,13 @@ sudo apt-get update -qq
 sudo apt-get install -y -qq --no-install-recommends \
   build-essential git curl ca-certificates cmake \
   libssl-dev libreadline-dev zlib1g-dev libpq-dev pkg-config \
-  lua5.4 liblua5.4-dev luarocks unzip >/dev/null
+  lua5.4 liblua5.4-dev luarocks unzip \
+  m4 >/dev/null
+# m4 IS NOT DECORATION. cqueues generates `src/errno.c` from an m4 template,
+# and without it the build stops at
+#     /bin/sh: 1: m4: not found
+# after printing "enabling Lua 5.4", which reads like a Lua problem. GitHub's
+# runners ship m4, so CI never needed to say this; a bare EC2 image does not.
 
 # --------------------------------------------------------- the instruments
 
@@ -109,9 +115,20 @@ fi
 sudo docker exec -i akkar-pg psql -q -U postgres -d akkar <<'SQL' >/dev/null
 create table if not exists users (
   id serial primary key, name text not null, email text, password_hash text);
-insert into users (name, email)
-  select 'user' || i, 'u' || i || '@example.com' from generate_series(1, 10000) i
-  on conflict do nothing;
+do $$
+begin
+  -- `on conflict do nothing` DID NOTHING HERE. There is no unique constraint
+  -- on `name`, so the clause had no conflict to detect and the second run of
+  -- this script inserted ten thousand more rows: `postgres rows: 20000`. The
+  -- table then stopped matching the 10,000 every other bench in this
+  -- repository uses, and `/users/:id` stopped meaning the same thing across
+  -- runs -- silently, because a bigger table answers every request correctly.
+  if (select count(*) from users) <> 10000 then
+    truncate users restart identity;
+    insert into users (name, email)
+      select 'user' || i, 'u' || i || '@example.com' from generate_series(1, 10000) i;
+  end if;
+end $$;
 SQL
 echo "postgres rows: $(sudo docker exec akkar-pg psql -tAqU postgres -d akkar -c 'select count(*) from users')"
 
@@ -133,14 +150,67 @@ echo "postgres rows: $(sudo docker exec akkar-pg psql -tAqU postgres -d akkar -c
 # from it silently. `http` comes from test_dependencies and is installed
 # explicitly -- akkar no longer requires it, but LAPIS DOES, and Lapis on
 # cqueues is the candidate the whole comparison turns on.
-step "akkar's rocks, into the user tree run.sh reads"
-if [ -f "$HOME/akkar/akkar-dev-1.rockspec" ]; then
-  luarocks --local install --only-deps "$HOME/akkar/akkar-dev-1.rockspec" 2>&1 | tail -3
-  luarocks --local install http 2>&1 | tail -2
-else
-  echo "no checkout at ~/akkar -- clone it first, then re-run this script"
+# THE PUBLISHED cqueues ROCK DOES NOT BUILD HERE, and that is not a surprise:
+#
+#     Failed installing dependency: cqueues-20200726.54-0.src.rock
+#
+# The rock is from July 2020 and this is Ubuntu 24.04 with OpenSSL 3. CI
+# already solved this -- `.github/workflows/ci.yml` builds cqueues from a
+# PINNED COMMIT of upstream master and asserts `require("cqueues").COMMIT`
+# afterwards. The study box gets the same build for a stronger reason than
+# convenience: measuring akkar on a substrate CI never tests would make the
+# numbers describe a configuration nobody ships.
+#
+# Keep this equal to CQUEUES_COMMIT in the workflow. If they drift, the
+# benchmark and the test suite stop describing the same runtime.
+CQUEUES_COMMIT=c36614982fe07917b2e1ce5a9e7a0e55b81be262
+
+step "cqueues, from the commit CI pins"
+installed=$(lua5.4 -e 'local ok, m = pcall(require, "cqueues") io.write(ok and (m.COMMIT or "?") or "")' 2>/dev/null)
+if [ "$installed" != "$CQUEUES_COMMIT" ]; then
+  [ -d "$RT/cqueues-build" ] || git clone -q https://github.com/wahern/cqueues.git "$RT/cqueues-build"
+  git -C "$RT/cqueues-build" fetch -q --all
+  git -C "$RT/cqueues-build" checkout -q "$CQUEUES_COMMIT"
+  make -C "$RT/cqueues-build" all5.4 CPPFLAGS="-I/usr/include/lua5.4" >/dev/null 2>&1
+  mkdir -p "$HOME/.luarocks/share/lua/5.4" "$HOME/.luarocks/lib/lua/5.4"
+  # Remove the destination FIRST: `make install` compares timestamps, and a
+  # destination newer than the cached objects makes it copy nothing while
+  # reporting success. CI records the same trap.
+  rm -f  "$HOME/.luarocks/lib/lua/5.4/_cqueues.so"
+  rm -rf "$HOME/.luarocks/share/lua/5.4/cqueues.lua" "$HOME/.luarocks/share/lua/5.4/cqueues"
+  make -C "$RT/cqueues-build" install5.4 \
+    lua54path="$HOME/.luarocks/share/lua/5.4" \
+    lua54cpath="$HOME/.luarocks/lib/lua/5.4" >/dev/null 2>&1
 fi
-eval "$(luarocks --local path)"
+eval "$(luarocks --local --lua-version 5.4 path)"
+lua5.4 -e "local got = require('cqueues').COMMIT
+           assert(got == '$CQUEUES_COMMIT', 'cqueues is not the pinned build: ' .. tostring(got))
+           print('cqueues ' .. got)" || echo "CQUEUES FAILED"
+
+step "akkar's rocks, into the user tree run.sh reads"
+# --lua-version 5.4 ON EVERY CALL, including `path`. Ubuntu's luarocks
+# defaults to 5.1 here, and the failure does not look like a version problem:
+# it says `cqueues 20200726.51-0 depends on lua 5.1 (5.1-1 provided by VM)`
+# and then `akkar dev-1 depends on lua >= 5.4, < 5.6 (not installed)` -- on a
+# box where lua5.4 is installed and on PATH. The rocks land in a 5.1 tree that
+# nothing in this comparison reads, and every probe below answers ABSENT.
+#
+# NAMED ONE BY ONE rather than `--only-deps` from the rockspec, because
+# `--only-deps` would try to install cqueues from LuaRocks and fail, taking
+# every other rock down with it. The cost is that this list has to be kept
+# equal to the rockspec's `dependencies` by hand: add one there, add it here.
+for rock in luaossl lua-cjson pgmoon luasocket basexx binaryheap fifo lpeg lpeg_patterns; do
+  luarocks --local --lua-version 5.4 install "$rock" >/dev/null 2>&1 \
+    || echo "ROCK FAILED: $rock"
+done
+# lua-http, with dependency resolution turned OFF so it cannot drag the
+# unbuildable cqueues rock back in over the pinned build. akkar carries its own
+# copy and does not require this one -- but `lapis.cqueues` does (it fails with
+# `module 'http.headers' not found`), and Lapis on cqueues is the candidate
+# that makes the comparison mean "akkar" rather than "a different stack".
+luarocks --local --lua-version 5.4 install --deps-mode=none http >/dev/null 2>&1 \
+  || echo "ROCK FAILED: http"
+eval "$(luarocks --local --lua-version 5.4 path)"
 for mod in cqueues http.server pgmoon cjson lpeg basexx; do
   printf '%-12s ' "$mod"
   lua5.4 -e "local ok, err = pcall(require, '$mod')
@@ -208,7 +278,7 @@ for mod in lapis.cqueues lapis.nginx lapis.bin.annotate; do
   # had just installed Lapis one step earlier. The probe then reported
   # `lapis.cqueues` ABSENT for a file it could have listed, which is the same
   # wrong conclusion the previous run reached by a different route.
-  eval "$(luarocks --local path)" 2>/dev/null
+  eval "$(luarocks --local --lua-version 5.4 path)" 2>/dev/null
   export LUA_PATH="$LUA_PATH;/usr/local/share/lua/5.4/?.lua;/usr/local/share/lua/5.4/?/init.lua;;"
   export LUA_CPATH="${LUA_CPATH:-};/usr/local/lib/lua/5.4/?.so;;"
   lua5.4 -e "local ok, err = pcall(require, '$mod')

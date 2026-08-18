@@ -67,6 +67,23 @@ function stream_mt:__tostring()
 		tostring(self.connection), self.state)
 end
 
+-- TWO CONDITIONS THAT NOBODY COULD EVER WAIT ON.
+--
+-- `headers_cond` and `chunk_cond` were created here per stream -- so per
+-- request, in HTTP/1.1 -- and signalled in five places. Nothing in lua-http
+-- ever waited on either of them, and that is not an artefact of vendoring:
+-- upstream's own h1_stream signals them and never polls them either. Only
+-- `h2_stream` has real waiters (`cqueues.poll(self.chunk_cond, ...)`), and
+-- h2 went when this half was vendored.
+--
+-- h1 does not need them by construction. A connection reads in one coroutine
+-- and a stream is served by that same coroutine, so there is no second party
+-- to wake: `get_next_chunk` looks in the fifo and, finding it empty, reads
+-- the socket itself.
+--
+-- Removed rather than kept "in case": a condition object per request that can
+-- have no waiter is not a hook, it is a cost. If h1 ever grows a concurrent
+-- reader, it will need a condition designed for that reader.
 local function new_stream(connection)
 	local self = setmetatable({
 		connection = connection;
@@ -78,21 +95,39 @@ local function new_stream(connection)
 
 		pipeline_cond = cc.new(); -- signalled when stream reaches front of pipeline
 
-		req_method = nil; -- string
-		peer_version = nil; -- 1.0 or 1.1
 		has_main_headers = false;
-		headers_in_progress = nil;
 		headers_fifo = new_fifo();
-		headers_cond = cc.new();
 		chunk_fifo = new_fifo();
-		chunk_cond = cc.new();
-		body_write_type = nil; -- "closed", "chunked", "length" or "missing"
-		body_write_left = nil; -- integer: only set when body_write_type == "length"
-		body_write_deflate_encoding = nil;
-		body_write_deflate = nil; -- nil or stateful deflate closure
-		body_read_type = nil;
-		body_read_inflate = nil;
-		close_when_done = nil; -- boolean
+
+		-- THE FIELDS THAT USED TO BE HERE SET TO nil ARE DOCUMENTED BELOW
+		-- INSTEAD, and the difference is 384 bytes on every request.
+		--
+		-- `k = nil` in a constructor stores nothing, but Lua sizes the hash
+		-- part from the SYNTACTIC key count, so ten documentation fields
+		-- reserved ten slots that held nothing and pushed the table from 16
+		-- to 32. Measured directly, 20,000 tables each way:
+		--
+		--     9 real keys + 10 nil keys   850 bytes
+		--     9 real keys                 466 bytes
+		--
+		-- The nine that remain plus the seven a served request actually
+		-- assigns come to sixteen, which is exactly what a 16-slot hash
+		-- holds -- so this trades a permanent 384 bytes for a rehash that
+		-- does not happen. That is a claim, and the allocation harness
+		-- checked it: 14,450 -> 14,070 bytes per request, byte-identical
+		-- across three runs. A rehash would have shown up as no change or
+		-- as worse.
+		--
+		--   req_method                   string
+		--   peer_version                 1.0 or 1.1
+		--   headers_in_progress          headers being parsed
+		--   body_write_type              "closed", "chunked", "length", "missing"
+		--   body_write_left              integer; only when type == "length"
+		--   body_write_deflate_encoding  string
+		--   body_write_deflate           stateful deflate closure
+		--   body_read_type               as body_write_type
+		--   body_read_inflate            stateful inflate closure
+		--   close_when_done              boolean
 	}, stream_mt)
 	return self
 end
@@ -259,7 +294,6 @@ function stream_methods:step(timeout)
 				return nil, err, errno
 			end
 			self.headers_fifo:push(headers)
-			self.headers_cond:signal(1)
 			return true
 		end
 		if self.body_read_left ~= 0 then
@@ -271,7 +305,6 @@ function stream_methods:step(timeout)
 				return nil, err, errno
 			end
 			self.chunk_fifo:push(chunk)
-			self.chunk_cond:signal()
 			return true
 		end
 		if self.body_read_type == "chunked" then
@@ -280,7 +313,6 @@ function stream_methods:step(timeout)
 				return nil, err, errno
 			end
 			self.headers_fifo:push(trailers)
-			self.headers_cond:signal(1)
 			return true
 		end
 	end
@@ -922,7 +954,6 @@ function stream_methods:read_next_chunk(timeout)
 			return nil, err, errno
 		end
 		self.headers_fifo:push(headers)
-		self.headers_cond:signal(1)
 		return self:get_next_chunk(deadline and deadline-monotime())
 	else
 		error("unknown body read type")
@@ -952,7 +983,6 @@ end
 
 function stream_methods:unget(str)
 	self.chunk_fifo:insert(1, str)
-	self.chunk_cond:signal()
 	return true
 end
 

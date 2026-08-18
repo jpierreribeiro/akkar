@@ -72,11 +72,28 @@ function headers_mt:__tostring()
 	return string.format("http.headers{%d headers}", self._n)
 end
 
+-- AKKAR: THE INDEX HOLDS AN INTEGER UNTIL A NAME REPEATS.
+--
+-- It used to hold `{n=1, i}` for every distinct header name -- a table with
+-- one array slot and one hash key, allocated per name, per request. Six
+-- headers on a small JSON request meant six of them, and the overwhelming
+-- majority of header names appear exactly once: `host`, `content-type`,
+-- `content-length`, `date`. Repeats are real (`set-cookie` is the reason this
+-- structure is a list at all) but they are the exception, and the exception
+-- was paying for everyone.
+--
+-- So `_index[name]` is now EITHER an integer -- the one position in `_data`
+-- -- OR the same `{n=k, ...}` table as before, once a second occurrence
+-- arrives. Four readers below know both shapes; there is no fifth, and
+-- `has()` needed no change because it only ever asked whether the value was
+-- nil.
 local function add_to_index(_index, name, i)
 	local dex = _index[name]
 	if dex == nil then
-		dex = {n=1, i}
-		_index[name] = dex
+		_index[name] = i
+	elseif type(dex) == "number" then
+		-- The second occurrence is where the table finally earns itself.
+		_index[name] = {n=2, dex, i}
 	else
 		local n = dex.n + 1
 		dex[n] = i
@@ -133,11 +150,16 @@ end
 function headers_methods:delete(name)
 	local dex = self._index[name]
 	if dex then
-		local n = dex.n
-		for i=n, 1, -1 do
-			table.remove(self._data, dex[i])
+		if type(dex) == "number" then
+			table.remove(self._data, dex)
+			self._n = self._n - 1
+		else
+			local n = dex.n
+			for i=n, 1, -1 do
+				table.remove(self._data, dex[i])
+			end
+			self._n = self._n - n
 		end
-		self._n = self._n - n
 		rebuild_index(self)
 		return true
 	else
@@ -154,6 +176,9 @@ end
 function headers_methods:get_as_sequence(name)
 	local dex = self._index[name]
 	if dex == nil then return { n = 0; } end
+	if type(dex) == "number" then
+		return { n = 1; self._data[dex].value }
+	end
 	local r = { n = dex.n; }
 	for i=1, r.n do
 		r[i] = self._data[dex[i]].value
@@ -161,12 +186,33 @@ function headers_methods:get_as_sequence(name)
 	return r
 end
 
+-- AKKAR: `get` and `get_comma_separated` answer the single-occurrence case
+-- without building a sequence at all.
+--
+-- Both used to go through `get_as_sequence` unconditionally, so reading one
+-- header -- which is what every caller in this library and in akkar does --
+-- allocated a table to hold one string and then threw it away. `get_headers`
+-- alone reads `content-length`, `transfer-encoding`, `connection` and
+-- `expect` on the way through a single request.
+--
+-- The sequence path is still there and still correct for repeats; it is no
+-- longer the only path.
 function headers_methods:get(name)
+	local dex = self._index[name]
+	if dex == nil then return end
+	if type(dex) == "number" then
+		return self._data[dex].value
+	end
 	local r = self:get_as_sequence(name)
 	return unpack(r, 1, r.n)
 end
 
 function headers_methods:get_comma_separated(name)
+	local dex = self._index[name]
+	if dex == nil then return nil end
+	if type(dex) == "number" then
+		return self._data[dex].value
+	end
 	local r = self:get_as_sequence(name)
 	if r.n == 0 then
 		return nil
@@ -185,6 +231,8 @@ function headers_methods:upsert(name, ...)
 	local dex = self._index[name]
 	if dex == nil then
 		self:append(name, ...)
+	elseif type(dex) == "number" then
+		self:modifyi(dex, ...)
 	else
 		assert(dex[2] == nil, "Cannot upsert multi-valued field")
 		self:modifyi(dex[1], ...)
