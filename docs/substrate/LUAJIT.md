@@ -53,9 +53,9 @@ alternating repetitions, zero non-2xx:
 | LuaJIT, two processes | 39,736 | 4.1% | 3.98 ms | 50.3 |
 
 The rule written in advance asked for 2×. **It is 1.62×, so LuaJIT is refused
-and this is the number.** `docs/WHERE-TO-GO.md` has what that implies for the
-other options; the short version is that 22% of the gap to OpenResty is the
-language and 78% is nginx being C.
+and this is the number.** `bench/study/COST-OF-A-REQUEST.md` carries the same
+figures beside the CPU decomposition they belong with: 22% of the gap to
+OpenResty is the language and 78% is nginx being C.
 
 ## "All 60 files parse" was NOT "akkar runs", and that is the lesson here
 

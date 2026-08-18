@@ -3,11 +3,10 @@
 A plan for the performance work that remains, written after a pass that cut
 allocation per request by 21.6% and bought 16.0% of throughput.
 
-**The goal is not OpenResty.** It is 9.4× faster and always will be: it is
-nginx in C with LuaJIT on top, and this is pure Lua 5.4 on cqueues. Saying so
-in the first paragraph is not modesty, it is the thing that keeps this plan
-honest — every item below is judged by what it is worth *within this stack*,
-not by how far it closes a gap that this stack cannot close.
+Every item below is judged by what it is worth **within this stack**: pure
+Lua 5.4/5.5 on cqueues. `bench/study/COST-OF-A-REQUEST.md` decomposes the gap
+to OpenResty and shows that 78% of it is nginx being C, which is why nothing
+here is measured against that number.
 
 What this plan is for: the runtime is near the practical frontier of what it
 is, and "near" is not "at". This is the list of what is still on the table,
