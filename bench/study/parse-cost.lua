@@ -91,6 +91,26 @@ local real  = rl + 4 * (hs + lower + append) + 4 * (hl + lower + append)
 print(("benchmark request  (1 line + 3 short headers) : %6.2f us"):format(bench / 1000))
 print(("production request (1 line + 8 mixed headers) : %6.2f us"):format(real / 1000))
 print()
-print(("against 83 us of CPU per request:"))
-print(("  benchmark shape  : %5.1f%%"):format(bench / 1000 / 83 * 100))
-print(("  production shape : %5.1f%%"):format(real / 1000 / 83 * 100))
+-- THE DENOMINATOR, WITH ITS PROVENANCE, because a share is two numbers and
+-- the old one carried only the first. This file divided by a bare `83` that
+-- nothing recorded the origin of -- and worse, invited being divided across
+-- machines: the numerator above is measured wherever this runs, and 83 was
+-- from somewhere else. On this laptop the same parse costs 17.29 us and on the
+-- benchmark box 7.87, a factor of 2.2, so mixing the two is not a rounding
+-- error.
+--
+-- The default is what `bench/study/regression.sh` measured on the box at
+-- a92177c, browser shape, /ping, 5 alternating repetitions: 20,548 req/s
+-- across 2.00 cores, which is 97.3 us of CPU per request. Run this ON the box
+-- to compare like with like, or pass the machine's own figure:
+--
+--     CPU_US=130.1 lua5.4 bench/study/parse-cost.lua    # origin/main's
+local CPU_US = tonumber(os.getenv "CPU_US") or 97.3
+
+print(("against %.1f us of CPU per request (see the note above):"):format(CPU_US))
+print(("  benchmark shape  : %5.1f%%"):format(bench / 1000 / CPU_US * 100))
+print(("  production shape : %5.1f%%"):format(real / 1000 / CPU_US * 100))
+print()
+print("What a C tokeniser could buy, at most: making the production figure")
+print(("ZERO would leave %.1f%% of the CPU, so %.2fx, by Amdahl and nothing else.")
+  :format(100 - real / 1000 / CPU_US * 100, 1 / (1 - real / 1000 / CPU_US)))
