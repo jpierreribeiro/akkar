@@ -19,7 +19,11 @@ set -uo pipefail
 RT="$HOME/rt"
 OUT="${OUT:-$RT/results}"
 mkdir -p "$OUT"
+rm -f "$OUT/d4-ping.txt"
 
+# Truncated at the start of every run, not appended to. Two runs' reps mixed
+# into one file give a Rule 3 spread computed across configurations that were
+# never the same configuration.
 REPS=${REPS:-3}
 DUR=${DUR:-10}
 CONNS=${CONNS:-100}
@@ -31,7 +35,18 @@ THREADS=${THREADS:-4}
 # read 0.67x per-process scaling from exactly that mistake.
 GEN_CPUS=${GEN_CPUS:-0,4}
 SVC_CPUS=${SVC_CPUS:-1,2,3,5,6,7}
-PROCS=${PROCS:-2}
+# PROCS IS ONE, AND SAYING SO IS THE FIX.
+#
+# This was `${PROCS:-2}` and nothing read it: all four candidates run a single
+# process, and `openresty/nginx.conf` carried a comment claiming "worker_processes
+# is set by run.sh to match every other candidate's process count" -- a guarantee
+# no code provided. The comparison was correct at one process each; the stated
+# mechanism was absent, which is how a later change to one candidate would have
+# gone unnoticed.
+#
+# `bench/study/regression.sh` is the harness that varies process count. This one
+# holds it at one.
+PROCS=1
 
 AKKAR_PORT=8403
 LUVIT_PORT=8411
@@ -41,7 +56,10 @@ LAPIS_PORT=8413
 # akkar from its own checkout, the rest from the shared rock tree. Every Lua
 # candidate here reads the SAME cqueues and lua-http out of ~/.luarocks, which
 # is what makes the akkar/Lapis delta mean "akkar" and not "a different stack".
-AKKAR_SRC="$HOME/akkar"
+# Overridable, because `deploy.sh` already is (`${AKKAR_SRC:-$HOME/akkar}`)
+# and the mismatch is silent: `AKKAR_SRC=... bash run.sh` staged one tree and
+# measured another, and the run looked completely normal.
+AKKAR_SRC="${AKKAR_SRC:-$HOME/akkar}"
 ROCKS_PATH="$AKKAR_SRC/?.lua;$AKKAR_SRC/?/init.lua;$HOME/.luarocks/share/lua/5.4/?.lua;$HOME/.luarocks/share/lua/5.4/?/init.lua;;"
 ROCKS_CPATH="$HOME/.luarocks/lib/lua/5.4/?.so;;"
 
@@ -164,7 +182,13 @@ parse_wrk() {   # stdin
     /Requests\/sec/  { rps = $2 }
     /^ *50(\.000)?%/ { p50 = $2 }
     /^ *99(\.000)?%/ { p99 = $2 }
-    /Non-2xx or 3xx/ { bad = $4 }
+    # $5, NOT $4. wrk prints `Non-2xx or 3xx responses: 18640`, so $4 is the
+    # literal word `responses:` -- a truthy-looking string in the column where
+    # a count belongs. THIS HID A REAL DEFECT: a run reported
+    # `non2xx responses:` while akkar was answering 18,640 errors out of
+    # 111,651 requests, and the number that run published was taken from a
+    # server failing one request in six.
+    /Non-2xx or 3xx/ { bad = $5 }
     END { printf "%s %s %s %s", (rps?rps:"0"), (p50?p50:"-"), (p99?p99:"-"), (bad?bad:"0") }'
 }
 

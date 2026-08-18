@@ -19,7 +19,16 @@
 
 set -uo pipefail
 export PATH=$HOME/.local/bin:$PATH
-eval "$(luarocks path --bin)" 2>/dev/null
+# --lua-version 5.4, AND IT IS NOT A PREFERENCE. On a box whose default
+# luarocks is 5.1 -- which is Ubuntu's -- the bare form exports a LUA_PATH and
+# LUA_CPATH pointing at 5.1 trees, and those OVERRIDE lua5.4's own defaults.
+# The line is worse than a no-op there: it breaks a working interpreter, and
+# nothing in this harness runs at all --
+#
+#     module 'cqueues' not found ... no file '~/.luarocks/lib/lua/5.1/cqueues.so'
+#
+# `bench/runtime/provision.sh` already spells it this way and says why.
+eval "$(luarocks --local --lua-version 5.4 path --bin)" 2>/dev/null
 
 # ------------------------------------------------------------------ topology
 # c5.2xlarge is 4 physical cores x 2 threads.  Two hyperthreads of one core are

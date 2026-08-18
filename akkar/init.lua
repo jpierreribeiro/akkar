@@ -2161,10 +2161,39 @@ function App:run(config)
     limits:close()
     if not soft then return nil end
 
-    -- Two per in-flight request, and leave a third of the budget for the
-    -- listening socket, the database pool, the log sink and whatever else
-    -- the application opens.
-    local ceiling = math.floor(tonumber(soft) * 0.66 / 2)
+    -- THREE PER IN-FLIGHT REQUEST, MEASURED. This said two, and two was the
+    -- controller alone -- it forgot the connection's own socket.
+    --
+    -- Counted from inside a server process of its own, sampling /proc while N
+    -- requests were held in a sleeping handler:
+    --
+    --     50 in flight    150 descriptors    3.00 each
+    --    100 in flight    300 descriptors    3.00 each
+    --    200 in flight    600 descriptors    3.00 each
+    --
+    -- Dead flat, which is what a per-request cost looks like. The controller
+    -- is two of the three on epoll (`spec/support/portable.lua` measured that
+    -- separately, and three on kqueue); the socket is the third.
+    --
+    -- The consequence of dividing by two was a ceiling FIFTY PERCENT HIGHER
+    -- than the box could serve. On a machine with the usual `ulimit -n 1024`
+    -- this promised 337 concurrent requests, which would need 1,011
+    -- descriptors -- more than the whole limit, never mind the third held
+    -- back. It now promises 225, which fits.
+    --
+    -- This is not hypothetical. `bench/runtime/run.sh` at 100 connections had
+    -- akkar answering 18,640 of 111,651 requests with
+    -- `unable to initialize continuation queue: Too many open files` -- one
+    -- request in six, on the run that produced a published throughput number.
+    -- Nobody saw it because that harness read the wrong awk field for the
+    -- error count.
+    --
+    -- ON DARWIN THIS IS STILL WRONG, and says so rather than guessing: a
+    -- controller costs three descriptors on kqueue, so a request costs four
+    -- there. The function reads /proc and so returns nil off Linux, which
+    -- means no ceiling is derived at all -- an honest nothing rather than a
+    -- confident 225. `docs/PLATFORMS.md` carries it.
+    local ceiling = math.floor(tonumber(soft) * 0.66 / 3)
     return math.max(ceiling, 16)
   end
 

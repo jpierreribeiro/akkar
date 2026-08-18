@@ -39,7 +39,11 @@ suite in CI.**
 ARM64 went green on the first run with no changes. macOS took seven, and only
 one of the seven was about akkar rather than about the build or the harness: a
 cqueues controller costs **three** descriptors on kqueue against two on epoll,
-which is the number `descriptor_ceiling()` divides by. Three real defects came
+which is most of the number `descriptor_ceiling()` divides by — most, because
+the request also holds its own socket, and that was found later and separately:
+the divisor was 2 when a request in flight costs 3, so the ceiling promised
+half again as much concurrency as the box could serve. `docs/PLATFORMS.md` has
+the counts. Three real defects came
 out of it — `akkar watch` was silently dead off Linux, `Registry:memory()`
 reported a resident size of zero, and the test harness called five Linux-only
 commands by name.
