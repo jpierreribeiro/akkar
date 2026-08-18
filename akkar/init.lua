@@ -2421,10 +2421,28 @@ function App:run(config)
         local h = headers_or_why
         -- The socket's own idea of who connected. Everything else about the
         -- client's identity is something the client typed.
+        --
+        -- CACHED ON THE CONNECTION, because it cannot change on one and a
+        -- keep-alive connection carries many requests. Asking the socket per
+        -- request cost a `getpeername` SYSCALL per request -- measured at
+        -- exactly 1.00 with `strace -c` against a server straced alone, out
+        -- of 10.87 syscalls per request in total. Nearly a tenth of the
+        -- server's system-call budget, spent re-reading a constant.
+        --
+        -- `false` rather than nil for "asked and the socket would not say":
+        -- nil would look like "not asked yet" and buy the failing call back
+        -- on every request of a connection that has already refused once.
         local peer
         do
-          local ok_peer, _, address = pcall(function() return stream:peername() end)
-          if ok_peer then peer = address end
+          local conn = stream.connection
+          local cached = conn and conn.akkar_peer
+          if cached == nil then
+            local ok_peer, _, address = pcall(function() return stream:peername() end)
+            if ok_peer then peer = address end
+            if conn then conn.akkar_peer = peer or false end
+          elseif cached ~= false then
+            peer = cached
+          end
         end
         local target = h:get ":path" or "/"
         local path, qs = target:match "^([^?]*)%??(.*)$"
