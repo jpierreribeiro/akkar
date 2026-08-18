@@ -41,6 +41,7 @@ local cqueues   = require "cqueues"
 local condition = require "cqueues.condition"
 local time    = require "akkar.time"
 local bitwise = require "akkar.bitwise"
+local random  = require "akkar.random"
 
 local M = {}
 
@@ -89,7 +90,11 @@ end
 -- Within a process a counter cannot collide at all, which is strictly better
 -- than hoping two 48-bit draws differ; across processes the prefix separates
 -- them.
-local ID_PREFIX = string.format("%08x", math.random(0, 0xffffffff))
+-- Through `akkar.random`, so a replay produces the same ids. The prefix
+-- separates processes and nothing more: `akkar/trace.lua:144` is explicit
+-- that an id which must be unguessable comes from `akkar.crypto` instead, and
+-- this one never had to be.
+local ID_PREFIX = string.format("%08x", random.integer(0, 0xffffffff))
 local id_counter = 0
 
 --- The next execution id. Callers that accept a caller-supplied id -- the HTTP

@@ -113,6 +113,7 @@ build = {
     -- `>>` and `//` are syntax errors rather than missing functions. See
     -- `docs/substrate/LUAJIT.md`.
     ["akkar.bitwise"] = "akkar/bitwise.lua",
+    ["akkar.random"]  = "akkar/random.lua",
 
     -- String work whose cost must not grow with attacker-controlled input.
     -- `^%s*(.-)%s*$` cost 515 us on a 10 KB header against 2 us here; every

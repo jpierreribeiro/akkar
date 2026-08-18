@@ -72,7 +72,8 @@ local cjson = require "akkar.json"
 local Queue = {}
 Queue.__index = Queue
 
-local time = require "akkar.time"
+local time   = require "akkar.time"
+local random = require "akkar.random"
 
 local M = {}
 
@@ -106,7 +107,11 @@ local function delay_for(attempt, backoff)
   local max    = backoff.max or 300
   local window = math.min(max, first * factor ^ (attempt - 1))
   if backoff.jitter == false then return window end
-  return math.random() * window
+  -- Through `akkar.random` rather than `math.random`, so a seeded run picks
+  -- the same jitter twice. Jitter is exactly what this module is for: it has
+  -- to be SPREAD OUT so a thundering herd of retries does not land together,
+  -- and it does not have to be unguessable.
+  return random.float() * window
 end
 
 local function supports(store, method)
