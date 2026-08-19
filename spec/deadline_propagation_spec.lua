@@ -42,7 +42,15 @@ describe("the execution budget", function()
       execution.begin(5)
       return execution.remaining()
     end)
-    assert.is_true(left > 4.9 and left <= 5,
+    -- THE SAME CLOCK TOLERANCE AS `bounded` BELOW, and this one was found by
+    -- sweeping for the shape rather than by waiting for CI to hit it.
+    -- `remaining` computes `(t + 5) - t'`, so `left <= 5` is a claim about
+    -- doubles and not about the deadline; the sibling assertion returned
+    -- 0.20000000000005 against a 0.2 budget on macOS. A nanosecond is far
+    -- below any clock here and far above the error, so `left > 4.9` still
+    -- carries the real content: time is counting DOWN.
+    local EPSILON = 1e-9
+    assert.is_true(left > 4.9 and left <= 5 + EPSILON,
       ("remaining was %s, expected just under 5"):format(tostring(left)))
   end)
 

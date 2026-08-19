@@ -909,10 +909,29 @@ a property of binary floating point rather than of `bounded`. It now carries a
 one-nanosecond tolerance, nine orders of magnitude below the observed error,
 so a budget that leaked a millisecond would still fail.
 
-**What this suggests, and has not been done:** a pass over every spec that
-compares a clock reading, asking whether it asserts on arithmetic or on a
-guarantee. Three were found by CI one at a time; looking for the rest on
-purpose is cheaper than waiting for the fourth.
+**The sweep, done 2026-08-19.** Every assertion in `spec/` that compares a
+clock-derived value against a literal: **42 candidates, one real**, and it was
+found before CI reached it.
+
+The 41 that are fine are fine for reasons worth stating, because "looks like a
+clock" is not the same as "is one":
+
+- `spec/time_spec.lua`'s exact equalities read the MANUAL clock, which returns
+  the integer it was handed. No arithmetic, nothing to round.
+- `spec/config_spec.lua`'s durations are parsing — `"30s"` to `30` — and never
+  touch a clock at all.
+- The loose bounds (`elapsed < 2`, `< 3`, `waited < 10`) assert a guarantee
+  with seconds of slack; float noise cannot reach them.
+
+The one that was wrong is `spec/deadline_propagation_spec.lua:45`,
+`left > 4.9 and left <= 5` after `begin(5)` — the identical shape to the
+assertion macOS broke, `(t + 5) - t'` compared to 5 as though doubles were
+exact. Fixed with the same nanosecond, which leaves `left > 4.9` carrying the
+real content: the budget counts DOWN.
+
+**The rule this leaves**, worth applying to anything written later: an
+assertion may compare a clock reading to a bound the CLOCK cannot cross, and
+may not compare it to the number the arithmetic was built from.
 
 ### 12.3 HTTP/2 has no fuzz suite
 
