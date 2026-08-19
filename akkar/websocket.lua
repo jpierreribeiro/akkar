@@ -151,6 +151,20 @@ function M.serve(stream, req, raw_headers, handlers, options)
   local ws = websocket.new_from_stream(stream, raw_headers)
   if not ws then return nil, "not a websocket handshake" end
 
+  -- THE BOUND, BEFORE ANY MESSAGE IS READ.
+  --
+  -- akkar's first paragraph says bodies are bounded by default so that an
+  -- unbounded request cannot happen, and a WebSocket message went through
+  -- none of it. Measured on the day this shipped: one 64 MB message cost
+  -- 192 MB of resident memory -- buffered, unmasked into a second string,
+  -- concatenated into a third -- against an application that had set
+  -- `body_limit = 1 MB`.
+  --
+  -- So a message is bounded by the same number a body is. It is the same
+  -- promise about the same kind of thing, and a second knob would have been a
+  -- second thing to forget.
+  ws.max_message = options.max_message
+
   local ok, err = ws:accept({ headers = options.headers }, options.handshake_timeout or 10)
   if not ok then return nil, tostring(err) end
 

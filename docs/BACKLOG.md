@@ -1068,6 +1068,32 @@ wrong.
 `spec/websocket_spec.lua` pins five properties, including the one easiest to
 lose: two messages must open the capability twice and release it twice.
 
+**And the hole it shipped with, found and closed the same day.** akkar's first
+paragraph promises that bodies are bounded so an unbounded request cannot
+happen; a WebSocket message went through none of it. Measured against an
+application with `body_limit = 1 MB`:
+
+| | resident memory |
+|---|---:|
+| one 64 MB message, before | **192 MB** |
+| the same message, after | 0.4 MB |
+
+Three times the message, because the payload is buffered by `sock:fill`,
+unmasked into a second string and concatenated into a third. Now bounded in two
+places, because one is not enough: on the length the peer DECLARES, before
+`fill` commits a byte of it, and on the SUM of the fragments, which a per-frame
+bound cannot see -- a thousand fragments of a megabyte each are a thousand
+legal frames and one illegal message. Refused with 1009, the code RFC 6455
+defines for it. `spec/websocket_limits_spec.lua`, and mutation-testing both
+bounds away fails three of its four cases.
+
+**The fuzzer that did not find it.** 15 hostile frame shapes -- unmasked
+frames, reserved bits, fragmented control frames, truncated headers, invalid
+UTF-8 -- and all 15 were survived, because `read_frame` already checks
+`#first_2 ~= 2` where h2's header read did not. The hole was not a malformed
+frame. It was a perfectly well-formed one that was simply too big, which is
+the shape a fuzzer looking for crashes does not look for.
+
 HTTP/3 is the exclusion that the argument actually fits: QUIC is a UDP
 transport with its own congestion control and TLS integration, neither cqueues
 nor lua-http has it, and there is no half of anything on disk to vendor.

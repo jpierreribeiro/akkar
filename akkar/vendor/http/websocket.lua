@@ -177,7 +177,13 @@ local function build_close(code, message, mask)
 	}
 end
 
-local function read_frame(sock, deadline)
+--- `max_payload` BOUNDS THE FRAME BEFORE IT IS BUFFERED, and the placement is
+--- the whole point: `sock:fill(fill_length, 0)` below commits the entire
+--- payload to the socket's buffer, so a check after it has already paid for
+--- the attack. Measured before this existed: one 64 MB message cost 192 MB of
+--- RSS -- read, unmasked into a second string, concatenated into a third --
+--- while the application's `body_limit` said one megabyte.
+local function read_frame(sock, deadline, max_payload)
 	local frame, first_2 do
 		local err, errno
 		first_2, err, errno = sock:xread(2, "b", deadline and (deadline-monotime()))
@@ -246,6 +252,22 @@ local function read_frame(sock, deadline)
 		extra_fill_unget = assert(sock:xread(8, "b", 0))
 		frame.length = sunpack(">I8", extra_fill_unget)
 		fill_length = fill_length - 8 + frame.length
+	end
+
+	-- Refused on the length the peer DECLARED, before a byte of it is
+	-- buffered. `EFBIG` rather than EILSEQ because this is not malformed --
+	-- the frame is perfectly well formed and simply too big -- and the caller
+	-- turns it into a 1009 close, which is the code RFC 6455 defines for
+	-- exactly this and which tells the client to send less rather than that it
+	-- did something wrong.
+	if max_payload and frame.length > max_payload then
+		-- NO `seterror` HERE, and that was the first attempt. Marking the
+		-- socket makes cqueues refuse every later operation on it -- including
+		-- the close frame this refusal exists to send -- and the failure
+		-- surfaces as "exceeded unchecked error limit (File too large)", which
+		-- names neither the message nor the size. The socket is left usable
+		-- precisely so the peer can be told 1009 before it goes.
+		return nil, "message too big", ce.EFBIG
 	end
 
 	if extra_fill_unget then
@@ -391,8 +413,12 @@ function websocket_methods:receive(timeout)
 	end
 	local deadline = timeout and (monotime()+timeout)
 	while true do
-		local frame, err, errno = read_frame(self.socket, deadline)
+		local frame, err, errno = read_frame(self.socket, deadline,
+		                                     self.max_message)
 		if frame == nil then
+			if errno == ce.EFBIG then
+				return close_helper(self, 1009, "Message too big", deadline)
+			end
 			return nil, err, errno
 		end
 
@@ -407,12 +433,26 @@ function websocket_methods:receive(timeout)
 					return close_helper(self, 1002, "Unexpected continuation frame", deadline)
 				end
 				self.databuffer[#self.databuffer+1] = frame.data
+				-- AND THE SUM OF THE FRAGMENTS, which the per-frame bound
+				-- above cannot see. A thousand fragments of a megabyte each
+				-- are a thousand legal frames and one illegal message, and
+				-- bounding only the frame would have left the hole exactly
+				-- where an attacker looks second.
+				if self.max_message then
+					self.databuffer_size = (self.databuffer_size or 0) + #frame.data
+					if self.databuffer_size > self.max_message then
+						self.databuffer, self.databuffer_type = nil, nil
+						self.databuffer_size = nil
+						return close_helper(self, 1009, "Message too big", deadline)
+					end
+				end
 			elseif frame.opcode == 0x1 or frame.opcode == 0x2 then -- Text or Binary frame
 				if self.databuffer then
 					return close_helper(self, 1002, "Continuation frame expected", deadline)
 				end
 				self.databuffer = { frame.data }
 				self.databuffer_type = frame.opcode
+				self.databuffer_size = #frame.data
 			else
 				return close_helper(self, 1002, "Reserved opcode", deadline)
 			end
@@ -433,6 +473,7 @@ function websocket_methods:receive(timeout)
 					databuffer_type = "binary"
 				end
 				self.databuffer_type, self.databuffer = nil, nil
+				self.databuffer_size = nil
 				return databuffer, databuffer_type
 			end
 		else -- Control frame

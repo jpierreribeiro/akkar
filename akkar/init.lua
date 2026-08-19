@@ -246,6 +246,7 @@ local SETTINGS = {
   max_concurrent = true, trusted_proxies = true,
   repair_substrate = true, socket_buffer = true, gc = true,
   cpu_limit = true, h2c = true, websocket_idle_timeout = true,
+  websocket_max_message = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -2814,6 +2815,10 @@ function App:run(config)
           local served, why = ws_module.serve(stream, upgrade.req, h,
             upgrade.handlers, {
               idle_timeout = config.websocket_idle_timeout or 300,
+              -- The same number that bounds a body, for the same reason.
+              max_message = config.websocket_max_message
+                         or config.body_limit
+                         or akkar.defaults.body_limit,
               make_scope = function(fn) return scope_for(self, config, fn) end,
               register = function(sock) self.sockets[sock] = true end,
               unregister = function(sock) self.sockets[sock] = nil end,

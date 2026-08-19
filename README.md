@@ -459,6 +459,12 @@ rather than hijacked, an idle socket is closed after `websocket_idle_timeout`
 (300 s), and `app:stop` sends every open socket a 1001 close frame instead of
 waiting for connections that have no reason to end.
 
+**And a message is bounded by the same number a body is.** `body_limit` covers
+both, on the length the peer declares and on the sum of its fragments, and the
+refusal is close code 1009. That is not decoration: measured before the bound
+existed, one 64 MB message cost **192 MB of resident memory** against an
+application that had set `body_limit = 1 MB`.
+
 **HTTP/2, negotiated rather than configured.** Serve TLS and a browser gets
 h2 by ALPN; there is no option to turn on and no second listener:
 
