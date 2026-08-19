@@ -530,7 +530,42 @@ end
 
 function server_methods:add_socket(socket)
 	self.n_connections = self.n_connections + 1
-	self.cq:wrap(handle_socket, self, socket)
+	-- ONE CONNECTION MUST NOT BE ABLE TO KILL THE SERVER, and until this
+	-- wrapper existed it could.
+	--
+	-- `cq:wrap` puts each connection in its own coroutine, and cqueues
+	-- propagates a raise out of `cq:loop()`. So an unexpected error anywhere
+	-- under `handle_socket` -- the framing layers, the TLS handshake, a
+	-- vendored parser meeting bytes it did not consider -- travelled out of
+	-- `app:run` and took the ACCEPT LOOP with it. The process stayed up and
+	-- the listening socket stayed open, and nothing was ever accepted again.
+	--
+	-- That is not hypothetical. It happened twice in this tree, from opposite
+	-- directions: `Content-Length: banana` on the h1 side, recorded in
+	-- `akkar/init.lua`, and a three-byte HTTP/2 frame header found by
+	-- `spec/h2_framing_spec.lua` on its first run. Both were one-line parser
+	-- bugs; both were total outages. The next one is a parser bug nobody has
+	-- found yet, and this is what decides whether it costs one connection or
+	-- the server.
+	--
+	-- THE BOOKKEEPING IS THE SUBTLE PART. `handle_socket` decrements
+	-- `n_connections` and signals `connection_done` on its LAST two lines, so
+	-- a raise skips both -- and a connection count that only goes up walls
+	-- the server off at `max_concurrent` just as completely, only slower.
+	-- Done here exactly when the raise happened, so the normal path still
+	-- does it exactly once.
+	self.cq:wrap(function()
+		local ok, err = xpcall(handle_socket, debug.traceback, self, socket)
+		if not ok then
+			self.n_connections = self.n_connections - 1
+			self.connection_done:signal(1)
+			pcall(function() socket:close() end)
+			-- Reported as its own operation, never as transport noise: a
+			-- connection that raised is a BUG, and `akkar/init.lua` logs it at
+			-- error level for the same reason it does `onstream`.
+			pcall(self:onerror(), self, socket, "connection", err)
+		end
+	end)
 	return true
 end
 

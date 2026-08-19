@@ -2795,7 +2795,16 @@ function App:run(config)
     -- 100% 503 in silence. A load generator would have reported forty
     -- thousand requests a second of it.
     onerror = function(_, _, op, e)
-      if op == "onstream" then
+      if op == "connection" then
+        -- A CONNECTION COROUTINE THAT RAISED. Contained by the guard in
+        -- `vendor/http/server.lua:add_socket` rather than allowed to take the
+        -- accept loop down -- so this line is the only evidence that anything
+        -- happened, and it carries the traceback for that reason.
+        internal:error("connection failed", {
+          op = op, detail = tostring(e),
+          effect = "this connection was dropped; the server is still serving",
+        })
+      elseif op == "onstream" then
         internal:error("stream handler failed", { op = op, detail = tostring(e) })
       else
         internal:warn("transport", { op = op, detail = tostring(e) })

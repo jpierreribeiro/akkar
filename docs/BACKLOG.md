@@ -997,6 +997,39 @@ against the neighbours is the one that matters.
 Blocked on access rather than on work: the study box answers on port 22 and
 refuses this machine's key.
 
+### 12.4b One connection can no longer kill the server
+
+Found by asking why the h2 defect above was fatal rather than local, which is a
+better question than "what was the parser bug".
+
+`cq:wrap` gives every connection its own coroutine in the server's controller,
+and cqueues propagates a raise out of `cq:loop()`. So ANY unexpected error
+under `handle_socket` took the accept loop with it: process up, listening
+socket open, nothing ever accepted again. Twice in this tree, from opposite
+directions -- `Content-Length: banana` on h1, three bytes of h2 frame header --
+each a one-line parser bug and each a total outage.
+
+`add_socket` now runs `handle_socket` under `xpcall`, gives the connection slot
+back by hand (`handle_socket` decrements `n_connections` on its last line, so a
+raise skipped it, and a count that only climbs walls the server off at
+`max_concurrent` just as completely, only slower), closes the socket, and
+reports `op = "connection"` -- which `akkar/init.lua` logs at ERROR with the
+traceback, because a connection that raised is a bug and everything else
+reaching `onerror` is a peer that went away.
+
+**Demonstrated against the real defect rather than a synthetic one.** With the
+h2 short-header bug reintroduced and the guard in place, the server logs
+`connection failed` with its traceback and keeps answering -- h2 and h1 -- on
+both hostile shapes that used to end it. Two independent layers now: the parser
+checks its input, and a parser that does not is one dropped connection.
+
+`spec/connection_containment_spec.lua` asserts all four properties, and
+mutation-testing the guard away fails all four with the right diagnoses.
+
+**What this does not do** is make a raise acceptable. It makes the next unknown
+parser bug cost one connection instead of the service, and it makes it visible
+-- which the silent version never was.
+
 ### 12.5 WebSocket, and HTTP/3
 
 Both absent, both now written down where somebody evaluating akkar reads.
