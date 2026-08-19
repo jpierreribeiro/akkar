@@ -241,9 +241,16 @@ which I already write daily and which need no toolchain".
 The difference matters. These are not decisions, they are work not yet done,
 and `docs/ROADMAP.md` sequences them.
 
-- **WebSocket.** lua-http has an implementation. The real question is
-  lifecycle: a long-lived connection outside the request and response model
-  needs its own capability and its own shutdown story. Marked **"Not small."**
+- ~~**WebSocket.**~~ **Built 2026-08-19.** The lifecycle question was the real
+  one and it had an answer that did not cost the invariant: a socket is three
+  callbacks and an object, not a handler that runs for hours, so handlers still
+  return. The two halves that looked hard turned out to be the same decision --
+  capabilities are acquired per MESSAGE through `ws:scope`, because a message
+  is the unit of work a request already is, and `app:stop` TELLS sockets to go
+  with a 1001 close frame rather than draining on connections that have no
+  reason to end. It cost no new dependency: `basexx`, `lpeg` and
+  `lpeg_patterns` were already declared for the vendored `request.lua`, and the
+  `compat53` requires are guarded behind `string.pack`, which Lua 5.4 has.
 - **Streamed uploads.** A multipart body is buffered in memory under
   `body_limit`.
 - **Lua 5.5 packaging** — and the blocker this bullet used to describe is

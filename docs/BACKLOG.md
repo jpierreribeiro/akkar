@@ -1047,13 +1047,26 @@ mutation-testing the guard away fails all four with the right diagnoses.
 parser bug cost one connection instead of the service, and it makes it visible
 -- which the silent version never was.
 
-### 12.5 WebSocket, and HTTP/3
+### 12.5 ~~WebSocket~~ — BUILT — and HTTP/3
 
-Both absent, both now written down where somebody evaluating akkar reads.
+**WebSocket is done, 2026-08-19.** The lifecycle question was the real one, and
+both halves of it had the same answer: the unit of work is a MESSAGE.
 
-WebSocket is lifecycle work, not protocol work — lua-http has an
-implementation, and what is missing is a capability and a shutdown story for a
-connection that outlives the request and response model.
+Capabilities are acquired per message through `ws:scope` rather than for the
+life of the socket — a pool slot held until a browser tab closes is the known
+streaming gap at hours instead of seconds — and `app:stop` sends every open
+socket a 1001 close frame rather than draining on connections that will never
+end by themselves. Handlers still return: a socket is three callbacks and an
+object, and `ws:send` / `ws:close` are the only mutations.
+
+It cost **no new dependency**. `basexx`, `lpeg` and `lpeg_patterns` were
+already declared for the vendored `request.lua`, and `websocket.lua`'s
+`compat53` requires are guarded behind `string.pack`, which Lua 5.4 has
+natively. The first assessment of this item said four new dependencies and was
+wrong.
+
+`spec/websocket_spec.lua` pins five properties, including the one easiest to
+lose: two messages must open the capability twice and release it twice.
 
 HTTP/3 is the exclusion that the argument actually fits: QUIC is a UDP
 transport with its own congestion control and TLS integration, neither cqueues

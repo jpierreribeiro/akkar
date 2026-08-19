@@ -23,6 +23,7 @@ local multipart = require "akkar.multipart"
 -- The execution machinery, with no HTTP in it. `akkar.execution` requires only
 -- `cqueues` and `akkar.time`, so there is no cycle back to this file.
 local execution = require "akkar.execution"
+local ws_module = require "akkar.websocket"
 local bitwise = require "akkar.bitwise"
 local text = require "akkar.text"
 
@@ -244,7 +245,7 @@ local SETTINGS = {
   check_capabilities = true, reuseport = true, strict = true,
   max_concurrent = true, trusted_proxies = true,
   repair_substrate = true, socket_buffer = true, gc = true,
-  cpu_limit = true, h2c = true,
+  cpu_limit = true, h2c = true, websocket_idle_timeout = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -738,7 +739,13 @@ local App = {}
 App.__index = App
 
 function akkar.new()
-  return setmetatable({ routes = {}, middleware = {}, exact = {}, mounts = {} }, App)
+  -- `sockets` is a set of open WebSockets, and it exists for shutdown: without
+  -- it `App:stop` would drain on `while in_flight > 0` against connections
+  -- that have no reason to end, and a deploy would hang until the grace period
+  -- killed it. `sockets_open` is the count, kept separately because counting a
+  -- set with `pairs` on every request would be a linear scan on the hot path.
+  return setmetatable({ routes = {}, middleware = {}, exact = {}, mounts = {},
+                        sockets = {}, sockets_open = 0 }, App)
 end
 
 local MAGIC = "[%-%.%+%[%]%(%)%$%^%%%?%*]"
@@ -806,6 +813,42 @@ for _, method in ipairs { "get", "post", "put", "patch", "delete" } do
     if #names == 0 then self.exact[verb .. " " .. path] = route end
     return self
   end
+end
+
+--- A WebSocket route.
+---
+--- Registered as the GET it actually IS -- a handshake is an ordinary GET
+--- until the moment it is accepted -- so routing, `:params`, `query` schemas,
+--- `before` hooks, middleware and the deadline all apply to it unchanged, and
+--- none of that had to be rebuilt. See `akkar/websocket.lua` for why a socket
+--- is three callbacks rather than a handler that runs for hours.
+function App:websocket(path, opts, handlers)
+  if handlers == nil then opts, handlers = nil, opts end
+  if type(handlers) ~= "table" or type(handlers.message) ~= "function" then
+    error("websocket " .. path .. " needs a table with a `message` function", 2)
+  end
+  for name in pairs(handlers) do
+    if name ~= "open" and name ~= "message" and name ~= "close" then
+      error("websocket " .. path .. ": unknown callback `" .. tostring(name)
+            .. "`; use open, message or close", 2)
+    end
+  end
+
+  return self:get(path, opts, function(req)
+    if not ws_module.wants_upgrade(req.headers) then
+      -- A PLAIN GET TO A SOCKET ROUTE gets an ordinary refusal rather than a
+      -- hijacked stream. 426 is the status that exists for exactly this, and
+      -- it names the protocol the client should have asked for.
+      return response(426, { error = "this endpoint speaks WebSocket" },
+                      { upgrade = "websocket", connection = "Upgrade" })
+    end
+    -- Carried out on a real response object so `dispatch` passes it through
+    -- untouched -- and so `execution.release` still runs on the handshake's
+    -- own capabilities before the socket begins its life.
+    local upgrading = response(101, nil)
+    upgrading.websocket = { handlers = handlers, req = req }
+    return upgrading
+  end)
 end
 
 function App:use(fn)
@@ -1739,6 +1782,32 @@ local REQUEST_MT = {
     end,
 }
 
+--- An execution scope with capabilities, for work that is not a request.
+---
+--- A WebSocket callback needs `req.db` exactly as a handler does, and needs it
+--- released exactly as promptly -- the difference being that the unit of work
+--- is a MESSAGE. This builds the same carrier `handle` builds, over the same
+--- closed capability set, and releases on every path including a raise.
+---
+--- The budget is the configured request timeout, for the same reason a request
+--- has one: work that will not finish must not hold a slot until it does.
+local function scope_for(app, config, fn)
+  local record = { capabilities = config, id = execution.id() }
+  local carrier = setmetatable({ __input = record, id = record.id }, REQUEST_MT)
+
+  local ok, result = pcall(function()
+    return execution.with_deadline(config.timeout or akkar.defaults.timeout,
+                                   function() return fn(carrier) end)
+  end)
+
+  -- ON EVERY PATH, which is the whole point of the wrapper. A socket that
+  -- raises inside a scope must not keep the connection it borrowed.
+  execution.release(record)
+
+  if not ok then error(result, 0) end
+  return result
+end
+
 local function handle(app, input)
   -- Before the chains are built, because the selected app has its own.
   local requested_host = input.host
@@ -2173,6 +2242,28 @@ function App:stop(grace)
   self.state = "STOP_ACCEPTING"
   internal:info("shutdown: no longer accepting connections")
   pcall(function() self.server:pause() end)
+
+  -- WEBSOCKETS ARE TOLD, RATHER THAN WAITED FOR.
+  --
+  -- A socket has no reason to end on its own: a browser tab left open holds
+  -- one for as long as the tab exists. Draining on `in_flight` alone would
+  -- therefore never finish, and a deploy would sit in DRAINING until the
+  -- grace period expired and then report a stall that was really a chat
+  -- window.
+  --
+  -- So every open socket gets a close frame with 1001 -- "going away", which
+  -- is the code that exists for exactly this and which tells a client it may
+  -- reconnect rather than that it did something wrong. The callback loop sees
+  -- the close and returns, `in_flight` comes down on its own, and the drain
+  -- below then means what it says.
+  if next(self.sockets or {}) then
+    local closing = 0
+    for sock in pairs(self.sockets) do
+      closing = closing + 1
+      pcall(sock.close, sock, 1001, "server is shutting down", 1)
+    end
+    internal:info("shutdown: closing websockets", { sockets = closing })
+  end
 
   self.state = "DRAINING"
   local deadline = time.monotime() + grace
@@ -2703,6 +2794,38 @@ function App:run(config)
         -- Nil for anything that is not a stream: dispatch has already run
         -- `execution.release` for those. Captured before a byte goes out.
         pending_release = res.release
+
+        -- THE STREAM IS TAKEN OVER HERE, and only here.
+        --
+        -- Everything above ran unchanged: routing, validation, middleware,
+        -- the deadline. What is different is that nothing is written back --
+        -- `websocket.serve` performs the handshake itself, because the
+        -- response to an upgrade is part of the protocol rather than a body
+        -- akkar could compose.
+        --
+        -- The handshake's own capabilities have already been released by
+        -- `dispatch`, which is the design and not an accident: a pool slot
+        -- must not be held for the life of a socket. `ws:scope` is how a
+        -- callback reaches the database, one message at a time.
+        if res.websocket then
+          local socket_id = self.sockets_open + 1
+          self.sockets_open = socket_id
+          local upgrade = res.websocket
+          local served, why = ws_module.serve(stream, upgrade.req, h,
+            upgrade.handlers, {
+              idle_timeout = config.websocket_idle_timeout or 300,
+              make_scope = function(fn) return scope_for(self, config, fn) end,
+              register = function(sock) self.sockets[sock] = true end,
+              unregister = function(sock) self.sockets[sock] = nil end,
+            })
+          self.sockets_open = self.sockets_open - 1
+          if not served then
+            internal:warn("websocket handshake refused",
+                          { detail = tostring(why) })
+          end
+          self.in_flight = self.in_flight - 1
+          return
+        end
 
         local rh = headers.new()
         rh:append(":status", tostring(res.status))

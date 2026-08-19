@@ -435,6 +435,30 @@ akkar itself measures clean — zero global writes across every module, checked
 in the bytecode — and the whole test suite runs under strict mode so that stays
 true.
 
+**WebSocket, as a route kind rather than a second programming model.** A
+handshake is an ordinary GET until it is accepted, so routing, `:params`,
+query schemas, middleware and the deadline all apply to it unchanged:
+
+```lua
+app:websocket("/chat/:room", {
+  open    = function(ws) ws:send("welcome to " .. ws.params.room) end,
+  message = function(ws, text)
+    ws:scope(function(req)                    -- capabilities for THIS message
+      req.db:query("insert into messages (room, body) values ($1, $2)",
+                   ws.params.room, text)
+    end)                                      -- released here, on every path
+    ws:send(text)
+  end,
+  close   = function(ws, code, reason) end,
+})
+```
+
+Handlers still return; `ws:send` and `ws:close` are the only mutations and they
+are on an explicit object. A plain GET to a socket route is refused with 426
+rather than hijacked, an idle socket is closed after `websocket_idle_timeout`
+(300 s), and `app:stop` sends every open socket a 1001 close frame instead of
+waiting for connections that have no reason to end.
+
 **HTTP/2, negotiated rather than configured.** Serve TLS and a browser gets
 h2 by ALPN; there is no option to turn on and no second listener:
 
@@ -880,7 +904,7 @@ JSON API has today, which is nothing.
 | | |
 |---|---|
 | No HTTP/3 | HTTP/1.1 and HTTP/2 are both here; QUIC is a UDP transport with its own congestion control and TLS integration, and neither cqueues nor lua-http has it. Behind a proxy this costs nothing, which is where h3 is terminated in practice |
-| No WebSocket | a long-lived connection outside the request/response model needs its own capability and its own shutdown story. lua-http has an implementation; the lifecycle is the work |
+| WebSocket holds no capability between messages | `ws:scope(fn)` is how a callback reaches the database, and the ceremony is deliberate: a pool slot acquired when a socket opens would be held until the browser tab closes. The unit of acquisition is a message, which is what a request already is |
 | HTTP/2 is fuzzed for framing, not for conformance | `spec/h2_framing_spec.lua` throws 22 hostile frame shapes at a live server and requires it to keep answering; its first run found a three-byte denial of service in upstream lua-http, fixed in the vendored copy. What it does not establish is h2 conformance — h2spec is separate work |
 | Uploads are buffered, not streamed | a multipart body is held in memory under `body_limit` |
 | `akkar.cache.memory` is per-process | two processes have two caches, and akkar's answer to more CPU is more processes |
