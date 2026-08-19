@@ -978,10 +978,27 @@ the payload case a retry cannot help; the peer sent half a header and left.
 
 Mutation-testing the guard away returns both original symptoms.
 
-**What this does NOT establish** is that lua-http's h2 is correct. It
-establishes that 22 named shapes do not take akkar down. h2spec, a real
-conformance suite, is different work against a server in another process, and
-belongs in `bench/`.
+**AND CONFORMANCE IS NOW MEASURED TOO**, by `bench/h2spec.sh` -- h2spec 2.6.0,
+146 cases straight out of RFC 7540 and RFC 7541, against a server in its own
+process. Five runs:
+
+| | runs |
+|---|---:|
+| 145 passed, 1 skipped, **0 failed** | 3 |
+| 144 passed, 1 skipped, **1 failed** | 2 |
+
+**The intermittent one is 3.8, GOAWAY.** h2spec sends a GOAWAY and then a PING
+and expects a clean close or a PING ACK; twice in five it got `connection reset
+by peer`. That is a deviation rather than a flaky measurement, and the
+mechanism is ordinary: closing a socket with unread inbound data makes the
+kernel send RST rather than FIN, so whether h2spec's PING has landed by the
+time the server closes decides which the peer sees.
+
+**Open, and small.** It is a deviation and not a hazard -- the connection is
+ending either way, and what an RST costs is data in flight on a connection the
+peer asked to close. Fixing it means draining before closing in the vendored
+`h2_connection` GOAWAY path, which is upstream's code and deserves more care
+than a conformance point is worth on its own.
 
 **And it should go upstream.** The bug is not akkar's and every lua-http user
 serving h2 has it.
