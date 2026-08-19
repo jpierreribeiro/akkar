@@ -824,9 +824,10 @@ and the README promising a watchdog that cannot see a C call.
 Recorded on 2026-08-18, in the order they cost. Nothing here is a decision
 deferred for comfort; each one names what would settle it.
 
-### 12.1 The pool leak the simulation found, and could not reproduce
+### 12.1 The pool leak the simulation found — FOUND AND FIXED, 2026-08-19
 
-**Status: open, and the sharpest thing on this list.**
+**Status: closed, by reading the acquisition path rather than by reproducing
+the failure.**
 
 `spec/simulation_spec.lua` — the machine-checked invariant from L1 — went red
 on CI twice on the same assertion: `live=4 idle=1` on seed 19 on a Linux
@@ -861,15 +862,35 @@ message, collects unconditionally, and runs the loop once more before reading
 stats. **Whether that makes CI green is not yet known**, and if it goes red
 again the message will now say which of the two things happened.
 
-**What would settle it:** a Linux box slow enough to reproduce, or an
-instrumented `Pool` that records who holds each resource and when the holder
-died. The second is more work and answers the question directly.
+**WHAT IT WAS.** `execution.release` is called from exactly one place --
+`dispatch`, once -- and it clears `record.released`. `M.acquire` calls
+`provided()`, and **`provided()` is allowed to yield**: opening a connection,
+or waiting for a pool slot. If the deadline fires while it is yielding, the 503
+goes out, dispatch runs the release, and dispatch RETURNS. The coroutine is
+resumed later, receives its resource, appends it to a freshly created list, and
+nothing ever calls release again.
 
-**And a live suspicion, not yet a finding:** `reap`'s short-circuit may be
-wrong in production too. Its job is to turn abandoned reservations into free
-slots; a pool full of abandoned *resources* with zero reservations gets a 0
-and no collection. Changing it means collecting on a path that runs when the
-pool looks full, so it needs measuring before it is touched.
+One leaked resource per request abandoned while acquiring, and self-reinforcing
+in the way `akkar/pool.lua` records from the study box: each leaked slot
+lengthens the wait, and a longer wait abandons more handlers inside it.
+
+`M.release` now marks the record before it walks the list, and an acquisition
+that comes back to a marked record releases its resource immediately instead of
+registering it with nobody. `spec/late_acquisition_spec.lua` reproduces the
+original deterministically -- a capability that takes five times its budget to
+open, which needs no pool and no slow machine -- and mutation-testing the guard
+away returns the exact original symptom, `opened 1, released 0`.
+
+**And the reap suspicion below was wrong**, which is worth keeping. `reserved()`
+counts `self.opening` -- coroutines abandoned while a resource is being OPENED
+-- so a pool with nothing opening has nothing for `reap` to recover, and its
+short-circuit is correct for the job it claims. The leaked resources were
+already open, which is exactly why `reserved` was 0 while `live` was 4.
+
+**What is still open here:** whether `spec/simulation_spec.lua` goes green on
+CI now. The defect it was reporting is fixed and its measurement was repaired,
+but the two were established separately and only CI can say the first was the
+whole of it.
 
 ### 12.2 Determinism is established on epoll, not on kqueue
 
