@@ -14,6 +14,20 @@ measured the fourth and found it unnecessary: a seeded run of forty concurrent
 requests already reproduces byte for byte, so no second scheduler is needed.
 This file is what that was for.
 
+**THAT CONCLUSION WAS DRAWN ON LINUX AND IS NARROWER THAN IT READ.** An
+instrumented report from macOS CI, added 2026-08-19, shows two of five seeded
+runs differing there -- same set of requests, an adjacent swap, and only on the
+route that calls `cqueues.sleep(0)`. What varies is the order cqueues resumes
+coroutines that became runnable in the SAME tick, which is a scheduler
+tie-break rather than anything a seed controls.
+
+So "no second scheduler is needed" holds for THIS file's purpose and not for
+the general one. What this file asserts is that the pool invariants survive
+generated faults, and those assertions do not depend on the interleaving: a
+resource is returned or it is not, whatever order the coroutines ran in. A
+simulator that replays an exact schedule would need control cqueues does not
+offer portably, and `spec/determinism_spec.lua` now says so in its own header.
+
 ## The defect class it aims at
 
 Not "a query failed". From `spec/fault_injection_spec.lua`, which built the

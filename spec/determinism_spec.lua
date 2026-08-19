@@ -13,11 +13,16 @@ that says so. With the seams akkar already has -- every I/O through an adapter,
 forty CONCURRENT requests through three routes produce a byte-identical trace
 across separate processes.
 
-**On Linux.** CI found two differing traces on macOS. Why is not known yet,
-and the explanation this file used to give -- epoll against kqueue -- was
-disproved by the fact that this workload opens no socket at all. The narrowing
-is kept in the assertion rather than in a footnote, and the reason given is the
-absence of evidence rather than a mechanism.
+**On Linux, and now for a known reason.** The instrumented report from macOS
+says the difference is purely ORDERING, confined to the one route that yields,
+and an adjacent swap of two coroutines that became runnable at the same
+instant. That is a scheduler tie-break, not a property of the seed: `sleep(0)`
+makes two coroutines ready in the same tick, and which of them resumes first is
+cqueues' business. Linux breaks the tie by insertion order every time; macOS
+does not.
+
+The explanation this file used to give -- epoll against kqueue -- was disproved
+by the fact that this workload opens no socket at all.
 
 The one thing that differed on the first run was the execution id prefix,
 which was drawn at module load and so before any generator could be installed.
@@ -119,17 +124,45 @@ end
 ---     `WORKER_IDLE` exits and how many are alive is a function of elapsed
 ---     time. Driving it from 0.1 s to 0.1 ms changed nothing either.
 ---
---- So the honest state is: the schedule is stable on Linux across every
---- perturbation tried, it is not stable on macOS, and NOBODY HAS THE DATA
---- that says why. `spec/support/determinism_report.lua` is the answer to
---- that: it reports the shape of the difference rather than two walls of
---- text, and CI runs it on every platform as an informational step, so the
---- machine with the problem is the one that describes it.
+--- THE REPORT CAME BACK, and it is specific. From macOS CI, 2 of 5 rounds
+--- differing:
 ---
---- Until that report comes back, the assertion is Linux-only, and the reason
---- given is "not established here" rather than a mechanism nobody verified.
---- What L1 needs from this file -- that a seed makes a counterexample
---- re-runnable -- holds on the machine the simulation runs on.
+---     SAME SET OF REQUESTS, so this is purely an ORDERING difference.
+---     first difference at position 36 of 40:
+---       run 1: work:9e8c9247000015:6
+---       run 2: work:9e8c9247000010:6
+---       run 1's line is at position 37 in run 2 (moved +1)
+---     positions that differ, by route: work x2
+---
+--- Three facts, and together they name the mechanism:
+---
+---   * **nothing vanished.** Every request ran and every one recorded a line,
+---     so this is not a lost request wearing an ordering difference's clothes;
+---   * **only `/work` moves.** It is the one route here that calls
+---     `cqueues.sleep(0)`, and `/ping` and `/echo` never move at all;
+---   * **it is an adjacent transposition**, at the tail, of two `/work`
+---     completions with the same step count.
+---
+--- So what varies is the order in which cqueues resumes coroutines that
+--- became runnable at the SAME INSTANT. `sleep(0)` asks for a deadline of
+--- now; two coroutines asking for it inside the same tick are tied, and how a
+--- tie is broken is an implementation detail of the scheduler rather than
+--- anything its API promises. Linux happens to break it by insertion order
+--- every time. macOS does not, twice in five.
+---
+--- WHAT THAT COSTS L1, stated plainly because this file was the reason L1
+--- skipped building a scheduler. This file's own header used to argue that a
+--- second scheduler was unnecessary because a seeded run already reproduces.
+--- That argument was made on Linux-only evidence, and it is now known to hold
+--- only where the tie-break happens to be stable. A simulator that replays a
+--- schedule has to CONTROL resumption order, and cqueues does not offer that
+--- portably.
+---
+--- What survives is still worth having, and it is what akkar actually
+--- controls: ids, random, the clock, capability acquisition and release, and
+--- every request's own path through the framework are reproducible from a
+--- seed. What is not akkar's to give is the interleaving of coroutines that
+--- are simultaneously ready.
 local KQUEUE = portable.os_name ~= "Linux"
 
 describe("a seeded run", function()

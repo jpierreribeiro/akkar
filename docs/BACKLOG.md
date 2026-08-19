@@ -892,7 +892,43 @@ CI now. The defect it was reporting is fixed and its measurement was repaired,
 but the two were established separately and only CI can say the first was the
 whole of it.
 
-### 12.2 Determinism is established on epoll, not on kqueue
+### 12.2 Determinism — the mechanism is now known, and it is a scheduler tie-break
+
+**Answered 2026-08-19, by instrumenting rather than by arguing.**
+
+Three explanations were written or tried and all three were wrong. The one in
+the repository said the kernel's polling mechanism orders the resumes, epoll
+against kqueue; that workload opens no socket, so neither had anything to
+order. Burning up to a millisecond of CPU between `sleep(0)` calls changed
+nothing across forty Linux runs. Driving the worker keepalive from 0.1 s to
+0.1 ms changed nothing either.
+
+`spec/support/determinism_report.lua` went and got the data instead, as a CI
+step that cannot fail a build. From macOS, 2 of 5 rounds differing:
+
+```
+SAME SET OF REQUESTS, so this is purely an ORDERING difference.
+first difference at position 36 of 40:
+  run 1: work:9e8c9247000015:6
+  run 2: work:9e8c9247000010:6
+  run 1's line is at position 37 in run 2 (moved +1)
+positions that differ, by route: work x2
+```
+
+Nothing vanished. Only `/work` moves, and it is the only route that calls
+`cqueues.sleep(0)`. It is an adjacent transposition of two coroutines with the
+same step count. **The variable is how cqueues breaks a tie between coroutines
+that became runnable in the same tick**, which its API does not promise.
+
+**What it costs:** the claim that a simulator needs no scheduler of its own was
+drawn from Linux-only evidence and is narrower than it read. Replaying an exact
+schedule needs control cqueues does not offer portably. What survives is what
+akkar controls: ids, random, clock, capability acquisition and release, and
+each request's own path, all reproducible from a seed. `spec/simulation_spec.lua`
+does not depend on interleaving -- a resource is returned or it is not -- so L1
+stands.
+
+### 12.2-old Determinism is established on epoll, not on kqueue
 
 **Status: narrowed, with the narrowing in the assertion.**
 
