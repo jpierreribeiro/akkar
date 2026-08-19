@@ -954,13 +954,37 @@ real content: the budget counts DOWN.
 assertion may compare a clock reading to a bound the CLOCK cannot cross, and
 may not compare it to the number the arithmetic was built from.
 
-### 12.3 HTTP/2 has no fuzz suite
+### 12.3 HTTP/2 fuzzing — BUILT, and it found a three-byte denial of service
 
-`spec/fuzz_spec.lua` covers h1 framing, which is where request smuggling
-lives. h2's framing layer is upstream lua-http 0.4's, unmodified, and akkar
-has not fuzzed it. The h1 fuzzer goes through a client, so it cannot express a
-frame this wrong; h2 needs its own, driving frames directly at
-`h2_connection`. Named in the README's known gaps rather than left implicit.
+**Status: `spec/h2_framing_spec.lua` exists, 22 hostile frame shapes, and the
+first run found a remote denial of service in upstream lua-http 0.4.**
+
+`read_http2_frame` reads a nine-byte frame header with `xread(9)`, which
+returns what it HAS when the peer goes away. Three bytes and a hang up produce
+a three-byte string; it is not nil, so every error branch is skipped, and
+`sunpack(">I3 B B I4", ...)` raises "data string too short".
+
+That raise travels out of the connection, out of the server loop, and out of
+`app:run`. The process stays up, the listening socket stays open, and
+**nothing is ever accepted again — HTTP/1.1 included**, because what died is
+the accept loop rather than the connection. Three bytes from one unauthenticated
+peer, permanently.
+
+Upstream checks for exactly this on the PAYLOAD twenty lines below —
+`if payload and #payload < size then -- hit EOF` — and not on the header. The
+vendored copy now mirrors it: a short header is EILSEQ, which is what the
+branch above it already uses for a protocol error. No unget, because unlike
+the payload case a retry cannot help; the peer sent half a header and left.
+
+Mutation-testing the guard away returns both original symptoms.
+
+**What this does NOT establish** is that lua-http's h2 is correct. It
+establishes that 22 named shapes do not take akkar down. h2spec, a real
+conformance suite, is different work against a server in another process, and
+belongs in `bench/`.
+
+**And it should go upstream.** The bug is not akkar's and every lua-http user
+serving h2 has it.
 
 ### 12.4 The historical benchmarks are still unrepeated
 

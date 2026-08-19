@@ -881,7 +881,7 @@ JSON API has today, which is nothing.
 |---|---|
 | No HTTP/3 | HTTP/1.1 and HTTP/2 are both here; QUIC is a UDP transport with its own congestion control and TLS integration, and neither cqueues nor lua-http has it. Behind a proxy this costs nothing, which is where h3 is terminated in practice |
 | No WebSocket | a long-lived connection outside the request/response model needs its own capability and its own shutdown story. lua-http has an implementation; the lifecycle is the work |
-| HTTP/2 has no fuzz suite of its own yet | `spec/fuzz_spec.lua` covers h1 framing, where request smuggling lives. h2's framing layer is upstream lua-http 0.4's, unmodified, but akkar has not fuzzed it |
+| HTTP/2 is fuzzed for framing, not for conformance | `spec/h2_framing_spec.lua` throws 22 hostile frame shapes at a live server and requires it to keep answering; its first run found a three-byte denial of service in upstream lua-http, fixed in the vendored copy. What it does not establish is h2 conformance — h2spec is separate work |
 | Uploads are buffered, not streamed | a multipart body is held in memory under `body_limit` |
 | `akkar.cache.memory` is per-process | two processes have two caches, and akkar's answer to more CPU is more processes |
 | Teal does not check schemas against handler output | schemas are runtime values; validation is what checks those |

@@ -374,6 +374,29 @@ function connection_methods:read_http2_frame(timeout)
 			return nil, err, errno
 		end
 	end
+	-- A HEADER THAT ARRIVED SHORT, which upstream checks for the PAYLOAD
+	-- twenty lines below -- `if payload and #payload < size then -- hit EOF`
+	-- -- and not here.
+	--
+	-- `xread(9)` returns what it has when the peer goes away, so three bytes
+	-- and a hang up produce a three-byte string. It is not nil, so every
+	-- branch above is skipped, and `sunpack(">I3 B B I4", ...)` raises "data
+	-- string too short". That raise travels out of the connection, out of the
+	-- server loop, and out of `app:run`: the process stays up and the
+	-- listening socket stays open, and nothing is ever accepted again.
+	--
+	-- Measured by `spec/h2_framing_spec.lua`: three bytes, and HTTP/1.1 stops
+	-- answering too, because what died is the accept loop rather than the
+	-- connection. It is the same shape `akkar/init.lua` records for
+	-- `Content-Length: banana` on the h1 side.
+	--
+	-- No unget: unlike the payload case, a retry cannot help. The peer sent a
+	-- partial frame header and left, so this is a protocol error, and EILSEQ
+	-- is what the branch above already uses for one.
+	if #frame_header < 9 then
+		self.socket:seterror("r", ce.EILSEQ)
+		return nil, onerror(self.socket, "read_http2_frame", ce.EILSEQ)
+	end
 	local size, typ, flags, streamid = sunpack(">I3 B B I4", frame_header)
 	if size > self.acked_settings[known_settings.MAX_FRAME_SIZE] then
 		local ok, errno2 = self.socket:unget(frame_header)
