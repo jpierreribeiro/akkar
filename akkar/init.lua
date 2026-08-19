@@ -246,7 +246,7 @@ local SETTINGS = {
   max_concurrent = true, trusted_proxies = true,
   repair_substrate = true, socket_buffer = true, gc = true,
   cpu_limit = true, h2c = true, websocket_idle_timeout = true,
-  websocket_max_message = true,
+  websocket_max_message = true, websocket_max_connections = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -835,7 +835,7 @@ function App:websocket(path, opts, handlers)
     end
   end
 
-  return self:get(path, opts, function(req)
+  local registered = self:get(path, opts, function(req)
     if not ws_module.wants_upgrade(req.headers) then
       -- A PLAIN GET TO A SOCKET ROUTE gets an ordinary refusal rather than a
       -- hijacked stream. 426 is the status that exists for exactly this, and
@@ -850,6 +850,10 @@ function App:websocket(path, opts, handlers)
     upgrading.websocket = { handlers = handlers, req = req }
     return upgrading
   end)
+  -- Marked so `akkar doctor` can tell an application that serves sockets from
+  -- one that does not, and warn about `max_concurrent` only when it matters.
+  self.routes[#self.routes].websocket_route = true
+  return registered
 end
 
 function App:use(fn)
@@ -2809,8 +2813,37 @@ function App:run(config)
         -- must not be held for the life of a socket. `ws:scope` is how a
         -- callback reaches the database, one message at a time.
         if res.websocket then
-          local socket_id = self.sockets_open + 1
-          self.sockets_open = socket_id
+          -- A CEILING OF THEIR OWN, because a socket is a connection that
+          -- lasts and `max_concurrent` counts connections.
+          --
+          -- Measured: with `max_concurrent = 10`, ten IDLE WebSockets consume
+          -- the entire connection budget and the eleventh client -- an
+          -- ordinary GET to an ordinary route -- is never accepted. A chat
+          -- feature takes the API down with it, and nothing in the
+          -- configuration hints that the number sized for concurrent requests
+          -- now has to cover connections that live for hours.
+          --
+          -- So sockets are bounded separately when the application says so,
+          -- and the refusal is a 503 on the handshake rather than a silence:
+          -- the client learns it should retry, which a stalled accept queue
+          -- never tells anybody.
+          local ceiling = config.websocket_max_connections
+          if ceiling and self.sockets_open >= ceiling then
+            internal:warn("websocket refused: at capacity", {
+              open = self.sockets_open, websocket_max_connections = ceiling,
+            })
+            local rh = headers.new()
+            rh:append(":status", "503")
+            rh:append("content-type", "application/json")
+            rh:append("retry-after", "5")
+            stream:write_headers(rh, false)
+            stream:write_chunk(
+              '{"error":"too many websocket connections"}', true)
+            self.in_flight = self.in_flight - 1
+            return
+          end
+
+          self.sockets_open = self.sockets_open + 1
           local upgrade = res.websocket
           local served, why = ws_module.serve(stream, upgrade.req, h,
             upgrade.handlers, {

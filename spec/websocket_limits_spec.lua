@@ -126,6 +126,84 @@ local function run(port, body)
   return result, delivered
 end
 
+describe("how many sockets there may be", function()
+  it("refuses past websocket_max_connections, and keeps serving HTTP",
+     function()
+    -- THE INTERACTION NOBODY READS ABOUT UNTIL IT HAPPENS. A socket is a
+    -- connection that lasts, and `max_concurrent` counts connections.
+    -- Measured before this bound existed: ten IDLE sockets against
+    -- `max_concurrent = 10`, and the eleventh client -- an ordinary GET to an
+    -- ordinary route -- was never accepted at all. A chat feature took the
+    -- API down with it.
+    local request = require "http.request"
+    local port = 8465
+    local CEILING = 3
+
+    local app = akkar.new()
+    app:get("/ping", function() return { pong = true } end)
+    app:websocket("/ws", { message = function() end })
+
+    local accepted, refused, ping_status = 0, 0, nil
+    local held = {}
+
+    local cq = cqueues.new()
+    cq:wrap(function()
+      pcall(function()
+        app:run { port = port, check_capabilities = false,
+                  websocket_max_connections = CEILING,
+                  log = akkar.log.new { level = "error",
+                                        sink = function() end } }
+      end)
+    end)
+    cq:wrap(function()
+      cqueues.sleep(0.4)
+      for _ = 1, CEILING + 3 do
+        local c = socket.connect("127.0.0.1", port)
+        c:setmode("bn", "bn")
+        c:onerror(function(_, _, why) return why end)
+        c:settimeout(5)
+        c:write("GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+                .. "Connection: Upgrade\r\n"
+                .. "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                .. "Sec-WebSocket-Version: 13\r\n\r\n")
+        c:flush()
+        local status = c:read "*l"
+        repeat local l = c:read "*l" until not l or l == "" or l == "\r"
+        if status and status:find "101" then
+          accepted = accepted + 1
+          held[#held + 1] = c
+        else
+          refused = refused + 1
+          c:close()
+        end
+      end
+
+      -- The point of the ceiling: ordinary requests still get through.
+      local ok, h, st = pcall(function()
+        local hh, ss = request.new_from_uri(
+          ("http://127.0.0.1:%d/ping"):format(port)):go(3)
+        return hh, ss
+      end)
+      if ok and h then ping_status = h:get ":status" end
+      if st and st.shutdown then pcall(function() st:get_body_as_string(2) end)
+        st:shutdown() end
+
+      for _, c in ipairs(held) do c:close() end
+      cqueues.sleep(0.2)
+      app:stop(2)
+    end)
+    assert(cq:loop(30))
+
+    assert.equal(CEILING, accepted,
+      ("%d sockets were accepted against a ceiling of %d")
+        :format(accepted, CEILING))
+    assert.equal(3, refused, "the sockets past the ceiling were not refused")
+    -- A 503 is a refusal the client can act on. A stalled accept queue is not.
+    assert.equal("200", ping_status,
+      "HTTP stopped being answered while sockets were at capacity")
+  end)
+end)
+
 describe("a WebSocket message", function()
   it("arrives whole when it is inside the limit", function()
     -- The guard must not have turned every message into a refusal. Four sizes,

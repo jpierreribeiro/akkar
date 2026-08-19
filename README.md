@@ -459,6 +459,14 @@ rather than hijacked, an idle socket is closed after `websocket_idle_timeout`
 (300 s), and `app:stop` sends every open socket a 1001 close frame instead of
 waiting for connections that have no reason to end.
 
+**And a socket has a ceiling of its own.** `max_concurrent` counts
+connections, and a socket is a connection that lasts: measured, ten idle
+WebSockets against `max_concurrent = 10` and the eleventh client — an ordinary
+GET to an ordinary route — is never accepted at all. `websocket_max_connections`
+bounds them separately and refuses the surplus with 503 and `retry-after`,
+which a stalled accept queue never tells anybody. `akkar doctor` warns when an
+application serves sockets and has not set it. An idle socket costs **10.2 KB**.
+
 **And a message is bounded by the same number a body is.** `body_limit` covers
 both, on the length the peer declares and on the sum of its fragments, and the
 refusal is close code 1009. That is not decoration: measured before the bound

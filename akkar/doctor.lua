@@ -342,6 +342,34 @@ function M.check_app(app, config, report)
       "enables cleartext h2 for a proxy or a gRPC client")
   end
 
+  -- WEBSOCKETS AGAINST `max_concurrent`, which is the interaction nobody
+  -- reads about until it happens. A socket is a connection that lasts, and
+  -- `max_concurrent` counts connections -- measured, ten idle sockets against
+  -- `max_concurrent = 10` and the eleventh client is never accepted at all.
+  local has_socket_route = false
+  for _, route in ipairs(app.routes or {}) do
+    if route.websocket_route then has_socket_route = true break end
+  end
+  if has_socket_route then
+    if config.websocket_max_connections then
+      report:ok("settings",
+        "websocket_max_connections = " .. tostring(config.websocket_max_connections),
+        "sockets cannot take the whole connection budget")
+    elseif config.max_concurrent then
+      report:warn("settings",
+        "websockets share max_concurrent with everything else",
+        ("max_concurrent is %s and a socket holds one of those for as long as "
+         .. "it lives; enough open sockets and ordinary requests stop being "
+         .. "accepted"):format(tostring(config.max_concurrent)),
+        "set websocket_max_connections to something below max_concurrent")
+    else
+      report:warn("settings", "websocket connections are unbounded",
+        "a socket holds a connection for as long as it lives, and nothing "
+        .. "here bounds how many there are",
+        "set websocket_max_connections")
+    end
+  end
+
   if config.reuseport then
     report:ok("settings", "reuseport is on",
               "several processes can share the port; capacity is processes")
