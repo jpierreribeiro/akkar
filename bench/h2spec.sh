@@ -14,7 +14,19 @@
 #
 # RESULT, akkar with `h2c = true`, h2spec 2.6.0, 2026-08-19:
 #
-#     146 tests, 145 passed, 1 skipped, 0 failed     15 runs out of 15
+#     146 tests, 146 passed, 0 skipped, 0 failed
+#
+# THE SKIPPED ONE WAS A FINDING, not a footnote. h2spec skips 5.1.2, "sends
+# HEADERS that cause the advertised concurrent stream limit to be exceeded",
+# when the server advertises no limit -- and akkar advertised
+# MAX_CONCURRENT_STREAMS = infinity, inherited from upstream's defaults.
+#
+# Measured: 500 concurrent streams on ONE connection all went through, at
+# 10 KB each, with `max_concurrent` never seeing them because it counts
+# connections and that was one. Advertising 100 made 5.1.2 run, and it FAILED,
+# which is how upstream's two `-- TODO: check MAX_CONCURRENT_STREAMS` comments
+# stopped being trivia. Enforced now, and the same 500-stream probe delivers
+# 100 to the application instead of 500.
 #
 # AND IT WAS NOT ALWAYS 15 OUT OF 15. The first five runs of this file split
 # 3/2: three clean, two failing 3.8, GOAWAY. h2spec sends a GOAWAY and then a

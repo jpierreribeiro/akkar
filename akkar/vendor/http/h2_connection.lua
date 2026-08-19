@@ -116,6 +116,10 @@ local function new_connection(socket, conn_type, settings)
 
 		streams = setmetatable({}, {__mode="kv"});
 		n_active_streams = 0;
+		-- How many streams a PEER may have open at once here. Set from the
+		-- settings this connection advertises, so the number enforced and the
+		-- number announced cannot drift apart.
+		max_peer_streams = nil;
 		onidle_ = nil;
 		stream0 = nil; -- store separately with a strong reference
 
@@ -166,6 +170,12 @@ local function new_connection(socket, conn_type, settings)
 	if self.type == "client" then
 		assert(socket:xwrite(preface, "f", 0))
 	end
+	-- The number ENFORCED comes from the number ANNOUNCED, taken here rather
+	-- than passed separately, so the two cannot drift apart in a later edit.
+	if settings then
+		self.max_peer_streams = settings[known_settings.MAX_CONCURRENT_STREAMS]
+		                     or settings[0x3]
+	end
 	assert(self.stream0:write_settings_frame(false, settings or {}, 0, "f"))
 	-- note that the buffer is *not* flushed right now
 
@@ -187,12 +197,31 @@ local function handle_frame(self, typ, flag, streamid, payload, deadline)
 	-- http2 spec section 4.1:
 	-- Implementations MUST ignore and discard any frame that has a type that is unknown.
 	if handler then
+		local refuse_stream = false
 		local stream = self.streams[streamid]
 		if stream == nil then
 			if xor(streamid % 2 == 1, self.type == "client") then
 				return nil, h2_error.errors.PROTOCOL_ERROR:new_traceback("Streams initiated by a client MUST use odd-numbered stream identifiers; those initiated by the server MUST use even-numbered stream identifiers"), ce.EILSEQ
 			end
-			-- TODO: check MAX_CONCURRENT_STREAMS
+			-- MAX_CONCURRENT_STREAMS, ENFORCED. Upstream leaves a TODO here and
+			-- advertises `math.huge`, which is why h2spec skipped 5.1.2: there
+			-- was no limit to exceed. Measured before this line existed, 500
+			-- concurrent streams on ONE connection went straight through at
+			-- 10 KB each, and `max_concurrent` never saw them because it
+			-- counts connections and that was one.
+			--
+			-- Refused, not dropped. The stream is still CREATED and the frame
+			-- is still handled below, because a HEADERS block has to be
+			-- decoded whatever happens to the request: skipping it would
+			-- desynchronise HPACK for every later stream on the connection,
+			-- which RFC 7540 section 6.8 says in as many words. What the
+			-- refusal changes is that the stream never reaches the
+			-- application, and the peer is told REFUSED_STREAM, which means
+			-- "not processed, retry elsewhere" rather than "you did something
+			-- wrong".
+			refuse_stream = self.max_peer_streams ~= nil
+			                and self.type == "server"
+			                and self.n_active_streams >= self.max_peer_streams
 			stream = self:new_stream(streamid)
 			--[[ http2 spec section 6.8
 			the sender will ignore frames sent on streams initiated by
@@ -211,12 +240,22 @@ local function handle_frame(self, typ, flag, streamid, payload, deadline)
 			unsynchronized.]]
 			-- If we haven't seen this stream before, and we should be discarding frames from it,
 			-- then don't push it into the new_streams fifo
-			if self.send_goaway_lowest == nil or streamid <= self.send_goaway_lowest then
+			if not refuse_stream
+				and (self.send_goaway_lowest == nil or streamid <= self.send_goaway_lowest) then
 				self.new_streams:push(stream)
 				self.new_streams_cond:signal(1)
 			end
 		end
 		local ok, err, errno = handler(stream, flag, payload, deadline)
+		if refuse_stream and ok then
+			-- After the handler, so HPACK has seen the block.
+			local ok2, err2, errno2 = stream:rst_stream(
+				h2_error.errors.REFUSED_STREAM, deadline and deadline-monotime())
+			if not ok2 then
+				return nil, err2, errno2
+			end
+			return true
+		end
 		if not ok then
 			if h2_error.is(err) and err.stream_error and streamid ~= 0 and stream.state ~= "idle" then
 				local ok2, err2, errno2 = stream:rst_stream(err, deadline and deadline-monotime())

@@ -108,7 +108,21 @@ local function wrap_socket(self, socket, timeout)
 	end
 	local conn, err, errno
 	if version == 2 then
-		conn, err, errno = h2_connection.new(socket, "server", nil)
+		-- A CEILING ON CONCURRENT STREAMS, advertised in the connection's
+		-- SETTINGS.
+		--
+		-- Upstream's default is `math.huge`, and the consequence is not
+		-- theoretical: h2spec skips 5.1.2, "sends HEADERS that cause the
+		-- advertised concurrent stream limit to be exceeded", precisely
+		-- because there is no limit to exceed. Measured here, 500 concurrent
+		-- streams on ONE connection were all accepted, at 10 KB each, with
+		-- `max_concurrent` doing nothing because `max_concurrent` counts
+		-- CONNECTIONS and this is one.
+		--
+		-- 100 is what nginx and most servers advertise. A browser opens six.
+		conn, err, errno = h2_connection.new(socket, "server",
+			self.h2_max_concurrent_streams and
+			{ [0x3] = self.h2_max_concurrent_streams } or nil)
 	else
 		conn, err, errno = h1_connection.new(socket, "server", version)
 	end
@@ -355,6 +369,7 @@ local function new_server(tbl)
 		ctx = tbl.ctx;
 		version = tbl.version;
 		h2c = tbl.h2c;
+		h2_max_concurrent_streams = tbl.h2_max_concurrent_streams;
 		max_concurrent = tbl.max_concurrent;
 		n_connections = 0;
 		pause_cond = cc.new();
@@ -435,6 +450,7 @@ local function listen(tbl)
 		ctx = ctx;
 		version = tbl.version;
 		h2c = tbl.h2c;
+		h2_max_concurrent_streams = tbl.h2_max_concurrent_streams;
 		max_concurrent = tbl.max_concurrent;
 		connection_setup_timeout = tbl.connection_setup_timeout;
 		intra_stream_timeout = tbl.intra_stream_timeout;

@@ -247,6 +247,7 @@ local SETTINGS = {
   repair_substrate = true, socket_buffer = true, gc = true,
   cpu_limit = true, h2c = true, websocket_idle_timeout = true,
   websocket_max_message = true, websocket_max_connections = true,
+  h2_max_concurrent_streams = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -2688,6 +2689,10 @@ function App:run(config)
     -- `h2c = true` because the preface sniff it needs is a read on every
     -- connection, h1 ones included. See `akkar/vendor/http/server.lua`.
     h2c = config.h2c,
+    -- One connection must not be able to open unbounded requests. See the
+    -- note in `vendor/http/server.lua`: `max_concurrent` counts connections,
+    -- and 500 streams on one connection were measured going straight through.
+    h2_max_concurrent_streams = config.h2_max_concurrent_streams or 100,
     reuseport = config.reuseport,
     max_concurrent = max_concurrent,
     onstream = function(_, stream)
