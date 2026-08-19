@@ -391,6 +391,16 @@ awk '{ n[$2]++; s[$2]+=$3; bad[$2] += $6
              if (bad[c] > 0)
                printf "%-10s REFUSED -- %d non-2xx across %d reps; a mean over a failing server is not a measurement\n",
                  c, bad[c], n[c]
+             # A CANDIDATE THAT NEVER STARTED HAS A MEAN OF ZERO, AND DIVIDING
+             # BY IT KILLED THE GATE. On the run where all four failed to
+             # start, this line was the only thing that crashed --
+             # "fatal: division by zero attempted" -- so the one summary that
+             # would have said "nothing was measured" was the one that never
+             # printed. A gate that dies on the input it exists to describe is
+             # worse than no gate, because its silence looks like assent.
+             else if (s[c] == 0)
+               printf "%-10s NO MEASUREMENT -- %d reps, all zero; the candidate did not run\n",
+                 c, n[c]
              else
                printf "%-10s mean %10.0f rps   spread %.2f%%\n",
                  c, s[c]/n[c], 100*(mx[c]-mn[c])/(s[c]/n[c])

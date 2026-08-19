@@ -1065,9 +1065,30 @@ spreads of 1.1% and 0.7% — a tie by this page's own rule, and it means HTTP/2,
 WebSocket and four new bounds cost nothing measurable. `bench/study/RESULTS.md`
 §0.
 
-**What is still not retaken** is the neighbour comparison, the D4 table, which
-needs OpenResty, Lapis and Luvit provisioned on the box as well. That is
-`bench/runtime/provision.sh` and a longer run, not a blocker.
+**AND THE NEIGHBOUR COMPARISON IS RETAKEN TOO**, 2026-08-19, all four
+candidates on one box in one run. `bench/runtime/RESULTS.md`, third run:
+
+| | req/s | spread | p99 |
+|---|---:|---:|---:|
+| OpenResty | 91,154 | 0.93% | 1.19 ms |
+| Luvit | 10,630 | 17.79% | 29.7 to 43.7 ms |
+| akkar | 10,417 | 0.39% | 12.70 ms |
+| Lapis | 6,676 | 1.09% | 17.85 ms |
+
+**OpenResty 8.75x. Lapis 1.56x the other way. Luvit is a tie** — 2.0% apart
+against Luvit's own 17.79% noise floor, which rule 3 says is not a result —
+**and akkar's tail is two to three and a half times better than Luvit's at the
+same throughput.**
+
+Two things the run found about itself. The first attempt measured nothing and
+said so, because `deploy.sh` had not been run; the harness refused rather than
+publishing a comparison one candidate had taken part in. And the summariser
+that would have printed "nothing was measured" was the only line that crashed,
+on division by zero — a gate that dies on the input it exists to describe.
+Fixed.
+
+**Still not measured**: D5 saturation, D7 dependency-down, and anything
+touching a database.
 
 ### 12.4-old The historical benchmarks are still unrepeated
 

@@ -212,9 +212,10 @@ For a JSON API, yes, and the honest comparison is on the page rather than in a
 footnote.
 
 akkar answers a JSON request in about 93 microseconds of CPU. Against OpenResty
-it is 9.15 times slower, and OpenResty is nginx: the request pipeline is C and
+it is 8.75 times slower, and OpenResty is nginx: the request pipeline is C and
 Lua only runs your handler. Against Lapis, the other Lua framework in the same
-shape, akkar is 1.47 times faster.
+shape, akkar is 1.56 times faster. Against Luvit, on libuv, the two are level
+on throughput and akkar's p99 is two to three times better.
 
 What that means in practice: an endpoint that spends four milliseconds in
 Postgres spends about a tenth of a millisecond in akkar. The runtime is not
