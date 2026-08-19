@@ -312,6 +312,24 @@ function connection_methods:shutdown()
 	for _, stream in pairs(self.streams) do
 		stream:shutdown()
 	end
+
+	-- DRAINED BEFORE THE READ SIDE IS SHUT DOWN, because closing a socket that
+	-- still holds unread inbound data makes the kernel send RST instead of
+	-- FIN -- and an RST discards whatever the peer had already put on the
+	-- wire, on a connection that was ending in an orderly way.
+	--
+	-- h2spec 3.8 is the case: it sends GOAWAY and then a PING, and expects
+	-- either a clean close or a PING ACK. Two runs in five it saw
+	-- "connection reset by peer" instead, and whether it did depended on
+	-- whether its PING had landed in the buffer by the time this line ran.
+	--
+	-- BOUNDED, because a peer that keeps sending must not be able to hold the
+	-- shutdown open: sixty-four reads of up to 4 KB, with no timeout, so this
+	-- reads what has ALREADY arrived and never waits for more.
+	for _ = 1, 64 do
+		if not self.socket:xread(-4096, 0) then break end
+	end
+
 	self.socket:shutdown("r")
 	return ok, err, errno
 end

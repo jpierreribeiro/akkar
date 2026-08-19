@@ -994,11 +994,17 @@ mechanism is ordinary: closing a socket with unread inbound data makes the
 kernel send RST rather than FIN, so whether h2spec's PING has landed by the
 time the server closes decides which the peer sees.
 
-**Open, and small.** It is a deviation and not a hazard -- the connection is
-ending either way, and what an RST costs is data in flight on a connection the
-peer asked to close. Fixing it means draining before closing in the vendored
-`h2_connection` GOAWAY path, which is upstream's code and deserves more care
-than a conformance point is worth on its own.
+**FIXED, and it was six lines.** `connection_methods:shutdown` shut the read
+side down while the peer's PING was still unread, and closing a socket with
+unread inbound data makes the kernel send RST rather than FIN. The vendored
+copy now drains what has ALREADY arrived -- bounded at 64 reads of 4 KB, with
+no timeout, so a peer that keeps sending cannot hold the shutdown open -- and
+then shuts the read side down.
+
+**15 consecutive clean runs since**, against 2-in-5 failing before. The
+deviation was small and the fix was smaller than the paragraph that deferred
+it, which is worth remembering the next time something is deferred for being
+upstream's code.
 
 **And it should go upstream.** The bug is not akkar's and every lua-http user
 serving h2 has it.

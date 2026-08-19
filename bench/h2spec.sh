@@ -12,28 +12,27 @@
 # h2spec is a Go binary, so it is one by construction, and it is fetched rather
 # than vendored.
 #
-# RESULT, akkar with `h2c = true`, h2spec 2.6.0, 2026-08-19, five runs:
+# RESULT, akkar with `h2c = true`, h2spec 2.6.0, 2026-08-19:
 #
-#     146 tests, 145 passed, 1 skipped, 0 failed     3 runs
-#     146 tests, 144 passed, 1 skipped, 1 failed     2 runs
+#     146 tests, 145 passed, 1 skipped, 0 failed     15 runs out of 15
 #
-# THE ONE THAT FAILS INTERMITTENTLY IS 3.8, GOAWAY. h2spec sends a GOAWAY and
-# then a PING, and expects either a clean close or a PING ACK; it sometimes
-# gets `connection reset by peer` instead. Two runs in five, which is a real
-# deviation rather than a flaky measurement -- and the mechanism is ordinary:
-# closing a socket that still has unread inbound data makes the kernel send
-# RST rather than FIN, so whether h2spec's PING has landed in the buffer by
-# the time the server closes decides which one it sees.
+# AND IT WAS NOT ALWAYS 15 OUT OF 15. The first five runs of this file split
+# 3/2: three clean, two failing 3.8, GOAWAY. h2spec sends a GOAWAY and then a
+# PING and expects either a clean close or a PING ACK, and twice in five it got
+# `connection reset by peer` instead.
 #
-# It is a deviation and not a hazard: the connection is going away either way,
-# and what a RST costs is data already in flight on a connection the peer
-# asked to end. Fixing it means draining before closing in the vendored
-# `h2_connection` GOAWAY path, which is upstream's code and a change worth
-# more care than a conformance point. Recorded in `docs/BACKLOG.md` §12.3.
+# The mechanism was ordinary and the fix was one loop.
+# `connection_methods:shutdown` shut the READ side down while the peer's PING
+# was still unread in the buffer, and closing a socket with unread inbound
+# data makes the kernel send RST rather than FIN. Whether h2spec's PING had
+# landed by then decided which one it saw. The vendored copy now drains what
+# has already arrived -- bounded, without waiting -- before shutting the read
+# side down. Fifteen consecutive clean runs since.
 #
 # The first run of this file reported 145/0 and the second 144/1. Reporting
 # the first number alone would have been the exact mistake this project spent
-# a week finding in its instruments.
+# a week finding in its instruments -- and it would also have hidden a real
+# defect that turned out to be fixable in six lines.
 #
 # Run it after touching anything under `akkar/vendor/http/h2_*`, `hpack.lua`,
 # or the negotiation in `server.lua`.
