@@ -39,9 +39,10 @@ that genuinely wants them different, and defaults to `body_limit`.
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
-local akkar   = require "akkar"
-local cqueues = require "cqueues"
-local socket  = require "cqueues.socket"
+local akkar     = require "akkar"
+local cqueues   = require "cqueues"
+local socket    = require "cqueues.socket"
+local websocket = require "http.websocket"
 
 local LIMIT = 64 * 1024
 
@@ -79,9 +80,9 @@ local function read_reply(c)
   end
   local body = len > 0 and c:read(len) or ""
   if opcode == 0x8 and #body >= 2 then
-    return opcode, (body:byte(1) << 8) | body:byte(2)
+    return opcode, (body:byte(1) << 8) | body:byte(2), body
   end
-  return opcode
+  return opcode, nil, body
 end
 
 local function run(port, body)
@@ -89,7 +90,13 @@ local function run(port, body)
 
   local app = akkar.new()
   app:websocket("/ws", {
-    message = function(_, text) delivered[#delivered + 1] = #text end,
+    -- ACKNOWLEDGED, so a caller can WAIT for delivery instead of sleeping and
+    -- hoping. See the note on the first case below: sleeping is what made
+    -- this file fail on a slower machine while passing here.
+    message = function(ws, text)
+      delivered[#delivered + 1] = #text
+      ws:send(tostring(#text))
+    end,
   })
 
   local function connect()
@@ -206,21 +213,64 @@ end)
 
 describe("a WebSocket message", function()
   it("arrives whole when it is inside the limit", function()
-    -- The guard must not have turned every message into a refusal. Four sizes,
-    -- the last one a thousand bytes under the bound, because an off-by-one in
-    -- a size check is the classic way to make a limit useless in the other
-    -- direction.
-    local _, delivered = run(8461, function(connect)
-      local c = connect()
-      for _, size in ipairs { 100, 1000, 60000, LIMIT - 1000 } do
-        c:write(frame(true, 0x1, string.rep("a", size)))
-        c:flush()
-        cqueues.sleep(0.3)
-      end
-      c:close()
-    end)
+    -- THE RAW CLIENT IS FOR HOSTILE FRAMES, AND THIS CASE IS NOT ONE. Every
+    -- other case here hand-builds frames because it sends shapes a library
+    -- refuses to send. This one only asks whether an ordinary message of an
+    -- ordinary size arrives, so it uses an ordinary client, and the previous
+    -- two versions of it were both wrong for want of that.
+    --
+    -- The first slept 0.3 s between messages and asserted all four had
+    -- arrived, which is an assumption about machine speed dressed as an
+    -- assertion about behaviour: on macOS CI the largest one had not been
+    -- read yet. The second waited for an acknowledgement instead, which was
+    -- the right idea against the wrong client -- the hand-rolled one never
+    -- got a reply for 60 KB, and an independent client proved that 60,000,
+    -- 64,536 and 65,536 byte messages all round-trip perfectly. The defect
+    -- was in the instrument twice over.
+    --
+    -- Sizes go right up to the limit itself, because an off-by-one in a size
+    -- check is the classic way to make a bound useless in the other direction.
+    local delivered = {}
 
-    assert.same({ 100, 1000, 60000, LIMIT - 1000 }, delivered)
+    local app = akkar.new()
+    app:websocket("/ws", {
+      message = function(ws, text)
+        delivered[#delivered + 1] = #text
+        ws:send(tostring(#text))            -- so the client can WAIT, not sleep
+      end,
+    })
+
+    local port = 8461
+    local acked = {}
+    local cq = cqueues.new()
+    cq:wrap(function()
+      pcall(function()
+        app:run { port = port, check_capabilities = false, body_limit = LIMIT,
+                  log = akkar.log.new { level = "error",
+                                        sink = function() end } }
+      end)
+    end)
+    cq:wrap(function()
+      cqueues.sleep(0.4)
+      local ws = websocket.new_from_uri(("ws://127.0.0.1:%d/ws"):format(port))
+      assert(ws:connect(5))
+      for _, size in ipairs { 100, 1000, 60000, LIMIT - 1000, LIMIT } do
+        assert(ws:send(string.rep("a", size), "text", 10))
+        -- One value, deliberately: `receive` returns (data, opcode), and
+        -- passing both to `tonumber` makes the opcode its BASE.
+        local body = ws:receive(10)
+        acked[#acked + 1] = tonumber(body)
+      end
+      pcall(function() ws:close(1000, nil, 2) end)
+      app:stop(2)
+    end)
+    assert(cq:loop(30))
+
+    local expected = { 100, 1000, 60000, LIMIT - 1000, LIMIT }
+    assert.same(expected, delivered)
+    -- And the acknowledgements agree, so what the handler saw is what the
+    -- client believes it sent.
+    assert.same(expected, acked)
   end)
 
   it("is refused with 1009 when one frame is too big", function()
@@ -277,7 +327,8 @@ describe("a WebSocket message", function()
              "the server stopped accepting websockets: " .. tostring(status))
       ordinary:write(frame(true, 0x1, "still here"))
       ordinary:flush()
-      cqueues.sleep(0.3)
+      local opcode = read_reply(ordinary)          -- the ack, not a sleep
+      assert(opcode == 0x1, "the ordinary socket was never answered")
       ordinary:close()
     end)
 

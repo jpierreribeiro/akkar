@@ -331,7 +331,11 @@ jobs:
       # position first diverges; how far a line moved; which routes are
       # involved. `|| true` because a diagnostic that can turn a build red is
       # a diagnostic somebody deletes.
+      # `if: always()` because the run this report is FOR is the run where the
+      # suite failed. Without it the step is skipped exactly when it would have
+      # said something, which is what happened on its first outing.
       - name: Determinism report (informational)
+        if: always()
         run: |
           lua5.4 -e 'require("spec.support.determinism_report").report(5)' || true
 
