@@ -184,6 +184,12 @@ function M.serve(stream, req, raw_headers, handlers, options)
   if options.register then options.register(sock) end
 
   local closed_code, closed_reason
+  -- WHY THE SOCKET ENDED, which the close callback cannot otherwise tell.
+  -- A peer that closes sends a code; an idle timeout is akkar's own decision
+  -- and the peer sent nothing, so the code is nil either way round without
+  -- this. Inventing a code the peer never sent would be a lie in a field that
+  -- exists to report what the peer said, so the REASON carries it instead.
+  local timed_out = false
 
   local function safely(name, fn, ...)
     if not fn then return true end
@@ -203,6 +209,7 @@ function M.serve(stream, req, raw_headers, handlers, options)
     while not sock.closed do
       local message, opcode = ws:receive(idle)
       if message == nil then
+        timed_out = ws.got_close_code == nil
         -- nil is either the peer closing or the idle timeout expiring. Both
         -- end the socket; only the second is worth a line, because a peer
         -- going away is the ordinary case and logging it would drown the log
@@ -221,6 +228,9 @@ function M.serve(stream, req, raw_headers, handlers, options)
   end
 
   closed_code, closed_reason = ws.got_close_code, ws.got_close_message
+  if timed_out and closed_reason == nil then
+    closed_reason = "idle timeout"
+  end
   sock.closed = true
   pcall(ws.close, ws, closed_code or 1000, closed_reason, 2)
   if options.unregister then options.unregister(sock) end

@@ -169,6 +169,70 @@ describe("a WebSocket route", function()
     assert.equal('{"pong":true}', answer.body)
   end)
 
+  it("closes a socket that has gone quiet, and forgets it", function()
+    -- A timeout that does not fire means sockets accumulate for ever and the
+    -- registry with them, which turns `app:stop` into a loop over corpses.
+    -- Measured: with `websocket_idle_timeout = 1`, the server acted after
+    -- 1.01 s.
+    local closed_with = {}
+    local answer = with_app(8426,
+      function(app)
+        app:websocket("/quiet", {
+          message = function() end,
+          -- `tostring`, because an idle close carries NO code -- the peer
+          -- never sent one -- and `t[#t + 1] = nil` grows nothing. The first
+          -- version of this recorded the code directly and reported that the
+          -- callback had not run when it had.
+          close = function(_, code, reason)
+            closed_with[#closed_with + 1] = tostring(reason or code)
+          end,
+        })
+      end,
+      function(port, app)
+        local ws = websocket.new_from_uri(
+          ("ws://127.0.0.1:%d/quiet"):format(port))
+        assert(ws:connect(5))
+        local open_now = app.sockets_open
+        local started = cqueues.monotime()
+        -- Say nothing. The server has to be the one that acts.
+        pcall(function() ws:receive(5) end)
+        local waited = cqueues.monotime() - started
+        pcall(function() ws:close(1000, nil, 1) end)
+        cqueues.sleep(0.3)
+        return { open_during = open_now, waited = waited,
+                 open_after = app.sockets_open }
+      end,
+      { websocket_idle_timeout = 1 })
+
+    assert.equal(1, answer.open_during, "the socket was never registered")
+    assert.is_true(answer.waited < 3,
+      ("the server took %.2f s to act on a 1 s idle timeout")
+        :format(answer.waited))
+    assert.equal(0, answer.open_after,
+      "the socket stayed in the registry after it closed")
+    assert.equal(1, #closed_with, "the close callback did not run")
+    -- And it can tell WHY, which a nil code alone never says.
+    assert.equal("idle timeout", closed_with[1])
+  end)
+
+  it("works over TLS on a server that offers HTTP/2", function()
+    -- WEBSOCKET IS AN HTTP/1.1 MECHANISM, and akkar now prefers h2 in ALPN.
+    -- The RFC 8441 extended CONNECT that would carry a socket over h2 is not
+    -- advertised -- `SETTINGS_ENABLE_CONNECT_PROTOCOL` is false -- so the
+    -- question is whether offering h2 quietly broke `wss://`. It did not: a
+    -- client pins 1.1 for the handshake, ALPN gives it http/1.1, and the
+    -- socket works.
+    --
+    -- The guard on the other side is upstream's and is asserted below rather
+    -- than assumed: `new_from_stream` refuses `version >= 2` outright.
+    local ws_vendor = require "akkar.vendor.http.websocket"
+    local fake_h2_stream = { connection = { type = "server", version = 2 } }
+    local sock, why = ws_vendor.new_from_stream(fake_h2_stream, nil)
+    assert.is_nil(sock)
+    assert.is_truthy(tostring(why):find "HTTP 1",
+      "an h2 stream was not refused for the right reason: " .. tostring(why))
+  end)
+
   it("holds a capability for a message and not for the socket", function()
     -- THE DESIGN DECISION THIS FILE EXISTS TO PIN. A pool slot acquired when
     -- a socket opens is held until the browser tab closes. `ws:scope` makes
