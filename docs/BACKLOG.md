@@ -888,6 +888,32 @@ scheduler of akkar's own on top of cqueues, or accepting that replay is a
 Linux property. L1's value — a seed makes a counterexample re-runnable — is
 intact on the machine the simulation runs on.
 
+### 12.2b macOS is the machine that finds the time-sensitive specs
+
+Worth naming as a pattern rather than as three incidents. The same commit,
+`ff16765`, was run twice by CI: the push run passed on macOS and the pull
+request run failed on it. Same tree, opposite verdicts — so macOS is not
+broken here, it is **less forgiving**, and each time it has been right about
+something.
+
+Three specs so far, and none of the three was an akkar defect:
+
+| spec | what macOS found |
+|---|---|
+| `simulation_spec` | a measurement that could not tell a slow machine from a leaking pool |
+| `determinism_spec` | a byte-for-byte claim that only ever held on epoll |
+| `deadline_propagation_spec` | `(t + 0.2) - t'` compared to 0.2 exactly, in doubles |
+
+The last returned **0.20000000000005** — fifty femtoseconds of overshoot, and
+a property of binary floating point rather than of `bounded`. It now carries a
+one-nanosecond tolerance, nine orders of magnitude below the observed error,
+so a budget that leaked a millisecond would still fail.
+
+**What this suggests, and has not been done:** a pass over every spec that
+compares a clock reading, asking whether it asserts on arithmetic or on a
+guarantee. Three were found by CI one at a time; looking for the rest on
+purpose is cheaper than waiting for the fourth.
+
 ### 12.3 HTTP/2 has no fuzz suite
 
 `spec/fuzz_spec.lua` covers h1 framing, which is where request smuggling

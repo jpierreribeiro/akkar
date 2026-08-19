@@ -89,8 +89,22 @@ describe("bounded", function()
       execution.begin(0.2)
       return execution.bounded(10)
     end)
-    assert.is_true(got <= 0.2,
-      ("bounded returned %s, which is more than the 0.2 budget"):format(tostring(got)))
+
+    -- THE TOLERANCE IS THE CLOCK'S, NOT A CONCESSION. `begin` stores
+    -- `monotime() + 0.2` and `remaining` returns `deadline - monotime()`, so
+    -- what this compares is `(t + 0.2) - t'` in doubles. That is exactly 0.2
+    -- only when the two reads and the addition all land on representable
+    -- values; on macOS CI it returned **0.20000000000005**, which is fifty
+    -- femtoseconds of overshoot and a property of binary floating point
+    -- rather than of `bounded`.
+    --
+    -- A nanosecond is nine orders of magnitude below the observed error and
+    -- far below any clock this runs on, so it separates the arithmetic from
+    -- the guarantee: a budget that leaked a millisecond would still fail.
+    local EPSILON = 1e-9
+    assert.is_true(got <= 0.2 + EPSILON,
+      ("bounded returned %s, which is more than the 0.2 budget by more than "
+       .. "the clock's own precision"):format(tostring(got)))
   end)
 
   it("returns what was asked for when the ask is smaller", function()
