@@ -1009,7 +1009,31 @@ upstream's code.
 **And it should go upstream.** The bug is not akkar's and every lua-http user
 serving h2 has it.
 
-### 12.4 The historical benchmarks are still unrepeated
+### 12.4 The historical benchmarks — the harness is proven, one number is retaken
+
+**Unblocked 2026-08-19.** The study box is reachable again and prepared with
+the CI recipe, so a number taken there and a number taken in CI mean the same
+thing: cqueues built from the pinned commit rather than the 2020 rock, and
+`spec/substrate_spec.lua` green on the box before anything was measured.
+
+**The fixed harness works, and the proof is in its own header.** A run now
+prints both commits, and the first real run printed two DIFFERENT ones:
+
+```
+tree-base: ec2fa93   tree-head: 5659f8a
+```
+
+**The first number retaken**: this branch against `origin/main`, five
+alternating repetitions. 21,672 req/s against 21,727, which is −0.3% against
+spreads of 1.1% and 0.7% — a tie by this page's own rule, and it means HTTP/2,
+WebSocket and four new bounds cost nothing measurable. `bench/study/RESULTS.md`
+§0.
+
+**What is still not retaken** is the neighbour comparison, the D4 table, which
+needs OpenResty, Lapis and Luvit provisioned on the box as well. That is
+`bench/runtime/provision.sh` and a longer run, not a blocker.
+
+### 12.4-old The historical benchmarks are still unrepeated
 
 Every number published before 2026-08-17 came from `bench/study/regression.sh`
 while it was comparing a tree with itself — `ROOT` resolved into a symlink and

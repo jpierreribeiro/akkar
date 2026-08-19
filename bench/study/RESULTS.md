@@ -20,6 +20,51 @@ contains `"error"` is refused rather than measured.
 
 ---
 
+## 0. What HTTP/2, WebSocket and four new bounds cost, 2026-08-19
+
+**Nothing measurable, and that is the number this section exists for.**
+
+Two days added HTTP/2 with full conformance, WebSocket, a guard that keeps one
+connection from killing the server, a ceiling on concurrent h2 streams, a
+ceiling on socket count, a bound on socket message size, and a fix for a
+capability leak on abandoned requests. All of it sits on the request path or
+beside it, and the fair question is what it took away.
+
+Measured on a fresh box, five alternating repetitions, restarting between every
+one:
+
+| tree | req/s | p50 | p99 | spread | µs/req |
+|---|---:|---:|---:|---:|---:|
+| `origin/main` `ec2fa93` | 21,727 | 4.50 ms | 6.51 ms | 1.1% | 92.0 |
+| this branch `5659f8a` | 21,672 | 4.60 ms | 5.95 ms | 0.7% | 92.3 |
+
+**−0.3%, against spreads of 1.1% and 0.7%.** A difference smaller than the
+noise of the run that produced it is not a slowdown, it is a tie, and this page
+has a rule about that: a difference below the larger of the two noise floors is
+not a result. The p99 moved the other way, 6.51 ms to 5.95 ms, and the same
+rule applies to it in the other direction.
+
+So the safety work is free at this load. Not "cheap": free, to the resolution
+this harness has.
+
+**AND THIS IS THE FIRST REGRESSION NUMBER SINCE THE HARNESS WAS FIXED**, which
+matters more than the number. `bench/study/regression.sh` resolved `ROOT`
+through a symlink and `cp -a` copied the symlink, so both trees were the same
+repository and every figure it produced compared a tree with itself. It
+reported "100.5% of baseline" for months because that is what comparing
+something to itself returns. The header of a run now names both commits, and
+this one names two different ones:
+
+```
+tree-base: ec2fa93   tree-head: 5659f8a
+```
+
+Every number on this page below section 0 predates that fix and was taken by
+other harnesses. They are not invalidated by it, and they have not been
+re-taken either.
+
+---
+
 ## 1. What the performance work bought
 
 akkar at `62a40ca`, before any fix, against HEAD. Same harness, same machine,
