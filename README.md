@@ -6,7 +6,7 @@ three in the morning.**
 
 One coroutine per request. One thread per process. A whole application, with
 Postgres, Redis, background jobs, sessions and metrics, answers its first
-request 29 milliseconds after you start it.
+request in tens of milliseconds rather than seconds.
 
 ```sh
 akkar new my-api && cd my-api && akkar run
@@ -23,7 +23,7 @@ return app
 
 | | |
 |---|---:|
-| boot to first response, full stack | **29 ms** |
+| boot to first response | **68 ms**, or 29 ms before HTTP/2 |
 | memory per idle connection | 9.2 KB |
 | tests, Lua 5.4 and Lua 5.5 | **1,852** |
 | HTTP/2 conformance, h2spec 2.6.0 | **146 of 146** |

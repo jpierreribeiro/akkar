@@ -23,7 +23,27 @@ local multipart = require "akkar.multipart"
 -- The execution machinery, with no HTTP in it. `akkar.execution` requires only
 -- `cqueues` and `akkar.time`, so there is no cycle back to this file.
 local execution = require "akkar.execution"
-local ws_module = require "akkar.websocket"
+--- WebSocket, LOADED ON THE FIRST `app:websocket` AND NOT BEFORE.
+---
+--- This was an eager `require` for one day, and the day was enough to measure
+--- what that costs: `akkar.websocket` pulls the vendored socket, which pulls
+--- lua-http's request and client halves, which pull three `lpeg_patterns`
+--- grammars. **123.7 ms and 65 modules**, on every boot of every application,
+--- including the overwhelming majority that never open a socket. It roughly
+--- doubled the time to `require "akkar"`.
+---
+--- Boot is a rounding error for a service that runs for weeks. It is the whole
+--- number for the two cases this project has written down: a process per
+--- student, where hundreds of boots are the workload, and any cold start.
+---
+--- Deferred rather than made optional, so nothing about the API changes: the
+--- first `app:websocket(...)` pays for it, and an application without one
+--- never does.
+local ws_module
+local function websocket_module()
+  ws_module = ws_module or require "akkar.websocket"
+  return ws_module
+end
 local bitwise = require "akkar.bitwise"
 local text = require "akkar.text"
 
@@ -837,7 +857,7 @@ function App:websocket(path, opts, handlers)
   end
 
   local registered = self:get(path, opts, function(req)
-    if not ws_module.wants_upgrade(req.headers) then
+    if not websocket_module().wants_upgrade(req.headers) then
       -- A PLAIN GET TO A SOCKET ROUTE gets an ordinary refusal rather than a
       -- hijacked stream. 426 is the status that exists for exactly this, and
       -- it names the protocol the client should have asked for.
@@ -2850,7 +2870,9 @@ function App:run(config)
 
           self.sockets_open = self.sockets_open + 1
           local upgrade = res.websocket
-          local served, why = ws_module.serve(stream, upgrade.req, h,
+          -- Loaded already: this branch is only reachable through a route
+          -- registered by `app:websocket`, which loads it.
+          local served, why = websocket_module().serve(stream, upgrade.req, h,
             upgrade.handlers, {
               idle_timeout = config.websocket_idle_timeout or 300,
               -- The same number that bounds a body, for the same reason.
