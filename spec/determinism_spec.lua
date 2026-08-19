@@ -13,11 +13,11 @@ that says so. With the seams akkar already has -- every I/O through an adapter,
 forty CONCURRENT requests through three routes produce a byte-identical trace
 across separate processes.
 
-**On epoll.** CI found two differing traces on macOS, and that narrowing is
-kept in the assertion rather than in a footnote: the order a cooperative
-scheduler resumes coroutines in comes from the kernel's polling mechanism, and
-kqueue is not epoll. What this file establishes is established for Linux, which
-is where the simulation runs.
+**On Linux.** CI found two differing traces on macOS. Why is not known yet,
+and the explanation this file used to give -- epoll against kqueue -- was
+disproved by the fact that this workload opens no socket at all. The narrowing
+is kept in the assertion rather than in a footnote, and the reason given is the
+absence of evidence rather than a mechanism.
 
 The one thing that differed on the first run was the execution id prefix,
 which was drawn at module load and so before any generator could be installed.
@@ -97,29 +97,49 @@ local function trace_under(seed, n)
   return table.concat(trace, "\n")
 end
 
---- WHERE THE CLAIM HOLDS, narrowed by CI rather than by argument.
+--- WHERE THE CLAIM HOLDS, and the explanation that turned out to be wrong.
 ---
 --- This file was written on Linux and asserted that forty concurrent requests
---- reproduce byte for byte. On macOS they do not: CI produced two traces that
---- differed, with gaps in the id sequence, and the reason is not akkar's. The
---- readiness order a cooperative scheduler resumes in comes from the kernel's
---- polling mechanism, and `spec/support/portable.lua` already records that
---- kqueue and epoll differ enough for a cqueues controller to cost two
---- descriptors on one and three on the other.
+--- reproduce byte for byte. On macOS CI they did not.
 ---
---- So the claim is now "on epoll", and it is stated rather than assumed. What
---- L1 needs from this file -- that a seed makes a counterexample re-runnable
---- -- is a property of the machine the simulation runs on, and that machine is
---- Linux. Establishing it on kqueue is real work and is in the backlog; it is
---- not established by this file passing somewhere it was never run.
+--- THE FIRST EXPLANATION WRITTEN HERE WAS THAT THE KERNEL'S POLLING MECHANISM
+--- ORDERS THE RESUMES, epoll against kqueue. It is wrong, and it was wrong in
+--- a way worth keeping, because it sounded plausible enough to close the
+--- question: **this workload opens no socket.** It drives `app:test` over
+--- in-memory adapters, so there is no descriptor for either polling interface
+--- to order, and naming them explained nothing.
+---
+--- Two more hypotheses died on Linux afterwards, both measured rather than
+--- argued:
+---
+---   * that the interval between `cqueues.sleep(0)` calls decides the order,
+---     since each asks for a deadline of "now". Burning up to a millisecond
+---     of real CPU inside every handler step changed nothing over forty runs;
+---   * that the worker keepalive decides it, since a worker idle for
+---     `WORKER_IDLE` exits and how many are alive is a function of elapsed
+---     time. Driving it from 0.1 s to 0.1 ms changed nothing either.
+---
+--- So the honest state is: the schedule is stable on Linux across every
+--- perturbation tried, it is not stable on macOS, and NOBODY HAS THE DATA
+--- that says why. `spec/support/determinism_report.lua` is the answer to
+--- that: it reports the shape of the difference rather than two walls of
+--- text, and CI runs it on every platform as an informational step, so the
+--- machine with the problem is the one that describes it.
+---
+--- Until that report comes back, the assertion is Linux-only, and the reason
+--- given is "not established here" rather than a mechanism nobody verified.
+--- What L1 needs from this file -- that a seed makes a counterexample
+--- re-runnable -- holds on the machine the simulation runs on.
 local KQUEUE = portable.os_name ~= "Linux"
 
 describe("a seeded run", function()
   it("produces the same trace twice, ids included", function()
     if KQUEUE then
-      pending(("byte-for-byte reproduction is established on epoll and not on "
-               .. "this kernel (%s); CI observed two differing traces on "
-               .. "macOS"):format(tostring(portable.os_name)))
+      pending(("byte-for-byte reproduction is established on Linux and not "
+               .. "here (%s). CI observed two differing traces on macOS, and "
+               .. "why is not yet known: see the header, and see the "
+               .. "determinism report CI runs on every platform")
+              :format(tostring(portable.os_name)))
       return
     end
     local a = trace_under(1234, 40)
