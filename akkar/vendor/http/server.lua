@@ -7,6 +7,7 @@ local cs = require "cqueues.socket"
 local connection_common = require "akkar.vendor.http.connection_common"
 local onerror = connection_common.onerror
 local h1_connection = require "akkar.vendor.http.h1_connection"
+local h2_connection = require "akkar.vendor.http.h2_connection"
 local http_tls = require "akkar.vendor.http.tls"
 local http_util = require "akkar.vendor.http.util"
 local openssl_bignum = require "openssl.bignum"
@@ -66,10 +67,8 @@ local function wrap_socket(self, socket, timeout)
 		if http_tls.has_alpn then
 			local proto = ssl:getAlpnSelected()
 			if proto then
-				if proto == "h2" then
-					-- Unreachable through our own alpn_select, which never
-					-- offers h2. Reachable if somebody supplies their own ctx.
-					return nil, "this build does not speak HTTP/2", ce.EILSEQNOSUPPORT
+				if proto == "h2" and (version == nil or version == 2) then
+					version = 2
 				elseif proto == "http/1.1" and (version == nil or version < 2) then
 					version = 1.1
 				elseif proto == "http/1.0" and (version == nil or version == 1.0) then
@@ -80,17 +79,53 @@ local function wrap_socket(self, socket, timeout)
 			end
 		end
 	end
-	-- Upstream sniffs here for the h2 cleartext preface. With h2 gone there is
-	-- nothing to choose between, so the sniff -- and the read it costs on
-	-- every single connection -- goes with it.
+	-- CLEARTEXT h2 IS OPT-IN, AND THE REASON IS A READ PER CONNECTION.
 	--
-	-- A client that sends the h2 preface anyway gets it parsed as HTTP/1.1,
-	-- where `PRI * HTTP/2.0` is a request with an unknown method and is
-	-- rejected as one. Wrong protocol, clean refusal, no hang.
+	-- Over TLS the version is settled by ALPN above, for free. Without TLS
+	-- there is nothing to negotiate with, so upstream sniffs the connection
+	-- for h2's `PRI * HTTP/2.0` preface -- and that sniff is a read on EVERY
+	-- connection, h1 ones included, before a byte of request is parsed.
+	-- Browsers never speak cleartext h2; what wants it is a proxy or a gRPC
+	-- client reaching akkar on a private network.
+	--
+	-- So it is `h2c = true` rather than the default, and with it off the
+	-- HTTP/1.1 path is byte for byte what it was before h2 came back.
+	--
+	-- With it off, a client that sends the preface anyway gets it parsed as
+	-- HTTP/1.1, where `PRI * HTTP/2.0` is a request with an unknown method and
+	-- is rejected as one. Wrong protocol, clean refusal, no hang.
 	if version == nil then
-		version = 1.1
+		if self.h2c then
+			local is_h2, sniff_err, sniff_errno = h2_connection.socket_has_preface(
+				socket, true, deadline and (deadline-monotime()))
+			if is_h2 == nil then
+				return nil, sniff_err or ce.EPIPE, sniff_errno
+			end
+			version = is_h2 and 2 or 1.1
+		else
+			version = 1.1
+		end
 	end
-	local conn, err, errno = h1_connection.new(socket, "server", version)
+	local conn, err, errno
+	if version == 2 then
+		-- A CEILING ON CONCURRENT STREAMS, advertised in the connection's
+		-- SETTINGS.
+		--
+		-- Upstream's default is `math.huge`, and the consequence is not
+		-- theoretical: h2spec skips 5.1.2, "sends HEADERS that cause the
+		-- advertised concurrent stream limit to be exceeded", precisely
+		-- because there is no limit to exceed. Measured here, 500 concurrent
+		-- streams on ONE connection were all accepted, at 10 KB each, with
+		-- `max_concurrent` doing nothing because `max_concurrent` counts
+		-- CONNECTIONS and this is one.
+		--
+		-- 100 is what nginx and most servers advertise. A browser opens six.
+		conn, err, errno = h2_connection.new(socket, "server",
+			self.h2_max_concurrent_streams and
+			{ [0x3] = self.h2_max_concurrent_streams } or nil)
+	else
+		conn, err, errno = h1_connection.new(socket, "server", version)
+	end
 	if not conn then
 		return nil, err, errno
 	end
@@ -126,8 +161,8 @@ local function server_loop(self)
 	end
 end
 
--- Declarado antes porque `handle_socket` passou a chama-lo direto; a definicao
--- continua onde estava, logo abaixo.
+-- Forward-declared because `handle_socket` now calls it directly; the
+-- definition stays where it was, just below.
 local handle_stream
 
 local function handle_socket(self, socket)
@@ -169,26 +204,34 @@ local function handle_socket(self, socket)
 				idle = false
 				deadline = nil
 
-				-- HTTP/1.1 RODA O STREAM AQUI MESMO, SEM CORROTINA PROPRIA.
+				-- HTTP/1.1 RUNS THE STREAM RIGHT HERE, WITH NO COROUTINE OF
+				-- ITS OWN.
 				--
-				-- `add_stream` faz `cq:wrap(handle_stream, ...)`, uma corrotina
-				-- por REQUISICAO, e ela custa ~3.900 bytes -- 43% da alocacao de
-				-- uma requisicao depois que a outra corrotina por requisicao, a
-				-- do prazo do akkar, virou worker reusado.
+				-- `add_stream` does `cq:wrap(handle_stream, ...)`, one coroutine
+				-- per REQUEST, and it costs ~3,900 bytes -- 43% of a request's
+				-- allocation once the other per-request coroutine, akkar's
+				-- deadline, became a reused worker.
 				--
-				-- E em h1 ela nao compra concorrencia nenhuma. Este laco fica
-				-- parado dentro de `get_next_incoming_stream` enquanto o stream
-				-- roda, porque h1 e serial: uma conexao nao produz o proximo
-				-- stream antes do atual terminar. As duas corrotinas se revezam
-				-- e nunca correm juntas. O wrap existe porque o lua-http de
-				-- upstream fala HTTP/2, onde os streams de uma conexao SAO
-				-- concorrentes -- e o h2 saiu quando esta metade foi vendorizada.
+				-- And in h1 it buys no concurrency at all. This loop sits parked
+				-- inside `get_next_incoming_stream` while the stream runs,
+				-- because h1 is serial: a connection does not produce the next
+				-- stream before the current one finishes. The two coroutines
+				-- take turns and never run together. The wrap exists because
+				-- lua-http speaks HTTP/2, where the streams of one connection
+				-- ARE concurrent.
 				--
-				-- CONDICIONADO, E NAO INCONDICIONAL, e isso e deliberado. Sem a
-				-- condicao, "so h1 por enquanto" viraria "so h1
-				-- estruturalmente", e quem for reintroduzir h2 nao teria como
-				-- saber que esta linha e a que precisa voltar. `add_stream`
-				-- continua sendo o caminho concorrente e continua exportado.
+				-- CONDITIONAL, NOT UNCONDITIONAL, and the condition earned
+				-- itself. It was written while akkar spoke only h1, so that
+				-- "h1 only for now" would not silently become "h1 only
+				-- structurally" -- and when the h2 half was vendored back in on
+				-- 2026-08-18, multiplexing worked on the first attempt because
+				-- this line already routed h2 to `add_stream`.
+				--
+				-- `spec/http2_spec.lua` asserts what it protects: two streams
+				-- that each sleep 0.4 s must finish in about 0.4 s on one
+				-- connection. Making this call unconditional takes them to
+				-- 0.81 s, which is that spec going red on wall clock rather
+				-- than on a crash. Measured, by doing it.
 				if conn.version and conn.version < 2 then
 					handle_stream(self, stream)
 				else
@@ -219,11 +262,13 @@ end
 
 -- Prefer whichever comes first
 local function alpn_select(ssl, protos, version)
-	-- h2 is deliberately not offered: this build of lua-http carries the
-	-- HTTP/1.1 half only. Not advertising it is what keeps a compliant client
-	-- from ever attempting it.
+	-- h2 IS offered, and offering it over TLS costs the HTTP/1.1 path nothing:
+	-- a client that does not ask for h2 never reaches the h2 branch. The
+	-- cleartext side is where a cost would appear, and it is gated separately
+	-- -- see `h2c` below.
 	for _, proto in ipairs(protos) do
-		if (proto == "http/1.1" and (version == nil or version == 1.1))
+		if (proto == "h2" and (version == nil or version == 2))
+			or (proto == "http/1.1" and (version == nil or version < 2))
 			or (proto == "http/1.0" and (version == nil or version == 1.0)) then
 			return proto
 		end
@@ -323,6 +368,8 @@ local function new_server(tbl)
 		tls = tbl.tls;
 		ctx = tbl.ctx;
 		version = tbl.version;
+		h2c = tbl.h2c;
+		h2_max_concurrent_streams = tbl.h2_max_concurrent_streams;
 		max_concurrent = tbl.max_concurrent;
 		n_connections = 0;
 		pause_cond = cc.new();
@@ -402,6 +449,8 @@ local function listen(tbl)
 		tls = tls;
 		ctx = ctx;
 		version = tbl.version;
+		h2c = tbl.h2c;
+		h2_max_concurrent_streams = tbl.h2_max_concurrent_streams;
 		max_concurrent = tbl.max_concurrent;
 		connection_setup_timeout = tbl.connection_setup_timeout;
 		intra_stream_timeout = tbl.intra_stream_timeout;
@@ -497,7 +546,42 @@ end
 
 function server_methods:add_socket(socket)
 	self.n_connections = self.n_connections + 1
-	self.cq:wrap(handle_socket, self, socket)
+	-- ONE CONNECTION MUST NOT BE ABLE TO KILL THE SERVER, and until this
+	-- wrapper existed it could.
+	--
+	-- `cq:wrap` puts each connection in its own coroutine, and cqueues
+	-- propagates a raise out of `cq:loop()`. So an unexpected error anywhere
+	-- under `handle_socket` -- the framing layers, the TLS handshake, a
+	-- vendored parser meeting bytes it did not consider -- travelled out of
+	-- `app:run` and took the ACCEPT LOOP with it. The process stayed up and
+	-- the listening socket stayed open, and nothing was ever accepted again.
+	--
+	-- That is not hypothetical. It happened twice in this tree, from opposite
+	-- directions: `Content-Length: banana` on the h1 side, recorded in
+	-- `akkar/init.lua`, and a three-byte HTTP/2 frame header found by
+	-- `spec/h2_framing_spec.lua` on its first run. Both were one-line parser
+	-- bugs; both were total outages. The next one is a parser bug nobody has
+	-- found yet, and this is what decides whether it costs one connection or
+	-- the server.
+	--
+	-- THE BOOKKEEPING IS THE SUBTLE PART. `handle_socket` decrements
+	-- `n_connections` and signals `connection_done` on its LAST two lines, so
+	-- a raise skips both -- and a connection count that only goes up walls
+	-- the server off at `max_concurrent` just as completely, only slower.
+	-- Done here exactly when the raise happened, so the normal path still
+	-- does it exactly once.
+	self.cq:wrap(function()
+		local ok, err = xpcall(handle_socket, debug.traceback, self, socket)
+		if not ok then
+			self.n_connections = self.n_connections - 1
+			self.connection_done:signal(1)
+			pcall(function() socket:close() end)
+			-- Reported as its own operation, never as transport noise: a
+			-- connection that raised is a BUG, and `akkar/init.lua` logs it at
+			-- error level for the same reason it does `onstream`.
+			pcall(self:onerror(), self, socket, "connection", err)
+		end
+	end)
 	return true
 end
 
@@ -510,4 +594,12 @@ return {
 	new = new_server;
 	listen = listen;
 	mt = server_mt;
+	-- EXPORTED because akkar builds its own TLS context from `certificate`
+	-- and `key` instead of going through `new_ctx` below, and a context that
+	-- never gets an ALPN callback never offers h2 -- which is exactly the bug
+	-- this export fixes. A browser then negotiates HTTP/1.1 against a server
+	-- that speaks HTTP/2 perfectly well, and nothing anywhere reports an
+	-- error: the handshake succeeds, the request is answered, and the
+	-- multiplexing simply never happens.
+	alpn_select = alpn_select;
 }

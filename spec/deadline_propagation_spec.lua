@@ -42,7 +42,15 @@ describe("the execution budget", function()
       execution.begin(5)
       return execution.remaining()
     end)
-    assert.is_true(left > 4.9 and left <= 5,
+    -- THE SAME CLOCK TOLERANCE AS `bounded` BELOW, and this one was found by
+    -- sweeping for the shape rather than by waiting for CI to hit it.
+    -- `remaining` computes `(t + 5) - t'`, so `left <= 5` is a claim about
+    -- doubles and not about the deadline; the sibling assertion returned
+    -- 0.20000000000005 against a 0.2 budget on macOS. A nanosecond is far
+    -- below any clock here and far above the error, so `left > 4.9` still
+    -- carries the real content: time is counting DOWN.
+    local EPSILON = 1e-9
+    assert.is_true(left > 4.9 and left <= 5 + EPSILON,
       ("remaining was %s, expected just under 5"):format(tostring(left)))
   end)
 
@@ -89,8 +97,22 @@ describe("bounded", function()
       execution.begin(0.2)
       return execution.bounded(10)
     end)
-    assert.is_true(got <= 0.2,
-      ("bounded returned %s, which is more than the 0.2 budget"):format(tostring(got)))
+
+    -- THE TOLERANCE IS THE CLOCK'S, NOT A CONCESSION. `begin` stores
+    -- `monotime() + 0.2` and `remaining` returns `deadline - monotime()`, so
+    -- what this compares is `(t + 0.2) - t'` in doubles. That is exactly 0.2
+    -- only when the two reads and the addition all land on representable
+    -- values; on macOS CI it returned **0.20000000000005**, which is fifty
+    -- femtoseconds of overshoot and a property of binary floating point
+    -- rather than of `bounded`.
+    --
+    -- A nanosecond is nine orders of magnitude below the observed error and
+    -- far below any clock this runs on, so it separates the arithmetic from
+    -- the guarantee: a budget that leaked a millisecond would still fail.
+    local EPSILON = 1e-9
+    assert.is_true(got <= 0.2 + EPSILON,
+      ("bounded returned %s, which is more than the 0.2 budget by more than "
+       .. "the clock's own precision"):format(tostring(got)))
   end)
 
   it("returns what was asked for when the ask is smaller", function()

@@ -5,6 +5,7 @@ local http_util = require "akkar.vendor.http.util"
 local connection_common = require "akkar.vendor.http.connection_common"
 local onerror = connection_common.onerror
 local new_h1_connection = require "akkar.vendor.http.h1_connection".new
+local new_h2_connection = require "akkar.vendor.http.h2_connection".new
 local openssl_ssl = require "openssl.ssl"
 local openssl_ctx = require "openssl.ssl.context"
 local openssl_verify_param = require "openssl.x509.verify_param"
@@ -30,12 +31,11 @@ local function negotiate(s, options, timeout)
 		end
 		if http_tls.has_alpn then
 			if version == nil then
-				-- http/1.1 only: see the note in server.lua's alpn_select.
-				ssl:setAlpnProtos({"http/1.1"})
+				ssl:setAlpnProtos({"h2", "http/1.1"})
 			elseif version == 1.1 then
 				ssl:setAlpnProtos({"http/1.1"})
 			elseif version == 2 then
-				ssl:setAlpnProtos({"http/1.1"})
+				ssl:setAlpnProtos({"h2"})
 			end
 		end
 		if version == 2 then
@@ -61,7 +61,17 @@ local function negotiate(s, options, timeout)
 	if version == nil then
 		local ssl = s:checktls()
 		if ssl then
-			-- h2 cannot be selected: it is never offered.
+			-- AND THIS `if` HAD NO BODY while h2 was gone, which left `version`
+			-- nil for the `version < 2` comparison below to raise on. It never
+			-- fired: `checktls` answers nil at this point, so every TLS
+			-- connection took the `else` and pinned 1.1. A dead branch that
+			-- would have crashed if it ever woke up is worse than either
+			-- outcome, and restoring upstream's body removes the question.
+			if http_tls.has_alpn and ssl:getAlpnSelected() == "h2" then
+				version = 2
+			else
+				version = 1.1
+			end
 		else
 			-- TODO: attempt upgrading http1 to http2
 			version = 1.1
@@ -70,7 +80,7 @@ local function negotiate(s, options, timeout)
 	if version < 2 then
 		return new_h1_connection(s, "client", version)
 	elseif version == 2 then
-		return nil, "this build does not speak HTTP/2", ce.EILSEQNOSUPPORT
+		return new_h2_connection(s, "client", options.h2_settings)
 	else
 		error("Unknown HTTP version: " .. tostring(version))
 	end

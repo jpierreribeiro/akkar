@@ -147,6 +147,8 @@ Two things follow, and they point in opposite directions, so both are stated:
 
 ## D1 — time to first response
 
+**THIS TABLE WAS MEASURING ITS OWN SLEEP AND IS WITHDRAWN.** It read:
+
 | candidate | boot to first 200 |
 |---|---:|
 | OpenResty | 113 ms |
@@ -154,8 +156,31 @@ Two things follow, and they point in opposite directions, so both are stated:
 | akkar | 114 ms |
 | Lapis | 221–327 ms |
 
-Nobody had ever measured akkar's. It is unremarkable, which is the useful
-answer: boot time is not a cost akkar is paying.
+`boot_ms` waited through `wait_for_port`, whose loop is `sleep .1`. Any boot
+faster than a tenth of a second is therefore reported AS a tenth of a second:
+the first curl fails, the shell sleeps 100 ms, the second succeeds. Three
+different runtimes landing on 113 is not three runtimes being equal — it is
+the signature of a quantised measurement, and it was there to be read.
+
+Re-measured on the same box with a 2 ms poll, five runs each, spread 1 ms:
+
+| what it loads | boot to first 200 |
+|---|---:|
+| `akkar` alone | **21 ms** |
+| `akkar` + `akkar.db` | 29 ms |
+| + redis | 29 ms |
+| + jobs, auth, metrics | **29 ms** |
+
+So a complete akkar application answers in **29 ms**, and the database stack
+is 8 ms of it while everything above costs nothing measurable. The old
+conclusion — "boot time is not a cost akkar is paying" — happens to survive,
+but it survived on a number that was four times too large and belonged to the
+harness.
+
+`boot_ms` now polls at 2 ms. `wait_for_port` keeps its 100 ms everywhere else,
+where it gates readiness and the granularity costs nothing. **Lapis at
+221–327 ms is the only row that was measuring the runtime**, and it needs
+re-running with the rest.
 
 ## D2 — resident memory, idle
 
@@ -429,3 +454,138 @@ exactly 64 for the whole run, meaning the pool was full and recycling
 continuously rather than overflowing, so the fraction paying a close is far
 below a third. **`-c200` peaks at 139 eventpoll, well past the pool, and the
 cost at that concurrency is unmeasured.**
+
+---
+
+# Third run — 19 August 2026, a rebuilt box, and the first four-way table since
+
+The study box was lost, rebuilt from scratch, and provisioned with the CI
+recipe rather than by hand, so a number taken here and a number taken in CI
+mean the same thing: cqueues from the pinned commit rather than the 2020 rock,
+and `spec/substrate_spec.lua` green on the box before anything was measured.
+
+```
+machine   : AWS EC2, 8 logical cores, Ubuntu, ulimit -n 1024
+candidates: akkar 5659f8a | OpenResty 1.31.1.1 | Luvit 2.18.1 | Lapis (cqueues)
+load      : wrk, browser shape (6 extra headers), 3 reps, alternating order
+gate      : all four answered `{"pong":true}` before any clock started
+date      : 2026-08-19
+```
+
+## What ran, and what did not, before any number
+
+The first attempt produced **zeros for all four candidates** and said so:
+
+```
+akkar: DID NOT START — excluded from this run
+luvit: DID NOT START — excluded from this run
+```
+
+`provision.sh` installs the runtimes and `deploy.sh` stages the services, and
+only the first had been run. The harness refused to measure rather than
+reporting whatever it could reach, which is the gate doing its job: a worse
+harness would have measured one candidate and published a comparison as though
+the others had taken part.
+
+The second attempt lost only akkar, for a duller reason: `run.sh` defaults
+`AKKAR_SRC` to `$HOME/akkar` and this box's checkout is `$HOME/akkar-git`. It
+was passed to `deploy.sh` and forgotten for `run.sh`.
+
+## D4 — throughput and tail on `/ping`
+
+| | req/s | spread | p50 | p99 |
+|---|---:|---:|---:|---:|
+| OpenResty | **91,154** | 0.93% | 1.09 ms | 1.19 ms |
+| Luvit | 10,630 | **17.79%** | 7.18 ms | 29.7 to 43.7 ms |
+| **akkar** | **10,417** | **0.39%** | 9.31 ms | **12.70 ms** |
+| Lapis | 6,676 | 1.09% | 14.64 ms | 17.85 ms |
+
+**OpenResty is 8.75x akkar.** The last published figure was 9.15x and the one
+before that 11.2x; the gap has not moved for any reason on this page, since all
+three came off different boxes and two came off a fixture that has since been
+retired. What is worth saying is that the shape of the answer has not changed:
+nginx runs the whole request pipeline in C and hands Lua only the handler, and
+no amount of Lua closes that.
+
+**akkar is 1.56x Lapis**, the other Lua framework in the same shape.
+
+**akkar and Luvit are tied, and this page's rule 3 is why.** They are 2.0%
+apart, and Luvit's own noise floor across three repetitions is 17.79%. A
+difference below the larger of two floors is not a result, so the honest
+statement is that they are level on throughput.
+
+**Where they are not level is the tail.** akkar's p99 is 12.70 ms and Luvit's
+ranges from 29.7 to 43.7 ms across the same three repetitions: two to three and
+a half times worse, on a run where the two serve the same number of requests
+per second. Luvit's 17.79% spread is not measurement noise either, since akkar
+managed 0.39% and OpenResty 0.93% on the same box in the same minutes. It is
+Luvit's own variance.
+
+## D1 — time to first response
+
+| | |
+|---|---:|
+| OpenResty | 15 ms |
+| Luvit | 15 ms |
+| **akkar** | **63 ms** |
+| Lapis | 186 ms |
+
+akkar's 63 ms here is against 29 ms measured for a complete akkar application
+on a developer laptop, and the difference is the box rather than the code: this
+one is a cold cloud instance with slower storage, and every candidate on it
+would pay the same tax. What the number is good for is the ordering, and the
+ordering says akkar boots four times slower than nginx and three times faster
+than Lapis.
+
+## D2 — resident memory, idle
+
+| | |
+|---|---:|
+| Luvit | 7,224 KB |
+| Lapis | 12,884 KB |
+| **akkar** | **14,432 KB** |
+| OpenResty | 17,624 KB |
+
+## D3 — cost per idle keep-alive connection
+
+| | marginal KB/conn |
+|---|---:|
+| OpenResty | 0.51 |
+| Luvit | 2.51 |
+| **akkar** | **3.67** |
+| Lapis | 8.54 |
+
+**AND THE COLUMN BESIDE IT IS NOT PUBLISHED, because it cannot be right.**
+The harness also solves for a fixed per-process step, and it came back negative
+for three of the four candidates: −219 KB for akkar, −103 for OpenResty, −1,068
+for Lapis. A fixed cost cannot be negative. Two points cannot separate a linear
+model from noise larger than the signal, and this is what that looks like from
+the outside. The marginal figures above are the difference between two measured
+points and stand on their own; the extrapolation back to zero does not.
+
+## akkar stops accepting at 675 connections, and that is deliberate
+
+The connection holder asks for 800. OpenResty, Luvit and Lapis all take 800.
+akkar takes **675** and refuses the rest.
+
+That is not a limit it ran into, it is one it enforces:
+`descriptor_ceiling()` reads the soft `RLIMIT_NOFILE`, which is 1,024 on this
+box, and returns 66% of it. 1,024 x 0.66 = 675 exactly.
+
+The third it holds back is on record and was bought with an incident. Before
+that reserve existed, `bench/runtime/run.sh` at 100 connections had akkar
+answering **18,640 of 111,651 requests** with `unable to initialize
+continuation queue: Too many open files` — one request in six, on a run that
+produced a published throughput number, and nobody noticed because the harness
+read the wrong awk field for the error count.
+
+So the honest comparison is that three candidates accept 800 connections and
+akkar accepts 675 and says no to the rest. Whether the other three still answer
+correctly at their own ceiling is not measured here, and this page does not
+guess.
+
+## What this run does not say
+
+D5 saturation and D7 dependency-down are a second pass and were not run.
+Nothing above involves a database. Lapis is on its cqueues backend rather than
+its nginx one, which is a choice `provision.sh` makes and records.

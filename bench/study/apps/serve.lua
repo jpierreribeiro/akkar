@@ -55,6 +55,31 @@ if gc then io.stderr:write(("gc=%s\n"):format(gc)) end
 local app = akkar.new()
 app:get("/ping", function() return { pong = true } end)
 
+--- The Lua heap, in kilobytes, so a soak can tell a leak from fragmentation.
+---
+--- `bench/study/soak.sh` samples RSS out of `/proc`, and RSS alone cannot
+--- separate two failures whose fixes are opposite:
+---
+---   * RSS climbs AND the Lua heap climbs -- something in akkar is holding a
+---     table it should have dropped. That is a defect and it is ours;
+---   * RSS climbs and the Lua heap is FLAT -- the collector is returning
+---     memory that the C allocator is not returning to the kernel. That is
+---     fragmentation or arena growth, and no amount of reading Lua code finds
+---     it.
+---
+--- This project has already paid for that confusion once: a "regression" in
+--- the per-connection memory figure turned out to be a single 1,024 KB
+--- allocator step, invisible to `collectgarbage "count"` and wrongly blamed on
+--- a commit for an afternoon.
+---
+--- No collection is forced here. `count` reports what is in use right now, and
+--- collecting before reading would report what is reachable after a full
+--- cycle, which is a different question and one that also perturbs the very
+--- timing the soak is measuring.
+app:get("/heap", function()
+  return { kb = collectgarbage "count" }
+end)
+
 app:get("/users/:id", { params = { id = akkar.v.integer { min = 1 } } },
   function(req)
     return req.db:one("select id, name, email from users where id = $1",

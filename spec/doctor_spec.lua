@@ -169,6 +169,32 @@ describe("the app check", function()
     assert.equal("ok", find(doctor.check_app(app, { reuseport = true }), "reuseport is on").level)
   end)
 
+  it("says which HTTP versions the server will actually speak", function()
+    -- THE FAILURE THIS REPORTS IS SILENT BY CONSTRUCTION. A TLS context with
+    -- no ALPN callback advertises no h2, so a browser negotiates HTTP/1.1
+    -- against a server that speaks HTTP/2 fine: handshake succeeds, request
+    -- is answered, multiplexing never happens, and nothing logs anything.
+    -- Doctor is the only place that can say so before a user wonders.
+    local app = akkar.new()
+    app:get("/", function() end)
+
+    assert.equal("ok",
+      find(doctor.check_app(app, {}), "HTTP/1.1 only").level)
+    assert.equal("ok",
+      find(doctor.check_app(app, { h2c = true }),
+           "cleartext HTTP/2").level)
+    assert.equal("ok",
+      find(doctor.check_app(app, { tls = { certificate = "x", key = "y" } }),
+           "HTTP/1.1 and HTTP/2").level)
+
+    -- A context akkar did not build is the one case it cannot vouch for, and
+    -- guessing would be worse than saying so: akkar will not reach into a
+    -- context the application configured.
+    assert.equal("warn",
+      find(doctor.check_app(app, { ctx = {} }),
+           "HTTP/2 over TLS cannot be confirmed").level)
+  end)
+
   it("warns when the startup capability check is disabled", function()
     local app = akkar.new()
     app:get("/", function() end)

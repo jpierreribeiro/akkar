@@ -14,6 +14,20 @@ measured the fourth and found it unnecessary: a seeded run of forty concurrent
 requests already reproduces byte for byte, so no second scheduler is needed.
 This file is what that was for.
 
+**THAT CONCLUSION WAS DRAWN ON LINUX AND IS NARROWER THAN IT READ.** An
+instrumented report from macOS CI, added 2026-08-19, shows two of five seeded
+runs differing there -- same set of requests, an adjacent swap, and only on the
+route that calls `cqueues.sleep(0)`. What varies is the order cqueues resumes
+coroutines that became runnable in the SAME tick, which is a scheduler
+tie-break rather than anything a seed controls.
+
+So "no second scheduler is needed" holds for THIS file's purpose and not for
+the general one. What this file asserts is that the pool invariants survive
+generated faults, and those assertions do not depend on the interleaving: a
+resource is returned or it is not, whatever order the coroutines ran in. A
+simulator that replays an exact schedule would need control cqueues does not
+offer portably, and `spec/determinism_spec.lua` now says so in its own header.
+
 ## The defect class it aims at
 
 Not "a query failed". From `spec/fault_injection_spec.lua`, which built the
@@ -131,15 +145,44 @@ local function simulate(seed, steps)
   end)
   assert(cq:loop(30))
 
-  -- Everything that could still be in flight has had its chance; `reap` is
-  -- what turns an abandoned coroutine's reservation back into a free slot,
-  -- and it is deliberately called rather than waited for.
+  -- DID THE RUN ACTUALLY FINISH? `cq:loop(timeout)` returns truthy whether it
+  -- drained or merely ran out of time, so asserting on its return value says
+  -- nothing about whether the work completed -- and a run that timed out
+  -- leaves live coroutines still holding their resources. Reported as a leak,
+  -- that is indistinguishable from the defect this file hunts.
+  --
+  -- The two are not the same finding and must not share a message. This one
+  -- says the machine did not finish; the assertions below say the pool broke.
+  --
+  -- Written after CI failed here on seed 19 with `live=4 idle=1` on a runner
+  -- slower than any machine this reproduced on: thirty seeds, five deadline
+  -- budgets, three pool sizes down to one slot, and the collector stopped
+  -- outright all came back clean here. An invariant test that cannot tell a
+  -- slow machine from a broken pool is not yet an invariant test.
+  local drained = cq:empty()
+
+
+  -- The two collections `Pool:reap` performs -- but unconditionally. `reap`
+  -- returns 0 immediately when nothing is RESERVED, which is exactly the
+  -- state after a drain, so its collections are skipped precisely when an
+  -- abandoned handler's release might still be waiting on a finalizer.
+  -- Measured: with `reserved = 0`, `reap` freed 0 and collected nothing.
+  collectgarbage(); collectgarbage()
+
+  -- AND THEN LET THE LOOP RUN AGAIN, which the old comment here claimed was
+  -- happening and was not. A release can be scheduled work; once `cq:loop`
+  -- has returned, anything queued after it never runs, so collecting and then
+  -- reading the stats measures a moment before the last releases had a chance
+  -- to happen. One more second of loop, which returns immediately when there
+  -- is nothing left, is the difference between "everything came back" and
+  -- "everything that had already come back, came back".
+  cq:loop(1)
   pool:reap()
 
   restore()
   execution.reset_id_prefix()
 
-  return pool:stats(), answered, raised
+  return pool:stats(), answered, raised, drained
 end
 
 describe("the invariants, under faults a seed chose", function()
@@ -148,7 +191,14 @@ describe("the invariants, under faults a seed chose", function()
     -- resource the pool created is back in it: nothing is held by a request
     -- that went away, and no reservation outlived the coroutine that made it.
     for seed = 1, 25 do
-      local stats, answered, raised = simulate(seed, 12)
+      local stats, answered, raised, drained = simulate(seed, 12)
+
+      -- Before anything about the pool: did the work finish at all? A run
+      -- that ran out of wall clock proves nothing either way.
+      assert.is_true(drained,
+        ("seed %d: the run did not drain within 30 s, so nothing here is a "
+         .. "statement about the pool -- this machine was too slow, or "
+         .. "something is not finishing"):format(seed))
 
       assert.is_true(stats.live >= 0,
         ("seed %d: live went negative (%d)"):format(seed, stats.live))

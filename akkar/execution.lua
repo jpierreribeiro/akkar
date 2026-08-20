@@ -179,12 +179,38 @@ function M.acquire(carrier, record, key)
       or (getmetatable(provided) or {}).__call then
     value = provided()
     if type(value) == "table" and type(value.release) == "function" then
-      -- LAZILY, and that is the whole reason this is a field rather than a
-      -- constructor argument. An execution that acquires nothing releasable
-      -- -- which is every `/ping` -- never allocates this table.
-      local list = record.released
-      if not list then list = {} record.released = list end
-      list[#list + 1] = value
+      if record.over then
+        -- ACQUIRED AFTER THE EXECUTION WAS ALREADY OVER, and until this
+        -- branch existed that was a leaked resource every time.
+        --
+        -- `provided()` above can YIELD -- opening a connection, or waiting
+        -- for a pool slot. If the deadline fires while it is yielding, the
+        -- 503 goes out and `dispatch` calls `release` from ITS only call
+        -- site, which clears the list. This coroutine is resumed afterwards,
+        -- gets its resource, appends it to a fresh list -- and nothing ever
+        -- calls release again, because dispatch already returned.
+        --
+        -- Reproduced deterministically with a capability that sleeps 0.1 s
+        -- against a 0.02 s budget: opened once, released zero times. It is
+        -- also the shape CI reported from `spec/simulation_spec.lua`,
+        -- `live=4 idle=1 reserved=0` -- resources out of the pool with no
+        -- reservation to reap, because reaping recovers slots held while
+        -- OPENING and these were already open.
+        --
+        -- Released here rather than registered, because there is no longer
+        -- anybody to register it with. The handler this belongs to has been
+        -- abandoned; `akkar/db.lua` and `redis.lua` already refuse a query
+        -- once the budget has gone negative, so what it holds is a resource
+        -- it cannot use.
+        pcall(value.release, value)
+      else
+        -- LAZILY, and that is the whole reason this is a field rather than a
+        -- constructor argument. An execution that acquires nothing releasable
+        -- -- which is every `/ping` -- never allocates this table.
+        local list = record.released
+        if not list then list = {} record.released = list end
+        list[#list + 1] = value
+      end
     end
   else
     value = provided
@@ -211,6 +237,12 @@ end
 --- rather than a double release. That is new: `handle` called `release_all`
 --- from exactly one place, so it could not happen. A worker loop can.
 function M.release(record)
+  -- MARKED FIRST, and the order is the point: a capability still being
+  -- acquired -- `provided()` is allowed to yield -- must find this flag set
+  -- when it comes back, including if it comes back while the loop below is
+  -- still running. See the `record.over` branch in `M.acquire`.
+  record.over = true
+
   local list = record.released
   if not list then return end
   record.released = nil

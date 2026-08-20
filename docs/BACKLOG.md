@@ -534,8 +534,8 @@ the milestone everything else was clearing the way for is still the milestone.
   Postgres query. A prefix tree would buy 0.8% of a request. Revisit past ~500
   dynamic routes; until then this is optimising noise.
 - **Lua 5.5 — done, and this entry was wrong twice on the way there.** akkar's
-  whole suite passes under Lua 5.5: **1763 passing, 0 failures, 0 errors**,
-  against 1801 on 5.4. The 38-test difference is tooling, measured rather than
+  whole suite passes under Lua 5.5: **1814 passing, 0 failures**,
+  against 1852 on 5.4. The 38-test difference is tooling, measured rather than
   assumed: 32 are `akkar.pq`'s half, which skips because one `pq_native.so`
   path serves two Lua ABIs, and 6 are `teal_spec`, which skips because `tl` is
   not installed in the 5.5 tree. Nothing in akkar had to change for any of it.
@@ -818,6 +818,393 @@ and the README promising a watchdog that cannot see a C call.
   only the first would leave the refusal untested while looking thorough —
   the same shape as the skip guard this project once shipped that never
   checked anything.
+
+## 12. Open after HTTP/2, and after the CI it turned red
+
+Recorded on 2026-08-18, in the order they cost. Nothing here is a decision
+deferred for comfort; each one names what would settle it.
+
+### 12.1 The pool leak the simulation found — FOUND AND FIXED, 2026-08-19
+
+**Status: closed, by reading the acquisition path rather than by reproducing
+the failure.**
+
+`spec/simulation_spec.lua` — the machine-checked invariant from L1 — went red
+on CI twice on the same assertion: `live=4 idle=1` on seed 19 on a Linux
+runner, `live=4 idle=3` on seed 16 on macOS. Resources checked out of the pool
+that never came back, which is the exact defect class the file was built to
+hunt, and the exact shape `akkar/pool.lua` records from the study box:
+`live=2 idle=0` and a permanent outage.
+
+**It does not reproduce here.** Thirty runs of seed 19; deadline budgets from
+20 ms down to 0.1 ms; pool sizes 4, 2 and 1 with up to 48 requests; the
+collector stopped outright so no finalizer could run. Every one clean, with
+`live=4 idle=4` before `reap` was even called.
+
+What the investigation established, which is worth more than the guesses it
+killed:
+
+- **`Pool:reap()` did nothing in any of those runs.** It returns 0 immediately
+  when `reserved()` is zero, and after a drain it always is — so the two
+  collections it performs, the ones its own comment says are what "finally
+  drops the coroutine", are skipped precisely when an abandoned handler's
+  release might be waiting on a finalizer. Measured, not inferred.
+- **The spec could not tell a slow machine from a broken pool.**
+  `cq:loop(30)` returns truthy whether it drained or ran out of time, and a
+  timed-out loop leaves coroutines still holding resources. That reads as a
+  leak and is not one.
+- **The spec measured before the last releases could happen.** Its comment
+  claimed everything in flight "has had its chance"; nothing in the code gave
+  it one, because anything scheduled after `cq:loop` returned never ran.
+
+All three are fixed: the spec now asserts `cq:empty()` separately with its own
+message, collects unconditionally, and runs the loop once more before reading
+stats. **Whether that makes CI green is not yet known**, and if it goes red
+again the message will now say which of the two things happened.
+
+**WHAT IT WAS.** `execution.release` is called from exactly one place --
+`dispatch`, once -- and it clears `record.released`. `M.acquire` calls
+`provided()`, and **`provided()` is allowed to yield**: opening a connection,
+or waiting for a pool slot. If the deadline fires while it is yielding, the 503
+goes out, dispatch runs the release, and dispatch RETURNS. The coroutine is
+resumed later, receives its resource, appends it to a freshly created list, and
+nothing ever calls release again.
+
+One leaked resource per request abandoned while acquiring, and self-reinforcing
+in the way `akkar/pool.lua` records from the study box: each leaked slot
+lengthens the wait, and a longer wait abandons more handlers inside it.
+
+`M.release` now marks the record before it walks the list, and an acquisition
+that comes back to a marked record releases its resource immediately instead of
+registering it with nobody. `spec/late_acquisition_spec.lua` reproduces the
+original deterministically -- a capability that takes five times its budget to
+open, which needs no pool and no slow machine -- and mutation-testing the guard
+away returns the exact original symptom, `opened 1, released 0`.
+
+**And the reap suspicion below was wrong**, which is worth keeping. `reserved()`
+counts `self.opening` -- coroutines abandoned while a resource is being OPENED
+-- so a pool with nothing opening has nothing for `reap` to recover, and its
+short-circuit is correct for the job it claims. The leaked resources were
+already open, which is exactly why `reserved` was 0 while `live` was 4.
+
+**What is still open here:** whether `spec/simulation_spec.lua` goes green on
+CI now. The defect it was reporting is fixed and its measurement was repaired,
+but the two were established separately and only CI can say the first was the
+whole of it.
+
+### 12.2 Determinism — the mechanism is now known, and it is a scheduler tie-break
+
+**Answered 2026-08-19, by instrumenting rather than by arguing.**
+
+Three explanations were written or tried and all three were wrong. The one in
+the repository said the kernel's polling mechanism orders the resumes, epoll
+against kqueue; that workload opens no socket, so neither had anything to
+order. Burning up to a millisecond of CPU between `sleep(0)` calls changed
+nothing across forty Linux runs. Driving the worker keepalive from 0.1 s to
+0.1 ms changed nothing either.
+
+`spec/support/determinism_report.lua` went and got the data instead, as a CI
+step that cannot fail a build. From macOS, 2 of 5 rounds differing:
+
+```
+SAME SET OF REQUESTS, so this is purely an ORDERING difference.
+first difference at position 36 of 40:
+  run 1: work:9e8c9247000015:6
+  run 2: work:9e8c9247000010:6
+  run 1's line is at position 37 in run 2 (moved +1)
+positions that differ, by route: work x2
+```
+
+Nothing vanished. Only `/work` moves, and it is the only route that calls
+`cqueues.sleep(0)`. It is an adjacent transposition of two coroutines with the
+same step count. **The variable is how cqueues breaks a tie between coroutines
+that became runnable in the same tick**, which its API does not promise.
+
+**What it costs:** the claim that a simulator needs no scheduler of its own was
+drawn from Linux-only evidence and is narrower than it read. Replaying an exact
+schedule needs control cqueues does not offer portably. What survives is what
+akkar controls: ids, random, clock, capability acquisition and release, and
+each request's own path, all reproducible from a seed. `spec/simulation_spec.lua`
+does not depend on interleaving -- a resource is returned or it is not -- so L1
+stands.
+
+### 12.2-old Determinism is established on epoll, not on kqueue
+
+**Status: narrowed, with the narrowing in the assertion.**
+
+`spec/determinism_spec.lua` claimed forty concurrent requests reproduce byte
+for byte. On macOS CI they did not — two traces differed, with gaps in the id
+sequence. The order a cooperative scheduler resumes coroutines in comes from
+the kernel's polling mechanism, and `spec/support/portable.lua` already
+records that kqueue and epoll differ enough for one cqueues controller to cost
+two descriptors on one and three on the other.
+
+The test is now `pending` off Linux with that reason, and the file's own claim
+says "on epoll". **Establishing it on kqueue is real work**: it means either a
+scheduler of akkar's own on top of cqueues, or accepting that replay is a
+Linux property. L1's value — a seed makes a counterexample re-runnable — is
+intact on the machine the simulation runs on.
+
+### 12.2b macOS is the machine that finds the time-sensitive specs
+
+Worth naming as a pattern rather than as three incidents. The same commit,
+`ff16765`, was run twice by CI: the push run passed on macOS and the pull
+request run failed on it. Same tree, opposite verdicts — so macOS is not
+broken here, it is **less forgiving**, and each time it has been right about
+something.
+
+Three specs so far, and none of the three was an akkar defect:
+
+| spec | what macOS found |
+|---|---|
+| `simulation_spec` | a measurement that could not tell a slow machine from a leaking pool |
+| `determinism_spec` | a byte-for-byte claim that only ever held on epoll |
+| `deadline_propagation_spec` | `(t + 0.2) - t'` compared to 0.2 exactly, in doubles |
+
+The last returned **0.20000000000005** — fifty femtoseconds of overshoot, and
+a property of binary floating point rather than of `bounded`. It now carries a
+one-nanosecond tolerance, nine orders of magnitude below the observed error,
+so a budget that leaked a millisecond would still fail.
+
+**The sweep, done 2026-08-19.** Every assertion in `spec/` that compares a
+clock-derived value against a literal: **42 candidates, one real**, and it was
+found before CI reached it.
+
+The 41 that are fine are fine for reasons worth stating, because "looks like a
+clock" is not the same as "is one":
+
+- `spec/time_spec.lua`'s exact equalities read the MANUAL clock, which returns
+  the integer it was handed. No arithmetic, nothing to round.
+- `spec/config_spec.lua`'s durations are parsing — `"30s"` to `30` — and never
+  touch a clock at all.
+- The loose bounds (`elapsed < 2`, `< 3`, `waited < 10`) assert a guarantee
+  with seconds of slack; float noise cannot reach them.
+
+The one that was wrong is `spec/deadline_propagation_spec.lua:45`,
+`left > 4.9 and left <= 5` after `begin(5)` — the identical shape to the
+assertion macOS broke, `(t + 5) - t'` compared to 5 as though doubles were
+exact. Fixed with the same nanosecond, which leaves `left > 4.9` carrying the
+real content: the budget counts DOWN.
+
+**The rule this leaves**, worth applying to anything written later: an
+assertion may compare a clock reading to a bound the CLOCK cannot cross, and
+may not compare it to the number the arithmetic was built from.
+
+### 12.3 HTTP/2 fuzzing — BUILT, and it found a three-byte denial of service
+
+**Status: `spec/h2_framing_spec.lua` exists, 22 hostile frame shapes, and the
+first run found a remote denial of service in upstream lua-http 0.4.**
+
+`read_http2_frame` reads a nine-byte frame header with `xread(9)`, which
+returns what it HAS when the peer goes away. Three bytes and a hang up produce
+a three-byte string; it is not nil, so every error branch is skipped, and
+`sunpack(">I3 B B I4", ...)` raises "data string too short".
+
+That raise travels out of the connection, out of the server loop, and out of
+`app:run`. The process stays up, the listening socket stays open, and
+**nothing is ever accepted again — HTTP/1.1 included**, because what died is
+the accept loop rather than the connection. Three bytes from one unauthenticated
+peer, permanently.
+
+Upstream checks for exactly this on the PAYLOAD twenty lines below —
+`if payload and #payload < size then -- hit EOF` — and not on the header. The
+vendored copy now mirrors it: a short header is EILSEQ, which is what the
+branch above it already uses for a protocol error. No unget, because unlike
+the payload case a retry cannot help; the peer sent half a header and left.
+
+Mutation-testing the guard away returns both original symptoms.
+
+**AND CONFORMANCE IS NOW MEASURED TOO**, by `bench/h2spec.sh` -- h2spec 2.6.0,
+146 cases straight out of RFC 7540 and RFC 7541, against a server in its own
+process. Five runs:
+
+| | runs |
+|---|---:|
+| 145 passed, 1 skipped, **0 failed** | 3 |
+| 144 passed, 1 skipped, **1 failed** | 2 |
+
+**The intermittent one is 3.8, GOAWAY.** h2spec sends a GOAWAY and then a PING
+and expects a clean close or a PING ACK; twice in five it got `connection reset
+by peer`. That is a deviation rather than a flaky measurement, and the
+mechanism is ordinary: closing a socket with unread inbound data makes the
+kernel send RST rather than FIN, so whether h2spec's PING has landed by the
+time the server closes decides which the peer sees.
+
+**FIXED, and it was six lines.** `connection_methods:shutdown` shut the read
+side down while the peer's PING was still unread, and closing a socket with
+unread inbound data makes the kernel send RST rather than FIN. The vendored
+copy now drains what has ALREADY arrived -- bounded at 64 reads of 4 KB, with
+no timeout, so a peer that keeps sending cannot hold the shutdown open -- and
+then shuts the read side down.
+
+**15 consecutive clean runs since**, against 2-in-5 failing before. The
+deviation was small and the fix was smaller than the paragraph that deferred
+it, which is worth remembering the next time something is deferred for being
+upstream's code.
+
+**And it should go upstream.** The bug is not akkar's and every lua-http user
+serving h2 has it.
+
+### 12.4 The historical benchmarks — the harness is proven, one number is retaken
+
+**Unblocked 2026-08-19.** The study box is reachable again and prepared with
+the CI recipe, so a number taken there and a number taken in CI mean the same
+thing: cqueues built from the pinned commit rather than the 2020 rock, and
+`spec/substrate_spec.lua` green on the box before anything was measured.
+
+**The fixed harness works, and the proof is in its own header.** A run now
+prints both commits, and the first real run printed two DIFFERENT ones:
+
+```
+tree-base: ec2fa93   tree-head: 5659f8a
+```
+
+**The first number retaken**: this branch against `origin/main`, five
+alternating repetitions. 21,672 req/s against 21,727, which is −0.3% against
+spreads of 1.1% and 0.7% — a tie by this page's own rule, and it means HTTP/2,
+WebSocket and four new bounds cost nothing measurable. `bench/study/RESULTS.md`
+§0.
+
+**AND THE NEIGHBOUR COMPARISON IS RETAKEN TOO**, 2026-08-19, all four
+candidates on one box in one run. `bench/runtime/RESULTS.md`, third run:
+
+| | req/s | spread | p99 |
+|---|---:|---:|---:|
+| OpenResty | 91,154 | 0.93% | 1.19 ms |
+| Luvit | 10,630 | 17.79% | 29.7 to 43.7 ms |
+| akkar | 10,417 | 0.39% | 12.70 ms |
+| Lapis | 6,676 | 1.09% | 17.85 ms |
+
+**OpenResty 8.75x. Lapis 1.56x the other way. Luvit is a tie** — 2.0% apart
+against Luvit's own 17.79% noise floor, which rule 3 says is not a result —
+**and akkar's tail is two to three and a half times better than Luvit's at the
+same throughput.**
+
+Two things the run found about itself. The first attempt measured nothing and
+said so, because `deploy.sh` had not been run; the harness refused rather than
+publishing a comparison one candidate had taken part in. And the summariser
+that would have printed "nothing was measured" was the only line that crashed,
+on division by zero — a gate that dies on the input it exists to describe.
+Fixed.
+
+**Still not measured**: D5 saturation, D7 dependency-down, and anything
+touching a database.
+
+### 12.4-old The historical benchmarks are still unrepeated
+
+Every number published before 2026-08-17 came from `bench/study/regression.sh`
+while it was comparing a tree with itself — `ROOT` resolved into a symlink and
+`cp -a` copied the symlink. The harness is fixed and re-verifies its refs after
+both prepares. **The numbers have not been re-taken**, and the D4 table
+against the neighbours is the one that matters.
+
+Blocked on access rather than on work: the study box answers on port 22 and
+refuses this machine's key.
+
+### 12.4b One connection can no longer kill the server
+
+Found by asking why the h2 defect above was fatal rather than local, which is a
+better question than "what was the parser bug".
+
+`cq:wrap` gives every connection its own coroutine in the server's controller,
+and cqueues propagates a raise out of `cq:loop()`. So ANY unexpected error
+under `handle_socket` took the accept loop with it: process up, listening
+socket open, nothing ever accepted again. Twice in this tree, from opposite
+directions -- `Content-Length: banana` on h1, three bytes of h2 frame header --
+each a one-line parser bug and each a total outage.
+
+`add_socket` now runs `handle_socket` under `xpcall`, gives the connection slot
+back by hand (`handle_socket` decrements `n_connections` on its last line, so a
+raise skipped it, and a count that only climbs walls the server off at
+`max_concurrent` just as completely, only slower), closes the socket, and
+reports `op = "connection"` -- which `akkar/init.lua` logs at ERROR with the
+traceback, because a connection that raised is a bug and everything else
+reaching `onerror` is a peer that went away.
+
+**Demonstrated against the real defect rather than a synthetic one.** With the
+h2 short-header bug reintroduced and the guard in place, the server logs
+`connection failed` with its traceback and keeps answering -- h2 and h1 -- on
+both hostile shapes that used to end it. Two independent layers now: the parser
+checks its input, and a parser that does not is one dropped connection.
+
+`spec/connection_containment_spec.lua` asserts all four properties, and
+mutation-testing the guard away fails all four with the right diagnoses.
+
+**What this does not do** is make a raise acceptable. It makes the next unknown
+parser bug cost one connection instead of the service, and it makes it visible
+-- which the silent version never was.
+
+### 12.5 ~~WebSocket~~ — BUILT — and HTTP/3
+
+**WebSocket is done, 2026-08-19.** The lifecycle question was the real one, and
+both halves of it had the same answer: the unit of work is a MESSAGE.
+
+Capabilities are acquired per message through `ws:scope` rather than for the
+life of the socket — a pool slot held until a browser tab closes is the known
+streaming gap at hours instead of seconds — and `app:stop` sends every open
+socket a 1001 close frame rather than draining on connections that will never
+end by themselves. Handlers still return: a socket is three callbacks and an
+object, and `ws:send` / `ws:close` are the only mutations.
+
+It cost **no new dependency**. `basexx`, `lpeg` and `lpeg_patterns` were
+already declared for the vendored `request.lua`, and `websocket.lua`'s
+`compat53` requires are guarded behind `string.pack`, which Lua 5.4 has
+natively. The first assessment of this item said four new dependencies and was
+wrong.
+
+`spec/websocket_spec.lua` pins five properties, including the one easiest to
+lose: two messages must open the capability twice and release it twice.
+
+**And the hole it shipped with, found and closed the same day.** akkar's first
+paragraph promises that bodies are bounded so an unbounded request cannot
+happen; a WebSocket message went through none of it. Measured against an
+application with `body_limit = 1 MB`:
+
+| | resident memory |
+|---|---:|
+| one 64 MB message, before | **192 MB** |
+| the same message, after | 0.4 MB |
+
+Three times the message, because the payload is buffered by `sock:fill`,
+unmasked into a second string and concatenated into a third. Now bounded in two
+places, because one is not enough: on the length the peer DECLARES, before
+`fill` commits a byte of it, and on the SUM of the fragments, which a per-frame
+bound cannot see -- a thousand fragments of a megabyte each are a thousand
+legal frames and one illegal message. Refused with 1009, the code RFC 6455
+defines for it. `spec/websocket_limits_spec.lua`, and mutation-testing both
+bounds away fails three of its four cases.
+
+**The fuzzer that did not find it.** 15 hostile frame shapes -- unmasked
+frames, reserved bits, fragmented control frames, truncated headers, invalid
+UTF-8 -- and all 15 were survived, because `read_frame` already checks
+`#first_2 ~= 2` where h2's header read did not. The hole was not a malformed
+frame. It was a perfectly well-formed one that was simply too big, which is
+the shape a fuzzer looking for crashes does not look for.
+
+HTTP/3 is the exclusion that the argument actually fits: QUIC is a UDP
+transport with its own congestion control and TLS integration, neither cqueues
+nor lua-http has it, and there is no half of anything on disk to vendor.
+Terminated at the edge in practice.
+
+### 12.6 Isolation against hostile code is a decision about product shape
+
+Not an akkar defect, and the inventory says so: `akkar/vm.lua` states in its
+own header that a sandbox inside one Lua state is not a security boundary, and
+`spec/vm_spec.lua` covers every escape it does claim — bytecode, the unhooked
+coroutine, the pcall that swallows the budget, the single allocation that
+outruns the sampler, the shared string metatable.
+
+So what decides it is the price of a process per tenant, and that is measured:
+**28 ms to first response, 12.8 MB resident idle** — 1.22 GB for a hundred
+idle exercises, 6.09 GB for five hundred. Cheap, and the only option that *is*
+a boundary. `akkar.vm` keeps the smaller case: a hook published inside an
+application that is otherwise trusted.
+
+### 12.7 LAB L2–L5
+
+Structured concurrency, adaptive CoDel, and a profiler. GC tuning already came
+back measured at ≤3.5% and is refused. These are the only items on this page
+that are optional.
 
 ## What is deliberately not being built
 

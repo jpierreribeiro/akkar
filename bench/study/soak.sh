@@ -52,8 +52,8 @@ echo "# soak: $MINUTES minutes, $PROCS processes, pool $POOL, $CONNS connections
 echo "# route /users/42, answering: $body"
 echo "# $(date -u +%FT%TZ)  machine $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
 echo
-printf "%-6s %10s %9s %9s %8s %7s %6s %6s %6s\n" \
-  min req/s p50 p99 rss_mb fds pg errors wrong
+printf "%-6s %10s %9s %9s %8s %8s %7s %6s %6s %6s\n" \
+  min req/s p50 p99 rss_mb heap_mb fds pg errors wrong
 
 samples=$((MINUTES * 60 / SAMPLE))
 for i in $(seq 1 "$samples"); do
@@ -73,6 +73,21 @@ for i in $(seq 1 "$samples"); do
   done
   pg=$(sudo docker exec akkar-pg psql -U postgres -d akkar -tAc \
        "select count(*) from pg_stat_activity where datname='akkar'" 2>/dev/null | tr -d ' ')
+
+  # THE LUA HEAP, BESIDE RSS, BECAUSE RSS ALONE CANNOT NAME THE FAILURE.
+  #
+  # RSS climbing with the heap is a table akkar is holding: a defect, and ours.
+  # RSS climbing while the heap is FLAT is memory the collector released and
+  # the C allocator did not return to the kernel: fragmentation or arena
+  # growth, which no amount of reading Lua finds. Opposite fixes, and this
+  # project has already spent an afternoon blaming a commit for what turned
+  # out to be one 1,024 KB allocator step.
+  #
+  # One process is sampled rather than all of them, because the heap is
+  # per-VM and summing figures from independent VMs would produce a number
+  # that is not any VM's heap.
+  heap=$(curl -s -m 2 "http://127.0.0.1:$PORT/heap" 2>/dev/null \
+         | grep -o '"kb":[0-9.]*' | cut -d: -f2)
 
   # The correctness sample. One request, compared byte for byte against what
   # the same route answered before the load started.
@@ -106,7 +121,8 @@ for i in $(seq 1 "$samples"); do
     echo "#   got     : ${now_body:-<nothing>}"
   fi
 
-  printf "%-6s %10s %9s %9s %8s %7s %6s %6s %6s\n" \
-    "$((i * SAMPLE / 60))" "$rps" "$p50" "$p99" "$((rss / 1024))" "$fds" \
+  printf "%-6s %10s %9s %9s %8s %8s %7s %6s %6s %6s\n" \
+    "$((i * SAMPLE / 60))" "$rps" "$p50" "$p99" "$((rss / 1024))" \
+    "$(awk -v k="${heap:-0}" 'BEGIN{printf "%.1f", k/1024}')" "$fds" \
     "${pg:-?}" "$errs" "$wrong"
 done

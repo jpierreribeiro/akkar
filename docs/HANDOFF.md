@@ -1,262 +1,265 @@
-# Handoff — 18 August 2026
+# Handoff, 19 August 2026
 
-For whoever picks this up, including you next week. What is waiting, what is
-now known, and where the programme stands — in that order, because the first
-has a cost per hour and the rest do not.
+Written to be read cold, by somebody who was not in the conversation that
+produced it. It assumes you know Lua and akkar's shape and nothing about the
+last two days.
 
-Rewritten rather than appended to. The previous version described a tree from
-before the HTTP optimisation pass and before the benchmark box came back.
+**Where everything is.** Branch `f4-refused`, pull request #7, 25 commits ahead
+of `main`. `main` itself is RED at `ec2fa93` and the fix is in this branch, so
+merging the pull request is what turns it green. Nothing here is on `main` yet.
 
----
-
-## Waiting on you
-
-**1. PR #6 is open** — https://github.com/jpierreribeiro/akkar/pull/6 — and the
-branch has moved a long way past it. This session does not merge.
-
-**2. Two things bill.** The study box `18.205.2.122` (a c5.2xlarge, fully
-provisioned and working), and the Railway service `akkar-deploy-test` from an
-earlier session.
-
-That is the whole list. The previous handoff's first item — an unreachable
-benchmark box — is gone: there is a new one, `bench/runtime/provision.sh` now
-brings a bare Ubuntu 24.04 image all the way up, and it has been exercised.
+**The one-line state:** akkar now speaks HTTP/2 and WebSocket, passes 146 of
+146 h2spec conformance cases, and 1,852 tests on Lua 5.4 and 1,814 on Lua 5.5,
+green on Linux x86_64, Linux arm64 and macOS.
 
 ---
 
-## What this session established
+## Waiting on you, and only these
 
-### The allocation cut became throughput, and it was measured
+1. **Merge pull request #7.** `main` is red without it. Nothing else in this
+   document depends on the merge, but everything published does.
 
-Five changes in `akkar/vendor/http/` took a request from **14,610 to 11,450
-bytes**, each measured on its own and byte-identical across three runs.
-`bench/study/HTTP-OPTIMISATION.md` has every step with its number, including
-an estimate that was wrong by six times and why.
+2. **Isolation against hostile code is a decision about product shape**, not a
+   defect, and it is still yours. `akkar/vm.lua` states in its own header that
+   a sandbox inside one Lua state is not a security boundary, and
+   `spec/vm_spec.lua` covers every escape it does claim. What decides the shape
+   is the price of a process per tenant, and that is measured: **28 ms to first
+   response, 12.8 MB resident idle**, so 1.22 GB for a hundred idle exercises
+   and 6.09 GB for five hundred. Cheap, and the only option that IS a boundary.
+   `akkar.vm` keeps the smaller case: a hook published inside an application
+   that is otherwise trusted.
 
-| | bytes/request |
-|---|---:|
-| before | 14,610 |
-| two conditions nobody could wait on | 14,450 |
-| ten `nil` keys that were only documentation | 14,070 |
-| header index holds an integer until a name repeats | 12,290 |
-| header entry flattened into parallel arrays | 11,660 |
-| chunk queue built only when something is read ahead | **11,450** |
+3. **Publishing to luarocks.org**, which is a release step nobody has taken,
+   and a compatibility policy, which does not exist. Both are decisions rather
+   than work.
 
-**−21.6%.** And on the reserved box, `/ping`, `38122ae` against `ed23e89`:
+Everything else below is work, and none of it is blocked on you.
 
-| | req/s | p99 | spread | µs/req at 2.00 cores |
+---
+
+## The benchmark box
+
+**It works again.** Address `98.80.193.148`, user `ubuntu`, key
+`~/Downloads/colossus.pem`. The old address is dead; this is a fresh instance,
+8 cores, `ulimit -n 1024`.
+
+Provisioned with **the CI recipe rather than by hand**, deliberately, so a
+number taken there and a number taken in CI mean the same thing: cqueues built
+from the pinned commit `c36614982fe07917b2e1ce5a9e7a0e55b81be262` rather than
+the 2020 rock. `spec/substrate_spec.lua` is green on it, and that gate runs
+before anything is measured.
+
+```sh
+ssh -i ~/Downloads/colossus.pem ubuntu@98.80.193.148
+cd ~/akkar-git && git fetch && git checkout f4-refused && git reset --hard origin/f4-refused
+
+# two knobs the harnesses need on THIS box, because the checkout is not $HOME/akkar
+ROOT=$HOME/akkar-git       bash bench/study/regression.sh origin/main HEAD
+AKKAR_SRC=$HOME/akkar-git  bash bench/runtime/deploy.sh   # stages the four services
+AKKAR_SRC=$HOME/akkar-git  bash bench/runtime/run.sh      # the four-way table
+H2SPEC_CACHE=/tmp/h2       bash bench/h2spec.sh           # conformance
+```
+
+`provision.sh` installs the runtimes and `deploy.sh` stages the services. Both
+are needed and only the first is obvious; running one without the other is how
+the first four-way attempt measured nothing.
+
+---
+
+## What the numbers say now
+
+**Against the neighbours**, all four on one box in one run, three alternating
+repetitions, browser shape. `bench/runtime/RESULTS.md`, third run:
+
+| | req/s | spread | p50 | p99 |
 |---|---:|---:|---:|---:|
-| before | 20,192 | 6.38 ms | 0.8% | 99.0 |
-| after | **22,783** | **5.42 ms** | 3.3% | **87.8** |
+| OpenResty | 91,154 | 0.93% | 1.09 ms | 1.19 ms |
+| Luvit | 10,630 | 17.79% | 7.18 ms | 29.7 to 43.7 ms |
+| akkar | 10,417 | 0.39% | 9.31 ms | 12.70 ms |
+| Lapis | 6,676 | 1.09% | 14.64 ms | 17.85 ms |
 
-**+12.8%**, and an independent second invocation gave +12.3%. CPU per request
-fell at fixed cores, so this is work removed rather than queueing rearranged.
+OpenResty is **8.75x**. Lapis is **1.56x** the other way. **Luvit is a tie**:
+2.0% apart against Luvit's own 17.79% noise floor, and this project's rule is
+that a difference below the larger of two floors is not a result. Where they
+are not tied is the tail, where akkar's p99 is two to three and a half times
+better at the same throughput.
 
-On `/users/42` the same harness gives +4.4% against a 6.5% spread. **By Rule 3
-that is not a result** and is recorded as one that does not clear the floor.
+**Against itself**, this branch against `origin/main`: **−0.3% against spreads
+of 1.1% and 0.7%**, which is a tie. Two days of protocol and safety work cost
+nothing measurable. `bench/study/RESULTS.md` §0.
 
-### akkar was returning errors under load, and nobody could see it
-
-The important finding of the session, and it came out of running the benchmark
-rather than reading code.
-
-`descriptor_ceiling` in `akkar/init.lua` divided the descriptor limit by 2 —
-the cost of a cqueues controller — and forgot that the request also holds the
-connection it arrived on. Counted from inside a server process of its own,
-holding N requests in a sleeping handler: **3.00 descriptors each**, flat at
-50, 100 and 200 in flight.
-
-So the ceiling promised half again as much concurrency as the box could serve.
-On the usual `ulimit -n 1024` it offered 337 concurrent requests, which need
-1,011 descriptors. At `wrk -c100` akkar answered **18,640 of 111,651 requests**
-with `unable to initialize continuation queue: Too many open files`.
-
-**Nobody saw it because the harness read the wrong `awk` field.** `parse_wrk`
-took `$4` of `Non-2xx or 3xx responses: 18640` — the literal word
-`responses:` — so a truthy string landed in the error-count column and the
-gate read as a pass. The `bench/runtime/RESULTS.md` sentence "zero non-2xx
-responses anywhere" was never verified by anything, and the 9,627 rps figure
-beside it is now withdrawn.
-
-Both are fixed. `spec/concurrency_spec.lua` now **counts** the descriptors
-against a fixture server in its own process, and compares the ceiling against
-what a real server derived — its old assertion re-derived the formula, divisor
-and all, and then asserted `expected >= 16`, which is true for any divisor on
-any box. A test that agrees with the code because it *is* the code cannot
-report that the code is wrong.
-
-### The 19.50 KB per idle connection was not where the plan said
-
-`docs/PLAN.md` attributed ~15 KB of it to lua-http and ~4 KB to akkar, by
-subtracting Lapis's figure from akkar's on the study box. Measured in-process
-instead of by subtraction, holding 200 idle connections:
-
-```
-Lua heap, bare cqueues socket server   2,568 bytes/connection
-Lua heap, akkar on vendored lua-http   3,415 bytes/connection
-```
-
-Everything akkar and lua-http hold above the cqueues floor is **847 bytes**.
-Optimising our own tables was never going to move that number.
-
-The memory is cqueues', and not on the Lua heap at all: every socket gets a
-4 KB input and a 4 KB output buffer, malloc'd **eagerly** at creation, invisible
-to `collectgarbage "count"` — which is why no allocation ceiling in this
-project ever saw it. `app:run { socket_buffer = 1024 }` writes cqueues'
-prototype; the buffers still grow on demand.
-
-**And it costs nothing.** `strace -c` counted `read()` at 4096, 1024 and 512
-over 300 requests, for a 13-byte JSON reply and a 256 KB one: identical on the
-small payload, four calls different over 76 MB on the large one. The buffer
-bounds what is preallocated, not what a read asks for.
-
-Result on the box: akkar went from **worst of four** on that dimension to best
-of the three that run a Lua VM.
-
-**The 6.96 KB figure that used to be quoted here is withdrawn**, along with the
-15.24 it was compared against. Neither is a per-connection cost: the instrument
-divided a fixed per-process allocator step by the connection count. Re-measured
-at two sizes, the same binary reports 10.24 KB at 200 connections and 6.40 at
-800. `bench/runtime/RESULTS.md` §D3 carries the correction. The direction of
-the result survives — the eager 4 KB buffers were real and shrinking them was
-real — but the number does not.
-
-### Lua 5.5 is done, C driver included
-
-```
-Lua 5.4    1,756 successes / 0 failures / 0 errors / 0 pending
-Lua 5.5    1,750 successes / 0 failures / 0 errors / 1 pending
-```
-
-The pending is `teal_spec` skipping because `tl` is not installed — tooling,
-not code. Building `pq_native.so` for 5.5 needed no root and no `libpq-dev`
-install; `src/build.sh` had documented the route since it was written and
-nobody had used it.
-
-### The rockspec no longer works by accident
-
-The vendored HTTP needs `basexx`, `binaryheap`, `fifo`, `lpeg` and
-`lpeg_patterns`. The rockspec declared none of them; they arrived transitively
-through `http >= 0.4`, so `luarocks install akkar` worked and would have
-broken the moment somebody acted on "we vendor http, so drop the dependency".
-All five are declared now, each with the file that needs it named beside it,
-and `http` moved to `test_dependencies` — which is what it is: an independent
-client, so a framing bug symmetric between our reader and our writer cannot
-pass its own tests.
+**Boot**: 68 ms to first answered request, down from 164 ms this morning. See
+the next section.
 
 ---
 
-## The benchmark box, which is now reproducible
+## What the last two days added
 
-It was not. `bench/runtime/run.sh` starts four services out of `~/rt/svc` and
-three of them were versioned in this repository; **akkar's was not.**
-`rt-akkar-serve.lua` had been typed into a terminal on a machine that no
-longer exists — the one candidate the whole comparison is about was the one
-candidate nobody could rebuild.
+**HTTP/2**, by reintegration and not implementation: the h2 half of lua-http
+0.4 is the same release the h1 half was vendored from. ALPN settles it over TLS
+with no configuration; `h2c = true` for cleartext, opt-in because the preface
+sniff costs a read on every connection including h1 ones. Multiplexing
+measured at 552 ms against 3,071 ms for six half-second requests on one
+connection.
 
-Now: `bench/runtime/akkar/serve.lua` is in the tree, `bench/runtime/deploy.sh`
-stages all four, and `provision.sh` gained four repairs it needed before it
-could provision a genuinely empty box:
+**WebSocket**, as a route kind rather than a second programming model. A
+handshake is an ordinary GET until it is accepted, so routing, `:params`, query
+schemas, middleware and the deadline all apply unchanged. Handlers still
+return; a socket is three callbacks and an object. `ws:scope(fn)` acquires
+capabilities per MESSAGE, because a pool slot taken when a socket opens is held
+until the browser tab closes.
 
-- **docker and `wrk` were assumed, not installed.** The first box had them
-  from earlier sessions.
-- **`m4` was missing**, and cqueues generates `src/errno.c` from an m4
-  template. The build stopped right after printing "enabling Lua 5.4", which
-  reads like a Lua problem.
-- **The published cqueues rock does not build on Ubuntu 24.04.** CI already
-  solved this by building from a pinned commit; the box gets the same one, for
-  a better reason than convenience — measuring akkar on a substrate CI never
-  tests would describe a configuration nobody ships.
-- **The Postgres seed was not idempotent.** `on conflict do nothing` with no
-  unique constraint meant the second run inserted ten thousand more rows, and
-  `postgres rows: 20000` still answers every request correctly.
-
-Five harness defects in `bench/` are fixed and each is commented where it
-lives. The one that mattered is `parse_wrk` above.
+**Bounds that did not exist**: socket message size (via `body_limit`), socket
+count (`websocket_max_connections`), concurrent h2 streams
+(`h2_max_concurrent_streams`, default 100), and a guard that keeps one
+connection's raise from taking the accept loop down.
 
 ---
 
-## Where F2 to F6 stand
+## Defects found, and what each one taught
 
-### F2 — deadline as budget · **half done, and the other half now has a number**
+Listed because the pattern matters more than the list: **of eight real defects,
+five were in instruments rather than in akkar**, and the two that were in akkar
+had both survived the full suite.
 
-**Done:** the deadline is arithmetic the whole execution can read, and
-`req.http` and `req.db` bound their wire calls by what is left. That closed a
-cascading-failure defect: `http.lua` opened every outbound call with a fresh
-ten seconds regardless of the caller's budget.
+| what | how it was found |
+|---|---|
+| **Three bytes killed the server.** A short h2 frame header made `string.unpack` raise, the raise left the connection, and the accept loop died with it, HTTP/1.1 included. Upstream lua-http's bug; we are a fork now, so no report | the h2 fuzzer, first run |
+| **A capability acquired after its execution ended was leaked, every time.** `provided()` can yield; if the deadline fires while it does, `dispatch` releases and returns, and the resource is registered with nobody | reading the acquisition path, after CI went red and no local reproduction worked |
+| **A WebSocket message was unbounded.** 64 MB in, 192 MB of resident memory out, against an app that had set `body_limit = 1 MB` | asking what a message COSTS, not fuzzing it |
+| **Ten idle WebSockets took the whole API down.** `max_concurrent` counts connections and a socket is a connection that lasts | measuring density |
+| **500 concurrent h2 streams on one connection**, all accepted | the h2spec case that was SKIPPED, because we advertised no limit |
+| **WebSocket cost every boot 96 ms**, including apps that never open a socket | profiling the boot path when asked where to improve |
+| **CI compared two runs of itself and disagreed**, so every red was ambiguous | noticing the same SHA passing and failing |
+| **The determinism claim was platform-dependent** for a reason nobody had | instrumenting rather than reasoning |
 
-**Blocked, still:** removing the controller. `spec/akkar_spec.lua` has a
-handler calling `cqueues.sleep(2)` against a 0.15 s budget that must answer
-503, and `sleep` goes through no adapter — capability bounds cover everything
-akkar mediates and nothing it does not.
-
-**What changed:** the wall is no longer a projection. It is 3 descriptors per
-in-flight request, measured, and the default `ulimit -n 1024` puts it at 225
-concurrent requests per process. Before this session akkar would have
-*claimed* 337 and failed at some number below it, loudly, in production.
-
-### F3 — LuaJIT spike · **partly answered for free**
-
-The 5.5 work priced most of it. LuaJIT's blockers are semantic: `math.type` is
-load-bearing in five modules, the compat shim's version **lies** (returns
-`"integer"` for integral floats), and `<close>` appears four times in
-`static.lua`. Still worth a timeboxed run for the throughput number.
-
-### F4 — validator codegen · **unchanged**
-
-F0 already pre-expands schemas at route registration, which is the insertion
-point codegen needs. The hard constraint stands: `akkar.from_spec` passes
-schemas that came from **data**, so a generator must never interpolate a field
-name into source.
-
-### F5 — the HTTP frontier · **the allocation half is done**
-
-−21.6% per request, +12.5% throughput, and the idle-connection number fixed.
-What is left is the C tokeniser, and the largest single remaining allocation
-win is the one this project has the most reason to distrust: pooling stream
-objects is worth **962 bytes** (measured, down from the 1,496 first quoted)
-and is the same shape as the controller pool implicated in
-`docs/substrate/SEGFAULT.md`.
-
-### F6 — timing wheel · **unchanged, still downstream of F2**
-
-`timeout.c` is William Ahern's, MIT, O(1), same author as cqueues, and cqueues
-does not embed it. For jobs, cron and idle-connection reaping — not the
-request path, where the deadline is arithmetic now.
+**The transferable lesson**, and it cost real time to learn: a measurement that
+agrees with expectation is not evidence, and three of the instrument defects
+reported success. The `WORKER_IDLE` sweep varied a variable nothing read; the
+boot A/B compared a configuration with itself because an empty string is true
+in Lua; the noise-floor gate crashed on exactly the input it existed to
+describe.
 
 ---
 
-## An instrument that did not work, so nobody builds it twice
+## Open, in the order I would do them
 
-To find where the remaining ~9,344 bytes of a request live in the vendored
-HTTP, every lua-http method was wrapped to report `collectgarbage "count"`
-across itself, with the collector stopped and nesting attributed to the
-outermost frame. It reported **−944 bytes attributed** out of 11,636 measured.
+### 1. Latency at low load has never been measured
 
-The reason is structural: **every one of those methods yields.** The window
-between the two readings contains whatever other coroutines ran, and the depth
-counter that suppresses nesting is shared across them. There is no fix that
-keeps the shape short of a custom Lua allocator in C.
+**The most valuable thing on this list, and it is measurement rather than
+code.** Every D4 run is at saturation, where p50 is queueing and not work:
+100 connections ÷ 10,417 req/s = 9.6 ms, and the measured p50 is 9.31 ms. That
+is Little's law, not akkar. What a real service at 5% utilisation delivers is
+unknown, and it is the number most readers actually want.
 
-**Ablation is what works here** — change one thing, measure end to end, keep
-the number — and it produced every figure in `HTTP-OPTIMISATION.md`.
+It also decides whether the OpenResty comparison means what people will read
+into it. At saturation akkar is 8.75x behind; at 5% utilisation both are
+answering in microseconds of their own code and the difference may be
+invisible.
+
+### 2. The rest of the boot path
+
+`require "akkar"` is 66 ms and 69 modules after this morning's fix. 46 ms of
+that is the HTTP server: `h1_connection`, `h1_stream`, `h2_connection`,
+`lpeg_patterns.http`. The h2 half and HPACK are only needed when a connection
+negotiates h2, so the same deferral that just cut 96 ms should be worth another
+15 to 20. The profiler is `bench/study/boot-profile.lua`, versioned rather than left in
+a scratch directory, with a note about the one column of it that overlaps.
+
+### 3. `akkar doctor` does not check `ulimit`
+
+Verified: no mention of RLIMIT anywhere in `akkar/doctor.lua`. akkar caps
+itself at 66% of the soft descriptor limit, so 675 on a box with the usual
+1,024, which is exactly what the four-way run measured while the other three
+took 800.
+That reserve is deliberate and was bought with an incident (18,640 of 111,651
+requests answered "Too many open files" on a run that produced a published
+number). But an operator on a container with a low limit discovers the cap in
+production, and doctor exists to say that first.
+
+### 4. HTTP/2 throughput is unknown
+
+Conformance is proved and multiplexing is measured on a toy case. What h2 costs
+per request against h1 under load, counting HPACK, the framing layer and the
+per-stream coroutine, has never been measured. If it is expensive, that matters, and
+nobody would currently know.
+
+### 5. Determinism on kqueue
+
+**The mechanism is now known**, which is the part that was missing. From the
+instrumented CI report on macOS: the difference is purely ordering, the set of
+requests is identical, it is an adjacent transposition, and it happens only on
+the route that calls `cqueues.sleep(0)`. What varies is how cqueues breaks a
+tie between coroutines that became runnable in the same tick, which is its
+business rather than something its API promises.
+
+What it costs: the claim that a simulator needs no scheduler of its own came
+from Linux-only evidence. Replaying an exact schedule needs control cqueues
+does not offer portably. `spec/simulation_spec.lua` does not depend on
+interleaving, so L1 stands on its own assertions.
+
+### 6. Smaller, and each is written down where it matters
+
+- **D3's fixed per-process column is unsound** and is withheld rather than
+  published: it came back negative for three of four candidates, because two
+  points cannot separate a linear model from noise larger than the signal.
+- **D5 saturation and D7 dependency-down** have never been run.
+- **No independent security review** has happened. The bounds, the fuzzers and
+  the conformance suite are real and all internal.
+- **`docs/UNKNOWNS.md` §8b** lists what is not known about h2 and WebSocket
+  specifically: the framing layers are upstream's and unread line by line,
+  nothing has held sockets open for hours, hostile flow control is not covered,
+  100 streams on one connection can ask for 100 pool connections and the pool's
+  fairness was measured under HTTP/1.1 arrival patterns, and `wss://` at volume
+  is unmeasured.
+- **LAB L2 to L5**: structured concurrency, adaptive CoDel, a profiler. GC
+  tuning was already refused at ≤3.5%. These are the only optional items here.
+
+---
+
+## Things that will bite you if nobody says them
+
+**Run the suite with the environment set explicitly.** `eval "$(luarocks path)"`
+is refused inside a worktree-isolated session:
+
+```sh
+PATH="$HOME/.luarocks/bin:$PATH" \
+LUA_PATH="./?.lua;./?/init.lua;$HOME/.luarocks/share/lua/5.4/?.lua;$HOME/.luarocks/share/lua/5.4/?/init.lua;;" \
+LUA_CPATH="$HOME/.luarocks/lib/lua/5.4/?.so;;" busted
+```
+
+Postgres and Redis are `docker start akkar-pg akkar-redis` (ports 55432 and
+6379). Without them about thirty tests error, and those errors look like
+regressions.
+
+**macOS in CI is the machine that finds time-sensitive defects.** It has been
+right four times running and not one was an akkar defect. When it goes red,
+read it before assuming the runner is flaky.
+
+**CI runs once per commit now**, on pull requests and `main`, with a
+concurrency group. A branch with no pull request is not tested, which is the
+trade. A run marked `cancelled` usually means a newer commit superseded it.
+
+**The em dash is banned in prose** by the author's preference; the README was
+rewritten to remove all fifty-two of them.
+
+**Never sign commits with a Claude co-author line.** Author is
+`jpierreribeiro <canaldopierre0@gmail.com>`.
 
 ---
 
 ## If you have an hour
 
-Re-read `bench/study/HTTP-OPTIMISATION.md`'s "what is left" table and decide
-whether the C tokeniser is next or whether F2's controller removal is. Both
-are sized; neither is started.
+Merge #7 and watch `main` go green.
 
 ## If you have a day
 
-`bench/runtime/run.sh` has never measured Tarantool, and D5 (saturation) and
-D7 (dependency down) have never been run at all. The box is up and every
-candidate is installed. D5 is the dimension the descriptor wall lives in.
+Item 1: measure latency at low load, publish it beside the saturation numbers,
+and say plainly which one a reader should care about.
 
 ## If you have a week
 
-F2's second half. The wall is now a measured number rather than an estimate,
-which means the fix has a target: 3 descriptors per in-flight request down to
-1, and 225 concurrent per process becomes 675.
+Items 1 through 4, and then the honest question this project keeps circling:
+akkar is capable of production for a service you operate yourself, and it is
+not proven in production. The distance between those is exposure, not features.
+The shortest path across it is one real service of yours running on it.

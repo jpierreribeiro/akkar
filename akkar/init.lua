@@ -23,6 +23,27 @@ local multipart = require "akkar.multipart"
 -- The execution machinery, with no HTTP in it. `akkar.execution` requires only
 -- `cqueues` and `akkar.time`, so there is no cycle back to this file.
 local execution = require "akkar.execution"
+--- WebSocket, LOADED ON THE FIRST `app:websocket` AND NOT BEFORE.
+---
+--- This was an eager `require` for one day, and the day was enough to measure
+--- what that costs: `akkar.websocket` pulls the vendored socket, which pulls
+--- lua-http's request and client halves, which pull three `lpeg_patterns`
+--- grammars. **123.7 ms and 65 modules**, on every boot of every application,
+--- including the overwhelming majority that never open a socket. It roughly
+--- doubled the time to `require "akkar"`.
+---
+--- Boot is a rounding error for a service that runs for weeks. It is the whole
+--- number for the two cases this project has written down: a process per
+--- student, where hundreds of boots are the workload, and any cold start.
+---
+--- Deferred rather than made optional, so nothing about the API changes: the
+--- first `app:websocket(...)` pays for it, and an application without one
+--- never does.
+local ws_module
+local function websocket_module()
+  ws_module = ws_module or require "akkar.websocket"
+  return ws_module
+end
 local bitwise = require "akkar.bitwise"
 local text = require "akkar.text"
 
@@ -244,7 +265,9 @@ local SETTINGS = {
   check_capabilities = true, reuseport = true, strict = true,
   max_concurrent = true, trusted_proxies = true,
   repair_substrate = true, socket_buffer = true, gc = true,
-  cpu_limit = true,
+  cpu_limit = true, h2c = true, websocket_idle_timeout = true,
+  websocket_max_message = true, websocket_max_connections = true,
+  h2_max_concurrent_streams = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -738,7 +761,13 @@ local App = {}
 App.__index = App
 
 function akkar.new()
-  return setmetatable({ routes = {}, middleware = {}, exact = {}, mounts = {} }, App)
+  -- `sockets` is a set of open WebSockets, and it exists for shutdown: without
+  -- it `App:stop` would drain on `while in_flight > 0` against connections
+  -- that have no reason to end, and a deploy would hang until the grace period
+  -- killed it. `sockets_open` is the count, kept separately because counting a
+  -- set with `pairs` on every request would be a linear scan on the hot path.
+  return setmetatable({ routes = {}, middleware = {}, exact = {}, mounts = {},
+                        sockets = {}, sockets_open = 0 }, App)
 end
 
 local MAGIC = "[%-%.%+%[%]%(%)%$%^%%%?%*]"
@@ -806,6 +835,46 @@ for _, method in ipairs { "get", "post", "put", "patch", "delete" } do
     if #names == 0 then self.exact[verb .. " " .. path] = route end
     return self
   end
+end
+
+--- A WebSocket route.
+---
+--- Registered as the GET it actually IS -- a handshake is an ordinary GET
+--- until the moment it is accepted -- so routing, `:params`, `query` schemas,
+--- `before` hooks, middleware and the deadline all apply to it unchanged, and
+--- none of that had to be rebuilt. See `akkar/websocket.lua` for why a socket
+--- is three callbacks rather than a handler that runs for hours.
+function App:websocket(path, opts, handlers)
+  if handlers == nil then opts, handlers = nil, opts end
+  if type(handlers) ~= "table" or type(handlers.message) ~= "function" then
+    error("websocket " .. path .. " needs a table with a `message` function", 2)
+  end
+  for name in pairs(handlers) do
+    if name ~= "open" and name ~= "message" and name ~= "close" then
+      error("websocket " .. path .. ": unknown callback `" .. tostring(name)
+            .. "`; use open, message or close", 2)
+    end
+  end
+
+  local registered = self:get(path, opts, function(req)
+    if not websocket_module().wants_upgrade(req.headers) then
+      -- A PLAIN GET TO A SOCKET ROUTE gets an ordinary refusal rather than a
+      -- hijacked stream. 426 is the status that exists for exactly this, and
+      -- it names the protocol the client should have asked for.
+      return response(426, { error = "this endpoint speaks WebSocket" },
+                      { upgrade = "websocket", connection = "Upgrade" })
+    end
+    -- Carried out on a real response object so `dispatch` passes it through
+    -- untouched -- and so `execution.release` still runs on the handshake's
+    -- own capabilities before the socket begins its life.
+    local upgrading = response(101, nil)
+    upgrading.websocket = { handlers = handlers, req = req }
+    return upgrading
+  end)
+  -- Marked so `akkar doctor` can tell an application that serves sockets from
+  -- one that does not, and warn about `max_concurrent` only when it matters.
+  self.routes[#self.routes].websocket_route = true
+  return registered
 end
 
 function App:use(fn)
@@ -1739,6 +1808,32 @@ local REQUEST_MT = {
     end,
 }
 
+--- An execution scope with capabilities, for work that is not a request.
+---
+--- A WebSocket callback needs `req.db` exactly as a handler does, and needs it
+--- released exactly as promptly -- the difference being that the unit of work
+--- is a MESSAGE. This builds the same carrier `handle` builds, over the same
+--- closed capability set, and releases on every path including a raise.
+---
+--- The budget is the configured request timeout, for the same reason a request
+--- has one: work that will not finish must not hold a slot until it does.
+local function scope_for(app, config, fn)
+  local record = { capabilities = config, id = execution.id() }
+  local carrier = setmetatable({ __input = record, id = record.id }, REQUEST_MT)
+
+  local ok, result = pcall(function()
+    return execution.with_deadline(config.timeout or akkar.defaults.timeout,
+                                   function() return fn(carrier) end)
+  end)
+
+  -- ON EVERY PATH, which is the whole point of the wrapper. A socket that
+  -- raises inside a scope must not keep the connection it borrowed.
+  execution.release(record)
+
+  if not ok then error(result, 0) end
+  return result
+end
+
 local function handle(app, input)
   -- Before the chains are built, because the selected app has its own.
   local requested_host = input.host
@@ -2174,6 +2269,28 @@ function App:stop(grace)
   internal:info("shutdown: no longer accepting connections")
   pcall(function() self.server:pause() end)
 
+  -- WEBSOCKETS ARE TOLD, RATHER THAN WAITED FOR.
+  --
+  -- A socket has no reason to end on its own: a browser tab left open holds
+  -- one for as long as the tab exists. Draining on `in_flight` alone would
+  -- therefore never finish, and a deploy would sit in DRAINING until the
+  -- grace period expired and then report a stall that was really a chat
+  -- window.
+  --
+  -- So every open socket gets a close frame with 1001 -- "going away", which
+  -- is the code that exists for exactly this and which tells a client it may
+  -- reconnect rather than that it did something wrong. The callback loop sees
+  -- the close and returns, `in_flight` comes down on its own, and the drain
+  -- below then means what it says.
+  if next(self.sockets or {}) then
+    local closing = 0
+    for sock in pairs(self.sockets) do
+      closing = closing + 1
+      pcall(sock.close, sock, 1001, "server is shutting down", 1)
+    end
+    internal:info("shutdown: closing websockets", { sockets = closing })
+  end
+
   self.state = "DRAINING"
   local deadline = time.monotime() + grace
   local warned = false
@@ -2458,6 +2575,17 @@ function App:run(config)
       local ctx = openssl_ctx.new(config.tls.protocol or "TLS", true)
       ctx:setCertificate(x509.new(pem(certificate)))
       ctx:setPrivateKey(pkey.new(pem(key)))
+
+      -- ALPN, WITHOUT WHICH HTTP/2 IS UNREACHABLE OVER TLS AND NOTHING SAYS
+      -- SO. A browser only ever speaks h2 after ALPN offers it; a context
+      -- built without the callback advertises nothing, the client falls back
+      -- to HTTP/1.1, the handshake succeeds and the request is answered. The
+      -- failure is silent by construction -- it was measured here as
+      -- `negotiated=HTTP/1.1` against a server that speaks h2 fine.
+      local http_tls = require "akkar.vendor.http.tls"
+      if http_tls.has_alpn then
+        ctx:setAlpnSelect(server.alpn_select, nil)
+      end
       return ctx
     end)
     if not ok then
@@ -2576,6 +2704,15 @@ function App:run(config)
 
   local s = assert(server.listen {
     host = host, port = port, tls = tls_on, ctx = tls_ctx,
+    -- HTTP/2 OVER TLS NEEDS NOTHING HERE: ALPN settles it, and a client that
+    -- does not ask for h2 never pays for its being on offer. CLEARTEXT h2 is
+    -- `h2c = true` because the preface sniff it needs is a read on every
+    -- connection, h1 ones included. See `akkar/vendor/http/server.lua`.
+    h2c = config.h2c,
+    -- One connection must not be able to open unbounded requests. See the
+    -- note in `vendor/http/server.lua`: `max_concurrent` counts connections,
+    -- and 500 streams on one connection were measured going straight through.
+    h2_max_concurrent_streams = config.h2_max_concurrent_streams or 100,
     reuseport = config.reuseport,
     max_concurrent = max_concurrent,
     onstream = function(_, stream)
@@ -2688,6 +2825,73 @@ function App:run(config)
         -- `execution.release` for those. Captured before a byte goes out.
         pending_release = res.release
 
+        -- THE STREAM IS TAKEN OVER HERE, and only here.
+        --
+        -- Everything above ran unchanged: routing, validation, middleware,
+        -- the deadline. What is different is that nothing is written back --
+        -- `websocket.serve` performs the handshake itself, because the
+        -- response to an upgrade is part of the protocol rather than a body
+        -- akkar could compose.
+        --
+        -- The handshake's own capabilities have already been released by
+        -- `dispatch`, which is the design and not an accident: a pool slot
+        -- must not be held for the life of a socket. `ws:scope` is how a
+        -- callback reaches the database, one message at a time.
+        if res.websocket then
+          -- A CEILING OF THEIR OWN, because a socket is a connection that
+          -- lasts and `max_concurrent` counts connections.
+          --
+          -- Measured: with `max_concurrent = 10`, ten IDLE WebSockets consume
+          -- the entire connection budget and the eleventh client -- an
+          -- ordinary GET to an ordinary route -- is never accepted. A chat
+          -- feature takes the API down with it, and nothing in the
+          -- configuration hints that the number sized for concurrent requests
+          -- now has to cover connections that live for hours.
+          --
+          -- So sockets are bounded separately when the application says so,
+          -- and the refusal is a 503 on the handshake rather than a silence:
+          -- the client learns it should retry, which a stalled accept queue
+          -- never tells anybody.
+          local ceiling = config.websocket_max_connections
+          if ceiling and self.sockets_open >= ceiling then
+            internal:warn("websocket refused: at capacity", {
+              open = self.sockets_open, websocket_max_connections = ceiling,
+            })
+            local rh = headers.new()
+            rh:append(":status", "503")
+            rh:append("content-type", "application/json")
+            rh:append("retry-after", "5")
+            stream:write_headers(rh, false)
+            stream:write_chunk(
+              '{"error":"too many websocket connections"}', true)
+            self.in_flight = self.in_flight - 1
+            return
+          end
+
+          self.sockets_open = self.sockets_open + 1
+          local upgrade = res.websocket
+          -- Loaded already: this branch is only reachable through a route
+          -- registered by `app:websocket`, which loads it.
+          local served, why = websocket_module().serve(stream, upgrade.req, h,
+            upgrade.handlers, {
+              idle_timeout = config.websocket_idle_timeout or 300,
+              -- The same number that bounds a body, for the same reason.
+              max_message = config.websocket_max_message
+                         or config.body_limit
+                         or akkar.defaults.body_limit,
+              make_scope = function(fn) return scope_for(self, config, fn) end,
+              register = function(sock) self.sockets[sock] = true end,
+              unregister = function(sock) self.sockets[sock] = nil end,
+            })
+          self.sockets_open = self.sockets_open - 1
+          if not served then
+            internal:warn("websocket handshake refused",
+                          { detail = tostring(why) })
+          end
+          self.in_flight = self.in_flight - 1
+          return
+        end
+
         local rh = headers.new()
         rh:append(":status", tostring(res.status))
         if res.headers then
@@ -2779,7 +2983,16 @@ function App:run(config)
     -- 100% 503 in silence. A load generator would have reported forty
     -- thousand requests a second of it.
     onerror = function(_, _, op, e)
-      if op == "onstream" then
+      if op == "connection" then
+        -- A CONNECTION COROUTINE THAT RAISED. Contained by the guard in
+        -- `vendor/http/server.lua:add_socket` rather than allowed to take the
+        -- accept loop down -- so this line is the only evidence that anything
+        -- happened, and it carries the traceback for that reason.
+        internal:error("connection failed", {
+          op = op, detail = tostring(e),
+          effect = "this connection was dropped; the server is still serving",
+        })
+      elseif op == "onstream" then
         internal:error("stream handler failed", { op = op, detail = tostring(e) })
       else
         internal:warn("transport", { op = op, detail = tostring(e) })

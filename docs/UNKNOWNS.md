@@ -135,6 +135,46 @@ induced failure and asked whether those three are enough to diagnose it. A
 metric that exists and does not answer the question is a metric nobody will
 miss until the night they need it.
 
+## 8b. The two protocols that arrived in two days
+
+**Added 2026-08-19, and the fact that this section had to be added is itself
+the finding.** HTTP/2 shipped on the 18th and WebSocket on the 19th, and until
+this paragraph existed neither appeared anywhere in this document. The README
+points here calling it the honest list of what is not known; a list that does
+not know about two whole subsystems was not that.
+
+What IS known about them, so the unknowns below are the actual remainder:
+h2spec 2.6.0 passes 146 of 146 with nothing skipped; 22 hostile HTTP/2 frame
+shapes and 15 hostile WebSocket ones leave the server answering; one connection
+is bounded to 100 concurrent streams and a socket message to `body_limit`.
+
+**What is not known:**
+
+- **The h2 and WebSocket framing layers are upstream lua-http 0.4's**, and
+  nobody here has read them line by line. Two defects have been found in them
+  by accident, both by measurement rather than by review: a frame header read
+  that raised on a short read, and a message size nobody bounded. A reviewer
+  looking on purpose would probably find more.
+
+- **Nothing has held sockets open for a long time.** The longest WebSocket
+  measurement here is seconds. What a thousand sockets look like after six
+  hours, whether the idle timeout interacts with a peer that pings just often
+  enough, and whether the registry stays consistent across a reload, are all
+  unmeasured.
+
+- **h2 under a hostile flow-control peer.** WINDOW_UPDATE games, a peer that
+  advertises a window and never reads, and the CONTINUATION flood that has its
+  own CVE class in other servers, are not covered by the 22 shapes.
+
+- **The interaction between h2 multiplexing and the pool.** 100 concurrent
+  streams on one connection can ask for 100 database connections, and the
+  pool's fairness was measured under HTTP/1.1 arrival patterns rather than
+  under a burst that arrives on one socket in one event loop turn.
+
+- **WebSocket under TLS at volume.** `wss://` is verified to work. Nothing has
+  measured what a thousand of them cost, or what happens to the handshake rate
+  when OpenSSL is doing the work.
+
 ## 9. Security, reviewed by somebody trying to break it
 
 `akkar.jwt`, `akkar.session`, `akkar.csrf`, `akkar.auth` and `akkar.crypto`

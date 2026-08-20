@@ -14,10 +14,33 @@
 
 name: ci
 
+# ONE RUN PER COMMIT, and this was measured rather than tidied.
+#
+# `push: ["**"]` together with `pull_request:` ran the ENTIRE matrix twice for
+# every commit on a branch with a PR open -- twelve jobs where six answer the
+# question, including the four-minute Lua 5.5 stack build twice over.
+#
+# It was not only waste. On 2026-08-18 commit `ff16765` was run by both, and
+# the two disagreed: macOS passed on the push run and failed on the pull
+# request run, same tree. Commit `b190384` did it again, with the arm suite
+# CANCELLED mid-step on the pull request run while every job on the push run
+# went green. A pair of runs that contradict each other on one SHA is worse
+# than a slow pipeline: it makes every red ambiguous, and an ambiguous red is
+# how a real failure gets waved through as "probably the flake".
+#
+# So: pull requests are tested, and `main` is tested. A branch with no pull
+# request is not, which is the trade -- it is also not going anywhere until it
+# has one.
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
+
+# And supersede rather than pile up: a second push to the same pull request
+# cancels the first run instead of racing it for the same runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 env:
   # Pinned deliberately. Moving it is a decision with a diff, not a drift:
@@ -294,6 +317,27 @@ jobs:
 
       - name: The suite, with no database and no Redis
         run: busted
+
+      # WHY A DIAGNOSTIC RUNS IN CI AND CANNOT FAIL IT.
+      #
+      # `spec/determinism_spec.lua` asserts two seeded runs produce the same
+      # trace, and on macOS they did not. Its assertion prints both traces and
+      # nothing else, so it says THAT they differ and never HOW -- and three
+      # hypotheses were killed on Linux without touching the cause, because
+      # the machine with the problem was never asked.
+      #
+      # This step asks it. It reports the SHAPE of the difference: same set of
+      # requests in a different order, or a request that vanished; which
+      # position first diverges; how far a line moved; which routes are
+      # involved. `|| true` because a diagnostic that can turn a build red is
+      # a diagnostic somebody deletes.
+      # `if: always()` because the run this report is FOR is the run where the
+      # suite failed. Without it the step is skipped exactly when it would have
+      # said something, which is what happened on its first outing.
+      - name: Determinism report (informational)
+        if: always()
+        run: |
+          lua5.4 -e 'require("spec.support.determinism_report").report(5)' || true
 
       # Exact, machine-independent, and the one number in `bench/` that
       # belongs in CI. Timing benchmarks do not: `bench/README.md` says
