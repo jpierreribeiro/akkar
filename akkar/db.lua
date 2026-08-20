@@ -315,8 +315,20 @@ end
 --- framework's own guarantee does not depend on it, and `DISCARD ALL` is a
 --- round-trip. Priced: 167 us, which is 4.2% of a real ~4 ms query and 78% of
 --- a handler that does one trivial `SELECT` and returns. Charging every
---- release for a cleanup most applications do not need is the wrong default;
---- `akkar doctor` warns the applications that do.
+--- release for a cleanup most applications do not need is the wrong default.
+---
+--- AND THE COST IS ONLY THAT ROUND-TRIP, which an external report on this pool
+--- made worth proving. `DISCARD ALL` destroys Postgres' plan cache, and a
+--- named prepared statement needs ~5 identical executions to compile a generic
+--- plan -- so on a driver that keeps named prepared statements, resetting every
+--- release would throw that away each time and cost far more than one
+--- round-trip. It does not apply here: pgmoon uses the UNNAMED statement (the
+--- note at the top of this file), which re-parses on every call and keeps no
+--- named plan to lose. Measured interleaved: the reset arm is 243 us over the
+--- bare query, the DISCARD alone is 191, and the 52 us between them is far
+--- below the 760 us noise floor of a networked query. No plan is cached and
+--- thrown away. A first SEQUENTIAL measurement said 331 us and "a plan was
+--- lost"; that was drift at 175% spread, the trap this project keeps catching.
 ---
 --- A connection already `broken` is discarded, not reset: there is nothing to
 --- reuse and the DISCARD would fail on a dead socket.
