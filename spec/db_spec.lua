@@ -342,6 +342,55 @@ describe("the boot-time warning about unbounded statements", function()
     assert.is_nil(boot(5):find("no statement_timeout", 1, true))
   end)
 
+  describe("reset_on_release wipes session state between checkouts", function()
+    -- MEASURED ON THE BOX: a SET search_path, a temp table and a session GUC
+    -- all survived release and reached the next checkout of the same pooled
+    -- connection. reset_on_release is the opt-in that closes it, and this is
+    -- both halves: it leaks without, and it does not with.
+    local function factory(reset)
+      local c = {}
+      for k, v in pairs(CONFIG) do c[k] = v end
+      c.pool_size = 1
+      c.reset_on_release = reset
+      return db.connect(c)
+    end
+
+    it("leaks search_path when off (the default)", function()
+      local f = factory(false)
+      local a = f()
+      a:exec "SET search_path TO tenant_toxico, public"
+      a:release()
+      local b = f()
+      local sp = b:one "SHOW search_path"
+      b:release()
+      assert.is_truthy(tostring(sp.search_path):find("tenant_toxico"),
+        "expected the leak this option exists to fix")
+    end)
+
+    it("does not leak search_path when on", function()
+      local f = factory(true)
+      local a = f()
+      a:exec "SET search_path TO tenant_toxico, public"
+      a:release()
+      local b = f()
+      local sp = b:one "SHOW search_path"
+      b:release()
+      assert.is_falsy(tostring(sp.search_path):find("tenant_toxico"),
+        "reset_on_release did not clear the previous tenant's search_path")
+    end)
+
+    it("does not leak a session GUC when on", function()
+      local f = factory(true)
+      local a = f()
+      a:exec "SET application_name TO 'tenant-A-marker'"
+      a:release()
+      local b = f()
+      local app = b:one "SHOW application_name"
+      b:release()
+      assert.is_falsy(tostring(app.application_name):find("tenant%-A"))
+    end)
+  end)
+
   it("speaks through the logger the application configured", function()
     -- A boot warning that ignores the configured sink never reaches whatever
     -- collects logs in production.
