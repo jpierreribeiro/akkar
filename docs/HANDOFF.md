@@ -4,18 +4,19 @@ Written to be read cold, by somebody who was not in the conversation that
 produced it. It assumes you know Lua and akkar's shape and nothing about the
 last few days.
 
-**Where everything is, and it is NOT lost.** Branch `f4-refused`, 31 commits
+**Where everything is, and it is NOT lost.** Branch `f4-refused`, 33 commits
 ahead of `main`, local and remote identical (`git rev-list --count HEAD...
 origin/f4-refused` is `0 0`). Pull request #7 was already MERGED on the 18th --
 that is why `gh pr list` shows no open PR -- but 31 commits were pushed to the
 branch AFTER that merge and never reached `main`. Everything from the 19th and
-20th is in those 31: HTTP/2, WebSocket, the crypto speedup, the pool leak fix,
-the audit findings. To land them, open a NEW pull request from `f4-refused`;
+20th is in those 33: HTTP/2, WebSocket, the crypto speedup, the pool leak fix,
+the audit findings, cache:remember. To land them, open a NEW pull request from `f4-refused`;
 the old one is closed and cannot be reused.
 
 **The one-line state:** akkar speaks HTTP/2 and WebSocket, passes 146 of 146
 h2spec conformance cases with nothing skipped, survives a CONTINUATION flood
 and a decompression bomb, and runs 1,863 tests on Lua 5.4 and 1,814 on Lua 5.5,
+head at `a19ea2b`,
 green on Linux x86_64, Linux arm64 and macOS.
 
 ## What the last day added
@@ -33,13 +34,24 @@ green on Linux x86_64, Linux arm64 and macOS.
   448 KB, GOAWAY, RSS flat) and a decompression bomb (400/415, RSS flat). Both
   came from an external audit; both were run for real, not read.
 - **A subprocess-spawn spike proved the design closes** (see the open items).
+- **An external research report audited the whole architecture** and, checked
+  point by point, validated ten theses already verified here (CONTINUATION
+  flood, pool leak, JWT, Amdahl, thundering herd, the determinism tie-break).
+  It flagged one half-measured cost -- that `reset_on_release`'s `DISCARD ALL`
+  might throw away a Postgres plan cache. Measured: it does not, because pgmoon
+  uses the UNNAMED statement and keeps no named plan to lose. The first,
+  sequential run said it did (331 us, "plan lost"); interleaved it was noise.
+  Fifth time that trap was caught. It also named **Landlock** as the LSM to
+  confine the subprocess child, which feeds open item 0.
 
 ---
 
 ## Waiting on you, and only these
 
-1. **Merge pull request #7.** `main` is red without it. Nothing else in this
-   document depends on the merge, but everything published does.
+1. **Open a NEW pull request from `f4-refused` to `main`.** PR #7 was merged
+   on the 18th and cannot be reused; the 33 commits since then -- everything
+   from HTTP/2 onward -- are on the branch and not on `main`. Nothing here
+   depends on the merge, but nothing reaches `main` without it.
 
 2. **Isolation against hostile code is a decision about product shape**, not a
    defect, and it is still yours. `akkar/vm.lua` states in its own header that
@@ -183,6 +195,13 @@ so the child sees EOF. Fix that, confirm the counter coroutine keeps advancing
 during the call (loop not blocked), and `akkar.subprocess` is a real module.
 Then it is a product decision whether to isolate hostile code this way, priced
 already at 28 ms boot and 12.8 MB per process.
+
+**And the confinement answer is now named.** The research report points at
+`Landlock` -- an unprivileged Linux LSM, no root -- to restrict the child to
+specific filesystem paths and TCP/UDP ports, alongside a `seccomp-bpf` filter
+for the syscall set. So the child of the spike is not just isolated by being a
+separate process; it can be locked down from inside itself. That closes the
+"how do I confine it" half of the isolation P0, which was open.
 
 
 ### 1. Latency at low load has never been measured
