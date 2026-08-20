@@ -1,16 +1,38 @@
-# Handoff, 19 August 2026
+# Handoff, 20 August 2026
 
 Written to be read cold, by somebody who was not in the conversation that
 produced it. It assumes you know Lua and akkar's shape and nothing about the
-last two days.
+last few days.
 
-**Where everything is.** Branch `f4-refused`, pull request #7, 25 commits ahead
-of `main`. `main` itself is RED at `ec2fa93` and the fix is in this branch, so
-merging the pull request is what turns it green. Nothing here is on `main` yet.
+**Where everything is, and it is NOT lost.** Branch `f4-refused`, 31 commits
+ahead of `main`, local and remote identical (`git rev-list --count HEAD...
+origin/f4-refused` is `0 0`). Pull request #7 was already MERGED on the 18th --
+that is why `gh pr list` shows no open PR -- but 31 commits were pushed to the
+branch AFTER that merge and never reached `main`. Everything from the 19th and
+20th is in those 31: HTTP/2, WebSocket, the crypto speedup, the pool leak fix,
+the audit findings. To land them, open a NEW pull request from `f4-refused`;
+the old one is closed and cannot be reused.
 
-**The one-line state:** akkar now speaks HTTP/2 and WebSocket, passes 146 of
-146 h2spec conformance cases, and 1,852 tests on Lua 5.4 and 1,814 on Lua 5.5,
+**The one-line state:** akkar speaks HTTP/2 and WebSocket, passes 146 of 146
+h2spec conformance cases with nothing skipped, survives a CONTINUATION flood
+and a decompression bomb, and runs 1,863 tests on Lua 5.4 and 1,814 on Lua 5.5,
 green on Linux x86_64, Linux arm64 and macOS.
+
+## What the last day added
+
+- **`cache:remember`** collapses a thundering herd to one computation with a
+  condition rather than a mutex, because one cooperative thread has no race to
+  guard. Measured: 100 concurrent requests, 100 computations naive, 1 coalesced.
+- **The Postgres pool leaked session state** (`SET search_path`, temp tables,
+  session GUCs survive a connection's return). `db.connect { reset_on_release =
+  true }` runs `DISCARD ALL`, opt-in because it costs 167 us and akkar's own
+  `scope` isolation rewrites the query and never touches session state.
+- **`crypto.to_hex` was 7.65x too slow** and cost more than the HMAC it renders;
+  fixed by reading bytes in bulk with a fast path for the common size.
+- **Two attacks fired at the box and held**: a CONTINUATION flood (refused at
+  448 KB, GOAWAY, RSS flat) and a decompression bomb (400/415, RSS flat). Both
+  came from an external audit; both were run for real, not read.
+- **A subprocess-spawn spike proved the design closes** (see the open items).
 
 ---
 
@@ -143,6 +165,25 @@ describe.
 ---
 
 ## Open, in the order I would do them
+
+### 0. Async subprocess: the design closes, one fd detail remains
+
+**This is the live thread, and it is the answer to process isolation** -- the
+teaching platform's second P0, and the "microservice to subprocess" pattern.
+`bench/spike/subprocess-spawn.lua` is a spike, not a module, and it proved the
+hard part: `luaposix` (installed on the box, a separate rock like akkar-pq) plus
+`cqueues` compose to `fork`, `dup2`, and `exec` a real external binary under the
+event loop. The child's exec SUCCEEDED -- the debug trace stops at the exec call
+with no return, which is exec replacing the image.
+
+What is left is one file-descriptor detail: the parent passed
+`child_end:pollfd()` (the cqueues wrapper's fd) where the child needs the RAW
+numeric fd to `dup2` onto stdin/stdout, and the parent must close its own copy
+so the child sees EOF. Fix that, confirm the counter coroutine keeps advancing
+during the call (loop not blocked), and `akkar.subprocess` is a real module.
+Then it is a product decision whether to isolate hostile code this way, priced
+already at 28 ms boot and 12.8 MB per process.
+
 
 ### 1. Latency at low load has never been measured
 
