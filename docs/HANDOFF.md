@@ -191,8 +191,14 @@ with no return, which is exec replacing the image.
 What is left is one file-descriptor detail: the parent passed
 `child_end:pollfd()` (the cqueues wrapper's fd) where the child needs the RAW
 numeric fd to `dup2` onto stdin/stdout, and the parent must close its own copy
-so the child sees EOF. Fix that, confirm the counter coroutine keeps advancing
-during the call (loop not blocked), and `akkar.subprocess` is a real module.
+so the child sees EOF. **The diagnosis sharpened on 2026-08-20**: the CHILD also
+inherits `parent_end` across the fork and must close IT too, or the exec'd
+program never sees EOF on its stdin. `bench/spike/subprocess-spawn.lua` has that
+fix; it still hung on the box and the box then went unreachable (the stuck
+`rev`/lua processes need `pkill` next login), so the round-trip is not yet
+confirmed end to end. The fork+exec half is proven; the socketpair EOF half
+needs one more interactive pass on a responsive box. Confirm the counter
+coroutine keeps advancing during the call, then `akkar.subprocess` is a module.
 Then it is a product decision whether to isolate hostile code this way, priced
 already at 28 ms boot and 12.8 MB per process.
 
@@ -204,7 +210,15 @@ separate process; it can be locked down from inside itself. That closes the
 "how do I confine it" half of the isolation P0, which was open.
 
 
-### 1. Latency at low load has never been measured
+### 1. Latency at low load, MEASURED 2026-08-20
+
+**Done.** Service time with no queue: GET /ping 14.5 us, GET /users/:id 20.1 us,
+POST /orders 21.5 us, through `app:test`. So a real endpoint at 4 ms of
+Postgres spends ~0.5% of the response in akkar. The 8.75x OpenResty gap is real
+and at SATURATION; at real load the runtime is a rounding error. `RESULTS.md`
+section 0b, `bench/study/low-load-latency.lua`. The original note follows.
+
+### 1-old. Latency at low load had never been measured
 
 **The most valuable thing on this list, and it is measurement rather than
 code.** Every D4 run is at saturation, where p50 is queueing and not work:
