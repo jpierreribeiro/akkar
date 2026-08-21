@@ -121,36 +121,60 @@ a request; a container-per-student would isolate as well and cost 10× the RAM.
   (`bench/spike/subprocess-spawn.lua`) plus Landlock is akkar's own path to it —
   but for dalivim, the runner already provides it and akkar does not need to.
 
-## Open questions for the product owner
+## Decisions, resolved
 
-These are decisions the code cannot make. Answers change what gets built.
+The product owner answered one and delegated the rest. The delegated ones are
+resolved here with a reason, because they are engineering calls the code can
+make, not product calls that need a person.
 
-1. **Is Lab #001 (URL shortener) live-collaborative, or single-player?** The
-   plan's §8 last row is conditional: `LiveRoomDO` is ready, but the Lab alone
-   does not need a live room. If single-player, the diagram-ops protocol work
-   drops entirely for now.
+1. **Single-player.** DECIDED by the owner. So the diagram-ops protocol on
+   `LiveRoomDO` (`node_add`/`node_move`/`edge_add`) drops entirely for Lab #001,
+   and the last row of the plan's §8 table stays out. The live room is a later
+   product (interview/whiteboard), and it is already built underneath when that
+   day comes. This removes the largest conditional piece of work from the Labs
+   scope right now.
 
-2. **Does Phase 4 want the generated project to run under `akkar build` (single
-   binary) or under a system-path akkar in the image?** Both work; the binary is
-   cleaner for the `-E` reason above, but is one more build step in the runner
-   image. Item 6 assumes the binary — confirm.
+2. **The generated project runs under the single binary (`akkar build`), not a
+   system-path akkar.** Resolved toward the binary for the reason the spike
+   already proved: the runner runs `lua5.4 -E`, which ignores `LUA_PATH`, so a
+   system-path install is fragile exactly where the jail is strictest. The
+   binary carries its own modules and is one file to place in the image. The
+   cost is one build step in the runner image, which is cheap and cacheable.
+   (Item 6 already assumed this; it is now confirmed by the constraint, not by
+   preference.)
 
-3. **For item 2, should `max_qps`/`latency_ms` be honoured by advancing the
-   injectable clock (deterministic, fast, my recommendation) or by real time
-   (simpler, but non-deterministic and slow)?** Determinism is the plan's own
-   D1/D4 principle, so I would advance the clock — but that means the load
-   generator (item 3) drives the clock too, which is a small design constraint
-   worth stating now.
+3. **Capacity params advance the injectable clock, not real time.** Resolved
+   toward the clock because it is the plan's own D1/D4 principle: a measurement
+   that changes between runs cannot be a verdict. `akkar.time` is already
+   injectable and the L1 simulation already depends on it, so a
+   `latency_ms = 8` is eight milliseconds of *simulated* time, deterministic and
+   instant. The design constraint this creates, stated so it is not a surprise:
+   the load generator (item 3) must drive that same clock, or a real-timed
+   generator and a clock-timed adapter disagree. One clock, both tools.
 
-4. **Priority order for the three TODO items.** My read: 2 (capacity params)
-   unlocks the loop and is the keystone; 3 (load generator) is what makes the
-   loop visible; 1 (cache fail/hang/drop) is the Lab #001 lesson itself. So
-   **2 → 3 → 1**, but 1 is what the *first* Lab needs to teach its climax
-   (cache stampede), so it could lead. Your call on whether the first Lab's
-   lesson or the general loop comes first.
+4. **Build order: 1 → 2 → 3.** Resolved toward the first Lab's lesson leading,
+   over the general loop, and here is the trade. Item 2 (capacity params) is the
+   keystone that closes the sim-and-run loop, and in the abstract it comes first.
+   But Lab #001's entire climax is the cache stampede, and that needs item 1
+   (cache `fail/hang/drop` parity) to exist at all. A keystone with no first Lab
+   to demonstrate it is a feature with no user. So build the thing the first Lab
+   teaches (1), then the keystone that generalises it (2), then the load
+   generator that makes it visible (3). Item 1 is also the smallest — it copies
+   an existing pattern from `akkar/db/memory.lua` — so it is the cheapest thing
+   to lead with.
 
-5. **Does the akkar-side work live in the akkar repo or as a dalivim fork of
-   it?** akkar is a separate project with its own test suite and CI. Items 1-3
-   are general akkar features (not dalivim-specific, as the plan itself notes),
-   so they belong upstream in akkar. Confirm that is the intent and not a
-   vendored copy.
+5. **The akkar work lands upstream in the akkar repo, not as a dalivim fork.**
+   Items 1-3 are general akkar features, not dalivim-specific, as the plan
+   itself notes: a fault-injectable cache, capacity-limited memory adapters and
+   an in-process load generator are useful to any akkar user testing a service.
+   akkar has its own test suite and CI (1,863 tests, three platforms), so a
+   vendored copy would fork that maintenance for no gain. They belong upstream,
+   and dalivim consumes them the same way it consumes the rest of akkar.
+
+## Status
+
+Nothing here is being built yet. This is the plan of record for when the Labs
+Phase 4/5 work starts: the six asks scored against the code, the three TODO
+items ordered 1 → 2 → 3, and the five decisions resolved. The seed for item 3
+(`bench/study/low-load-latency.lua`) already exists. Whoever picks this up
+starts from here, not from the code.
