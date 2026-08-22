@@ -27,6 +27,9 @@ Every public symbol on this page, in alphabetical order.
 | [`conn:expire`](#connexpirekey-seconds) | method |
 | [`conn:get`](#conngetkey) | method |
 | [`conn:incr`](#connincrkey) | method |
+| [`conn:pfadd`](#connpfaddkey-) | method |
+| [`conn:pfcount`](#connpfcountkey-) | method |
+| [`conn:pfmerge`](#connpfmergedestination-) | method |
 | [`conn:ping`](#connping) | method |
 | [`conn:release`](#connrelease) | method |
 | [`conn:set`](#connsetkey-value-ttl) | method |
@@ -220,6 +223,64 @@ print(conn:incr "ref_redis_counter")   --> 2
 conn:del "ref_redis_counter"
 conn:release()
 ```
+
+### conn:pfadd(key, ...)
+
+Adds one or more observations to a Redis HyperLogLog.
+
+**Returns** `1` when at least one internal register changed, `0` otherwise.
+That is not exactly the same as "the item was new": a new observation can
+leave every register unchanged once the sketch has enough data.
+
+HyperLogLog estimates distinct items without storing the items themselves.
+Redis uses at most about 12 KB per dense sketch and reports a standard error
+of 0.81%. That is an error distribution, not a promise that every answer is
+within 0.81% of the exact count. Use a set when the answer must be exact.
+
+```lua
+local redis = require "akkar.redis"
+local conn = redis.connect { port = 6379 }()
+
+local bikes = "ref_redis_hll_bikes"
+local commuter = "ref_redis_hll_commuter"
+local all = "ref_redis_hll_all"
+conn:del(bikes, commuter, all)
+
+print(conn:pfadd(bikes, "Hyperion", "Deimos", "Phoebe", "Quaoar"))  --> 1
+print(conn:pfcount(bikes))                                             --> 4
+
+conn:pfadd(commuter, "Salacia", "Mimas", "Quaoar")
+print(conn:pfcount(bikes, commuter))                                   --> 6
+print(conn:pfmerge(all, bikes, commuter))                              --> OK
+print(conn:pfcount(all))                                               --> 6
+
+conn:del(bikes, commuter, all)
+conn:release()
+```
+
+The sketch is a Redis string, so `get` and `set` can serialize and restore it.
+Use `conn:expire(key, seconds)` when a daily or monthly sketch should age out.
+
+### conn:pfcount(key, ...)
+
+**Returns** the approximate cardinality as a number. With several keys it
+estimates their union without storing a merged key. A missing single key
+counts as zero.
+
+Single-key `PFCOUNT` caches its result and is cheap. Multi-key `PFCOUNT`
+builds a temporary union, is O(N) in the number of sketches, and has a much
+larger constant cost. Do not put a large fan-in on a hot request path.
+
+### conn:pfmerge(destination, ...)
+
+Merges the source sketches into `destination` and **returns** `"OK"`.
+An existing destination participates in the union rather than being cleared
+first. The destination can subsequently be counted, expired, serialized or
+merged again like any other HyperLogLog.
+
+The helpers follow Redis' own `PFADD`, `PFCOUNT` and `PFMERGE` signatures and
+all go through [`conn:command`](#conncommand), so they inherit its execution
+deadline, socket timeout and connection-health rules.
 
 ### conn:ping()
 

@@ -98,6 +98,36 @@ describe("RESP reply parsing", function()
   end)
 end)
 
+describe("HyperLogLog command helpers", function()
+  local function recording(reply)
+    local called
+    local conn = setmetatable({}, { __index = redis.Redis })
+    conn.command = function(_, ...)
+      called = { ... }
+      return reply
+    end
+    return conn, function() return called end
+  end
+
+  it("adds every observation in order", function()
+    local conn, called = recording(1)
+    assert.equal(1, conn:pfadd("visitors", "ada", "alan"))
+    assert.same({ "PFADD", "visitors", "ada", "alan" }, called())
+  end)
+
+  it("counts one sketch or the union of several", function()
+    local conn, called = recording(42)
+    assert.equal(42, conn:pfcount("monday", "tuesday"))
+    assert.same({ "PFCOUNT", "monday", "tuesday" }, called())
+  end)
+
+  it("merges sources into the destination", function()
+    local conn, called = recording("OK")
+    assert.equal("OK", conn:pfmerge("week", "monday", "tuesday"))
+    assert.same({ "PFMERGE", "week", "monday", "tuesday" }, called())
+  end)
+end)
+
 -- ---------------------------------------------------------------------------
 
 local function reachable()
@@ -205,7 +235,13 @@ end)
 describe("akkar.redis against a real server", function()
   local conn
   before_each(function() conn = redis.connect { pool_size = 0 }() end)
-  after_each(function() if conn then conn:del "akkar:spec" conn:close() end end)
+  after_each(function()
+    if conn then
+      conn:del("akkar:spec", "akkar:spec:hll:bikes",
+               "akkar:spec:hll:commuter", "akkar:spec:hll:all")
+      conn:close()
+    end
+  end)
 
   it("returns nil for a missing key", function()
     conn:del "akkar:spec"
@@ -224,6 +260,23 @@ describe("akkar.redis against a real server", function()
     assert.equal(2, conn:incr "akkar:spec")
     conn:expire("akkar:spec", 60)
     assert.is_true(conn:ttl "akkar:spec" > 50)
+  end)
+
+  it("estimates unique observations and merges overlapping sketches", function()
+    local bikes = "akkar:spec:hll:bikes"
+    local commuter = "akkar:spec:hll:commuter"
+    local all = "akkar:spec:hll:all"
+
+    assert.equal(1, conn:pfadd(bikes, "Hyperion", "Deimos", "Phoebe", "Quaoar"))
+    assert.equal(0, conn:pfadd(bikes, "Quaoar"),
+      "adding the same observation changed the sketch")
+    assert.equal(4, conn:pfcount(bikes))
+
+    assert.equal(1, conn:pfadd(commuter, "Salacia", "Mimas", "Quaoar"))
+    assert.equal(6, conn:pfcount(bikes, commuter),
+      "the overlapping observation was counted twice in the union")
+    assert.equal("OK", conn:pfmerge(all, bikes, commuter))
+    assert.equal(6, conn:pfcount(all))
   end)
 
   it("raises a Redis error as an error, with the server's message", function()

@@ -184,6 +184,22 @@ function Redis:incr(key)
   return self:command("INCR", key)
 end
 
+--- Adds observations to a Redis HyperLogLog.
+--- Returns 1 when at least one internal register changed, 0 otherwise.
+function Redis:pfadd(key, ...)
+  return self:command("PFADD", key, ...)
+end
+
+--- Estimates the cardinality of one HyperLogLog, or the union of several.
+function Redis:pfcount(...)
+  return self:command("PFCOUNT", ...)
+end
+
+--- Merges source HyperLogLogs into `destination` and returns "OK".
+function Redis:pfmerge(destination, ...)
+  return self:command("PFMERGE", destination, ...)
+end
+
 function Redis:expire(key, seconds)
   return self:command("EXPIRE", key, seconds)
 end
