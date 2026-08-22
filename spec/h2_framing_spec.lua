@@ -248,6 +248,64 @@ describe("hostile HTTP/2 frames", function()
         :format(connected, #cases))
   end)
 
+  it("bounds a CONTINUATION flood, the CVE-2024-27983 class", function()
+    -- A HEADERS frame without END_HEADERS, then CONTINUATION frames that never
+    -- end the block. The vendored h2_stream caps the SUM of the header
+    -- fragments at 400 KB (`MAX_HEADER_BUFFER_SIZE`, rechecked on every
+    -- CONTINUATION), so an unbounded flood is refused rather than buffered.
+    -- Proven end to end on the box at ~448 KB / GOAWAY 0x1;
+    -- `bench/study/continuation-flood.py` is that proof. This is the cheap
+    -- regression: send past the cap and require the server to still answer.
+    local survived
+    local app = akkar.new()
+    app:get("/ping", function() return { pong = true } end)
+
+    local cq = cqueues.new()
+    cq:wrap(function()
+      pcall(function()
+        app:run { port = PORT + 2, h2c = true, check_capabilities = false,
+                  log = akkar.log.new { level = "error",
+                                        sink = function() end } }
+      end)
+    end)
+    cq:wrap(function()
+      cqueues.sleep(0.3)
+      local c = socket.connect("127.0.0.1", PORT + 2)
+      c:setmode("bn", "bn")
+      c:onerror(function(_, _, why) return why end)
+      c:settimeout(2)
+      c:write(PREFACE)
+      c:write(frame(0x4, 0x0, 0))                       -- SETTINGS
+      -- HEADERS, no END_HEADERS: a short valid-enough HPACK block.
+      c:write(frame(0x1, 0x0, 1, "\130\134\132\65\138"))
+      -- 32 CONTINUATION frames of 16 KB = 512 KB, past the 400 KB cap. Never
+      -- END_HEADERS. `pcall` the writes, because a refused connection closes
+      -- under us mid-flood and that is the point.
+      local blob = string.rep("\0", 16384)
+      for _ = 1, 32 do
+        local ok = pcall(function() c:write(frame(0x9, 0x0, 1, blob)); c:flush() end)
+        if not ok then break end
+      end
+      c:read(-64)
+      c:close()
+
+      -- THE PROPERTY: an ordinary client, right after, is still answered.
+      local req = request.new_from_uri(
+        ("http://127.0.0.1:%d/ping"):format(PORT + 2))
+      req.version = 2
+      local ok, h, stream = pcall(function()
+        local hh, ss = req:go(3); return hh, ss
+      end)
+      survived = ok and h and h:get ":status" == "200"
+      if stream then pcall(function() stream:get_body_as_string(2) end); stream:shutdown() end
+      app:stop(2)
+    end)
+    assert(cq:loop(30))
+
+    assert.is_true(survived,
+      "the server did not survive a CONTINUATION flood past its header cap")
+  end)
+
   it("does not accept a frame larger than it advertises", function()
     -- SETTINGS_MAX_FRAME_SIZE defaults to 16,384 and akkar sends no override.
     -- A peer that ignores it must be refused rather than allocated for: this

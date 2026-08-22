@@ -198,6 +198,22 @@ describe("identity", function()
       seen[id] = true
     end
   end)
+
+  it("does not wrap after six hexadecimal digits", function()
+    -- `%06x` is a minimum width. The old implementation masked the counter
+    -- with 0xffffff first, so request 16,777,217 silently reused the first
+    -- request's id in a long-lived process.
+    execution.reset_id_prefix(0xfffffe)
+    local last_six = execution.id()
+    local first_seven = execution.id()
+
+    assert.equal("ffffff", last_six:sub(9))
+    assert.equal("1000000", first_seven:sub(9))
+    assert.are_not.equal(last_six, first_seven)
+
+    -- No later spec inherits the synthetic counter or its prefix.
+    execution.reset_id_prefix()
+  end)
 end)
 
 describe("the budget", function()

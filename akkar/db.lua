@@ -299,7 +299,45 @@ end
 -- Returns the connection to the pool it came from.  A connection that is
 -- still inside a transaction, or whose rollback failed, is discarded rather
 -- than reused: the next request must not inherit an open BEGIN.
+--- `reset_on_release` WIPES POSTGRES SESSION STATE BEFORE THE CONNECTION GOES
+--- BACK, and it is off by default because it is not free and akkar's own
+--- isolation does not need it.
+---
+--- MEASURED, on the benchmark box: a `SET search_path`, a temp table and a
+--- session GUC all survived `release` and reached the next checkout of the
+--- same pooled connection. That is real, and for an application that isolates
+--- tenants with `SET ROLE`, RLS or a per-tenant `search_path` it is a
+--- cross-tenant leak.
+---
+--- It is NOT a hole in `akkar.scope`, which isolates by rewriting the query --
+--- `WHERE project_id = $1` -- and never touches session state, so nothing it
+--- relies on is what leaks. That is why this is opt-in rather than on: the
+--- framework's own guarantee does not depend on it, and `DISCARD ALL` is a
+--- round-trip. Priced: 167 us, which is 4.2% of a real ~4 ms query and 78% of
+--- a handler that does one trivial `SELECT` and returns. Charging every
+--- release for a cleanup most applications do not need is the wrong default.
+---
+--- AND THE COST IS ONLY THAT ROUND-TRIP, which an external report on this pool
+--- made worth proving. `DISCARD ALL` destroys Postgres' plan cache, and a
+--- named prepared statement needs ~5 identical executions to compile a generic
+--- plan -- so on a driver that keeps named prepared statements, resetting every
+--- release would throw that away each time and cost far more than one
+--- round-trip. It does not apply here: pgmoon uses the UNNAMED statement (the
+--- note at the top of this file), which re-parses on every call and keeps no
+--- named plan to lose. Measured interleaved: the reset arm is 243 us over the
+--- bare query, the DISCARD alone is 191, and the 52 us between them is far
+--- below the 760 us noise floor of a networked query. No plan is cached and
+--- thrown away. A first SEQUENTIAL measurement said 331 us and "a plan was
+--- lost"; that was drift at 175% spread, the trap this project keeps catching.
+---
+--- A connection already `broken` is discarded, not reset: there is nothing to
+--- reuse and the DISCARD would fail on a dead socket.
 function Db:release()
+  if self.reset_on_release and self.pg and not self.broken
+     and not self.in_transaction then
+    local ok = pcall(self.exec, self, "DISCARD ALL")
+    if not ok then self.broken = true end
+  end
   if self.pool then self.pool:put(self) else self:close() end
 end
 
@@ -386,9 +424,12 @@ local M = {}
 -- out and opens a connection per request, which is what the substrate proof
 -- measured and what a one-off script wants.
 function M.connect(config)
+  local reset_on_release = config.reset_on_release == true
+
   local function open()
     if config.driver == "pq" then
-      return setmetatable({ pg = pq_open(config) }, Db)
+      return setmetatable({ pg = pq_open(config),
+                            reset_on_release = reset_on_release }, Db)
     end
     if config.driver ~= nil and config.driver ~= "pgmoon" then
       error("db: unknown driver '" .. tostring(config.driver) ..
@@ -492,7 +533,7 @@ function M.connect(config)
     --
     -- Nothing is lost: pgmoon leaves a SQL NULL out of the row table entirely
     -- unless `convert_null` is set, which akkar does not set.
-    return setmetatable({ pg = pg }, Db)
+    return setmetatable({ pg = pg, reset_on_release = reset_on_release }, Db)
   end
 
   local size = config.pool_size == nil and 10 or config.pool_size

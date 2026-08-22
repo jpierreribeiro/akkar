@@ -126,6 +126,7 @@ build = {
     ["akkar.jobs"] = "akkar/jobs.lua",
     ["akkar.jobs.redis"] = "akkar/jobs/redis.lua",
     ["akkar.jobs.memory"] = "akkar/jobs/memory.lua",
+    ["akkar.cache_remember"] = "akkar/cache_remember.lua",
     ["akkar.compress"] = "akkar/compress.lua",
     ["akkar.config"] = "akkar/config.lua",
     ["akkar.crypto"] = "akkar/crypto.lua",

@@ -20,6 +20,39 @@ contains `"error"` is refused rather than measured.
 
 ---
 
+## 0b. Latency at LOW load, the number every throughput figure hid
+
+**2026-08-20, and it is the answer to "why is akkar 8.75x behind OpenResty".**
+
+Every throughput figure on this page and in `bench/runtime/` is taken at
+SATURATION, where p50 is Little's law -- concurrency over throughput, which is
+queueing and not the framework's work. 100 connections over 10,417 req/s is
+9.6 ms, and the measured p50 was 9.31: the queue, not akkar.
+
+A service at 5% utilisation has no queue. What it delivers per request is the
+SERVICE TIME, one request alone start to finish. Measured through `app:test`
+(pure akkar CPU, no socket or kernel), interleaved, GC collected between rounds
+so the collector does not land inside a measurement:
+
+| shape | service time |
+|---|---:|
+| `GET /ping` | **14.5 us** |
+| `GET /users/:id`, validated param | 20.1 us |
+| `POST /orders`, validated body | 21.5 us |
+
+**So a real endpoint that spends 4 ms in Postgres spends ~0.02 ms in akkar --
+half a percent of the response.** The 8.75x gap to OpenResty is real and it is
+at saturation; at the load almost every service actually runs, the runtime is a
+rounding error and the latency a user feels is the database. That is the honest
+frame for the comparison, and it is why chasing OpenResty's req/s was refused
+with arithmetic rather than pursued.
+
+`bench/study/low-load-latency.lua` is the measurement. It runs `app:test`, so
+these are lower bounds -- a real socket adds the kernel round-trip, which is
+itself far below a database query.
+
+---
+
 ## 0. What HTTP/2, WebSocket and four new bounds cost, 2026-08-19
 
 **Nothing measurable, and that is the number this section exists for.**
