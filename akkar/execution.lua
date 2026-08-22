@@ -39,9 +39,8 @@ then delegates here. This module never learns what a header is.
 
 local cqueues   = require "cqueues"
 local condition = require "cqueues.condition"
-local time    = require "akkar.time"
-local bitwise = require "akkar.bitwise"
-local random  = require "akkar.random"
+local time      = require "akkar.time"
+local random    = require "akkar.random"
 
 local M = {}
 
@@ -89,7 +88,10 @@ end
 -- A counter behind a per-process prefix, not a random draw per execution.
 -- Within a process a counter cannot collide at all, which is strictly better
 -- than hoping two 48-bit draws differ; across processes the prefix separates
--- them.
+-- them. The width below is a MINIMUM, not a mask: after `ffffff` the suffix
+-- grows to seven digits. Masking it to six made request 16,777,217 reuse the
+-- first request's id in a long-lived process while this comment promised the
+-- opposite.
 -- Through `akkar.random`, so a replay produces the same ids. The prefix
 -- separates processes and nothing more: `akkar/trace.lua:144` is explicit
 -- that an id which must be unguessable comes from `akkar.crypto` instead, and
@@ -115,7 +117,7 @@ local id_counter = 0
 function M.id()
   ID_PREFIX = ID_PREFIX or string.format("%08x", random.integer(0, 0xffffffff))
   id_counter = id_counter + 1
-  return ID_PREFIX .. string.format("%06x", bitwise.band(id_counter, 0xffffff))
+  return ID_PREFIX .. string.format("%06x", id_counter)
 end
 
 --- Forgets the prefix, so the next id draws a new one.
@@ -123,9 +125,11 @@ end
 --- For a replay harness and for tests, which are the only callers that want
 --- two runs in one process to look like two processes. Not exported through
 --- `akkar` itself: an application has no reason to renumber its own requests.
-function M.reset_id_prefix()
+--- `counter` is the test seam for a boundary that otherwise takes 16 million
+--- calls to reach. Production callers have no reason to pass it.
+function M.reset_id_prefix(counter)
   ID_PREFIX = nil
-  id_counter = 0
+  id_counter = counter or 0
 end
 
 -- ============================================================== the lifetime
