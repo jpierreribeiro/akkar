@@ -88,6 +88,16 @@ describe("inventory-safe SQL", function()
     assert.is_false(ok)
     assert.is_truthy(tostring(why):find("only valid on select", 1, true))
   end)
+
+  it("builds a checked idempotent insert", function()
+    local query = sql.insert_into("event_ids", { event_id = "e-1" })
+      :on_conflict_do_nothing({ "tenant_id", "event_id" }):returning("event_id")
+      :scope("tenant_id", "t-1")
+    assert.equal("insert into event_ids (event_id, tenant_id) values ($1, $2) " ..
+                 "on conflict (tenant_id, event_id) do nothing returning event_id",
+                 query:to_string())
+    assert.same({ "e-1", "t-1" }, query:values())
+  end)
 end)
 
 describe("application metrics", function()

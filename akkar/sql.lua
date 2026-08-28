@@ -90,6 +90,31 @@ end
 
 M.identifier = checked_identifier
 
+-- PostgreSQL does not implicitly coerce a parameter declared as text into a
+-- UUID column.  pgmoon deliberately declares Lua strings as text, so UUIDs
+-- need an explicit SQL type while remaining bound values.  A small closed set
+-- avoids turning this into a raw-cast escape hatch.
+local CASTS = { uuid = true, jsonb = true, timestamptz = true }
+local TYPED_VALUE = {}
+
+function M.cast(value, postgres_type)
+  if not CASTS[postgres_type] then
+    error("akkar.sql: unsupported parameter cast: " .. tostring(postgres_type), 0)
+  end
+  return setmetatable({ value = value, postgres_type = postgres_type }, TYPED_VALUE)
+end
+
+function M.uuid(value) return M.cast(value, "uuid") end
+function M.jsonb(value) return M.cast(value, "jsonb") end
+function M.timestamptz(value) return M.cast(value, "timestamptz") end
+
+local function typed_value(value)
+  if type(value) == "table" and getmetatable(value) == TYPED_VALUE then
+    return value.value, value.postgres_type
+  end
+  return value, nil
+end
+
 -- ==================================================================== builder
 local function new_query(kind)
   return setmetatable({
@@ -108,6 +133,7 @@ local function new_query(kind)
     _limit = nil,
     _offset = nil,
     _for_update = false,
+    _on_conflict = nil,
     _scoped = false,
   }, Query)
 end
@@ -268,6 +294,28 @@ function Query:all_rows()
   return self
 end
 
+--- Makes an INSERT idempotent without exposing a raw SQL suffix. Conflict
+--- columns are identifiers and therefore checked with the same discipline as
+--- every other client-selected identifier in this builder.
+function Query:on_conflict_do_nothing(columns, allowed)
+  if self._kind ~= "insert" then
+    error("akkar.sql: on_conflict_do_nothing is only valid on inserts", 0)
+  end
+  if columns ~= nil then
+    if type(columns) ~= "table" or #columns == 0 then
+      error("akkar.sql: conflict columns must be a non-empty list", 0)
+    end
+    local checked = {}
+    for index, column in ipairs(columns) do
+      checked[index] = checked_identifier(column, allowed, "conflict column")
+    end
+    self._on_conflict = "(" .. table.concat(checked, ", ") .. ") do nothing"
+  else
+    self._on_conflict = "do nothing"
+  end
+  return self
+end
+
 --- Binds the query to one tenant.
 ---
 --- On a read or a write with a where clause it adds `column = value` as a
@@ -376,6 +424,7 @@ function Query:build()
     values[#values + 1] = self._offset
   end
   if self._for_update then parts[#parts + 1] = " for update" end
+  if self._on_conflict then parts[#parts + 1] = " on conflict " .. self._on_conflict end
   if self._returning then
     parts[#parts + 1] = " returning " .. self._returning
   end
@@ -385,7 +434,9 @@ function Query:build()
   local index = 0
   text = text:gsub("%?", function()
     index = index + 1
-    return "$" .. index
+    local raw, cast = typed_value(values[index])
+    values[index] = raw
+    return "$" .. index .. (cast and "::" .. cast or "")
   end)
 
   if index ~= #values then

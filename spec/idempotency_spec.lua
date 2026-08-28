@@ -181,6 +181,31 @@ describe("what must not be remembered", function()
 end)
 
 describe("which requests it touches", function()
+  it("isolates the same key across application namespaces", function()
+    in_controller(function()
+      local shared_prefix = prefix()
+      local first_runs, second_runs = 0, 0
+      local first = akkar.new()
+      first:use(akkar.idempotency {
+        prefix = shared_prefix, namespace = function() return "tenant-a" end,
+      })
+      first:post("/charges", function() first_runs = first_runs + 1; return { tenant = "a" } end)
+      local second = akkar.new()
+      second:use(akkar.idempotency {
+        prefix = shared_prefix, namespace = function() return "tenant-b" end,
+      })
+      second:post("/charges", function() second_runs = second_runs + 1; return { tenant = "b" } end)
+      local factory = redis.connect { pool_size = 2 }
+      local headers = { ["idempotency-key"] = "same-client-key" }
+      local a = first:test { cache = factory }:post("/charges", { body = {}, headers = headers })
+      local b = second:test { cache = factory }:post("/charges", { body = {}, headers = headers })
+      assert.equal("a", a.body.tenant)
+      assert.equal("b", b.body.tenant)
+      assert.equal(1, first_runs)
+      assert.equal(1, second_runs)
+    end)
+  end)
+
   it("leaves methods that HTTP already defines as idempotent alone", function()
     in_controller(function()
       local app, runs = charging_app { prefix = prefix() }

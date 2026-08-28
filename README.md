@@ -471,6 +471,21 @@ Likewise an `UPDATE` or `DELETE` with no `WHERE` is refused until you call
 `:all_rows()`. That shape is legitimate in a migration and almost never in a
 handler.
 
+pgmoon declares Lua strings as PostgreSQL `text`, and PostgreSQL intentionally
+does not coerce a typed text parameter into UUID, JSONB or timestamptz columns.
+Keep those parameters bound and state their database type explicitly:
+
+```lua
+sql.insert_into("sessions", {
+  user_id = sql.uuid(user_id),
+  metadata = sql.jsonb(encoded_json),
+  expires_at = sql.timestamptz(iso8601),
+}, { "user_id", "metadata", "expires_at" })
+```
+
+Only that closed set of casts is accepted. The emitted statement contains
+`$1::uuid`, never the value; an arbitrary cast string is rejected.
+
 ## Jobs that survive failing
 
 Retries are **off unless asked for**, which is the same position the old
@@ -598,6 +613,17 @@ the difference, and only if it remembers.
 
 ```lua
 app:use(akkar.idempotency { ttl = 86400 })
+```
+
+In multitenant applications, namespace records with server-resolved tenant
+identity. The namespace is part of the Redis key, so two tenants may safely
+send the same client-generated key:
+
+```lua
+app:use(akkar.idempotency {
+  ttl = 86400,
+  namespace = function(req) return req.tenant.id end,
+})
 ```
 
 ```

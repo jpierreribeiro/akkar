@@ -159,6 +159,7 @@ function M.new(options)
   local header     = options.header or "idempotency-key"
   local max_bytes  = options.max_bytes or 64 * 1024
   local required   = options.required or false
+  local namespace  = options.namespace
 
   local methods = {}
   for _, m in ipairs(options.methods or { "POST", "PATCH" }) do
@@ -189,7 +190,18 @@ function M.new(options)
     end
 
     local cache = options.cache or req.cache
-    local record = prefix .. key
+    local scoped = ""
+    if namespace then
+      scoped = tostring(namespace(req) or "")
+      if scoped == "" then
+        error("idempotency: namespace returned an empty value", 0)
+      end
+      if #scoped > 255 then
+        error("idempotency: namespace must be at most 255 characters", 0)
+      end
+      scoped = scoped .. ":"
+    end
+    local record = prefix .. scoped .. key
     local fingerprint = fingerprint_of(req)
 
     local verdict = claim(cache, { record }, { ttl, fingerprint })

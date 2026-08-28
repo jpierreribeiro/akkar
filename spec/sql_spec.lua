@@ -43,6 +43,35 @@ describe("building a query", function()
     local q = sql.select("*"):from("users"):where_in("id", {})
     assert.equal("select * from users where false", q:to_string())
   end)
+
+  it("casts a bound UUID without interpolating its value", function()
+    local id = "5b06ddf5-4158-45e8-9726-60e064478cac"
+    local q = sql.insert_into("memberships", {
+      tenant_id = sql.uuid(id), role = "owner",
+    }, { "tenant_id", "role" })
+    assert.equal(
+      "insert into memberships (role, tenant_id) values ($1, $2::uuid)",
+      q:to_string())
+    assert.same({ "owner", id }, q:values())
+  end)
+
+  it("supports typed UUIDs in composed conditions and tenant scopes", function()
+    local tenant_id = "5b06ddf5-4158-45e8-9726-60e064478cac"
+    local item_id = "746c24d7-f2da-4fe4-872c-1809b527a75c"
+    local q = sql.select("*"):from("items")
+      :where("id = ?", sql.uuid(item_id))
+      :scope("tenant_id", sql.uuid(tenant_id))
+    assert.equal(
+      "select * from items where id = $1::uuid and tenant_id = $2::uuid",
+      q:to_string())
+    assert.same({ item_id, tenant_id }, q:values())
+  end)
+
+  it("rejects arbitrary cast text", function()
+    local ok, err = pcall(sql.cast, "x", "uuid); drop table users; --")
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):match("unsupported parameter cast"))
+  end)
 end)
 
 describe("values can never become SQL", function()

@@ -16,6 +16,7 @@ Docker should still get a green suite.
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local db = require "akkar.db"
+local sql = require "akkar.sql"
 
 local CONFIG = {
   host = "127.0.0.1", port = 55432, database = "akkar",
@@ -152,6 +153,19 @@ describe("akkar.db parameter typing", function()
     assert.equal("float", math.type(42.0))
     assert.equal(42, conn:one("select $1::bigint as v", 42).v)
     assert.equal(42, conn:one("select $1::float8 as v", 42.0).v)
+  end)
+
+  it("binds UUID strings through an explicit typed query value", function()
+    conn:exec "drop table if exists akkar_uuid_typing_spec"
+    conn:exec "create table akkar_uuid_typing_spec (id uuid primary key, label text not null)"
+    local id = "5b06ddf5-4158-45e8-9726-60e064478cac"
+    conn:exec(sql.insert_into("akkar_uuid_typing_spec", {
+      id = sql.uuid(id), label = "crystal",
+    }, { "id", "label" }))
+    local row = conn:one(sql.select("label"):from("akkar_uuid_typing_spec")
+      :where("id = ?", sql.uuid(id)))
+    assert.equal("crystal", row.label)
+    conn:exec "drop table akkar_uuid_typing_spec"
   end)
 
   it("leaves a SQL NULL out of the row rather than needing a sentinel", function()
