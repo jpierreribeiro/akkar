@@ -221,6 +221,13 @@ function M.connect(config)
       user = config.user,
       password = config.password,
       socket_type = "cqueues",
+      ssl = config.ssl or false,
+      ssl_required = config.ssl_required or false,
+      ssl_verify = config.ssl_verify,
+      cert = config.cert,
+      key = config.key,
+      ssl_version = config.ssl_version,
+      cqueues_openssl_context = config.cqueues_openssl_context,
     }
     local ok, err = pg:connect()
     if not ok then error("db: could not connect: " .. tostring(err), 0) end
