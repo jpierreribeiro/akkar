@@ -58,14 +58,19 @@ local function to_schema(rule)
   -- promises.  Reporting a `max` that is not applied would be a lie.
   if expanded.min then
     if expanded.kind == "string" then schema.minLength = expanded.min
-    else schema.minimum = expanded.min end
+    elseif expanded.kind == "integer" or expanded.kind == "number" then
+      schema.minimum = expanded.min
+    end
   end
   if expanded.max then
     if expanded.kind == "string" then schema.maxLength = expanded.max
-    else schema.maximum = expanded.max end
+    elseif expanded.kind == "integer" or expanded.kind == "number" then
+      schema.maximum = expanded.max
+    end
   end
   if expanded.one_of then schema["enum"] = expanded.one_of end
-  if expanded.match then schema.pattern = expanded.match end
+  if expanded.openapi_pattern then schema.pattern = expanded.openapi_pattern
+  elseif expanded.match then schema.pattern = expanded.match end
   if expanded.default ~= nil then schema.default = expanded.default end
   if expanded.kind == "object" then
     schema = object_schema(expanded.fields or {})
@@ -145,6 +150,10 @@ function M.document(app, info)
       operationId = (route.method:lower() .. entry.path:gsub("[^%w]+", "_")):gsub("_$", ""),
       responses = {},
     }
+    local metadata = opts.openapi or {}
+    operation.summary = metadata.summary
+    operation.description = metadata.description
+    operation.security = metadata.security
 
     local params = {}
     if opts.params then
@@ -159,6 +168,18 @@ function M.document(app, info)
     end
     if opts.query then
       for _, p in ipairs(parameters("query", opts.query)) do params[#params + 1] = p end
+    end
+    if metadata.headers then
+      for name, declaration in pairs(metadata.headers) do
+        params[#params + 1] = {
+          name = name, ["in"] = "header", required = declaration.required == true,
+          description = declaration.description, schema = declaration.schema or { type = "string" },
+        }
+      end
+      table.sort(params, function(a, b)
+        if a["in"] == b["in"] then return a.name < b.name end
+        return a["in"] < b["in"]
+      end)
     end
     if #params > 0 then operation.parameters = params end
 
@@ -206,6 +227,7 @@ function M.document(app, info)
       version = info.version or "0.0.0",
       description = info.description,
     },
+    components = info.components,
     paths = paths,
   }
 end

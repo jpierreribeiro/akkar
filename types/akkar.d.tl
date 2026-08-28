@@ -98,6 +98,8 @@ local record akkar
       min: number
       max: number
       match: string
+      -- ECMAScript/OpenAPI spelling when the Lua pattern uses `%` escapes.
+      openapi_pattern: string
       one_of: {string}
       default: any
       -- `object` and `array` recurse through these two fields.
@@ -120,6 +122,7 @@ local record akkar
       response: Schema
       responses: {integer: any}
       before: {Middleware}
+      openapi: any
    end
 
    record Validators

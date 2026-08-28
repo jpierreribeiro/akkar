@@ -3,8 +3,10 @@ package.path = "./?.lua;./?/init.lua;" .. package.path
 local akkar = require "akkar"
 local metrics = require "akkar.metrics"
 local openapi = require "akkar.openapi"
+local idempotency = require "akkar.idempotency"
 local sql = require "akkar.sql"
 local v = akkar.v
+local db = require "akkar.db"
 
 describe("nested schemas", function()
   local item = v.object { fields = {
@@ -27,6 +29,15 @@ describe("nested schemas", function()
     } })
     assert.equal(200, res.status)
     assert.same({ { sku = "CR-1", quantity = 2 } }, res.body.items)
+  end)
+
+  it("preserves empty arrays as JSON arrays", function()
+    local app = akkar.new()
+    app:get("/items", { response = v.object { fields = {
+      items = v.array { items = "string" },
+    } } }, function() return { items = setmetatable({}, require("cjson").array_mt) } end)
+    local response = app:test():get "/items"
+    assert.equal("[]", require("cjson").encode(response.body.items))
   end)
 
   it("returns paths precise enough for a form to render", function()
@@ -69,8 +80,81 @@ describe("nested schemas", function()
     local request = operation.requestBody.content["application/json"].schema
     assert.equal("array", request.properties.items.type)
     assert.equal(1, request.properties.items.minItems)
+    assert.is_nil(request.properties.items.minimum)
+    assert.is_nil(request.properties.items.maximum)
     assert.equal("integer", request.properties.items.items.properties.quantity.type)
     assert.equal("object", operation.responses["201"].content["application/json"].schema.type)
+  end)
+
+  it("can document an ECMAScript pattern distinct from Lua syntax", function()
+    local app = akkar.new()
+    app:get("/ids/:id", { params = {
+      id = v.string { match = "^%x+$", openapi_pattern = "^[0-9a-fA-F]+$" },
+    } }, function(req) return { id = req.params.id } end)
+    local parameter = openapi.document(app).paths["/ids/{id}"].get.parameters[1]
+    assert.equal("^[0-9a-fA-F]+$", parameter.schema.pattern)
+    assert.equal(200, app:test():get("/ids/deadbeef").status)
+    assert.equal(422, app:test():get("/ids/not-hex").status)
+  end)
+
+  it("carries explicit security and header metadata", function()
+    local app = akkar.new()
+    app:post("/charges", {
+      openapi = {
+        security = { { bearer = {} } },
+        headers = { ["Idempotency-Key"] = { required = true } },
+      },
+    }, function() return {} end)
+    local document = openapi.document(app, {
+      components = { securitySchemes = { bearer = { type = "http", scheme = "bearer" } } },
+    })
+    local operation = document.paths["/charges"].post
+    assert.same({ { bearer = {} } }, operation.security)
+    assert.equal("Idempotency-Key", operation.parameters[1].name)
+    assert.is_true(operation.parameters[1].required)
+    assert.equal("bearer", document.components.securitySchemes.bearer.scheme)
+  end)
+end)
+
+describe("idempotency fingerprints", function()
+  it("hashes the full body instead of a shared prefix", function()
+    local prefix = string.rep("x", 700)
+    local first = idempotency.fingerprint_of {
+      method = "POST", path = "/charges", body = { payload = prefix .. "a" },
+    }
+    local second = idempotency.fingerprint_of {
+      method = "POST", path = "/charges", body = { payload = prefix .. "b" },
+    }
+    assert.not_equal(first, second)
+  end)
+
+  it("canonicalizes object keys but preserves array order", function()
+    local first = idempotency.fingerprint_of {
+      method = "POST", path = "/charges",
+      body = { customer = { name = "Luz", age = 30 }, items = { "a", "b" } },
+    }
+    local equivalent = idempotency.fingerprint_of {
+      method = "POST", path = "/charges",
+      body = { items = { "a", "b" }, customer = { age = 30, name = "Luz" } },
+    }
+    local reordered = idempotency.fingerprint_of {
+      method = "POST", path = "/charges",
+      body = { items = { "b", "a" }, customer = { age = 30, name = "Luz" } },
+    }
+    assert.equal(first, equivalent)
+    assert.not_equal(first, reordered)
+  end)
+end)
+
+describe("verified PostgreSQL TLS", function()
+  it("sets SNI and hostname verification for DNS hosts", function()
+    local ssl = db.tls_client { host = "postgres.example.test", ssl = true, ssl_verify = true }
+    assert.equal("postgres.example.test", ssl:getHostName())
+  end)
+
+  it("does not send an IP address as SNI", function()
+    local ssl = db.tls_client { host = "127.0.0.1", ssl = true, ssl_verify = true }
+    assert.is_nil(ssl:getHostName())
   end)
 end)
 

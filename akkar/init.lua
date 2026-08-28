@@ -171,7 +171,7 @@ local SETTINGS = {
 -- route then accepts anything while looking validated.
 local ROUTE_OPTIONS = {
   params = true, query = true, body = true, response = true, responses = true,
-  before = true,
+  before = true, openapi = true,
 }
 
 local function nearest(word, candidates)
@@ -432,7 +432,7 @@ local function check_one(value, rule, coerce)
     if rule.min and count < rule.min then return nil, "min items " .. rule.min end
     if rule.max and count > rule.max then return nil, "max items " .. rule.max end
     if rule.items == nil then return nil, "array schema needs items" end
-    local clean, failures = {}, {}
+    local clean, failures = setmetatable({}, cjson.array_mt), {}
     for index, item in ipairs(value) do
       local got, err = check_one(item, expand(rule.items), coerce)
       if err then
@@ -1015,8 +1015,9 @@ end
 ---
 --- The default is unchanged and stays deliberately bare: `{"error":
 --- "internal server error"}`. A Lua error carries file paths, line numbers
---- and sometimes SQL. The detail belongs in the log beside the request id,
---- which is already how it works and is why the response carries that id.
+--- and sometimes credentials or personal data. Raw exception text therefore
+--- belongs in neither the response nor routine logs; correlation uses the
+--- request id and route location.
 local function internal_error(app, err, req)
   local fallback = response(500, { error = "internal server error" })
 
@@ -1034,7 +1035,7 @@ local function internal_error(app, err, req)
   if not ok then
     internal:error("the error handler itself raised", {
       request_id = req and req.id,
-      detail = tostring(result),
+      error_kind = type(result),
       hint = "the built-in 500 was sent instead",
     })
     return fallback
@@ -1043,7 +1044,7 @@ local function internal_error(app, err, req)
   local valid, response_or_why = pcall(normalize, result)
   if not valid then
     internal:error("the error handler returned something that is not a response", {
-      request_id = req and req.id, detail = tostring(response_or_why),
+      request_id = req and req.id, error_kind = type(response_or_why),
     })
     return fallback
   end
@@ -1156,7 +1157,7 @@ local function dispatch(app, req)
     -- return value back through every frame.
     if is_response(result) then return result end
     internal:error("handler raised", {
-      request_id = req.id, at = route.where, detail = tostring(result),
+      request_id = req.id, at = route.where, error_kind = type(result),
     })
     return internal_error(app, result, req)
   end
@@ -1553,7 +1554,7 @@ local function handle(app, input)
 
   if not ok then
     if is_response(res) then return res end
-    internal:error("middleware raised", { request_id = req.id, detail = tostring(res) })
+    internal:error("middleware raised", { request_id = req.id, error_kind = type(res) })
     return internal_error(app, res, req)
   end
   return res
@@ -1843,7 +1844,7 @@ function App:run(config)
               internal:error("stream producer failed", {
                 request_id = res.headers and res.headers["x-request-id"],
                 wrote_bytes = wrote,
-                detail = tostring(failure),
+                error_kind = type(failure),
                 hint = wrote and "response already committed; connection dropped"
                               or "nothing was written yet, but the status was",
               })
@@ -1864,11 +1865,11 @@ function App:run(config)
           if send_body then stream:write_chunk(payload, true) end
         end
       end)
-      if not ok then internal:error("stream failed", { detail = tostring(err) }) end
+      if not ok then internal:error("stream failed", { error_kind = type(err) }) end
       stream:shutdown()
       self.in_flight = self.in_flight - 1
     end,
-    onerror = function(_, _, op, e) internal:warn("transport", { op = op, detail = tostring(e) }) end,
+    onerror = function(_, _, op, e) internal:warn("transport", { op = op, error_kind = type(e) }) end,
   })
 
   assert(s:listen())

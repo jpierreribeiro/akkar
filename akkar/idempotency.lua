@@ -64,6 +64,7 @@ write into a shared cache, and it is stated rather than discovered.
 ]]
 
 local cjson = require "cjson"
+local digest = require "openssl.digest"
 
 local M = {}
 
@@ -129,21 +130,51 @@ local function evaluator(script)
   end
 end
 
---- A stable summary of the request, so the same key with different content is
---- detectable.
----
---- Not a cryptographic hash: this distinguishes an honest client's retry from
---- an honest client's mistake, and it is not a defence against an attacker who
---- can already choose the key. Method and path are included because the same
---- key on a different route is the same class of error.
+local function is_array(value)
+  local count, maximum = 0, 0
+  for key in pairs(value) do
+    if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then return false end
+    count, maximum = count + 1, math.max(maximum, key)
+  end
+  return count == maximum
+end
+
+-- cjson follows Lua's hash iteration order for objects. Canonicalize object
+-- keys so semantically identical JSON produces the same fingerprint across
+-- processes, while preserving array order.
+local function canonical_json(value)
+  if type(value) ~= "table" then return cjson.encode(value) end
+  local parts = {}
+  if is_array(value) then
+    for index = 1, #value do parts[index] = canonical_json(value[index]) end
+    return "[" .. table.concat(parts, ",") .. "]"
+  end
+  local keys = {}
+  for key in pairs(value) do keys[#keys + 1] = tostring(key) end
+  table.sort(keys)
+  for _, key in ipairs(keys) do
+    parts[#parts + 1] = cjson.encode(key) .. ":" .. canonical_json(value[key])
+  end
+  return "{" .. table.concat(parts, ",") .. "}"
+end
+
+local function sha256(value)
+  local hash = assert(digest.new "sha256")
+  assert(hash:update(value))
+  return (hash:final():gsub(".", function(char)
+    return string.format("%02x", char:byte())
+  end))
+end
+
+--- A stable, full-body summary of the request. Method and path are included
+--- because the same key on another route is a client error too.
 local function fingerprint_of(req)
   local body = ""
   if req.body ~= nil then
-    local ok, encoded = pcall(cjson.encode, req.body)
+    local ok, encoded = pcall(canonical_json, req.body)
     body = ok and encoded or tostring(req.body)
   end
-  return req.method .. " " .. req.path .. " " .. #body .. ":" ..
-         tostring(body:sub(1, 512))
+  return req.method .. " " .. req.path .. " " .. #body .. ":" .. sha256(body)
 end
 
 M.fingerprint_of = fingerprint_of
@@ -155,11 +186,14 @@ M.fingerprint_of = fingerprint_of
 function M.new(options)
   options = options or {}
   local ttl        = options.ttl or 86400
+  local running_ttl = options.running_ttl or math.min(ttl, 30)
   local prefix     = options.prefix or "akkar:idem:"
   local header     = options.header or "idempotency-key"
   local max_bytes  = options.max_bytes or 64 * 1024
   local required   = options.required or false
   local namespace  = options.namespace
+  local seal       = options.seal
+  local open       = options.open
 
   local methods = {}
   for _, m in ipairs(options.methods or { "POST", "PATCH" }) do
@@ -204,7 +238,7 @@ function M.new(options)
     local record = prefix .. scoped .. key
     local fingerprint = fingerprint_of(req)
 
-    local verdict = claim(cache, { record }, { ttl, fingerprint })
+    local verdict = claim(cache, { record }, { running_ttl, fingerprint })
     local state = verdict[1]
 
     if state == "mismatch" then
@@ -223,6 +257,13 @@ function M.new(options)
     if state == "done" then
       local status = tonumber(verdict[2]) or 200
       local body = verdict[3]
+      if body and open then
+        local opened, clear = pcall(open, body)
+        if not opened or type(clear) ~= "string" then
+          error("idempotency: stored response authentication failed", 0)
+        end
+        body = clear
+      end
       local decoded
       if body and #body > 0 then
         local ok, value = pcall(cjson.decode, body)
@@ -269,20 +310,37 @@ function M.new(options)
       encoded = encoded_ok and value or ""
     end
 
-    if #encoded > max_bytes then
+    local stored_body = encoded
+    if seal then
+      local sealed, value = pcall(seal, encoded)
+      if not sealed or type(value) ~= "string" then
+        -- Keep the claim in `running` rather than store a secret in cleartext
+        -- or release a successfully executed operation for duplicate replay.
+        local log = rawget(req, "log")
+        if log then log:error("idempotency: response sealing failed") end
+        return result
+      end
+      stored_body = value
+    end
+
+    if #stored_body > max_bytes then
       -- Refusing to store beats an unbounded write into a shared cache. The
       -- guarantee is lost for this response and the caller is told so.
       pcall(function() release(cache, { record }, {}) end)
       local log = rawget(req, "log")
       if log then
         log:warn("idempotency: response too large to store", {
-          bytes = #encoded, max_bytes = max_bytes, path = req.path,
+          bytes = #stored_body, max_bytes = max_bytes, path = req.path,
         })
       end
       return result
     end
 
-    pcall(function() store(cache, { record }, { status, encoded, ttl }) end)
+    local stored = pcall(function() store(cache, { record }, { status, stored_body, ttl }) end)
+    if not stored then
+      local log = rawget(req, "log")
+      if log then log:error("idempotency: response store failed; durable handler recovery required") end
+    end
     return result
   end
 end

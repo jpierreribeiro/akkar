@@ -208,12 +208,37 @@ end
 
 local M = {}
 
+local function tls_client(config)
+  local context_module = require "openssl.ssl.context"
+  local context = context_module.new(config.ssl_version or "TLS", false)
+  local store = context:getStore()
+  if config.cafile then store:add(config.cafile) else store:addDefaults() end
+  context:setVerify(context_module.VERIFY_PEER)
+  if config.cert then context:setCertificate(config.cert) end
+  if config.key then context:setPrivateKey(config.key) end
+
+  local params = require("openssl.x509.verify_param").new()
+  local host = assert(config.host, "db TLS verification needs host")
+  if host:match("^%d+%.%d+%.%d+%.%d+$") then params:setIP(host)
+  else params:setHost(host) end
+  context:setParam(params)
+
+  local ssl = require("openssl.ssl").new(context)
+  if not host:match("^%d+%.%d+%.%d+%.%d+$") then ssl:setHostName(host) end
+  ssl:setParam(params)
+  return ssl
+end
+
+M.tls_client = tls_client
+
 -- ==================================================================== connect
 -- Returns a factory: akkar calls it once per request.  `pool_size = 0` opts
 -- out and opens a connection per request, which is what the substrate proof
 -- measured and what a one-off script wants.
 function M.connect(config)
   local function open()
+    local tls = config.cqueues_openssl_context
+    if config.ssl and config.ssl_verify and not tls then tls = tls_client(config) end
     local pg = pgmoon.new {
       host = config.host or "127.0.0.1",
       port = config.port or 5432,
@@ -226,8 +251,9 @@ function M.connect(config)
       ssl_verify = config.ssl_verify,
       cert = config.cert,
       key = config.key,
+      cafile = config.cafile,
       ssl_version = config.ssl_version,
-      cqueues_openssl_context = config.cqueues_openssl_context,
+      cqueues_openssl_context = tls,
     }
     local ok, err = pg:connect()
     if not ok then error("db: could not connect: " .. tostring(err), 0) end
