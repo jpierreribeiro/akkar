@@ -28,10 +28,12 @@ local KIND_TO_JSON = {
   number  = { type = "number" },
   boolean = { type = "boolean" },
   table   = { type = "object" },
+  object  = { type = "object" },
+  array   = { type = "array" },
 }
 
 local SHORTHAND = { string = true, integer = true, number = true,
-                    boolean = true, table = true }
+                    boolean = true, table = true, object = true, array = true }
 
 -- Same expansion `akkar.validate` performs, kept in one shape so the document
 -- can never describe something different from what is enforced.
@@ -42,6 +44,8 @@ local function expand(rule)
   if not SHORTHAND[kind] then return nil end
   return { kind = kind, optional = optional }
 end
+
+local object_schema
 
 local function to_schema(rule)
   local expanded = expand(rule)
@@ -63,10 +67,17 @@ local function to_schema(rule)
   if expanded.one_of then schema["enum"] = expanded.one_of end
   if expanded.match then schema.pattern = expanded.match end
   if expanded.default ~= nil then schema.default = expanded.default end
+  if expanded.kind == "object" then
+    schema = object_schema(expanded.fields or {})
+  elseif expanded.kind == "array" then
+    schema.items = to_schema(expanded.items or "table")
+    if expanded.min then schema.minItems = expanded.min end
+    if expanded.max then schema.maxItems = expanded.max end
+  end
   return schema
 end
 
-local function object_schema(fields)
+object_schema = function(fields)
   local properties, required = {}, {}
   for name, rule in pairs(fields) do
     properties[name] = to_schema(rule)
@@ -77,6 +88,13 @@ local function object_schema(fields)
   local schema = { type = "object", properties = properties }
   if #required > 0 then schema.required = required end
   return schema
+end
+
+local function schema_of(declaration)
+  if type(declaration) == "table" and declaration.kind then
+    return to_schema(declaration)
+  end
+  return object_schema(declaration)
 end
 
 local function parameters(where, fields)
@@ -147,16 +165,25 @@ function M.document(app, info)
     if opts.body then
       operation.requestBody = {
         required = true,
-        content = { ["application/json"] = { schema = object_schema(opts.body) } },
+        content = { ["application/json"] = { schema = schema_of(opts.body) } },
       }
     end
 
     -- `response` is optional and describes the success body.  Without it the
     -- document says a response exists but not its shape, which is honest.
-    if opts.response then
+    if opts.responses then
+      for status, declaration in pairs(opts.responses) do
+        operation.responses[tostring(status)] = {
+          description = tonumber(status) == 201 and "Created" or
+                        tonumber(status) == 204 and "No Content" or "Response",
+          content = tonumber(status) == 204 and nil or
+                    { ["application/json"] = { schema = schema_of(declaration) } },
+        }
+      end
+    elseif opts.response then
       operation.responses["200"] = {
         description = "OK",
-        content = { ["application/json"] = { schema = object_schema(opts.response) } },
+        content = { ["application/json"] = { schema = schema_of(opts.response) } },
       }
     else
       operation.responses["200"] = { description = "OK" }

@@ -28,12 +28,39 @@ function M.new(options)
     requests = {},        -- [method|route|status] = count
     duration = {},        -- [method|route] = { counts = {}, sum, total }
     gauges   = {},        -- [name|labels] = value
+    counters = {},        -- [name|labels] = monotonically increasing value
     started  = os.time(),
   }, Registry)
 end
 
 local function key(...)
   return table.concat({ ... }, "\1")
+end
+
+local METRIC_NAME = "^[a-zA-Z_:][a-zA-Z0-9_:]*$"
+
+--- Increments an application counter. Labels are an ordered list of
+--- { name, value } pairs so callers cannot accidentally create unstable keys.
+function Registry:counter(name, delta, labels)
+  if type(name) ~= "string" or not name:match(METRIC_NAME) then
+    error("akkar.metrics: invalid counter name " .. tostring(name), 2)
+  end
+  delta = delta or 1
+  if type(delta) ~= "number" or delta < 0 then
+    error("akkar.metrics: counter delta must be a non-negative number", 2)
+  end
+  local label_key = ""
+  for _, pair in ipairs(labels or {}) do
+    label_key = label_key .. "\1" .. tostring(pair[1]) .. "\1" .. tostring(pair[2])
+  end
+  local storage_key = key(name, label_key)
+  local found = self.counters[storage_key]
+  if not found then
+    found = { name = name, labels = labels, value = 0 }
+    self.counters[storage_key] = found
+  end
+  found.value = found.value + delta
+  return found.value
 end
 
 function Registry:observe(method, route, status, seconds)
@@ -89,6 +116,22 @@ function Registry:render()
     line("akkar_requests_total" ..
          labels_of { { "method", method }, { "route", route }, { "status", status } } ..
          " " .. self.requests[k])
+  end
+
+  if next(self.counters) then
+    line ""
+    local counter_keys = {}
+    for k in pairs(self.counters) do counter_keys[#counter_keys + 1] = k end
+    table.sort(counter_keys)
+    local declared = {}
+    for _, k in ipairs(counter_keys) do
+      local counter = self.counters[k]
+      if not declared[counter.name] then
+        line("# TYPE " .. counter.name .. " counter")
+        declared[counter.name] = true
+      end
+      line(counter.name .. labels_of(counter.labels or {}) .. " " .. counter.value)
+    end
   end
 
   line ""

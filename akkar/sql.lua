@@ -107,6 +107,7 @@ local function new_query(kind)
     _order = nil,
     _limit = nil,
     _offset = nil,
+    _for_update = false,
     _scoped = false,
   }, Query)
 end
@@ -250,6 +251,17 @@ function Query:offset(n)
   return self
 end
 
+--- Locks the selected rows until the surrounding transaction completes.
+--- Only SELECT accepts the clause; making it a named builder operation keeps
+--- handlers from reaching for a raw SQL suffix during inventory reservation.
+function Query:for_update()
+  if self._kind ~= "select" then
+    error("akkar.sql: for_update is only valid on select queries", 0)
+  end
+  self._for_update = true
+  return self
+end
+
 --- Says out loud that every row is the intent, for the one case where it is.
 function Query:all_rows()
   self._all_rows = true
@@ -363,6 +375,7 @@ function Query:build()
     parts[#parts + 1] = " offset ?"
     values[#values + 1] = self._offset
   end
+  if self._for_update then parts[#parts + 1] = " for update" end
   if self._returning then
     parts[#parts + 1] = " returning " .. self._returning
   end

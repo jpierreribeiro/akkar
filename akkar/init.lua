@@ -170,7 +170,8 @@ local SETTINGS = {
 -- silently declaring no schema at all is worse than an error, because the
 -- route then accepts anything while looking validated.
 local ROUTE_OPTIONS = {
-  params = true, query = true, body = true, response = true, before = true,
+  params = true, query = true, body = true, response = true, responses = true,
+  before = true,
 }
 
 local function nearest(word, candidates)
@@ -347,9 +348,11 @@ v.integer = validator "integer"
 v.number  = validator "number"
 v.boolean = validator "boolean"
 v.table   = validator "table"
+v.object  = validator "object"
+v.array   = validator "array"
 
 local SHORTHAND = { string = true, integer = true, number = true,
-                    boolean = true, table = true }
+                    boolean = true, table = true, object = true, array = true }
 
 local function expand(rule)
   if type(rule) == "table" then return rule end
@@ -360,9 +363,21 @@ local function expand(rule)
   local kind = optional and rule:sub(1, -2) or rule
   if not SHORTHAND[kind] then
     error("unknown schema type: '" .. rule ..
-          "'; use string, integer, number, boolean, table (with ? for optional)", 0)
+          "'; use string, integer, number, boolean, table, object, array " ..
+          "(with ? for optional)", 0)
   end
   return { kind = kind, optional = optional }
+end
+
+local validate, validate_rule
+
+local function prefixed_errors(prefix, errors)
+  local out = {}
+  for field, why in pairs(errors or {}) do
+    local key = field == "" and tostring(prefix) or (tostring(prefix) .. "." .. field)
+    out[key] = why
+  end
+  return out
 end
 
 local function check_one(value, rule, coerce)
@@ -400,6 +415,38 @@ local function check_one(value, rule, coerce)
     if type(value) ~= "boolean" then return nil, "expected boolean" end
   elseif kind == "table" then
     if type(value) ~= "table" then return nil, "expected table" end
+  elseif kind == "object" then
+    if type(value) ~= "table" or value[1] ~= nil then return nil, "expected object" end
+    if type(rule.fields) ~= "table" then return nil, "object schema needs fields" end
+    local clean, failures = validate_rule(value, rule, coerce)
+    if failures then return nil, failures end
+    value = clean
+  elseif kind == "array" then
+    if type(value) ~= "table" then return nil, "expected array" end
+    local count = #value
+    for key in pairs(value) do
+      if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > count then
+        return nil, "expected array"
+      end
+    end
+    if rule.min and count < rule.min then return nil, "min items " .. rule.min end
+    if rule.max and count > rule.max then return nil, "max items " .. rule.max end
+    if rule.items == nil then return nil, "array schema needs items" end
+    local clean, failures = {}, {}
+    for index, item in ipairs(value) do
+      local got, err = check_one(item, expand(rule.items), coerce)
+      if err then
+        if type(err) == "table" then
+          for path, why in pairs(prefixed_errors(index, err)) do failures[path] = why end
+        else
+          failures[tostring(index)] = err
+        end
+      else
+        clean[index] = got
+      end
+    end
+    if next(failures) then return nil, failures end
+    value = clean
   end
 
   if rule.default ~= nil and value == nil then value = rule.default end
@@ -407,7 +454,23 @@ local function check_one(value, rule, coerce)
 end
 
 -- Returns (clean_table, nil) or (nil, failures_by_field)
-local function validate(input, schema, coerce)
+validate_rule = function(input, schema, coerce)
+  local expanded = expand(schema)
+  if expanded.kind == "object" then
+    return validate(input, expanded.fields, coerce)
+  end
+  local clean, err = check_one(input, expanded, coerce)
+  if err then
+    if type(err) == "table" then return nil, err end
+    return nil, { [""] = err }
+  end
+  return clean, nil
+end
+
+validate = function(input, schema, coerce)
+  if type(schema) == "table" and schema.kind then
+    return validate_rule(input, schema, coerce)
+  end
   -- Defensive: anything that is not a table is treated as absent, so a
   -- surprising body shape becomes a field-level error rather than a 500.
   if type(input) ~= "table" then input = {} end
@@ -417,7 +480,10 @@ local function validate(input, schema, coerce)
     local value = input[field]
     if value == nil and expanded.default ~= nil then value = expanded.default end
     local got, err = check_one(value, expanded, coerce)
-    if err then failures[field] = err any = true
+    if type(err) == "table" then
+      for path, why in pairs(prefixed_errors(field, err)) do failures[path] = why end
+      any = true
+    elseif err then failures[field] = err any = true
     else cleaned[field] = got end
   end
   if any then return nil, failures end
@@ -988,9 +1054,11 @@ local function apply_response_schema(res, schema, where, app, req)
   if res.status < 200 or res.status >= 300 then return res end
   if res.raw then return res end
   if type(res.body) ~= "table" then return res end
-  -- An array body is out of scope: `response` describes an object, and a list
-  -- schema is a separate decision rather than an oversight.
-  if res.body[1] ~= nil then return res end
+  -- Legacy field maps describe objects. Root arrays are validated only when
+  -- the route explicitly declares v.array{}, preserving the old behaviour.
+  if res.body[1] ~= nil and not (type(schema) == "table" and schema.kind) then
+    return res
+  end
 
   local cleaned, failures = validate(res.body, schema, false)
   if failures then
@@ -1093,8 +1161,13 @@ local function dispatch(app, req)
     return internal_error(app, result, req)
   end
 
-  if opts and opts.response then
-    result = apply_response_schema(result, opts.response, route.where, app, req)
+  if opts then
+    local declared = opts.responses and
+      (opts.responses[result.status] or opts.responses[tostring(result.status)])
+    local schema = declared or opts.response
+    if schema then
+      result = apply_response_schema(result, schema, route.where, app, req)
+    end
   end
   return result
 end

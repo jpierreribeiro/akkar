@@ -100,6 +100,9 @@ local record akkar
       match: string
       one_of: {string}
       default: any
+      -- `object` and `array` recurse through these two fields.
+      fields: {string: any}
+      items: any
    end
 
    -- A schema field is either a Rule or the shorthand string form:
@@ -115,6 +118,7 @@ local record akkar
       -- A mismatch is a 500: a response breaking its own contract is a server
       -- bug, not the client's fault.
       response: Schema
+      responses: {integer: any}
       before: {Middleware}
    end
 
@@ -124,6 +128,8 @@ local record akkar
       number: function({string: any}): Rule
       boolean: function({string: any}): Rule
       table: function({string: any}): Rule
+      object: function({string: any}): Rule
+      array: function({string: any}): Rule
    end
 
    -- ================================================================ adapters

@@ -129,6 +129,16 @@ app:post("/users", {
   body = { name = "string", email = "string?" },
 }, function(req) return akkar.created(req.body) end)
 
+-- Nested contracts remain one declaration for validation and OpenAPI.
+app:post("/orders", {
+  body = v.object { fields = {
+    items = v.array { min = 1, items = v.object { fields = {
+      sku = "string", quantity = v.integer { min = 1 },
+    } } },
+  } },
+  responses = { [201] = v.object { fields = { id = "string" } } },
+}, function(req) return akkar.created { id = create(req.body.items) } end)
+
 -- 3b. expressive validation; "string?" is sugar for v.string{optional=true}
 app:put("/users/:id", {
   params = { id = v.integer { min = 1 } },
