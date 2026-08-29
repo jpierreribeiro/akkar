@@ -260,15 +260,61 @@ function M.check_app(app, config, report)
   -- Which production defaults are actually in force, stated as numbers rather
   -- than as "defaults applied". A limit nobody can see is a limit nobody
   -- checks against.
-  local defaults = require("akkar").defaults
+  local akkar = require "akkar"
+  local defaults = akkar.defaults
+
+  -- Before anything is REPORTED about a setting, whether the runtime can use
+  -- it at all. `app:run{}` raises on a bad value, and the doctor's job is to
+  -- say so a deploy earlier -- a `timeout` read out of the environment as a
+  -- string names the right option, boots, and then 500s every request.
+  local usable, why = pcall(akkar.check_settings, config, "app:run{}")
+  if not usable then
+    report:fail("settings", "a setting has a value the runtime cannot use",
+      tostring(why):match "[^\n]*",
+      "app:run{} raises on this; fix it before deploying")
+  end
+
   local settings = {
     { "body_limit", "bytes" }, { "timeout", "s" }, { "shutdown_grace", "s" },
+    { "read_timeout", "s" }, { "http_version", "" },
   }
   for _, entry in ipairs(settings) do
     local key, unit = entry[1], entry[2]
     local value = config[key] or defaults[key]
     local source = config[key] and "configured" or "default"
-    report:ok("settings", key .. " = " .. tostring(value) .. " " .. unit, source)
+    report:ok("settings", key .. " = " .. tostring(value) ..
+              (unit == "" and "" or (" " .. unit)), source)
+  end
+
+  -- HTTP/2 multiplexes streams inside one connection and lua-http leaves
+  -- MAX_CONCURRENT_STREAMS unbounded, so `max_concurrent` -- the only
+  -- admission control akkar has, and the thing standing between this process
+  -- and the descriptor ceiling -- stops bounding requests. Measured: 40
+  -- streams in flight against `max_concurrent = 1`.
+  if (config.http_version or defaults.http_version) == 2 then
+    report:warn("settings", "http_version = 2 bypasses max_concurrent",
+      "max_concurrent bounds connections; h2 puts unbounded streams inside one",
+      "put a proxy that bounds streams in front, or run http_version = 1.1")
+  end
+
+  -- `shutdown_grace` is the moment akkar starts SAYING the drain is slow; it
+  -- forces nothing, by design.  What actually bounds a drain is how long a
+  -- client can hold a request open, which is `read_timeout`.  Configured the
+  -- wrong way round, the grace names a number no operator will observe: the
+  -- process keeps draining well past it, and whoever wrote the deployment's
+  -- termination period sized it from the wrong figure.
+  local read_timeout = config.read_timeout or defaults.read_timeout
+  local grace = config.shutdown_grace or defaults.shutdown_grace
+  if read_timeout > grace then
+    report:warn("settings",
+      "read_timeout (" .. read_timeout .. " s) is longer than shutdown_grace (" .. grace .. " s)",
+      "a drain is bounded by how long a client may hold a request open, so " ..
+      "shutdown can run to " .. read_timeout .. " s while the grace claims " .. grace,
+      "set read_timeout <= shutdown_grace, and size the orchestrator's " ..
+      "termination period from read_timeout")
+  else
+    report:ok("settings", "read_timeout <= shutdown_grace",
+      "a drain finishes within " .. read_timeout .. " s")
   end
 
   if config.check_capabilities == false then

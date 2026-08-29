@@ -119,6 +119,11 @@ akkar.defaults = {
   body_limit     = 1024 * 1024,   -- 1 MB
   timeout        = 30,            -- seconds of wall clock per request
   shutdown_grace = 10,            -- seconds to drain before saying so
+  read_timeout   = 30,            -- seconds a client may take to deliver one
+                                  -- request: measured from the first byte, so
+                                  -- trickling cannot extend it
+  http_version   = 1.1,           -- the protocol the rest of this runtime
+                                  -- assumes; see `http_version` in App:run
 }
 
 -- ================================================== capabilities and settings
@@ -161,9 +166,9 @@ local internal = log.new { level = "info", format = "text" }
 -- running with a 30 s deadline the author believed was 5 s.
 local SETTINGS = {
   host = true, port = true, tls = true, ctx = true,
-  body_limit = true, timeout = true, shutdown_grace = true,
+  body_limit = true, timeout = true, shutdown_grace = true, read_timeout = true,
   check_capabilities = true, reuseport = true, strict = true,
-  max_concurrent = true, trusted_proxies = true,
+  max_concurrent = true, trusted_proxies = true, http_version = true,
 }
 
 -- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
@@ -391,7 +396,30 @@ local function check_one(value, rule, coerce)
     -- Route and query values arrive as strings; coercing is right there.
     if coerce and type(value) == "string" then value = tonumber(value) end
     if type(value) ~= "number" then return nil, "expected " .. kind end
-    if kind == "integer" and value % 1 ~= 0 then return nil, "expected integer" end
+    -- `value % 1 ~= 0` reads like an integer test and is not one.  It is a
+    -- test for a FRACTIONAL PART, which every large float passes: `1e15` and
+    -- `1e308` are both whole and both floats, so `v.integer { min = 1 }`
+    -- accepted them and handed a float to code that had been promised an
+    -- integer.  Confirmed downstream on this branch -- `?limit=1e1` validated
+    -- here and then raised inside the SQL builder, turning an unauthenticated
+    -- query string into a 500 -- and these are prices and quantities.
+    --
+    -- So the value must BE an integer, or convert to one exactly.  The
+    -- conversion is what keeps `?limit=10` working when it arrives as the
+    -- string "10" and coercion produces a float on some paths.  Anything
+    -- from 2^53 up is rejected outright rather than converted: at that
+    -- magnitude a float no longer has an integer to be exact about, which is
+    -- how cjson turns `9007199254740993` in a body into ...992, and rounding
+    -- somebody's amount by one and calling it valid is the worst of the
+    -- three outcomes available here.
+    if kind == "integer" and math.type(value) ~= "integer" then
+      local exact = math.tointeger(value)
+      if exact == nil or value >= 9007199254740992.0
+                      or value <= -9007199254740992.0 then
+        return nil, "expected integer"
+      end
+      value = exact
+    end
     if rule.min and value < rule.min then return nil, "min is " .. rule.min end
     if rule.max and value > rule.max then return nil, "max is " .. rule.max end
   elseif kind == "string" then
@@ -530,6 +558,11 @@ local function remove_watchdog()
   debug.sethook()
 end
 
+-- Forward declaration.  `traced` captures a failing frame's stack for the log
+-- and is defined with the rest of the error handling, below; the deadline
+-- needs it because the deadline owns the frame that runs the chain.
+local traced
+
 -- ================================================================== deadline
 -- Wall-clock budget for one request.
 --
@@ -573,7 +606,11 @@ local function with_deadline(seconds, fn)
   local winner, result
 
   cq:wrap(function()
-    local ok, res = pcall(fn)
+    -- `traced` and not `pcall`: this frame is the last place the handler's
+    -- stack still exists.  The rethrow at the bottom of this function crosses
+    -- a coroutine boundary, and a traceback taken there describes the
+    -- rethrow, not the failure.
+    local ok, res = xpcall(fn, traced)
     if winner == nil then              -- first arbitrating event wins
       winner = ok and "COMPLETION" or "ERROR"
       result = res
@@ -688,7 +725,23 @@ for _, method in ipairs { "get", "post", "put", "patch", "delete" } do
   end
 end
 
+-- The chain is compiled once, on the first request, and never rebuilt: that is
+-- what makes middleware cost a closure per layer rather than a table walk per
+-- request.  The consequence is that registering one afterwards does nothing,
+-- and it used to do nothing SILENTLY.  An app that called `app:use(auth)` from
+-- inside a lazily-required module served every route unauthenticated and said
+-- so nowhere.
+--
+-- A late registration is therefore an error, not a warning.  There is no
+-- reading of it that is correct: either the middleware was meant to run, and
+-- the process is now serving requests without it, or it was not, and the call
+-- is a mistake either way.
 function App:use(fn)
+  if self._chain then
+    error("app:use() was called after the first request; the middleware chain " ..
+          "is built once, so this middleware would never run.  Register every " ..
+          "middleware before app:run{} or app:test{}.", 2)
+  end
   self.middleware[#self.middleware + 1] = fn
   return self
 end
@@ -980,6 +1033,150 @@ local function normalize(value)
   return response(200, value)
 end
 
+-- ============================================== responses the framework owns
+--
+-- A handler is allowed to return a module-level constant.  Nothing forbids it,
+-- the "handlers return a value" thesis makes it look free, and it is the
+-- obvious thing to write for `/health`:
+--
+--     local UP = akkar.ok { status = "up" }
+--     app:get("/health", function() return UP end)
+--
+-- The framework then wrote `x-request-id` into that table -- on EVERY request,
+-- creating `headers` on it the first time -- and so did every middleware that
+-- decorates a response on the way out.  The table is shared, so the writes
+-- accumulate on it forever.  Reproduced with a real server and separate TCP
+-- connections: a session middleware's `set-cookie` for alice, written onto a
+-- hoisted response, was still on that response when an anonymous probe hit the
+-- same route.  Correlation ids cross-contaminated the same way -- two
+-- responses held by one client were literally the same table, so the second
+-- request rewrote the first one's id.
+--
+-- Commit d1e5d45 fixed exactly this for `release`, by copying.  `headers` is
+-- written on every request rather than on streamed ones, so it needed it more.
+--
+-- The copy is taken once, at the boundary where an application's value first
+-- enters the framework -- the handler's return, and a middleware's own
+-- short-circuit -- and tagged with the request that owns it, so carrying it
+-- back up through a chain of middleware does not copy it again.  A handler
+-- returning a plain table costs nothing at all: `normalize` already builds it
+-- a fresh response.
+local function own(res, token)
+  if not is_response(res) then return res end
+  if token ~= nil and rawget(res, "__owner") == token then return res end
+
+  local copied = setmetatable({}, Response)
+  for key, value in pairs(res) do copied[key] = value end
+  if res.headers then
+    local hdrs = {}
+    for name, value in pairs(res.headers) do hdrs[name] = value end
+    copied.headers = hdrs
+  end
+  copied.__owner = token
+  return copied
+end
+
+-- =========================================== what the operator sees, only
+--
+-- `internal_error` keeps the RESPONSE bare on purpose: a Lua error carries
+-- file paths, line numbers and sometimes credentials or personal data, and
+-- none of that belongs on the wire.  That redaction (commit f1c1388) was then
+-- applied to the LOGS as well, which nobody outside the process reads -- and
+-- the result was an outage whose entire trace was five lines of
+--
+--     ERROR stream failed error_kind=string
+--
+-- The kind of the error and nothing else: not the message, not the file, not
+-- the line.  So the two audiences are separated here rather than conflated.
+-- The client keeps `{"error": "internal server error"}` and the request id.
+-- The operator gets the message and the stack, in the log.
+--
+-- The traceback has to be captured by a message handler, at the frame that
+-- raised, because by the time `pcall` returns the stack is gone.  A
+-- response-as-error is control flow rather than a failure and passes through
+-- untouched, so `is_response` still recognises it on the other side.
+function traced(err)
+  if is_response(err) then return err end
+  -- Already captured deeper in, at a frame closer to the failure than this
+  -- one.  Wrapping it again would bury the real stack under a rethrow.
+  if type(err) == "table" and rawget(err, "__traced") then return err end
+  return { __traced = true, err = err, stack = debug.traceback(nil, 2) }
+end
+
+--- The value the application was given, whether or not `traced` wrapped it.
+local function cause_of(result)
+  if type(result) == "table" and rawget(result, "__traced") then return result.err end
+  return result
+end
+
+--- The frames worth printing, on one line.
+---
+--- Folded onto one line because logfmt and JSON are both one entry per line,
+--- and a traceback that breaks that is a traceback no collector reassembles.
+--- Cut to the frames nearest the failure because the rest is always the same
+--- five layers of akkar, the deadline and the test runner: a log line long
+--- enough to be truncated by the collector loses the top of the stack, which
+--- is the only part anybody reads.
+local TRACEBACK_FRAMES = 6
+
+local function fold_traceback(stack)
+  local frames = {}
+  for line in stack:gmatch "[^\n]+" do
+    line = line:match "^%s*(.-)%s*$"
+    if line ~= "" and line ~= "stack traceback:" then
+      frames[#frames + 1] = line
+      if #frames == TRACEBACK_FRAMES then break end
+    end
+  end
+  return table.concat(frames, " | ")
+end
+
+--- Log fields for a failure: the message, and where it came from.
+local function diagnosis(result)
+  local err = cause_of(result)
+  local message
+  if type(err) == "string" then message = err
+  elseif type(err) == "table" and type(err.message) == "string" then message = err.message
+  else message = tostring(err) end
+
+  local fields = { error_kind = type(err), error = message }
+  if type(result) == "table" and rawget(result, "__traced") then
+    fields.traceback = fold_traceback(result.stack)
+  end
+  return fields
+end
+
+--- `fields` for a failure, plus whatever else the call site wants to say.
+local function diagnosis_with(result, extra)
+  local fields = diagnosis(result)
+  for key, value in pairs(extra) do fields[key] = value end
+  return fields
+end
+
+-- ======================================= middleware that forgets to return
+--
+--     app:use(function(req, next) next(req) end)      -- one missing `return`
+--
+-- The handler ran, its answer was thrown away, and `normalize(nil)` turned
+-- that into 204: an empty SUCCESS.  Every signal an operator has said the
+-- request was fine -- 2xx in the access log, 2xx in the metrics -- and the
+-- client received nothing.  Written into a logging middleware, it blanks
+-- every response in the application at once and explains itself nowhere.
+--
+-- Returning nothing WITHOUT calling `next` is a different thing and stays
+-- legal: that is a middleware deciding to answer 204.  Only the pair -- next
+-- was called, nothing came back -- has no correct reading, and it becomes a
+-- 500 naming where the middleware was defined, because a wrong answer that
+-- announces itself is worth more than a wrong answer that does not.
+local function forgot_return(mw)
+  local info = debug.getinfo(mw, "S")
+  error(string.format(
+    "middleware defined at %s:%d called next() and returned nothing, so the " ..
+    "handler's response was discarded and the client would have received an " ..
+    "empty 204.  Middleware must `return next(req)`.",
+    info and info.short_src or "?", info and info.linedefined or 0), 0)
+end
+
 -- Applies a route's `response` schema to what the handler produced.
 --
 -- Filtering first is the part that earns its keep: a handler doing `select *`
@@ -1024,7 +1221,7 @@ local function internal_error(app, err, req)
   local handler = app and app._on_error
   if not handler then return fallback end
 
-  local ok, result = pcall(handler, err, req)
+  local ok, result = pcall(handler, cause_of(err), req)
 
   -- `normalize` turns nil into 204, which is the right reading of "the
   -- handler had nothing to add" everywhere except here: answering an empty
@@ -1033,22 +1230,22 @@ local function internal_error(app, err, req)
   if ok and result == nil then return fallback end
 
   if not ok then
-    internal:error("the error handler itself raised", {
+    internal:error("the error handler itself raised", diagnosis_with(result, {
       request_id = req and req.id,
-      error_kind = type(result),
       hint = "the built-in 500 was sent instead",
-    })
+    }))
     return fallback
   end
 
   local valid, response_or_why = pcall(normalize, result)
   if not valid then
-    internal:error("the error handler returned something that is not a response", {
-      request_id = req and req.id, error_kind = type(response_or_why),
-    })
+    internal:error("the error handler returned something that is not a response",
+      diagnosis_with(response_or_why, { request_id = req and req.id }))
     return fallback
   end
-  return response_or_why
+  -- The application's error handler may return a hoisted response too, and it
+  -- is on the path that runs when things are already going wrong.
+  return own(response_or_why, req)
 end
 
 local function apply_response_schema(res, schema, where, app, req)
@@ -1138,27 +1335,45 @@ local function dispatch(app, req)
   end
 
   -- Route-scoped middleware, after the global chain.
-  local run = function() return route.handler(req) end
+  -- `own` is applied to the HANDLER's value, before any middleware sees it:
+  -- this is the innermost point an application's table enters the framework,
+  -- and a route middleware decorating a hoisted response is the same leak as
+  -- a global one doing it.
+  local run = function() return own(route.handler(req), req) end
   if opts and opts.before then
     for i = #opts.before, 1, -1 do
       local mw, nxt = opts.before[i], run
-      run = function() return mw(req, function() return nxt() end) end
+      run = function()
+        local reached = false
+        local value = mw(req, function() reached = true; return nxt() end)
+        if value == nil and reached then forgot_return(mw) end
+        return own(value, req)
+      end
     end
   end
 
   install_watchdog(route.where)
   -- `normalize` runs INSIDE the pcall: a handler returning an invalid value
   -- must become a 500 with a clear log, not escape as an unhandled error.
-  local ok, result = pcall(function() return normalize(run()) end)
+  -- `xpcall` rather than `pcall` for one reason: the traceback only exists
+  -- while the failing frame is still on the stack.
+  local ok, result = xpcall(function()
+    local res = normalize(run())
+    -- Whatever produced it -- the handler, `normalize` wrapping a plain
+    -- table, a route middleware -- it belongs to this request from here on,
+    -- so the global chain above may decorate it without copying again.
+    res.__owner = req
+    return res
+  end, traced)
   remove_watchdog()
 
   if not ok then
     -- Response-as-error: a deep layer can signal HTTP without threading a
     -- return value back through every frame.
-    if is_response(result) then return result end
-    internal:error("handler raised", {
-      request_id = req.id, at = route.where, error_kind = type(result),
-    })
+    if is_response(result) then return own(result, req) end
+    internal:error("handler raised", diagnosis_with(result, {
+      request_id = req.id, at = route.where,
+    }))
     return internal_error(app, result, req)
   end
 
@@ -1168,6 +1383,7 @@ local function dispatch(app, req)
     local schema = declared or opts.response
     if schema then
       result = apply_response_schema(result, schema, route.where, app, req)
+      result.__owner = req      -- filtering rebuilds it; it is still ours
     end
   end
   return result
@@ -1182,7 +1398,17 @@ local function build_chain(app, terminal)
   for i = #app.middleware, 1, -1 do
     local mw, next_fn = app.middleware[i], chain
     chain = function(a, req)
-      return normalize(mw(req, function(r) return next_fn(a, r or req) end))
+      local reached = false
+      local value = mw(req, function(r)
+        reached = true
+        return next_fn(a, r or req)
+      end)
+      if value == nil and reached then forgot_return(mw) end
+      -- Free when the middleware passed the response through: `own` sees its
+      -- own tag and returns the same table.  It copies only when the
+      -- middleware short-circuited with a response of its own, which may be
+      -- hoisted like any other.
+      return own(normalize(value), req)
     end
   end
   return chain
@@ -1212,23 +1438,64 @@ end
 -- a handler had to write
 --   req.headers.authorization or (req.headers.get and req.headers:get "...")
 -- which is the framework leaking lua-http into user code.
--- A request id, taken from the client when it sends one so a trace survives
--- across services, generated otherwise.  Not a UUID: this only has to be
--- unique enough to correlate lines within a window, and pulling in a UUID
--- library for that would be a dependency bought with nothing.
--- A random prefix chosen once per process, then a counter.  Two RNG calls per
--- request bought nothing: within a process a counter cannot collide at all,
--- which is strictly better than hoping two 48-bit draws differ, and across
--- processes the prefix separates them.
+-- ============================================================== request id
+--
+-- Who the request IS, which is a different question from what the request
+-- SAYS -- the same distinction `req.ip` draws sixty lines below, and it used
+-- to be drawn the other way here.  `X-Request-Id` was taken verbatim, length
+-- checked and otherwise believed, twenty lines above the essay explaining why
+-- `X-Forwarded-For` must never be.  Two things came of that, both measured on
+-- a running server:
+--
+--   `akkar.limit` keys a concurrency slot on `req.id`.  Clients all sending
+--   `X-Request-Id: x` shared ONE slot between them: peak 46 simultaneous
+--   requests against `limit = 2`.  The framework's only admission control,
+--   defeated by a constant header.
+--
+--   Every framework log line carries `request_id=<that string>`, and logfmt
+--   separates fields with spaces.  One header --
+--   `abc level=error message=DB_DELETED actor=admin` -- wrote four fields
+--   into the operator's log, three of them lies.
+--
+-- So `req.id` is akkar's own: unique by construction, and made of characters
+-- no log format can be steered with.  What the client sent survives as
+-- `req.client_request_id`, sanitised, and named so that believing it is a
+-- decision an application makes rather than one it inherits.  Correlation
+-- across services that has to be trusted is what `traceparent` is for, and
+-- that one is validated rather than echoed.
+--
+-- Not a UUID: this only has to be unique enough to correlate lines within a
+-- window, and pulling in a UUID library for that would be a dependency bought
+-- with nothing.  A random prefix chosen once per process, then a counter.
+-- Two RNG calls per request bought nothing: within a process a counter cannot
+-- collide at all, which is strictly better than hoping two 48-bit draws
+-- differ, and across processes the prefix separates them.
 local ID_PREFIX = string.format("%08x", math.random(0, 0xffffffff))
 local id_counter = 0
 
-local function request_id(headers)
-  local given = headers and headers["x-request-id"]
-  if given and #given > 0 and #given <= 200 then return given end
+local function request_id()
   id_counter = id_counter + 1
   return ID_PREFIX .. string.format("%06x", id_counter & 0xffffff)
 end
+
+-- Letters, digits and the four separators every id scheme in the wild already
+-- restricts itself to.  No space and no `=`, which is what makes a logfmt
+-- field; no quote, brace or backslash, which is what makes a JSON one.
+--
+-- Length is capped at a UUID with room to spare, and anything outside the set
+-- is DROPPED rather than stripped or truncated: an id sanitised into a
+-- different id correlates to the wrong request, which is worse than not
+-- correlating at all.
+local CLIENT_REQUEST_ID_MAX = 128
+
+local function client_request_id(headers)
+  local given = headers and headers["x-request-id"]
+  if type(given) ~= "string" then return nil end
+  if #given == 0 or #given > CLIENT_REQUEST_ID_MAX then return nil end
+  if given:match "^[%w%._:%-]+$" then return given end
+  return nil
+end
+akkar.client_request_id = client_request_id
 
 -- W3C Trace Context, which is the same idea as `x-request-id` with a format
 -- everything else already speaks:
@@ -1320,6 +1587,131 @@ local function in_cidr(address, cidr)
   return (a & mask) == (b & mask)
 end
 akkar.in_cidr = in_cidr
+
+-- ======================================= what a setting must actually BE
+--
+-- `check_config` checks the NAME of every option and stops there, and half a
+-- check turns out to be worth about half as much:
+--
+--     app:run { timeout = os.getenv "REQUEST_TIMEOUT" }
+--
+-- The name is spelled right, so it boots, and every request afterwards is a
+-- 500 -- the deadline compares a string to a number and raises -- while the
+-- only thing in the log is `error_kind=string`.  Four more passed the same
+-- way, each one a server that starts and then does not work:
+--
+--     body_limit = -1            rejects every body, including empty ones
+--     port = "not-a-port"        reaches server.listen as a string
+--     max_concurrent = 0         accepts no connection at all
+--     trusted_proxies = "10/8"   a string where a list belongs, so the walk
+--                                over it finds nothing and no proxy is
+--                                trusted -- while the config says one is
+--
+-- The whole argument for the name check applies unchanged: a mistake found at
+-- boot costs a second, and found in production costs an incident.  So the
+-- values are checked against what the code that reads them actually needs,
+-- and the message says what was passed rather than only what was wanted.
+--
+-- Each rule returns the expectation when the value is wrong, and nothing when
+-- it is fine.  A setting with no rule here is one whose value the framework
+-- genuinely cannot judge -- `ctx` is an OpenSSL object, `db` is checked
+-- against its contract instead.
+local function valid_cidr(cidr)
+  local base, bits = cidr:match "^([%d%.]+)/(%d+)$"
+  if not base then base, bits = cidr, "32" end
+  bits = tonumber(bits)
+  return ipv4_to_int(base) ~= nil and bits ~= nil and bits >= 0 and bits <= 32
+end
+
+local function seconds(allow_zero)
+  local wanted = allow_zero and "a number of seconds, zero or more"
+                             or "a positive number of seconds"
+  return function(value)
+    if type(value) ~= "number" or value ~= value then return wanted end
+    if value < 0 or (not allow_zero and value == 0) then return wanted end
+  end
+end
+
+local SETTING_RULES = {
+  host = function(value)
+    if type(value) ~= "string" or value == "" then return "a non-empty string" end
+  end,
+  port = function(value)
+    if math.type(value) ~= "integer" or value < 0 or value > 65535 then
+      return "an integer from 0 to 65535 (0 asks the kernel for a free port)"
+    end
+  end,
+  body_limit = function(value)
+    if math.type(value) ~= "integer" or value < 1 then
+      return "a positive whole number of bytes"
+    end
+  end,
+  -- `false` and `0` both mean "no deadline" to `with_deadline`, and an
+  -- application that means it should be able to say so.
+  timeout = function(value)
+    if value == false then return nil end
+    if type(value) ~= "number" or value ~= value or value < 0 then
+      return "a number of seconds, or false for no deadline"
+    end
+  end,
+  read_timeout   = seconds(false),
+  shutdown_grace = seconds(true),
+  max_concurrent = function(value)
+    if math.type(value) ~= "integer" or value < 1 then
+      return "an integer of at least 1 (it is a ceiling on connections)"
+    end
+  end,
+  http_version = function(value)
+    if value ~= 1.0 and value ~= 1.1 and value ~= 2 then
+      return "1.0, 1.1 or 2"
+    end
+  end,
+  reuseport          = function(value) if type(value) ~= "boolean" then return "true or false" end end,
+  strict             = function(value) if type(value) ~= "boolean" then return "true or false" end end,
+  check_capabilities = function(value) if type(value) ~= "boolean" then return "true or false" end end,
+  tls                = function(value) if type(value) ~= "boolean" then return "true or false" end end,
+  log = function(value)
+    if type(value) ~= "table" then return "a logger, from akkar.log.new{}" end
+  end,
+  peer = function(value)
+    if type(value) ~= "string" then return "an address, as a string" end
+  end,
+  trusted_proxies = function(value)
+    local list = [[a LIST of CIDR strings, e.g. { "10.0.0.0/8" }]]
+    if type(value) ~= "table" then return list end
+    if next(value) ~= nil and value[1] == nil then return list end
+    for _, cidr in ipairs(value) do
+      if type(cidr) ~= "string" then return list end
+      -- A CIDR that does not parse matches nothing, so the proxy list looks
+      -- configured and trusts no hop -- failing closed, silently, which is
+      -- the failure mode this whole section exists to make loud.
+      if not valid_cidr(cidr) then
+        return "a list of IPv4 CIDRs; '" .. cidr .. "' is not one"
+      end
+    end
+  end,
+}
+
+local function describe_value(value)
+  if type(value) == "string" then return string.format("string %q", value) end
+  return type(value) .. " " .. tostring(value)
+end
+
+--- Raises on the first setting whose VALUE the runtime cannot use.
+--- Exported so `akkar.doctor` can report the same finding without booting.
+local function check_setting_values(config, what)
+  for key, value in pairs(config) do
+    local rule = SETTING_RULES[key]
+    if rule and value ~= nil then
+      local expected = rule(value)
+      if expected then
+        error(string.format("%s: %s must be %s; got %s",
+                            what, key, expected, describe_value(value)), 3)
+      end
+    end
+  end
+end
+akkar.check_settings = check_setting_values
 
 local function is_trusted(address, trusted)
   if not address or not trusted then return false end
@@ -1415,7 +1807,7 @@ local function handle(app, input)
     body    = body,
     headers = request_headers,
     host    = normalize_host(requested_host),
-    id      = request_id(request_headers),
+    id      = request_id(),
     user    = guard("req.user", "req.user is not set; this route is missing the authentication middleware"),
   }
 
@@ -1464,6 +1856,16 @@ local function handle(app, input)
         return parsed
       end
 
+      -- Lazy for the same reason `trace` and `ip` are, and the reason is the
+      -- allocation ceiling: a ninth field in the constructor grows `req`'s
+      -- hash part and was measured at 191 bytes on EVERY request, including
+      -- the overwhelming majority that never look at it.
+      if key == "client_request_id" then
+        local given = client_request_id(rawget(self, "headers"))
+        if given then rawset(self, "client_request_id", given) end
+        return given
+      end
+
       if not CAPABILITIES[key] then return nil end
       local provided = input.capabilities and input.capabilities[key]
       local value
@@ -1472,7 +1874,13 @@ local function handle(app, input)
         -- that need configuring before they appear are diagnostics nobody
         -- sees.  Bound to the request id here, so a handler writing
         -- `req.log:info(...)` correlates without doing anything.
-        value = (provided or internal):with { request_id = self.id }
+        -- Both ids, when the client sent one worth carrying: `request_id` is
+        -- akkar's and is the one a slot or a rate limit may be keyed on,
+        -- `client_request_id` is the caller's and is there to join against an
+        -- upstream's logs.  Naming them apart is the whole point.
+        value = (provided or internal):with {
+          request_id = self.id, client_request_id = self.client_request_id,
+        }
       elseif provided == nil then
         value = guard("req." .. key,
                       "req." .. key .. " is not configured; pass " ..
@@ -1504,11 +1912,15 @@ local function handle(app, input)
   local chain = input.short and short or normal
   if input.short then req.__short = input.short end
 
-  local ok, res = pcall(function()
+  local ok, res = xpcall(function()
     local winner, value = with_deadline(input.timeout, function()
       return normalize(chain(app, req))
     end)
     if is_response(value) then
+      -- Never into a table the application owns.  See `own`: everything
+      -- below this line is a write, and a handler is allowed to return the
+      -- same constant table to every request there will ever be.
+      value = own(value, req)
       value.headers = value.headers or {}
       value.headers["x-request-id"] = req.id
       -- Echoed back so a client can tie the response to the trace it started.
@@ -1522,7 +1934,7 @@ local function handle(app, input)
       return response(503, { error = "request deadline exceeded" })
     end
     return value
-  end)
+  end, traced)
   -- A streamed body has not been produced yet, so its capabilities cannot be
   -- released here.  Releasing a database connection at this point would hand
   -- a live cursor to the next request.  The writer calls this instead, once
@@ -1554,7 +1966,9 @@ local function handle(app, input)
 
   if not ok then
     if is_response(res) then return res end
-    internal:error("middleware raised", { request_id = req.id, error_kind = type(res) })
+    internal:error("middleware raised", diagnosis_with(res, {
+      request_id = req.id, method = req.method, path = req.path,
+    }))
     return internal_error(app, res, req)
   end
   return res
@@ -1605,7 +2019,7 @@ end
 -- well, since a chunked body declares no length at all.  `get_body_as_string`
 -- has no limit of its own, so calling it on an untrusted request is how a
 -- client turns a 5 MB upload into whatever the process can allocate.
-local function read_body(stream, request_headers, limit)
+local function read_body(stream, request_headers, limit, timeout)
   -- `:get` returns NO values when the header is absent, not nil, so it cannot
   -- be passed straight into tonumber() -- that call would receive zero
   -- arguments and raise.  Bind it first.
@@ -1615,8 +2029,21 @@ local function read_body(stream, request_headers, limit)
     return nil, "declared"
   end
 
+  -- The body read is bounded for the same reason the header read is: a client
+  -- that announces a content-length and then stops holds the request open, and
+  -- a read with no deadline turns that into a drain with no end.  The deadline
+  -- is absolute -- computed once, before the first chunk -- so a client cannot
+  -- extend it by trickling a byte just before each individual wait expires.
+  local deadline = timeout and cqueues.monotime() + timeout
   local parts, total = {}, 0
-  for chunk in stream:each_chunk() do
+  while true do
+    local chunk, err = stream:get_next_chunk(deadline and deadline - cqueues.monotime())
+    if chunk == nil then
+      -- No chunk and no error is the end of the body.  No chunk WITH an error
+      -- is a client that stopped talking, whether it timed out or vanished.
+      if err == nil then break end
+      return nil, "incomplete"
+    end
     total = total + #chunk
     if total > limit then return nil, "streamed" end
     parts[#parts + 1] = chunk
@@ -1676,6 +2103,7 @@ function App:run(config)
   for k in pairs(SETTINGS) do allowed[k] = true end
   for k in pairs(CAPABILITIES) do allowed[k] = true end
   check_config(config, allowed, "app:run{}")
+  check_setting_values(config, "app:run{}")
 
   if config.check_capabilities ~= false then
     check_capability_contracts(config)
@@ -1693,8 +2121,9 @@ function App:run(config)
 
   local port = config.port or 8080
   local host = config.host or "127.0.0.1"
-  local body_limit = config.body_limit or akkar.defaults.body_limit
-  local timeout    = config.timeout    or akkar.defaults.timeout
+  local body_limit   = config.body_limit   or akkar.defaults.body_limit
+  local timeout      = config.timeout      or akkar.defaults.timeout
+  local read_timeout = config.read_timeout or akkar.defaults.read_timeout
   -- An app-supplied logger replaces the framework's own voice, so a service
   -- gets one stream in one format rather than two.
   if config.log then internal = config.log end
@@ -1773,14 +2202,68 @@ function App:run(config)
   local max_concurrent = config.max_concurrent
   if max_concurrent == nil then max_concurrent = descriptor_ceiling() end
 
+  -- ================================================= which protocol, stated
+  --
+  -- lua-http speaks HTTP/2, and left unsaid it ACCEPTS it: `h2` over ALPN on
+  -- TLS, and the prior-knowledge preface in cleartext.  Nothing here asked
+  -- for that, nothing in akkar or docs/ mentioned it, and it silently removed
+  -- the only admission control the runtime has.
+  --
+  -- `max_concurrent` bounds CONNECTIONS.  HTTP/2 multiplexes streams inside
+  -- one connection, and lua-http sets MAX_CONCURRENT_STREAMS to math.huge, so
+  -- the ceiling stops bounding anything a client cares about.  Measured, with
+  -- `max_concurrent = 1`: forty requests over ONE h2c connection, peak
+  -- in-flight forty, all of them finishing in the time one takes.  The
+  -- descriptor ceiling above -- the reason `max_concurrent` exists, and a
+  -- machine was lost proving it -- is defeated by `--http2-prior-knowledge`.
+  --
+  -- Everything else in the runtime assumes one request per connection as
+  -- well: `in_flight` is counted per stream but the drain reasons about
+  -- connections, and `read_timeout` bounds a header block, not a settings
+  -- exchange.  So the version is now an explicit setting that defaults to
+  -- what the rest of this file actually implements, rather than a capability
+  -- nobody chose.
+  --
+  -- `http_version = 2` remains available for anyone who wants it, and says
+  -- what it costs rather than pretending the ceiling still holds.  Bounding
+  -- streams properly would mean an admission gate inside the h2 connection,
+  -- which lua-http exposes no hook for; until that exists, opting in means
+  -- opting out of the ceiling.
+  local http_version = config.http_version
+  if http_version == nil then http_version = akkar.defaults.http_version end
+  if http_version == 2 then
+    internal:warn("http_version = 2: max_concurrent bounds connections, not streams", {
+      max_concurrent = max_concurrent,
+      consequence = "one client can hold unbounded requests in flight on one connection",
+      measured = "40 streams in flight against max_concurrent = 1",
+    })
+  end
+
   local s = assert(server.listen {
     host = host, port = port, tls = config.tls or false, ctx = config.ctx,
     reuseport = config.reuseport,
     max_concurrent = max_concurrent,
+    version = http_version,
     onstream = function(_, stream)
+      -- A connection that has not finished its header block is not a request
+      -- yet, and counting it as one is what makes a drain unable to end.  One
+      -- half-open socket -- a port scanner, a slowloris, a phone that left the
+      -- network mid-request -- holds `in_flight` above zero for as long as the
+      -- peer's kernel keeps the socket, so every deploy stalls until something
+      -- SIGKILLs the process.  That kill truncates whatever else was still
+      -- being written, which is the exact corruption the never-force policy in
+      -- App:stop exists to prevent: an unbounded read there defeats it here.
+      --
+      -- So the header read carries a deadline, and the count starts when there
+      -- is something to serve.  A connection waiting between keep-alive
+      -- requests is not inside this function and was never counted.
+      local h = stream:get_headers(read_timeout)
+      if not h then
+        pcall(function() stream:shutdown() end)
+        return
+      end
       self.in_flight = self.in_flight + 1
-      local ok, err = pcall(function()
-        local h = assert(stream:get_headers())
+      local ok, err = xpcall(function()
         -- The socket's own idea of who connected. Everything else about the
         -- client's identity is something the client typed.
         local peer
@@ -1791,9 +2274,12 @@ function App:run(config)
         local target = h:get ":path" or "/"
         local path, qs = target:match "^([^?]*)%??(.*)$"
 
-        local raw, oversize = read_body(stream, h, body_limit)
+        local raw, oversize = read_body(stream, h, body_limit, read_timeout)
         local body, short
-        if oversize then
+        if oversize == "incomplete" then
+          short = response(408, { error = "request body was not delivered within " ..
+                                          read_timeout .. " seconds" })
+        elseif oversize then
           short = response(413, { error = "request body exceeds " ..
                                           body_limit .. " bytes" })
         elseif raw and #raw > 0 then
@@ -1828,7 +2314,7 @@ function App:run(config)
 
           if not is_head then
             local wrote = false
-            local produced, failure = pcall(res.stream, function(chunk)
+            local produced, failure = xpcall(res.stream, traced, function(chunk)
               if chunk == nil or chunk == "" then return end
               wrote = true
               assert(stream:write_chunk(tostring(chunk), false))
@@ -1841,13 +2327,12 @@ function App:run(config)
               -- become a 500.  Dropping the connection without the terminating
               -- chunk is the only signal left: the client sees a truncated
               -- response instead of a complete-looking lie.
-              internal:error("stream producer failed", {
+              internal:error("stream producer failed", diagnosis_with(failure, {
                 request_id = res.headers and res.headers["x-request-id"],
                 wrote_bytes = wrote,
-                error_kind = type(failure),
                 hint = wrote and "response already committed; connection dropped"
                               or "nothing was written yet, but the status was",
-              })
+              }))
             end
           end
 
@@ -1864,12 +2349,16 @@ function App:run(config)
           stream:write_headers(rh, not send_body)
           if send_body then stream:write_chunk(payload, true) end
         end
-      end)
-      if not ok then internal:error("stream failed", { error_kind = type(err) }) end
+      end, traced)
+      -- This is the outermost frame a request has, so it is the last place
+      -- anything can be said about a failure at all.  Saying only
+      -- `error_kind=string` here is what made a live outage produce five
+      -- identical lines and no cause.
+      if not ok then internal:error("stream failed", diagnosis(err)) end
       stream:shutdown()
       self.in_flight = self.in_flight - 1
     end,
-    onerror = function(_, _, op, e) internal:warn("transport", { op = op, error_kind = type(e) }) end,
+    onerror = function(_, _, op, e) internal:warn("transport", diagnosis_with(e, { op = op })) end,
   })
 
   assert(s:listen())
@@ -1901,6 +2390,10 @@ function App:test(config)
                     peer = true, trusted_proxies = true }
   for k in pairs(CAPABILITIES) do allowed[k] = true end
   check_config(config, allowed, "app:test{}")
+  -- The same value check the server does.  A test client configured with a
+  -- string timeout would otherwise 500 every call and say `error_kind=string`,
+  -- which is the production failure reproduced in a place nobody debugs.
+  check_setting_values(config, "app:test{}")
 
   chains(self)
   local client = {}

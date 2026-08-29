@@ -80,14 +80,25 @@ describe("akkar.log", function()
 end)
 
 describe("request correlation", function()
-  it("keeps a request id the client supplied", function()
+  it("does not let the client choose the request id", function()
+    -- This test used to assert the opposite: `X-Request-Id` became `req.id`
+    -- verbatim, "so a trace survives across services". That is the assertion
+    -- that encoded the bug. `req.id` is the concurrency limiter's slot
+    -- identity and every framework log line's `request_id`, so a client
+    -- choosing it collapsed limiter slots (peak 46 against `limit = 2`) and
+    -- wrote its own fields into the operator's log.
+    --
+    -- What the client sent is still available, under a name that says whose
+    -- it is.
     local app = akkar.new()
-    app:get("/x", function(req) return { id = req.id } end)
+    app:get("/x", function(req)
+      return { id = req.id, from_client = req.client_request_id }
+    end)
 
     local res = app:test():get("/x", { headers = { ["X-Request-Id"] = "from-client" } })
-    -- Preserved so a trace survives across services.
-    assert.equal("from-client", res.body.id)
-    assert.equal("from-client", res.headers["x-request-id"])
+    assert.are_not.equal("from-client", res.body.id)
+    assert.equal("from-client", res.body.from_client)
+    assert.equal(res.body.id, res.headers["x-request-id"])
   end)
 
   it("generates one when the client sends none", function()
@@ -115,21 +126,26 @@ describe("request correlation", function()
       return { ok = true }
     end)
 
-    app:test { log = logger }:get("/x", { headers = { ["x-request-id"] = "trace-me" } })
+    local res = app:test { log = logger }
+      :get("/x", { headers = { ["x-request-id"] = "trace-me" } })
 
     local entry = cjson.decode(lines[#lines])
     assert.equal("handler ran", entry.message)
     -- The handler passed no id.  Correlation is a property of the logger, not
     -- something every call site has to remember.
-    assert.equal("trace-me", entry.request_id)
+    assert.equal(res.headers["x-request-id"], entry.request_id)
+    -- And the caller's own id rides along beside it, named as theirs, so a
+    -- line can still be joined to an upstream's logs.
+    assert.equal("trace-me", entry.client_request_id)
     assert.equal(1, entry.detail)
   end)
 
-  it("echoes the id on an error response too", function()
+  it("puts a request id on an error response too", function()
     local app = akkar.new()
     app:get("/boom", function() error "nope" end)
     local res = app:test():get("/boom", { headers = { ["x-request-id"] = "trace-error" } })
     assert.equal(500, res.status)
-    assert.equal("trace-error", res.headers["x-request-id"])
+    assert.is_string(res.headers["x-request-id"])
+    assert.are_not.equal("trace-error", res.headers["x-request-id"])
   end)
 end)
