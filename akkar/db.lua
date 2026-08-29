@@ -144,7 +144,30 @@ function Db:query(sql, ...)
     self.broken = true
     error("db: " .. tostring(res), 0)
   end
-  if not res then error("db: " .. tostring(err), 0) end
+  if not res then
+    -- A RETURNED error is ambiguous in a way a raised one is not.  PostgreSQL
+    -- rejecting a query -- a unique violation, a bad column -- reports exactly
+    -- like a backend that went away, and the two demand opposite handling: the
+    -- first leaves a perfectly good connection, the second leaves a corpse.
+    --
+    -- Guessing wrong in the safe-looking direction is what makes the pool
+    -- unrecoverable.  Nothing marks the dead connection, the fitness predicate
+    -- below sees no transaction, no break and a non-nil `pg`, so it goes back
+    -- to `idle` and is handed out again -- and every request fails, forever,
+    -- while PostgreSQL is healthy and `/health/live` still answers 200.
+    -- Measured before this line existed: a pool of two, eight consecutive
+    -- failures after one `pg_terminate_backend`, with no recovery.
+    --
+    -- So ask, instead of inferring.  One round trip, only on a path that has
+    -- already failed, and only to answer the question the pool actually needs
+    -- answered: is this connection still usable?  A dead socket answers
+    -- immediately, and a live one costs a `select 1` on an error path.
+    self.in_flight = true
+    local probed, alive = pcall(self.pg.query, self.pg, "select 1")
+    self.in_flight = false
+    if not (probed and alive) then self.broken = true end
+    error("db: " .. tostring(err), 0)
+  end
   return res
 end
 
@@ -165,16 +188,79 @@ end
 
 -- Closure-scoped transaction: commit at the end, rollback on any error.
 -- There is no path where a BEGIN stays open because someone forgot.
+--
+-- That invariant was true and it was the wrong one, because it says nothing
+-- about a BEGIN opened while one was already open.  A helper that owns a
+-- transaction -- `charge()` -- called from a handler that owns a bigger one --
+-- `place_order()` -- is the most ordinary refactor there is, and Postgres
+-- answers the second `begin` with a warning and no transaction.  Then the
+-- inner `commit` ENDS THE OUTER ONE, every statement after it autocommits, and
+-- the outer `rollback` is a no-op warning.  Reproduced here against Postgres:
+-- an outer transaction that raised left all three rows committed
+-- (`[outer-before, inner, outer-after]`, expected `[]`), with `in_transaction`
+-- false, `broken` false, and the pool judging the connection fit for reuse.
+-- Statements issued: `begin | begin | select 1 | commit | commit`.
+--
+-- SAVEPOINT rather than refusing the nested call, for two reasons.  Refusing
+-- turns a correct-looking refactor into a runtime error on a path that may
+-- only be exercised in production -- and it pushes people towards passing a
+-- boolean like `already_in_transaction` down through the helpers, which is the
+-- bookkeeping this file exists to remove.  A savepoint gives the inner block
+-- the only nesting semantics one connection can offer: its work is undone on
+-- its own failure, and made durable only when the outermost block commits.
+-- That is the semantics a caller wants from `charge()` anyway; a helper whose
+-- write must survive the caller's rollback needs a second connection, not a
+-- second BEGIN.
+--
+-- The savepoint is named per depth, which is enough: a name is released before
+-- the same depth can be entered again.
 function Db:transaction(fn)
+  local depth = self.tx_depth or 0
+
+  if depth > 0 then
+    local name = "akkar_sp_" .. (depth + 1)
+    self:query("savepoint " .. name)
+    self.tx_depth = depth + 1
+    local ok, result = pcall(fn, self)
+    self.tx_depth = depth
+
+    if not ok then
+      -- `rollback to savepoint` also clears the aborted state a failed
+      -- statement leaves behind, which is what lets the OUTER transaction
+      -- carry on after a helper failed.  If it does not work, the outer
+      -- transaction is unrecoverable and the connection must not be reused.
+      if not pcall(function() self:query("rollback to savepoint " .. name) end) then
+        self.broken = true
+      end
+      error(result, 0)        -- the outer block still decides what to do
+    end
+
+    -- Releasing keeps the savepoint stack from growing for the length of a
+    -- long outer transaction; it commits nothing on its own.
+    if not pcall(function() self:query("release savepoint " .. name) end) then
+      self.broken = true
+      error("db: could not release " .. name, 0)
+    end
+    return result
+  end
+
   self:query "begin"
   self.in_transaction = true
+  self.tx_depth = 1
   local ok, result = pcall(fn, self)
+  self.tx_depth = 0
+
   if not ok then
     local rolled = pcall(function() self:query "rollback" end)
     -- A connection whose rollback failed is in an unknown state.  Marking it
-    -- keeps the pool from handing that state to the next request.
-    self.in_transaction = not rolled
-    self.broken = not rolled
+    -- keeps the pool from handing that state to the next request.  Only ever
+    -- set, never cleared: a successful rollback says nothing about a break
+    -- some other path already found.
+    if rolled then
+      self.in_transaction = false
+    else
+      self.in_transaction, self.broken = true, true
+    end
     error(result, 0)          -- preserves response-as-error
   end
   self:query "commit"
@@ -255,7 +341,23 @@ function M.connect(config)
       ssl_version = config.ssl_version,
       cqueues_openssl_context = tls,
     }
+    -- Bound the CONNECT, not just the query.
+    --
+    -- A blackholed backend -- a firewall change, a failed failover, a NAT
+    -- table that forgot the flow -- neither accepts nor refuses, so `connect`
+    -- waits for as long as the kernel will let it. The request's deadline then
+    -- abandons the coroutine inside this function, and the pool slot it took
+    -- goes with it. The pool reclaims such a slot on its own, but not needing
+    -- to is better.
+    --
+    -- Set on the socket and cleared the moment the handshake is done: cqueues
+    -- applies a socket timeout to every later read as well, and a long query
+    -- must not inherit the connect budget. pgmoon takes milliseconds.
+    if config.connect_timeout then
+      pg:settimeout(config.connect_timeout * 1000)
+    end
     local ok, err = pg:connect()
+    if config.connect_timeout then pg:settimeout(nil) end
     if not ok then error("db: could not connect: " .. tostring(err), 0) end
 
     -- Override pgmoon's number serializer per connection, so this fix needs
@@ -321,7 +423,17 @@ function M.connect(config)
   local pool = Pool.new(open, size, function(conn)
     return not conn.in_transaction and not conn.broken
        and not conn.in_flight and conn.pg ~= nil
-  end)
+  end, {
+    -- Recycling and bounded waiting are the pool's, and their reasons are
+    -- written there.  Only the numbers belong to the application, and the
+    -- default for each is the pool's.
+    max_lifetime = config.max_lifetime,
+    idle_timeout = config.idle_timeout,
+    wait_timeout = config.pool_wait_timeout,
+    -- A slot outstanding for much longer than a connect attempt can take is a
+    -- connect that will never come back.
+    open_timeout = config.connect_timeout and config.connect_timeout * 2 or nil,
+  })
   -- A callable table rather than a plain function, so the pool can be reached
   -- for shutdown and diagnostics.  Lua functions cannot carry fields.
   return setmetatable({ pool = pool }, {

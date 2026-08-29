@@ -19,6 +19,7 @@ libraries implement it" stops being a slogan: the pool it uses is the same
 ]]
 
 local socket = require "cqueues.socket"
+local errno  = require "cqueues.errno"
 local Pool   = require "akkar.pool"
 
 local Redis = {}
@@ -61,17 +62,48 @@ local function read_reply(sock)
   if tag == "-" then return nil, rest, "reply" end
   if tag == ":" then return tonumber(rest) end
 
+  -- `$-1` is a nil reply.  A header that does not parse is NOT.
+  --
+  -- Treating both as nil returned successfully from a reply that was never
+  -- consumed: the payload stayed in the socket, `broken` was never set,
+  -- `in_flight` was cleared, and the reuse predicate below saw a healthy
+  -- connection and pooled it.  Demonstrated with one corrupt header:
+  --
+  --     1st command: value=nil            (reads as a cache miss)
+  --     2nd command: value=USER-A-SECRET  (request A's reply)
+  --
+  -- RESP matches replies to commands by order alone, so one unread reply
+  -- hands every later request on that connection somebody else's answer.
+  -- A malformed header means the stream is at an offset nobody knows, which
+  -- is a transport failure -- the third value stays nil so `command` breaks
+  -- the connection rather than returning it to the pool.
   if tag == "$" then
     local length = tonumber(rest)
-    if not length or length < 0 then return nil end     -- $-1 is a nil reply
+    if not length or length < -1 or length % 1 ~= 0 then
+      return nil, "malformed bulk length '" .. rest .. "'"
+    end
+    if length == -1 then return nil end
     local data, read_err = sock:read(length + 2)        -- payload plus CRLF
     if not data then return nil, read_err or "truncated bulk reply" end
+    -- `sock:read(n)` is not guaranteed to deliver n bytes: at EOF it returns
+    -- what it has. Returning that as the value made a truncated reply read as
+    -- a complete one -- an `INCR` for `limit.rate` came back 4 instead of 42,
+    -- and the rate limit silently did not fire. The trailing CRLF is checked
+    -- for the same reason: if it is not there, the length was not the length,
+    -- and everything after it is misaligned.
+    if #data ~= length + 2 or data:sub(length + 1) ~= CRLF then
+      return nil, "truncated bulk reply: wanted " .. (length + 2)
+                  .. " bytes, got " .. #data
+    end
     return data:sub(1, length)
   end
 
   if tag == "*" then
     local count = tonumber(rest)
-    if not count or count < 0 then return nil end       -- *-1 is a nil array
+    if not count or count < -1 or count % 1 ~= 0 then
+      return nil, "malformed array length '" .. rest .. "'"
+    end
+    if count == -1 then return nil end                  -- *-1 is a nil array
     local out = {}
     for i = 1, count do
       local value, item_err = read_reply(sock)
@@ -193,6 +225,25 @@ function M.connect(config)
     sock:setmode("bn", "bn")
     sock:onerror(function(_, _, why) return why end)
 
+    -- `socket.connect` only prepares the socket; the handshake happens on the
+    -- first use. Bound it here rather than letting a blackholed server -- one
+    -- that neither accepts nor refuses -- hold a pool slot for as long as the
+    -- kernel will allow, with the coroutine abandoned inside `open` and the
+    -- slot gone with it.
+    --
+    -- Done as an argument to `connect` and NOT as `sock:settimeout`, because a
+    -- socket timeout applies to every later read: `jobs.redis` waits on
+    -- `BRPOP` for seconds at a time on purpose, and it must not inherit the
+    -- connect budget.
+    if config.connect_timeout then
+      local connected, why = sock:connect(config.connect_timeout)
+      if not connected then
+        -- `onerror` above hands back a bare errno, which is not a diagnosis
+        -- anyone should have to look up at three in the morning.
+        error("redis: could not connect: " .. tostring(errno.strerror(why) or why), 0)
+      end
+    end
+
     local conn = setmetatable({ sock = sock }, Redis)
     if config.password then conn:command("AUTH", config.password) end
     if config.database then conn:command("SELECT", config.database) end
@@ -209,7 +260,12 @@ function M.connect(config)
   -- notice. Rejected here means closed and the slot freed.
   local pool = Pool.new(open, size, function(conn)
     return not conn.broken and not conn.in_flight and conn.sock ~= nil
-  end)
+  end, {
+    max_lifetime = config.max_lifetime,
+    idle_timeout = config.idle_timeout,
+    wait_timeout = config.pool_wait_timeout,
+    open_timeout = config.connect_timeout and config.connect_timeout * 2 or nil,
+  })
   return setmetatable({ pool = pool }, {
     __call = function() return pool:get() end,
   })
