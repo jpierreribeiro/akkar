@@ -45,6 +45,10 @@ against Gin degrades continuously.
 > standard library rather than `orjson`. See the warning at the top of
 > `bench/compare/RESULTS.md`. **akkar's own degradation shape across payload
 > sizes stands** — it is measured against itself — but the peer ratios do not.
+>
+> The re-run has since happened on a corrected harness: `bench/study/RESULTS.md`
+> has the numbers, and on the two-hundred-row route akkar is 65% **ahead** of
+> FastAPI rather than behind it. Read that page for any akkar-vs-peer figure.
 
 ## Lines of investigation
 
@@ -319,14 +323,38 @@ Per path, against the state at the top of this document:
 | a body of any size | the double null walk | **1.47x** |
 | every request | the deadline controller pool | **1.21x** |
 
-**Not measured: the old baseline against current HEAD, end to end.** That is
-one A/B and nobody has run it.
+**The old baseline against current HEAD, end to end — since measured.** It was
+missing when the paragraph above was written; `bench/study/RESULTS.md` §1 ran
+it, akkar at `62a40ca` against HEAD on the same harness, alternating: `/ping`
+**+17.0%** (18,575 → 21,732 req/s, p99 7.67 → 5.59 ms) and `/users/42`
+**+184.7%** (2,724 → 7,758 req/s, p50 −64%, p99 −75%), against noise floors of
+2.8% and 1.7%. Reproduced on three machines across two CPU generations. The
+warning above it still holds: those are per-path figures, and multiplying the
+certified fixes together would still be wrong.
 
-**Not measured either: anything against another framework.** The comparison in
-`bench/compare/RESULTS.md` is retracted — four asymmetries ran simultaneously
-under every number on that page — and the re-run it promises has not happened.
-So the honest statement today is that akkar is measurably faster **than
-itself**, and where it stands against Gin or FastAPI is currently unknown.
+**And the peer comparison has happened.** The old paragraph here said the
+re-run `bench/compare/RESULTS.md` promised "has not happened"; it did, on a
+harness built to refuse the four asymmetries the retraction names — process
+count verified after every start, `ORJSONResponse` enabled, the response schema
+removed, akkar reported twice (as shipped and lean). The results are in
+`bench/study/RESULTS.md`, and they go both ways:
+
+- **Better than the retracted page claimed.** akkar is at parity with FastAPI
+  on the framework path (20,648 vs 22,009 req/s on `/ping`) and **ahead** of it
+  on every route that touches the database — 29% ahead on one indexed row
+  (7,322 vs 5,688), 65% ahead on two hundred rows (1,450 vs 880). The retracted
+  page had FastAPI 1.4x ahead on `/ping` and 3.4x ahead on the query; that is
+  reversed.
+- **Prediction 2 was still wrong, just less wrong.** The gap to Gin *narrows*
+  with a database rather than widening — 0.18x on `/ping` to 0.28x on
+  `/users/42` — where the retracted page had it widening to 0.10x.
+- **Gin remains 3x to 5x ahead**, and per process, which is the comparison that
+  means something for a runtime where one VM is one core, it is
+  10,267 against ~58,600 — **5.7x**. That has not moved.
+
+So the honest statement today is no longer "unknown": akkar is measurably
+faster than itself by the figures above, roughly level with FastAPI and ahead
+of it once a database is involved, and several times behind Gin.
 
 ### 9. Concurrency has a hard ceiling, and it is descriptors — **measured**
 

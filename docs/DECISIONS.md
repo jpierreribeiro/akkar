@@ -426,7 +426,7 @@ a body nobody asked for.
 | | Where |
 |---|---|
 | Ten HTTP scenarios against a real Postgres | `examples/crud.lua` |
-| Twelve in-process tests, no socket and no database, in 0.11 s | `spec/` |
+| 580 tests in ~33 s (measured 2026-08-29, and growing) — most in-process, but the suite as a whole needs PostgreSQL on `127.0.0.1:55432` (db `akkar`/`postgres`/`akkar`) and Redis on `127.0.0.1:6379`; without them the integration specs skip silently as `pending` (at 456 tests: 384/18/30/2) | `spec/` |
 | Transaction rollback with a thrown response | `POST /users/:id/failing-transfer` |
 | A sub-app tested standalone and mounted | `spec/` |
 | Guards on `req.user` and `req.db` | `spec/` |

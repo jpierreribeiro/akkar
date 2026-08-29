@@ -25,7 +25,11 @@ core** and the servers to the other three, which is what makes the numbers
 below the server's rather than the generator's. Verified during a run: server
 cores at 100% while generator cores sat at 66% and 23%.
 
-The full suite — 139 tests — passes on this machine.
+The full suite — **580 tests in ~33 s** (measured 2026-08-29) — passes on this
+machine, with PostgreSQL on `127.0.0.1:55432` (db `akkar`, user `postgres`,
+password `akkar`) and Redis on `127.0.0.1:6379` up. Without those two the
+integration specs skip silently as `pending` (at 456 tests that read
+384 / 18 / 30 / 2).
 
 ### Noise floor
 

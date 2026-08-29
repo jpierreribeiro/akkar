@@ -19,15 +19,27 @@ eval "$(luarocks path --bin)"
 Then:
 
 ```sh
-busted                      # 183 tests with Postgres, Redis and tl available, no database needed, ~2 s
+busted                      # 580 tests, ~33 s — needs Postgres AND Redis, see below
 ```
 
-Only the examples and the substrate scripts need Postgres:
+**580 passes / 0 failures / 0 errors / 0 pending** (measured 2026-08-29 — the
+suite is growing, so re-measure rather than quoting this), and
+only with PostgreSQL on `127.0.0.1:55432` (database `akkar`, user `postgres`,
+password `akkar`) and Redis on `127.0.0.1:6379` running. Without them the same
+command skips the integration specs silently as `pending` rather than saying
+they did not run (at 456 tests that read **384 / 18 / 30 / 2**), so a smaller
+green-looking
+number is not the same result. The suite has NOT been "no database needed"
+for some time, and it has never been ~2 s.
+
+The examples and the substrate scripts need the same Postgres:
 
 ```sh
 docker run -d --name akkar-pg \
   -e POSTGRES_PASSWORD=akkar -e POSTGRES_DB=akkar \
   -p 55432:5432 postgres:16-alpine
+
+docker run -d --name akkar-redis -p 6379:6379 redis:7-alpine
 
 docker exec -i akkar-pg psql -U postgres -d akkar <<'SQL'
 create table if not exists users (
@@ -447,6 +459,17 @@ that accepts anything while looking validated.
   `work.queue(cache, name)` still works and forwards, so nothing breaks.
 
 - **Comparison against Gin and FastAPI**, `bench/compare/RESULTS.md`.
+
+  **⚠ The magnitudes in this entry are retracted and superseded** — an audit
+  found four asymmetries running under every number below, and the re-run on a
+  corrected harness is in `bench/study/RESULTS.md`. What it found: akkar at
+  parity with FastAPI on `/ping` (20,648 vs 22,009) and **ahead** of it on
+  every database route (7,322 vs 5,688 at one row, 1,450 vs 880 at two
+  hundred) — so the "1.4x slower than FastAPI" line at the end of this entry
+  is itself now wrong, and the gap to Gin narrows with a database (0.18x to
+  0.28x) rather than widening. The pgmoon conclusion, which is what this entry
+  is really about, survives the re-run. Kept for the reasoning, not the
+  figures.
 
   | `/ping` | | `/users/:id` | |
   |---|---:|---|---:|

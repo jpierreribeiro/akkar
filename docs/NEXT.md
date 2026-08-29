@@ -195,6 +195,13 @@ cap and must say what happens past it. And the guarantee is only as strong as
 the cache: with `cache.memory` it is per-process, which is not idempotency
 across a fleet. The docs must say which one the reader is getting.
 
+> **What was actually built is stricter than this paragraph.** As shipped,
+> `akkar.idempotency` decides inside the store with `EVAL`, and
+> `akkar.cache.memory` raises on `EVAL` rather than approximating it — so with
+> the memory cache there is no per-process idempotency at all: every request
+> carrying the key header is a **500**. Redis is required. Corrected here
+> because this paragraph is the one a reader quotes.
+
 ---
 
 ## 4. `If-Match` → 412 (Rails, and HTTP itself)
