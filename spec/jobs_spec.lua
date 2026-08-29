@@ -103,7 +103,11 @@ end
 if redis_reachable() then
   behaves_like_a_queue("redis", function()
     local cache = redis.connect { pool_size = 0 }()
-    cache:del "akkar:queue:spec-redis"
+    -- The in-flight keys too: these tests pop without acking, and under
+    -- at-least-once delivery an unacked job is still on the books.
+    cache:del("akkar:queue:spec-redis", "akkar:queue:spec-redis:inflight",
+              "akkar:queue:spec-redis:inflight:deadlines",
+              "akkar:queue:spec-redis:dead")
     return jobs_redis.new(cache, "spec-redis")
   end)
 else

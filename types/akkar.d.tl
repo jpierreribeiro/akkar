@@ -190,10 +190,18 @@ local record akkar
 
    record Queue
       push: function(Queue, string, any): integer
+      -- `pop` takes a LEASE, not the job outright: the job stays on the books
+      -- until `ack` retires it, and a worker that dies before acking has its
+      -- job redelivered by `reap`.  Delivery is therefore at-least-once, which
+      -- means a handler will sometimes run twice -- dedup on `Job.uid`, which
+      -- is stable across every retry and redelivery.
       pop: function(Queue, ?number): Job, string
+      ack: function(Queue, Job): boolean
+      reap: function(Queue, ?number): integer
+      in_flight: function(Queue): integer
       depth: function(Queue): integer
-      -- A failing job is logged and dropped.  A retry policy nobody chose
-      -- hides the failure and repeats the side effects already committed.
+      -- A failing job is retried with backoff and finally dead-lettered.
+      -- `consume` acks on success and settles a failure through that path.
       consume: function(Queue, {string: function(any, ?Job)}, ?ConsumeOptions): {string: integer}
    end
 

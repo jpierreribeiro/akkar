@@ -92,13 +92,26 @@ end
 describe("the job queue", function()
   local cache, queue
 
+  -- Several tests here pop WITHOUT acking, on purpose. Delivery is
+  -- at-least-once now, so an unacked job is still on the books: it stays in
+  -- the in-flight list with a deadline, waiting to be redelivered. Left
+  -- behind, those entries accumulate in whatever Redis the suite is pointed
+  -- at, one run at a time. The fixture owns them the same way it owns the
+  -- ready list.
+  local function clear()
+    cache:del "akkar:queue:spec"
+    cache:del "akkar:queue:spec:inflight"
+    cache:del "akkar:queue:spec:inflight:deadlines"
+    cache:del "akkar:queue:spec:dead"
+  end
+
   before_each(function()
     cache = redis.connect { pool_size = 0 }()
     queue = work.queue(cache, "spec")
-    cache:del "akkar:queue:spec"
+    clear()
   end)
   after_each(function()
-    if cache then cache:del "akkar:queue:spec" cache:close() end
+    if cache then clear() cache:close() end
   end)
 
   it("round-trips a job through Redis", function()

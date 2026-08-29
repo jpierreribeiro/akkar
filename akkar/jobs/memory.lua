@@ -4,9 +4,20 @@ akkar.jobs.memory — in-process persistence for a job queue.
 Same argument as the other `_memory` adapters: a shared, tested implementation
 of the store contract beats a fake per test file.
 
-Delivery is **at most once**, the same as the Redis store: `dequeue` removes
-the job and returns it, and nothing holds it while a handler runs. Here the
-crash boundary is the process, and losing the process loses the queue anyway.
+Delivery is **at least once**, the same as the Redis store, and that is not
+decoration here either. Losing the process loses this queue anyway -- so the
+crash it has to survive is not a dead process but a dead COROUTINE: a handler
+that raised past its worker, a cqueues deadline that abandoned the loop
+mid-job, a `should_stop` that returned true while a job was in hand. Those
+lose the job on a store that pops and hands over in one step, and they are the
+same shape as the crash that matters on Redis.
+
+It matters more than "it is only a fake" suggests: this store is what the
+semantic tests run against, so a fake with a weaker safety property than the
+real thing is how a test proves the wrong thing. `lease`, `ack`, `expired`
+and `in_flight_depth` are here so that both backends answer the same
+questions the same way, and `spec/jobs_delivery_spec.lua` asserts exactly
+that against both.
 
 `dequeue` does not block. Nothing here should sleep waiting for work that can
 only arrive from the same process -- if the queue is empty it will stay empty
@@ -42,6 +53,80 @@ end
 function Store:depth(key)
   local list = self.lists[key]
   return list and #list or 0
+end
+
+-- ====================================================== holding one in flight
+-- Modelled on what the Redis store can express, not on what a table makes
+-- easy.  There the in-flight record is a list entry and the deadline is a
+-- sorted-set score, and an entry claimed by a reaper has lost its score but
+-- not its list entry -- so here an entry is `{ deadline = n }` and a claimed
+-- one is `{ deadline = false }`, still counted by `in_flight_depth`, still
+-- waiting for an `ack` that will now say "no, this was taken from you".
+--
+-- The alternative -- deleting on reap -- would have made this store answer
+-- `ack` differently from Redis on the one path the whole feature exists for.
+
+local function held(self, key)
+  local entries = self.inflight[key]
+  if not entries then entries = {} self.inflight[key] = entries end
+  return entries
+end
+
+--- Takes a job and holds it, in one step.  No `timeout`: nothing here can
+--- arrive while this coroutine is inside the call, so blocking would be a
+--- deadlock rather than a wait.
+function Store:lease(key, _timeout, visibility)
+  local encoded = self:dequeue(key)
+  if not encoded then return nil end
+  held(self, key)[encoded] = { deadline = os.time() + (visibility or 300) }
+  return encoded
+end
+
+--- Retires an in-flight record.  1 when it was still ours, 0 when a reaper
+--- had already claimed it -- which tells the caller its handler outran the
+--- visibility timeout and the job is being run somewhere else too.
+function Store:ack(key, encoded)
+  local entries = self.inflight[key]
+  local entry = entries and entries[encoded]
+  if not entry then return 0 end
+  entries[encoded] = nil
+  return entry.deadline and 1 or 0
+end
+
+--- Claims what ran out of time, oldest deadline first, and returns it.
+---
+--- Claiming and RELEASING are deliberately separate: the entry stays in
+--- flight until the caller has written its next copy somewhere, so a crash in
+--- between costs a redelivery instead of the job.
+function Store:expired(key, now, _visibility, limit)
+  local entries = self.inflight[key]
+  if not entries then return {} end
+
+  local due = {}
+  for encoded, entry in pairs(entries) do
+    if entry.deadline and entry.deadline <= now then
+      due[#due + 1] = { encoded = encoded, deadline = entry.deadline }
+    end
+  end
+  table.sort(due, function(a, b)
+    if a.deadline ~= b.deadline then return a.deadline < b.deadline end
+    return a.encoded < b.encoded            -- `pairs` order is not an order
+  end)
+
+  local out = {}
+  for i = 1, math.min(#due, limit or 500) do
+    entries[due[i].encoded].deadline = false               -- claimed, not gone
+    out[#out + 1] = due[i].encoded
+  end
+  return out
+end
+
+function Store:in_flight_depth(key)
+  local entries = self.inflight[key]
+  if not entries then return 0 end
+  local n = 0
+  for _ in pairs(entries) do n = n + 1 end
+  return n
 end
 
 -- ============================================================ the optional half
@@ -129,11 +214,15 @@ function Store:scheduled_depth(key)
 end
 
 function M.store()
-  return setmetatable({ lists = {}, scheduled = {}, claims = {} }, Store)
+  return setmetatable({ lists = {}, scheduled = {}, claims = {}, inflight = {} },
+                      Store)
 end
 
-function M.new(name)
-  return jobs.new(M.store(), name)
+--- `options` goes straight to `akkar.jobs.new`, matching `akkar.jobs.redis`:
+--- a fake that cannot be configured the way the real store can is a fake the
+--- tests cannot ask the same questions of.
+function M.new(name, options)
+  return jobs.new(M.store(), name, options)
 end
 
 M.Store = Store

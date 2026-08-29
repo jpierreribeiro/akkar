@@ -41,8 +41,11 @@ local function in_redis(fn)
     })
     local ok, res = pcall(fn, q, conn)
     -- Leave nothing behind: another run of this suite must not inherit it.
+    -- The in-flight keys are in the list because a job leased and never acked
+    -- -- which several tests here do on purpose -- outlives the test.
     pcall(function()
       conn:del(q.key); conn:del(q:dead_key()); conn:del(q.key .. ":scheduled")
+      conn:del(store:inflight_key(q.key)); conn:del(store:deadline_key(q.key))
     end)
     conn:close()
     if ok then result = res else failure = res end
