@@ -322,6 +322,9 @@ M.tls_client = tls_client
 -- out and opens a connection per request, which is what the substrate proof
 -- measured and what a one-off script wants.
 function M.connect(config)
+  local ssl_required = config.ssl_required
+  if ssl_required == nil then ssl_required = config.ssl or false end
+
   local function open()
     local tls = config.cqueues_openssl_context
     if config.ssl and config.ssl_verify and not tls then tls = tls_client(config) end
@@ -333,7 +336,22 @@ function M.connect(config)
       password = config.password,
       socket_type = "cqueues",
       ssl = config.ssl or false,
-      ssl_required = config.ssl_required or false,
+      -- Asking for TLS means requiring it.
+      --
+      -- PostgreSQL's SSL negotiation happens in cleartext: the client asks,
+      -- and the server answers `S` or `N`.  pgmoon fails on an error reply or
+      -- when `ssl_required` is set, and otherwise -- on a plain `N` -- falls
+      -- through to `return true` and continues UNENCRYPTED.  So with
+      -- `ssl_required` defaulting to false, everything above this line is
+      -- skipped without a certificate ever being presented: VERIFY_PEER, the
+      -- CA store, setHost/setIP, SNI.  Anyone positioned to answer that byte
+      -- strips the TLS, and `ssl_verify = true` reports success.
+      --
+      -- So the default follows the request: a caller who said `ssl = true`
+      -- gets an error rather than a downgrade.  Opportunistic TLS is still
+      -- available, and now has to be said out loud -- `ssl_required = false`
+      -- is a sentence someone has to write, which is the point.
+      ssl_required = ssl_required,
       ssl_verify = config.ssl_verify,
       cert = config.cert,
       key = config.key,
