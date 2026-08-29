@@ -173,3 +173,29 @@ describe("the cheap half", function()
     assert.equal(200, res.status)
   end)
 end)
+
+describe("a body whose keys are not all integers", function()
+  -- `value[1] ~= nil` was read as "this is an array", so every other key was
+  -- dropped from the tag while cjson sent all of them to the client. Two
+  -- bodies differing only in `status` got one ETag: If-Match accepted a stale
+  -- write, If-None-Match answered 304 for content that had changed.
+  it("tags a mixed table by everything in it", function()
+    local draft     = { [1] = "row", status = "draft",     owner = "alice" }
+    local published = { [1] = "row", status = "PUBLISHED", owner = "mallory" }
+    assert.not_equal(etag.canonical(draft), etag.canonical(published))
+    assert.not_equal(etag.of(draft), etag.of(published))
+  end)
+
+  it("keeps a numeric key's value instead of writing it out as null", function()
+    -- Sorting a list of tostring(k) and then indexing with it looked up the
+    -- string "2" in a table holding the number 2.
+    assert.equal([[{"2":"x","name":"y"}]], etag.canonical { [2] = "x", name = "y" })
+    assert.not_equal(etag.of { [2] = "x", name = "y" },
+                     etag.of { [2] = "z", name = "y" })
+  end)
+
+  it("still treats a real array as an array", function()
+    assert.equal([=[["a","b"]]=], etag.canonical { "a", "b" })
+    assert.equal("[]", etag.canonical {})
+  end)
+end)

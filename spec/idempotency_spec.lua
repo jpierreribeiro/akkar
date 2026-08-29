@@ -44,6 +44,9 @@ local function prefix() return "akkar:spec:idem:" .. math.random(1, 1e9) .. ":" 
 
 --- An app whose handler counts how many times it actually ran.
 local function charging_app(opts)
+  -- Explicitly single-tenant: these cases are about the mechanism, not about
+  -- whose keyspace it is, and the namespace is required rather than defaulted.
+  if opts.namespace == nil then opts.namespace = false end
   local runs = 0
   local app = akkar.new()
   app:use(akkar.idempotency(opts))
@@ -92,7 +95,7 @@ describe("a retried request", function()
     -- Returning nothing is wrong and running it twice is worse.
     in_controller(function()
       local app = akkar.new()
-      app:use(akkar.idempotency { prefix = prefix() })
+      app:use(akkar.idempotency { prefix = prefix(), namespace = false })
       app:post("/slow", function()
         cqueues.sleep(0.3)
         return akkar.created { done = true }
@@ -164,7 +167,7 @@ describe("what must not be remembered", function()
     -- consequence -- the guarantee is lost for that response -- is real.
     in_controller(function()
       local app = akkar.new()
-      app:use(akkar.idempotency { prefix = prefix(), max_bytes = 64 })
+      app:use(akkar.idempotency { prefix = prefix(), namespace = false, max_bytes = 64 })
       local runs = 0
       app:post("/big", function()
         runs = runs + 1

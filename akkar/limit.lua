@@ -43,6 +43,28 @@ store -- so the decision happens where the state is. akkar sends these as
 `EVAL`, and the scripts are **Lua**, which means a Lua framework's rate
 limiter is written in the language it is already written in.
 
+## Whose bucket is it
+
+A bucket name answers three questions, and for a long time it answered only
+one. `prefix` was a constant, so two `limit.rate{}` middlewares on different
+routes shared one bucket and whichever was tighter silently governed both.
+There was no tenant, so in a multi-tenant application tenant A's user 7 spent
+tenant B's user 7's allowance. So the key is now, in order:
+
+    <prefix> <this limiter> <tenant> <caller>
+
+length-prefixed, because `user:7` under `acme` and `user:7` under `evil` are
+otherwise the same eleven characters. An unnamed limiter is identified by its
+own settings; `name` separates two that are configured alike. `namespace` is
+the tenant, and a single-tenant application leaves it out.
+
+## When the store is the thing that broke
+
+The script call carried no `pcall`, so a Redis blip answered **500** on every
+rate-limited route -- a degraded dependency turned into a total outage of the
+routes someone thought worth protecting. `on_error` names the choice instead:
+`"open"` (the default) serves the request and logs it, `"closed"` answers 429.
+
 ## The limit that must be stated
 
 These are only as strong as the store behind them. With `akkar.cache.memory`
@@ -53,6 +75,8 @@ not rate limiting. With Redis it is shared and real.
 `akkar.limit` says which one it is at boot rather than leaving it to be
 discovered under load.
 ]]
+
+local rand = require "openssl.rand"
 
 local M = {}
 
@@ -186,6 +210,33 @@ end
 M.scriptable = scriptable
 
 -- ================================================================ middleware
+--
+-- A bucket name is assembled out of values several different parties choose,
+-- so the pieces are LENGTH-PREFIXED rather than joined by a colon. Plain
+-- concatenation makes `user:7` under tenant `acme` and `user:7` under tenant
+-- `evil` the same eleven characters, and lets a user id that itself contains
+-- a colon spell somebody else's bucket.
+local function segment(value)
+  value = tostring(value or "")
+  return #value .. ":" .. value
+end
+
+--- Which tenant's budget this is.
+---
+--- Without it every tenant's user 7 spends one shared allowance -- the same
+--- collision `akkar.scope` exists to remove on the database side. A constant
+--- string or a resolver; absent means the application is single-tenant.
+local function namespace_for(options, req)
+  local namespace = options.namespace
+  if namespace == nil then return "" end
+  local value = type(namespace) == "function" and namespace(req) or namespace
+  value = tostring(value or "")
+  if value == "" then
+    error("limit: namespace returned an empty value", 0)
+  end
+  return value
+end
+
 local function key_for(options, req)
   if options.key then return options.key(req) end
   -- The default is the authenticated caller when there is one and the client
@@ -214,6 +265,28 @@ local function key_for(options, req)
   return "ip:" .. tostring(req.ip or "unknown")
 end
 
+--- What to do when the STORE is the thing that failed.
+---
+--- The script call carried no `pcall`, so a Redis blip turned every
+--- rate-limited route into a 500 -- converting a degraded dependency into a
+--- total outage of exactly the routes someone thought worth protecting.
+--- Neither answer is free, so the choice is named: `on_error = "open"` serves
+--- the request unlimited (the default, because a limiter is a safeguard and a
+--- safeguard that takes the site down is not one), `"closed"` refuses with
+--- 429. Either way it is logged, because silently unlimited is how a limiter
+--- is discovered to have been off for a week.
+local function unavailable(options, req, which, err)
+  local log = rawget(req, "log")
+  if log then
+    log:warn("limit: the store could not answer; " ..
+             (options.on_error == "closed" and "refusing" or "serving unlimited"), {
+      limiter = which, on_error = options.on_error or "open",
+      error = tostring(err), path = req.path,
+    })
+  end
+  return options.on_error == "closed"
+end
+
 local function too_many(retry_after_ms)
   local seconds = math.max(1, math.ceil((retry_after_ms or 1000) / 1000))
   local res = require("akkar").response(429, {
@@ -229,18 +302,35 @@ end
 --- Requests per second, with a burst.
 ---
 ---     app:use(akkar.limit.rate { per_second = 10, burst = 20 })
+---
+--- `name` separates this limiter's buckets from another's. The default was a
+--- constant prefix, so two `limit.rate{}` middlewares mounted on different
+--- routes shared one bucket and the tighter configuration silently governed
+--- both. Unnamed, a limiter's bucket carries its own settings, which keeps
+--- differently-configured limiters apart; two identical ones deliberately
+--- kept separate need a `name`.
 function M.rate(options)
   options = options or {}
   local per_second = options.per_second or 10
   local burst      = options.burst or per_second
   local cost       = options.cost or 1
   local prefix     = options.prefix or "akkar:rate:"
+  local bucket     = options.name
+                     or (per_second .. "/" .. burst .. "/" .. cost)
   local run = evaluator(RATE_SCRIPT)     -- holds a SHA, never a connection
 
   return function(req, next)
     local cache = options.cache or req.cache
-    local reply = run(cache, { prefix .. key_for(options, req) },
-                      { burst, per_second, cost })
+    local key = prefix .. segment(bucket)
+              .. segment(namespace_for(options, req))
+              .. segment(key_for(options, req))
+    local ok, reply = pcall(run, cache, { key }, { burst, per_second, cost })
+    if not ok or type(reply) ~= "table" then
+      if unavailable(options, req, "rate", ok and "malformed reply" or reply) then
+        return too_many(options.retry_after_ms or 1000)
+      end
+      return next(req)
+    end
     if tonumber(reply[1]) ~= 1 then
       return too_many(tonumber(reply[3]))
     end
@@ -260,13 +350,35 @@ function M.concurrent(options)
   local limit  = options.limit or 10
   local ttl    = options.ttl or 30      -- a slot cannot be held longer
   local prefix = options.prefix or "akkar:concurrent:"
+  local bucket = options.name or (limit .. "/" .. ttl)
   local acquire = evaluator(CONCURRENT_SCRIPT)
   local release = evaluator(RELEASE_SCRIPT)
 
   return function(req, next)
     local cache = options.cache or req.cache
-    local key = prefix .. key_for(options, req)
-    local reply = acquire(cache, { key }, { limit, ttl, req.id })
+    local key = prefix .. segment(bucket)
+              .. segment(namespace_for(options, req))
+              .. segment(key_for(options, req))
+
+    -- The slot's name is minted HERE, not taken from `req.id`. The ZSET
+    -- member is what a release deletes, and `req.id` is a value the caller
+    -- can influence: send the id somebody else's in-flight request is
+    -- holding and the release frees THEIR slot, letting the caller sit above
+    -- the limit while the limiter's own count says it did not. A slot
+    -- identity the caller can forge is not a slot identity, whatever the
+    -- request id happens to be constrained to today.
+    local slot = ("%s-%d"):format(rand.bytes(8):gsub(".", function(char)
+      return string.format("%02x", char:byte())
+    end), os.time())
+
+    local acquired, reply = pcall(acquire, cache, { key }, { limit, ttl, slot })
+    if not acquired or type(reply) ~= "table" then
+      if unavailable(options, req, "concurrent",
+                     acquired and "malformed reply" or reply) then
+        return too_many(options.retry_after_ms or 1000)
+      end
+      return next(req)
+    end
     if tonumber(reply[1]) ~= 1 then
       return too_many(options.retry_after_ms or 1000)
     end
@@ -275,7 +387,7 @@ function M.concurrent(options)
     -- error, for the same reason the connection pool releases on every exit:
     -- a slot that leaks on the error path leaks exactly when load is highest.
     local ok, result = pcall(next, req)
-    pcall(function() release(cache, { key }, { req.id }) end)
+    pcall(function() release(cache, { key }, { slot }) end)
     if not ok then error(result, 0) end
     return result
   end
@@ -288,19 +400,40 @@ end
 --- number. What it has is its own in-flight count, which is honest and local.
 ---
 ---     app:use(akkar.limit.shed {
+---       app = app, capacity = 500,
 ---       critical = function(req) return req.path:match "^/payments" end,
 ---     })
+---
+--- Both `app` and `capacity` are required, and that is a correction rather
+--- than a preference. The in-flight count lives on the app object, so without
+--- `app` this read 0 forever; the ceiling is a server setting that is never
+--- published back onto the app, so `app.max_concurrent` was nil and the
+--- comparison was skipped anyway. Its own docstring example passed neither,
+--- nothing in the repo set them, and there was no spec -- so the shedder as
+--- documented shed nothing, under any load, ever. Refusing to be built is the
+--- only version of that a team finds out about.
 function M.shed(options)
   options = options or {}
-  local ceiling  = options.ceiling or 0.8   -- fraction of max_concurrent
+  local ceiling  = options.ceiling or 0.8   -- fraction of capacity
   local critical = options.critical or function() return false end
+  local app      = options.app
+  local capacity = options.capacity
+
+  if type(app) ~= "table" then
+    error("limit.shed: app is required -- the in-flight count it sheds on "
+       .. "lives on the app object, and without it the shedder reads zero in "
+       .. "flight and never sheds. Pass app = app.", 0)
+  end
+  if type(capacity) ~= "number" or capacity <= 0 then
+    error("limit.shed: capacity is required -- how many requests in flight "
+       .. "counts as loaded. app:run{ max_concurrent = n } is a server "
+       .. "setting and is not readable from the app, so it has to be stated "
+       .. "here: capacity = n.", 0)
+  end
 
   return function(req, next)
-    local app = options.app
-    local in_flight = app and app.in_flight or 0
-    local capacity  = options.capacity or (app and app.max_concurrent)
-
-    if capacity and in_flight > capacity * ceiling and not critical(req) then
+    local in_flight = app.in_flight or 0
+    if in_flight > capacity * ceiling and not critical(req) then
       return too_many(options.retry_after_ms or 1000)
     end
     return next(req)

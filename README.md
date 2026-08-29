@@ -28,8 +28,14 @@ in: body limits, deadlines, pooling, graceful shutdown, structured logs,
 metrics, OpenAPI, multipart, an in-memory adapter for every capability, Teal
 declarations, and a strict mode that turns an accidental global into an error.
 
-Measured on a c5.2xlarge: linear scaling across physical cores, and the
-database dominating a real request twelve to one. See `bench/RESULTS.md`.
+Measured on a c5.2xlarge: linear scaling across physical cores, and a database
+route twelve times more expensive than the framework path. That cost is
+**pgmoon's, not Postgres's** — `bench/RESULTS.md` originally read the gap as
+"the database dominates" and retracts it in place: Gin reached 26,212 req/s and
+FastAPI 9,316 against the same Postgres on the same box, so Postgres was never
+the limit at akkar's 2.7k. The pure-Lua wire-protocol parser was. See
+`bench/RESULTS.md` for the retraction and `bench/study/RESULTS.md` for the
+peer numbers.
 
 There is no compatibility policy. The API will change.
 
@@ -220,8 +226,7 @@ end)
 ```
 
 **Adapters you can run without infrastructure.** Every capability ships an
-in-memory implementation next to the real one, so tests need nothing running
-and a small deployment can skip Redis entirely:
+in-memory implementation next to the real one, so tests need nothing running:
 
 ```lua
 local app_client = app:test {
@@ -236,6 +241,16 @@ The cache one is a real implementation with expiry, not a stand-in. The
 database one matches programmed queries and does not parse SQL, because a fake
 SQL engine would be a second database whose disagreements show up as tests
 that pass and production that does not.
+
+**A deployment cannot skip Redis** on the strength of that, and this README
+used to say it could. `akkar.cache.memory` implements `get`/`set`/`del`/`incr`/
+`expire`/`ttl` honestly, and if that is all you use it is a real cache with the
+per-process caveat you would expect. But `akkar.limit` and `akkar.idempotency`
+decide inside the store, as `EVAL`, and the memory adapter raises on `EVAL`
+rather than approximating it. What you get is not a weaker limiter: the rate
+limiter fails **open** by default (no limiting at all, one warning per request)
+and idempotency answers **500** on every keyed request. Redis is required for
+those two. See the two sections on them below.
 
 **Types, if you want them.** Lua checks nothing before the program runs, and
 writing akkar carefully does not change that. `types/akkar.d.tl` means a
@@ -315,8 +330,18 @@ assert.equal(422, res.status)
 assert.equal("required", res.body.fields["body.name"])
 ```
 
-The whole suite runs in about two seconds, most of which is deliberate
-sleeping in the deadline tests.
+The suite is **580 tests in about 33 seconds** (`busted`, measured
+2026-08-29 — 580 passes, 0 failures, 0 errors, 0 pending). It is under active
+development; re-measure rather than quoting this number back.
+
+**That number has a precondition.** It needs PostgreSQL on `127.0.0.1:55432`
+(database `akkar`, user `postgres`, password `akkar`) and Redis on
+`127.0.0.1:6379` — see "Running the examples" below for the two `docker run`
+lines. Without them the integration specs that need a store do not announce
+that they were skipped, they simply do not run -- when the suite stood at 456
+tests that turned it into **384 passes, 18 failures, 30 errors and 2 pending**.
+The exact figure tracks the size of the suite; the failure mode does not. A green-looking
+smaller number is not the same result.
 
 ---
 
@@ -600,10 +625,20 @@ handler error — and entries older than a TTL are dropped on acquire, so a
 handler that dies without releasing costs one slot for one TTL rather than
 forever. A limiter that leaks slots is worse than no limiter.
 
-**The limit that must be stated:** these are only as strong as the store. With
-`akkar.cache.memory` the counters are per process, so a fleet of six enforces
-six times the configured limit. That is a development default, not rate
-limiting. `akkar.limit.scriptable(cache)` says which one you have.
+**The limit that must be stated:** these need a store that runs scripts, and
+`akkar.cache.memory` is not one. It does **not** degrade to a weaker
+per-process counter — there is no such fallback in the code. `limit.rate` and
+`limit.concurrent` call `EVAL` unconditionally; the memory adapter raises
+`unsupported command 'EVAL'`; the limiter catches that and applies its
+`on_error` policy, which defaults to **`"open"` — the request is served
+unlimited** and a warning is logged. Measured on the shipped code: four
+requests against `per_second = 1, burst = 1` on the memory adapter all return
+200. `on_error = "closed"` turns the same situation into a 429 on every
+request instead. Neither is rate limiting; **rate limiting requires Redis.**
+
+`akkar.limit.scriptable(cache)` returns false for the memory adapter, but
+nothing calls it for you. Check it at startup if you would rather fail loudly
+than discover a week later, from the logs, that the limiter was never on.
 
 ## The same request twice, charged once
 
@@ -611,19 +646,24 @@ A client cannot tell "the request never arrived" from "the response never came
 back", so it retries — and the card is charged twice. Only the server can tell
 the difference, and only if it remembers.
 
-```lua
-app:use(akkar.idempotency { ttl = 86400 })
-```
-
-In multitenant applications, namespace records with server-resolved tenant
-identity. The namespace is part of the Redis key, so two tenants may safely
-send the same client-generated key:
+The key comes from the client, so the record it names has to be scoped by
+something the client does not choose. `namespace` is that something, and it is
+**required** — a single global keyspace over a client-supplied header means one
+tenant's `Idempotency-Key` can replay another tenant's response body, which was
+measured happening before this was mandatory. In a multitenant application it is
+the server-resolved tenant:
 
 ```lua
 app:use(akkar.idempotency {
   ttl = 86400,
   namespace = function(req) return req.tenant.id end,
 })
+```
+
+A genuinely single-tenant service says so, by name, rather than by omission:
+
+```lua
+app:use(akkar.idempotency { ttl = 86400, namespace = akkar.idempotency.GLOBAL })
 ```
 
 ```
@@ -646,8 +686,12 @@ remembered.
 **What it is not:** deduplication at the door, not an idempotent handler. If
 the handler charges a card and then crashes before returning, the charge
 happened and nothing here knows. That needs the payment processor's own key
-underneath this one. And the guarantee is only as strong as the store: with
-`akkar.cache.memory` it is per process, which is not deduplication at all.
+underneath this one. And it requires a store that runs scripts: with
+`akkar.cache.memory` it does not deduplicate per process — it does not run.
+The claim goes out as `EVAL`, the memory adapter raises `unsupported command
+'EVAL'`, and unlike the rate limiter this call has no `pcall` around it, so
+**every request carrying an `Idempotency-Key` becomes a 500.** Measured on the
+shipped code. Idempotency requires Redis.
 
 ## The write that vanishes
 
@@ -690,6 +734,7 @@ JSON API has today, which is nothing.
 |---|---|
 | Uploads are buffered, not streamed | a multipart body is held in memory under `body_limit` |
 | `akkar.cache.memory` is per-process | two processes have two caches, and akkar's answer to more CPU is more processes |
+| `akkar.cache.memory` cannot run scripts | it raises on `EVAL`, so `akkar.limit` fails open (no limiting) and `akkar.idempotency` answers 500. Both require Redis; there is no degraded in-memory mode |
 | Teal does not check schemas against handler output | schemas are runtime values; validation is what checks those |
 | Linear scan for dynamic routes | measured: 33 µs worst case at 50 routes against ~4000 µs for one query. Revisit past ~500 dynamic routes |
 | Pinned to Lua 5.4 | `cqueues` pins `lua == 5.4` and has had no release since 2020 — not `lua-http`, which accepts `>= 5.1` |

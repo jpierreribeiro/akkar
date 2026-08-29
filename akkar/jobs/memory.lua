@@ -4,6 +4,10 @@ akkar.jobs.memory — in-process persistence for a job queue.
 Same argument as the other `_memory` adapters: a shared, tested implementation
 of the store contract beats a fake per test file.
 
+Delivery is **at most once**, the same as the Redis store: `dequeue` removes
+the job and returns it, and nothing holds it while a handler runs. Here the
+crash boundary is the process, and losing the process loses the queue anyway.
+
 `dequeue` does not block. Nothing here should sleep waiting for work that can
 only arrive from the same process -- if the queue is empty it will stay empty
 until this coroutine yields, so blocking would be a deadlock rather than a
@@ -81,6 +85,18 @@ function Store:claim(key, id, ttl)
   if held and held > now then return false end
   seen[id] = now + (ttl or 3600)
   return true
+end
+
+--- Gives a claim back when the job it was taken for never got queued, so a
+--- failed enqueue does not leave the id answering "duplicate" for an hour
+--- about a job that does not exist. The Redis store does the same, because a
+--- fake whose behaviour differs from the real one is how a test proves the
+--- wrong thing.
+function Store:unclaim(key, id)
+  local seen = self.claims[key]
+  if not seen or seen[id] == nil then return 0 end
+  seen[id] = nil
+  return 1
 end
 
 --- Reads without removing, oldest first, to match what a reader expects.

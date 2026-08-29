@@ -18,7 +18,10 @@ Today every handler has to solve this individually, which means most will not.
 Middleware, not core -- the same argument as `akkar.cors`. Which requests are
 idempotent, and for how long, is application knowledge.
 
-    app:use(akkar.idempotency { ttl = 86400 })
+    app:use(akkar.idempotency {
+      ttl = 86400,
+      namespace = function(req) return req.tenant.id end,
+    })
 
     POST /charges
     Idempotency-Key: 8f14e45f-ea6e-4b3f-9c2a-1d2f3e4b5a60
@@ -26,6 +29,15 @@ idempotent, and for how long, is application knowledge.
 The first request with a given key runs and its response is stored. A repeat
 gets the stored response back -- the same status, the same body -- without the
 handler running again.
+
+**`namespace` is not optional, and that is the point.** The key is a header
+the CLIENT chooses, so a single global keyspace means tenant `evil` sends
+tenant `acme`'s key and is handed acme's stored 201 verbatim -- customer
+email, card last four, all of it -- with `idempotent-replay: true` on it. The
+namespace is what makes the keyspace the server's. Construction raises without
+one; `namespace = false` is the explicit "this application is single-tenant"
+opt-out, written down rather than inherited. `akkar.scope` refuses a nil tenant
+id for the same reason.
 
 ## Four cases, and three of them are the interesting ones
 
@@ -53,10 +65,14 @@ charges a card and then crashes before returning, the charge happened and
 nothing here knows. That is a two-phase problem and needs the payment
 processor's own idempotency key underneath this one.
 
-**The guarantee is only as strong as the store.** With `akkar.cache.memory`
-the record is per process, so a fleet of six deduplicates six times over --
-which is not deduplication. With Redis it is shared and real, and
-`akkar.limit.scriptable(cache)` says which one you have.
+**The guarantee is only as strong as the store, and one store cannot give it
+at all.** The claim is a Redis script, and `akkar.cache.memory` has no `EVAL`.
+There is no per-process fallback: on a store that cannot run the script every
+idempotent request is answered **503**, because the alternative -- running the
+handler with no claim -- is the double charge this module exists to prevent,
+and it would happen without a word. `akkar.limit.scriptable(cache)` answers
+this before the first request rather than after it. **Idempotency requires
+Redis.**
 
 **A stored response has a size cap.** Beyond it the response is not kept, and
 a repeat re-runs the handler. Refusing to store is better than an unbounded
@@ -65,22 +81,34 @@ write into a shared cache, and it is stated rather than discovered.
 
 local cjson = require "cjson"
 local digest = require "openssl.digest"
+local rand   = require "openssl.rand"
 
 local M = {}
+
+--- The explicit "this application really is single-tenant" opt-out, so that
+--- one global keyspace over a client-chosen header value is something a team
+--- wrote down rather than something it inherited.
+M.GLOBAL = false
 
 -- Claim, replay, or refuse -- decided in one atomic step, because the whole
 -- mechanism is read-then-write and the retry that matters is the one arriving
 -- while the first request is still running.
+--
+-- The claim carries a token nobody else can guess. Without it, a handler that
+-- outlived its claim would DELETE the claim of the retry that replaced it, and
+-- store its own answer over a record that is no longer about its request.
 local CLAIM_SCRIPT = [[
 local key         = KEYS[1]
 local ttl         = tonumber(ARGV[1])
 local fingerprint = ARGV[2]
+local token       = ARGV[3]
 
 local found = redis.call('HMGET', key, 'state', 'fingerprint', 'status', 'body')
 local state = found[1]
 
 if not state then
-  redis.call('HSET', key, 'state', 'running', 'fingerprint', fingerprint)
+  redis.call('HSET', key, 'state', 'running', 'fingerprint', fingerprint,
+             'token', token)
   redis.call('EXPIRE', key, ttl)
   return { 'run' }
 end
@@ -97,14 +125,24 @@ end
 return { 'done', found[3], found[4] }
 ]]
 
+-- Stores only under the token this request claimed with. A 0 back means the
+-- claim expired mid-handler and someone else now owns the key -- which is the
+-- double execution this module exists to prevent, so the caller is told rather
+-- than left to overwrite a stranger's record.
 local STORE_SCRIPT = [[
+if redis.call('HGET', KEYS[1], 'token') ~= ARGV[4] then return 0 end
 redis.call('HSET', KEYS[1], 'state', 'done', 'status', ARGV[1], 'body', ARGV[2])
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
 return 1
 ]]
 
--- A handler that failed must not poison the key: the retry is the point.
-local RELEASE_SCRIPT = [[ return redis.call('DEL', KEYS[1]) ]]
+-- A handler that failed must not poison the key: the retry is the point. Token
+-- guarded, so a late release cannot free the claim of the request that
+-- replaced it and hand a third copy of the work to the next retry.
+local RELEASE_SCRIPT = [[
+if redis.call('HGET', KEYS[1], 'token') ~= ARGV[1] then return 0 end
+return redis.call('DEL', KEYS[1])
+]]
 
 -- Reuses the evaluator discipline from `akkar.limit`: the cache handle is
 -- passed at call time and never captured, because a captured handle belongs
@@ -149,11 +187,15 @@ local function canonical_json(value)
     for index = 1, #value do parts[index] = canonical_json(value[index]) end
     return "[" .. table.concat(parts, ",") .. "]"
   end
+  -- Sorted by the key's JSON spelling, indexed by the key itself: sorting a
+  -- list of `tostring(key)` and then reading `value[key]` off it looks up the
+  -- string "2" in a table holding the number 2, so a mixed body fingerprinted
+  -- as `"2":null` and two different requests shared one fingerprint.
   local keys = {}
-  for key in pairs(value) do keys[#keys + 1] = tostring(key) end
-  table.sort(keys)
+  for key in pairs(value) do keys[#keys + 1] = key end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
   for _, key in ipairs(keys) do
-    parts[#parts + 1] = cjson.encode(key) .. ":" .. canonical_json(value[key])
+    parts[#parts + 1] = cjson.encode(tostring(key)) .. ":" .. canonical_json(value[key])
   end
   return "{" .. table.concat(parts, ",") .. "}"
 end
@@ -186,7 +228,15 @@ M.fingerprint_of = fingerprint_of
 function M.new(options)
   options = options or {}
   local ttl        = options.ttl or 86400
-  local running_ttl = options.running_ttl or math.min(ttl, 30)
+  -- The claim has to outlive the handler. It used to expire at 30 seconds,
+  -- which is the module's own motivating scenario exactly -- "a proxy times
+  -- out at thirty seconds while the handler takes thirty-one" -- so the claim
+  -- was gone by the time the retry arrived and the card was charged twice,
+  -- with `idempotent-replay` on neither answer. Fifteen minutes outlasts any
+  -- handler the request deadline has not already killed, and still frees a
+  -- claim stranded by a crashed process the same afternoon rather than a day
+  -- later.
+  local running_ttl = options.running_ttl or math.min(ttl, 900)
   local prefix     = options.prefix or "akkar:idem:"
   local header     = options.header or "idempotency-key"
   local max_bytes  = options.max_bytes or 64 * 1024
@@ -194,6 +244,26 @@ function M.new(options)
   local namespace  = options.namespace
   local seal       = options.seal
   local open       = options.open
+
+  -- The record is `prefix .. key` over a header the CLIENT chooses. With one
+  -- global keyspace, tenant `evil` sends tenant `acme`'s key and is handed
+  -- acme's stored 201 verbatim -- customer_email, card_last4 and all -- with
+  -- `idempotent-replay: true`. The namespace is what makes the keyspace the
+  -- server's rather than the caller's, so it is not optional; `akkar.scope`
+  -- raises on a nil tenant id for the same reason, and this is the same bug.
+  if namespace == nil then
+    error("idempotency: namespace is required. The idempotency key comes from "
+       .. "the client, so without a server-resolved namespace one tenant can "
+       .. "replay another tenant's stored response body. Pass "
+       .. "namespace = function(req) return req.tenant.id end, or "
+       .. "namespace = false to state that this application is single-tenant "
+       .. "and one global keyspace is intended.", 0)
+  end
+  if namespace ~= false and type(namespace) ~= "function"
+     and type(namespace) ~= "string" then
+    error("idempotency: namespace must be a function(req), a constant string, "
+       .. "or false", 0)
+  end
 
   local methods = {}
   for _, m in ipairs(options.methods or { "POST", "PATCH" }) do
@@ -226,19 +296,52 @@ function M.new(options)
     local cache = options.cache or req.cache
     local scoped = ""
     if namespace then
-      scoped = tostring(namespace(req) or "")
+      scoped = type(namespace) == "function" and namespace(req) or namespace
+      scoped = tostring(scoped or "")
       if scoped == "" then
         error("idempotency: namespace returned an empty value", 0)
       end
       if #scoped > 255 then
         error("idempotency: namespace must be at most 255 characters", 0)
       end
-      scoped = scoped .. ":"
     end
-    local record = prefix .. scoped .. key
+    -- Length-prefixed rather than joined by a colon: the namespace and the key
+    -- are both caller-influenced strings, and `"a:b" .. ":" .. "c"` and
+    -- `"a" .. ":" .. "b:c"` are the same record -- a cross-tenant replay
+    -- assembled out of two legal values.
+    local record = prefix .. #scoped .. ":" .. scoped .. key
     local fingerprint = fingerprint_of(req)
+    local token = (rand.bytes(16):gsub(".", function(char)
+      return string.format("%02x", char:byte())
+    end))
 
-    local verdict = claim(cache, { record }, { running_ttl, fingerprint })
+    -- A store that cannot answer is not a reason to run the handler. The
+    -- claim call carried no `pcall`, so `akkar.cache.memory` -- which has no
+    -- EVAL and says so -- turned every idempotent route into a 500, and a
+    -- Redis blip did the same. Neither is the per-process deduplication the
+    -- docstring used to promise.
+    --
+    -- Unlike `akkar.limit`, there is no fail-open here and there should not
+    -- be: serving the request unguarded is exactly the double charge this
+    -- module exists to prevent, and it would happen silently. 503 says the
+    -- guarantee is unavailable, which a client can retry against.
+    local claimed, verdict = pcall(claim, cache, { record },
+                                   { running_ttl, fingerprint, token })
+    if not claimed or type(verdict) ~= "table" then
+      local log = rawget(req, "log")
+      if log then
+        log:error("idempotency: the store could not answer; refusing rather "
+               .. "than running the handler unguarded", {
+          error = tostring(verdict), path = req.path,
+        })
+      end
+      local res = akkar.response(503, {
+        error = "idempotency is unavailable; the request was not run",
+        hint = "retry with the same " .. header,
+      })
+      res.headers = { ["retry-after"] = "1" }
+      return res
+    end
     local state = verdict[1]
 
     if state == "mismatch" then
@@ -281,7 +384,7 @@ function M.new(options)
     -- support is refused for the whole TTL.
     local ok, result = pcall(next, req)
     if not ok then
-      pcall(function() release(cache, { record }, {}) end)
+      pcall(function() release(cache, { record }, { token }) end)
       error(result, 0)
     end
 
@@ -294,13 +397,13 @@ function M.new(options)
     --
     -- Not storable, so the claim goes back and a repeat re-runs the export.
     if result and result.stream then
-      pcall(function() release(cache, { record }, {}) end)
+      pcall(function() release(cache, { record }, { token }) end)
       return result
     end
 
     local status = result and result.status or 200
     if status < 200 or status >= 300 then
-      pcall(function() release(cache, { record }, {}) end)
+      pcall(function() release(cache, { record }, { token }) end)
       return result
     end
 
@@ -326,7 +429,7 @@ function M.new(options)
     if #stored_body > max_bytes then
       -- Refusing to store beats an unbounded write into a shared cache. The
       -- guarantee is lost for this response and the caller is told so.
-      pcall(function() release(cache, { record }, {}) end)
+      pcall(function() release(cache, { record }, { token }) end)
       local log = rawget(req, "log")
       if log then
         log:warn("idempotency: response too large to store", {
@@ -336,10 +439,20 @@ function M.new(options)
       return result
     end
 
-    local stored = pcall(function() store(cache, { record }, { status, stored_body, ttl }) end)
+    local stored, held = pcall(function()
+      return store(cache, { record }, { status, stored_body, ttl, token })
+    end)
+    local log = rawget(req, "log")
     if not stored then
-      local log = rawget(req, "log")
       if log then log:error("idempotency: response store failed; durable handler recovery required") end
+    elseif tonumber(held) == 0 and log then
+      -- The claim was gone by the time the handler finished, so this response
+      -- is not stored and the retry that already ran is a second execution.
+      -- Silence here is how a double charge stays invisible.
+      log:error("idempotency: the in-flight claim expired before the handler "
+             .. "returned; the operation may have run twice", {
+        path = req.path, running_ttl_s = running_ttl,
+      })
     end
     return result
   end

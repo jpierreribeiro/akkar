@@ -77,6 +77,23 @@ end
 
 M.fnv1a = fnv1a
 
+--- A table is an array only if its keys are exactly 1..n. `value[1] ~= nil`
+--- was not that test: `{ [1] = "row", status = "draft", owner = "alice" }`
+--- took the array branch, serialised to `["row"]`, and every other key
+--- vanished from the tag while cjson sent all of them to the client. Two
+--- bodies differing only in `status` hashed identically, so `If-Match`
+--- accepted a stale write and `If-None-Match` answered 304 for content that
+--- had changed -- in the module whose whole subject is the write that
+--- vanishes.
+local function is_array(value)
+  local count, maximum = 0, 0
+  for key in pairs(value) do
+    if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then return false end
+    count, maximum = count + 1, math.max(maximum, key)
+  end
+  return count == maximum
+end
+
 --- Canonical JSON, so the tag does not change when nothing did.
 ---
 --- `pairs()` has no defined order in Lua, so encoding the same table twice can
@@ -89,19 +106,23 @@ local function canonical(value)
     return cjson.encode(value)
   end
 
-  if value[1] ~= nil or next(value) == nil then       -- array or empty
+  if is_array(value) then                             -- array or empty
     local parts = {}
     for i = 1, #value do parts[i] = canonical(value[i]) end
     return "[" .. table.concat(parts, ",") .. "]"
   end
 
+  -- Sorted by the key's JSON spelling, but indexed by the key itself: sorting
+  -- a list of `tostring(k)` and then reading `value[k]` off it looked up the
+  -- string "2" in a table holding the number 2 and emitted `"2":null`, which
+  -- is a second way for a change to leave the tag alone.
   local keys = {}
-  for k in pairs(value) do keys[#keys + 1] = tostring(k) end
-  table.sort(keys)
+  for k in pairs(value) do keys[#keys + 1] = k end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
 
   local parts = {}
   for i, k in ipairs(keys) do
-    parts[i] = cjson.encode(k) .. ":" .. canonical(value[k])
+    parts[i] = cjson.encode(tostring(k)) .. ":" .. canonical(value[k])
   end
   return "{" .. table.concat(parts, ",") .. "}"
 end

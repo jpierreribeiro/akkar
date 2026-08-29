@@ -61,14 +61,37 @@ function M.yielding(every, fn)
   end)
 end
 
---- Wraps a handler so its whole body runs with a yield budget.  Useful when
---- the expensive part is a library call you cannot thread a `yield` into but
---- which does return to Lua often.
+--- Wraps a handler so it is HANDED a yield, as a trailing argument, without
+--- having to build the counter itself.
+---
+---     app:get("/report", akkar.work.chunked(500)(function(req, yield)
+---       for _, row in ipairs(rows) do
+---         out[#out + 1] = render(row)
+---         yield()
+---       end
+---       return out
+---     end))
+---
+--- It used to be an identity wrapper. The inner closure took no argument and
+--- so never called the yield function `yielding` handed it, which made
+--- `chunked(10)` over a million iterations produce **zero** scheduler trips
+--- while documenting itself as "wraps a handler so its whole body runs with a
+--- yield budget". A wrapper that measurably does nothing is worse than no
+--- wrapper: someone reads the call site and stops looking.
+---
+--- The old claim -- a yield budget over a body that does not cooperate --
+--- cannot be honoured, and this module already says why: there is no point at
+--- which Lua regains control inside a C call that does not return. So the
+--- handler is given the yield and decides where a turn is safe to take.
 function M.chunked(every)
   return function(fn)
     return function(...)
       local args = table.pack(...)
-      return M.yielding(every, function() return fn(table.unpack(args, 1, args.n)) end)
+      return M.yielding(every, function(yield)
+        args[args.n + 1] = yield
+        args.n = args.n + 1
+        return fn(table.unpack(args, 1, args.n))
+      end)
     end
   end
 end

@@ -28,6 +28,13 @@ Memory.__index = Memory
 local M = {}
 
 --- The clock is injectable so tests can move time without sleeping.
+---
+--- Held as a plain function and called as `self.now()`, never with a colon.
+--- Called with the colon it was handed the cache table as its argument, so
+--- the default `os.time` was asked to read a date out of a table of entries
+--- and every TTL write raised `field 'year' missing in date table` -- on the
+--- documented single-process path, which no spec exercised because every spec
+--- that touches a TTL injects a clock of its own.
 function M.new(options)
   options = options or {}
   return setmetatable({
@@ -39,7 +46,7 @@ end
 local function live(self, key)
   local entry = self.store[key]
   if not entry then return nil end
-  if entry.expires and entry.expires <= self:now() then
+  if entry.expires and entry.expires <= self.now() then
     self.store[key] = nil
     return nil
   end
@@ -54,7 +61,7 @@ end
 function Memory:set(key, value, ttl)
   self.store[key] = {
     value = tostring(value),
-    expires = ttl and (self:now() + ttl) or nil,
+    expires = ttl and (self.now() + ttl) or nil,
   }
   return "OK"
 end
@@ -81,7 +88,7 @@ end
 function Memory:expire(key, seconds)
   local entry = live(self, key)
   if not entry then return 0 end
-  entry.expires = self:now() + seconds
+  entry.expires = self.now() + seconds
   return 1
 end
 
@@ -91,7 +98,7 @@ function Memory:ttl(key)
   local entry = live(self, key)
   if not entry then return -2 end
   if not entry.expires then return -1 end
-  return entry.expires - self:now()
+  return entry.expires - self.now()
 end
 
 function Memory:command(name, ...)

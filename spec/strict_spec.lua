@@ -11,10 +11,14 @@ local akkar  = require "akkar"
 local strict = require "akkar.strict"
 
 describe("strict mode", function()
-  after_each(function() strict.off() end)
+  -- `off` needs the key `on` returned: strict mode is process-wide, so being
+  -- able to switch it off from anywhere would switch it off for everyone.
+  local key
+  local function turn_on() key = strict.on() ; return key end
+  after_each(function() if key then strict.off(key) ; key = nil end end)
 
   it("raises on assignment to an undeclared global", function()
-    strict.on()
+    turn_on()
     local ok, err = pcall(function()
       local chunk = load "akkar_spec_leaked = 1"
       chunk()
@@ -24,7 +28,7 @@ describe("strict mode", function()
   end)
 
   it("explains why it matters on a server, not just that it happened", function()
-    strict.on()
+    turn_on()
     local _, err = pcall(function() load "akkar_spec_leaked2 = 1" () end)
     -- A message that only says "undeclared global" teaches nothing.
     assert.is_truthy(tostring(err):match "outlives the request")
@@ -32,21 +36,21 @@ describe("strict mode", function()
   end)
 
   it("raises on reading an undeclared global", function()
-    strict.on()
+    turn_on()
     local ok, err = pcall(function() return load "return akkar_spec_typo" () end)
     assert.is_false(ok)
     assert.is_truthy(tostring(err):match "read of undeclared global")
   end)
 
   it("leaves the standard library alone", function()
-    strict.on()
+    turn_on()
     assert.is_function(print)
     assert.is_table(table)
     assert.is_function(require)
   end)
 
   it("allows a global that was declared on purpose", function()
-    strict.on()
+    turn_on()
     strict.declare "akkar_spec_intentional"
     local ok = pcall(function() load "akkar_spec_intentional = 42" () end)
     assert.is_true(ok)
@@ -54,17 +58,17 @@ describe("strict mode", function()
   end)
 
   it("is idempotent and reversible", function()
-    strict.on()
-    strict.on()
+    turn_on()
+    turn_on()
     assert.is_true(strict.active())
-    strict.off()
+    strict.off(key) ; key = nil
     assert.is_false(strict.active())
     local ok = pcall(function() load "akkar_spec_after_off = 1" () end)
     assert.is_true(ok)
   end)
 
   it("catches a handler leaking state between requests", function()
-    strict.on()
+    turn_on()
     local app = akkar.new()
     -- The bug this exists for: a counter that looks local and is not, so the
     -- second request sees the first request's value.

@@ -26,11 +26,26 @@ Reading an undeclared global raises. Writing one raises. Declaring one on
 purpose is possible and explicit.
 
     local strict = require "akkar.strict"
-    strict.on()
+    local key = strict.on()
 
     counter = 0                 -- error: assignment to undeclared global 'counter'
     strict.declare "counter"    -- explicit, and now allowed
     counter = 0                 -- fine
+
+    strict.off(key)             -- and only with the key `on` gave back
+
+`on` hands back a key because strict mode is **process-wide**: `off` used to
+be callable by anything that could `require` this module, which is every
+handler in the process, so one of them could switch the check off for the
+whole server and every other request in it.
+
+`_G`'s metatable is shared ground and this module does not try to own it. `on`
+refuses to install over one somebody else put there rather than replacing it,
+and `off` puts back what it found and only when the metatable is still the one
+it installed. Setting `__metatable` to make it untouchable was tried and
+reverted: busted swaps `_G`'s metatable to implement `insulate` and `expose`,
+so protecting it stops the test suite dead -- which is the same lesson from
+the other side.
 
 ## What it costs
 
@@ -47,6 +62,9 @@ local M = {}
 
 local declared = {}
 local active = false
+local installed                 -- the metatable we put on _G, to recognise it
+local previous                  -- whatever was there before, to give back
+local key                       -- what `off` has to present
 
 -- Everything already present when strict mode is installed counts as
 -- declared: the standard library, and anything the program set up before
@@ -74,12 +92,37 @@ function M.declared(name)
 end
 
 --- Installs the check.  Idempotent.
+---
+--- Returns the KEY that `off` requires. `off` used to be callable by anyone
+--- who could `require` this module -- which is every handler in the process --
+--- so any one of them could turn strict mode off for the whole server and for
+--- every other request in it. Turning it off now belongs to whoever turned it
+--- on.
+---
+--- Refuses to install over somebody else's `_G` metatable rather than
+--- replacing it. Two libraries arguing over the global table is a
+--- configuration error, and silently winning it would break whatever the
+--- other one was doing -- an ORM's lazy loader, a REPL's autocomplete --
+--- somewhere far from here.
 function M.on()
-  if active then return M end
+  if active then return key end
+
+  local existing = getmetatable(_G)
+  if existing ~= nil then
+    error("akkar.strict: the global table already has a metatable, and " ..
+          "replacing it would silently break whatever installed it. Turn " ..
+          "that off, or leave strict mode off.", 2)
+  end
+
   snapshot()
   active = true
+  previous = existing
+  key = {}
 
-  setmetatable(_G, {
+  installed = {
+    -- Protected, so the check cannot be removed by a `setmetatable(_G, nil)`
+    -- from anywhere in the process. `off` restores through `debug` because
+    -- that is the only door left, and it is the one this module holds.
     __newindex = function(table, name, value)
       if not declared[name] then
         error(string.format(
@@ -103,14 +146,26 @@ function M.on()
       end
       return nil
     end,
-  })
-  return M
+  }
+
+  debug.setmetatable(_G, installed)
+  return key
 end
 
-function M.off()
+--- Takes the check back off, given the key `on` returned.
+function M.off(given)
   if not active then return M end
-  setmetatable(_G, nil)
-  active = false
+  if given ~= key then
+    error("akkar.strict: off() needs the key on() returned. Strict mode is " ..
+          "process-wide, so switching it off from anywhere in the process " ..
+          "switches it off for every request in it.", 2)
+  end
+  -- Only ours comes off. If something replaced it despite the protection,
+  -- removing that would be the clobber this module refuses to do.
+  if rawequal(debug.getmetatable(_G), installed) then
+    debug.setmetatable(_G, previous)
+  end
+  installed, key, active = nil, nil, false
   return M
 end
 

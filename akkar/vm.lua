@@ -14,8 +14,8 @@ subprocess. What exists here is:
 
 - a curated `_ENV` -- the untrusted chunk sees only what is listed below;
 - text-only loading, because bytecode escapes every sandbox ever written;
-- an instruction budget enforced by a count hook;
-- a memory ceiling sampled at those same hook firings.
+- an instruction budget charged on every hook firing;
+- a memory ceiling sampled on every LINE the chunk executes.
 
 Within those limits it is real. Beyond them it is not a security boundary
 against a determined attacker sharing your process, and this file will not
@@ -48,6 +48,37 @@ all.
 So the bound is installed on the real `string.rep`, and applies only while a
 sandbox is running -- a depth counter set by `run`. Outside a run it behaves
 exactly as it always did.
+
+**And bounding `rep` does not bound `..`.** `s = s .. s` is one instruction,
+twelve of them double a string twelve times, and the count hook fires every
+thousand -- so it never fired at all. Measured: a chunk built a **4 GiB**
+string against a 1 MB ceiling and the report came back `peak_kb = 0,
+instructions = 0, exceeded = nil`. One tenant OOM-kills the process for every
+tenant, and the sandbox says nothing happened.
+
+Concatenation of two strings is executed by the VM without consulting any
+metatable, so there is nothing to wrap. What there is instead is the **line**
+hook: memory is sampled on every line the chunk executes, so a doubling loop
+is checked once per iteration. The residual, stated rather than discovered:
+the overshoot is bounded by what a single LINE can allocate, not by the
+ceiling itself -- the run above now stops at 1,530 KB against 1,024. If that
+margin matters, it is the separate-process answer above.
+
+Two consequences of the line hook, both stated rather than discovered.
+Installing it **starves the count hook**: measured on `while true do end`,
+200,000 line events arrived with one count event beside them, so the budget is
+charged on both -- `step` for a count event, one for a line -- and a chunk is
+under-charged for its work rather than over-charged. And a sandbox now runs
+about an order of magnitude slower than host code, which is the price of a
+ceiling that is a ceiling.
+
+**Anything reachable through the shared string metatable, not just `rep`.**
+`env.string.dump = nil` removed the sandbox's copy, and the copy was never the
+route: `("").dump` resolves through that same metatable to the real library. A
+chunk handed a host function through the documented `options.expose` pattern
+dumped it and read a live-looking API key out of the constant table. So
+`dump` is withdrawn where `rep` is bounded -- on the real library, for the
+duration of a run, on this coroutine only.
 
 `string.format` was bounded here too, against a wide field like
 `%099999999d`. It has been taken out: Lua 5.4 rejects any width of 100 or
@@ -181,13 +212,21 @@ local MAX_STRING = 1024 * 1024
 -- abandoned coroutine's entry is simply garbage that nothing ever reads
 -- again, and no two sandboxes can see each other's ceiling. The table holds
 -- weak keys so a collected coroutine takes its entry with it.
-local MAX_STRING = 1024 * 1024
 local active = setmetatable({}, { __mode = "k" })
 local bounds_installed = false
 
 local function current_limit()
   local co = coroutine.running()
   return co and active[co] or nil
+end
+
+--- True while THIS coroutine is inside `run`.
+---
+--- Distinct from `current_limit`, which answers "how many bytes", because the
+--- functions withdrawn from a sandbox are withdrawn regardless of size.
+local function in_sandbox()
+  local co = coroutine.running()
+  return co ~= nil and active[co] ~= nil
 end
 
 local function install_string_bounds()
@@ -206,6 +245,25 @@ local function install_string_bounds()
       end
     end
     return rep(s, n, sep)
+  end
+
+  -- `env.string.dump = nil` deleted the sandbox's COPY, and the copy is not
+  -- the route: `("").dump` resolves through the shared string metatable to
+  -- the real library, which is the exact mechanism this file already wrote
+  -- down for `rep` and then did not generalise. Measured: a chunk handed a
+  -- host function through the documented `options.expose` pattern dumped it
+  -- and read a live-looking API key straight out of the constant table.
+  --
+  -- So it is withdrawn where it actually lives, on the same depth counter, and
+  -- restored to the host the moment the run ends.
+  local dump = string.dump
+
+  string.dump = function(...)
+    if in_sandbox() then
+      error("string.dump produces bytecode, and bytecode carries the "
+         .. "function's constants; it is not available inside a sandbox", 2)
+    end
+    return dump(...)
   end
 end
 
@@ -288,18 +346,61 @@ function M.run(chunk, limits, ...)
   local baseline = collectgarbage "count"
   local used, peak = 0, 0
 
-  local function hook()
-    used = used + step
+  local function sample()
     local grown = collectgarbage "count" - baseline
     if grown > peak then peak = grown end
+    return grown
+  end
 
-    if used > max_instructions then
+  -- Fires on every LINE as well as every `step` instructions.
+  --
+  -- Sampling only on the count hook meant the ceiling did not bound `..` at
+  -- all: `for i = 1, 22 do s = s .. s end` is a couple of dozen instructions,
+  -- so the hook never fired, and a measured run built a 4 GiB string against
+  -- a 1 MB ceiling and reported `peak_kb = 0, instructions = 0, exceeded =
+  -- nil`. One tenant OOM-kills the process for every tenant, and the report
+  -- says nothing happened.
+  --
+  -- There is no allocation hook in Lua, and `..` on two strings is handled by
+  -- the VM without consulting any metatable, so it cannot be wrapped the way
+  -- `string.rep` is. The line hook is the closest thing to one: a doubling
+  -- loop is checked once per iteration, so the overshoot is what a SINGLE
+  -- LINE can allocate rather than what a program can. That residual is stated
+  -- in the module comment rather than left to be discovered.
+  -- A line hook fires on `run`'s OWN lines as well, including the ones after
+  -- the chunk has returned and memory is still high. Raising there would
+  -- happen outside the pcall and escape to the caller as a framework error
+  -- rather than as this chunk's refusal. So the budget is only enforced on a
+  -- frame belonging to the untrusted source -- checked on the raising path,
+  -- which is taken once, and never on the sampling path, which is taken
+  -- constantly.
+  local chunk_source = debug.getinfo(chunk, "S").short_src
+
+  local function in_the_chunk()
+    local info = debug.getinfo(3, "S")     -- 1 = here, 2 = hook, 3 = interrupted
+    return info ~= nil and info.short_src == chunk_source
+  end
+
+  -- Charged per hook firing, and the two firings are worth different amounts.
+  --
+  -- A count event means `step` instructions went by. A line event means at
+  -- least one did. Both are charged because installing the line mask starves
+  -- the count hook: measured on `while true do end`, 200,000 line events
+  -- arrived with ONE count event beside them, so a budget fed only by count
+  -- events stopped stopping infinite loops. Charging a line as one
+  -- instruction under-counts real work and never over-counts it, which is the
+  -- right direction for a budget to be wrong in.
+  local function hook(event)
+    used = used + (event == "count" and step or 1)
+    local grown = sample()
+
+    if used > max_instructions and in_the_chunk() then
       state.exceeded = state.exceeded or "instruction budget"
       state.reason = "akkar.vm: instruction budget of " .. max_instructions ..
                      " exhausted"
       error(state.reason, 2)
     end
-    if grown > max_memory_kb then
+    if grown > max_memory_kb and in_the_chunk() then
       state.exceeded = state.exceeded or "memory ceiling"
       state.reason = ("akkar.vm: memory ceiling of %d KB exceeded (%.0f KB)")
                      :format(max_memory_kb, grown)
@@ -311,7 +412,7 @@ function M.run(chunk, limits, ...)
   -- blocking watchdog is a count hook too, and losing it here would silence
   -- the diagnostic for every request that ran a sandbox.
   local previous, previous_mask, previous_count = debug.gethook()
-  debug.sethook(hook, "", step)
+  debug.sethook(hook, "l", step)
   -- Marked on THIS coroutine only, so an abandoned run cannot bound anybody
   -- else and two tenants cannot see each other's ceiling.
   local co = coroutine.running()
@@ -319,9 +420,15 @@ function M.run(chunk, limits, ...)
   if co then active[co] = state.max_string or MAX_STRING end
 
   local results = table.pack(pcall(chunk, ...))
+  debug.sethook(previous, previous_mask or "", previous_count or 0)
+
+  -- The last thing a chunk does can be the expensive thing, and it happens
+  -- after the final hook fired. Sampling once more is the difference between
+  -- a report and a report that is wrong in the caller's favour -- the run
+  -- that built four gigabytes reported `peak_kb = 0`.
+  sample()
 
   if co then active[co] = restore end
-  debug.sethook(previous, previous_mask or "", previous_count or 0)
 
   local report = { instructions = used, peak_kb = peak, exceeded = state.exceeded }
   if not results[1] then return false, results[2], report end

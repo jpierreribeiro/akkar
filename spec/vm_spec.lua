@@ -236,3 +236,75 @@ describe("bounding the real string library", function()
     assert.equal(2 * 1024 * 1024, #("x"):rep(2 * 1024 * 1024))
   end)
 end)
+
+describe("the memory ceiling", function()
+  it("bounds concatenation, which is where the ceiling used to end", function()
+    -- `s = s .. s` is one instruction and twelve of them double a string
+    -- twelve times, so the count hook -- every thousandth instruction --
+    -- never fired. Measured before this: a 4 GiB string against a 1 MB
+    -- ceiling, reported as `peak_kb = 0, exceeded = nil`.
+    local ok, err, report = vm.eval([[
+      local s = string.rep("x", 1024)
+      for i = 1, 22 do s = s .. s end
+      return #s
+    ]], { limits = { memory_kb = 1024, instructions = 10e6 } })
+
+    assert.is_false(ok, "the chunk built " .. tostring(err) .. " bytes freely")
+    assert.equal("memory ceiling", report.exceeded)
+    assert.is_truthy(tostring(err):find("memory ceiling", 1, true))
+  end)
+
+  it("reports the peak it actually reached", function()
+    -- A report that says `peak_kb = 0` about a run that took gigabytes is
+    -- worse than no report: it is used to decide the limits are generous.
+    local _, _, report = vm.eval([[
+      local s = string.rep("x", 1024)
+      for i = 1, 22 do s = s .. s end
+      return #s
+    ]], { limits = { memory_kb = 1024, instructions = 10e6 } })
+    assert.is_true(report.peak_kb > 1024,
+      "peak_kb came back as " .. tostring(report.peak_kb))
+  end)
+
+  it("does not raise past the chunk, into the framework", function()
+    -- The line hook fires on `run`'s own lines too, after the chunk returned
+    -- and while memory is still high. Raising there is outside the pcall.
+    local ok = pcall(vm.eval, [[
+      local s = string.rep("x", 1024)
+      for i = 1, 22 do s = s .. s end
+    ]], { limits = { memory_kb = 1024 } })
+    assert.is_true(ok, "the ceiling escaped run() instead of refusing the chunk")
+  end)
+
+  it("leaves an ordinary chunk alone", function()
+    local ok, value, report = vm.eval "local t = 0 for i = 1, 500 do t = t + i end return t"
+    assert.is_true(ok)
+    assert.equal(125250, value)
+    assert.is_nil(report.exceeded)
+  end)
+end)
+
+describe("string.dump, which the curated environment does not cover", function()
+  it("is not reachable through the shared string metatable", function()
+    -- `env.string.dump = nil` removed the sandbox's COPY. `("").dump`
+    -- resolves through the string metatable to the real library, and the
+    -- bytecode it returns carries the function's constants: a host closure
+    -- passed in through the documented `expose` pattern gave up an API key.
+    local function host() return "sk-live-DEADBEEF-not-a-real-key" end
+    local ok, err = vm.eval([[ return ("").dump(leaked) ]],
+                            { expose = { leaked = host } })
+    assert.is_false(ok, "the chunk dumped a host closure")
+    assert.is_truthy(tostring(err):find("bytecode", 1, true))
+  end)
+
+  it("is not reachable through the sandbox's own string table either", function()
+    local ok = vm.eval [[ return string.dump(function() end) ]]
+    assert.is_false(ok)
+  end)
+
+  it("still works for the host, which is the point of the depth counter", function()
+    local function host() return 41 + 1 end
+    vm.eval "return 1"
+    assert.is_true(#string.dump(host) > 0)
+  end)
+end)

@@ -26,6 +26,7 @@ belongs here.
     store:schedule(key, encoded, run_at)  -- hold until a wall-clock time
     store:promote(key, now)               -- move what is due into the queue
     store:claim(key, id, ttl)             -- false if this id was seen already
+    store:unclaim(key, id)                -- give a claim back
     store:peek(key, limit)                -- read without removing
     store:trim(key, keep)                 -- cap a list's length
 
@@ -65,9 +66,39 @@ can: an id the store refuses to accept twice.
 The second push returns `false, "duplicate"`. That is deduplication at the
 door, which is a different thing from an idempotent handler and does not
 pretend to replace one.
+
+## What a delivery is worth, said before it is relied on
+
+**At most once.** Both shipped stores take a job off the queue and hand it
+over in one step; there is no processing list, no visibility timeout and no
+acknowledgement. A worker killed between the pop and the end of its handler
+takes that job with it, and nothing redelivers it or records that it existed.
+
+That is a real limit and it is the store's to fix, not this module's -- see
+`akkar.jobs.redis`. What belongs here is saying so, because a queue whose
+users believe it is at-least-once is worse than one they know is not.
 ]]
 
 local cjson = require "cjson"
+local rand  = require "openssl.rand"
+
+-- Every job carries one of these, and it is not decoration.
+--
+-- The Redis store schedules with `ZADD <key> <run_at> <encoded job>`, so the
+-- ENCODED JOB is the sorted-set member and two byte-identical jobs due in the
+-- same second are one member: a customer double-clicking "email me the
+-- receipt" got one email, and a hundred jobs failing against a database that
+-- had just come back merged into a single retry. The memory store, which
+-- appends to a list, did not collapse them -- so the two backends silently
+-- disagreed about how many jobs existed.
+--
+-- Fixed here rather than in the store, because uniqueness is a property of a
+-- job, and a fix in one store would have left the other still disagreeing.
+local function unique_id()
+  return (rand.bytes(12):gsub(".", function(char)
+    return string.format("%02x", char:byte())
+  end))
+end
 
 local Queue = {}
 Queue.__index = Queue
@@ -147,21 +178,41 @@ function Queue:push(kind, payload, options)
 
   local encoded = cjson.encode {
     id = options.id,
+    uid = unique_id(),
     kind = kind,
     payload = payload,
     queued_at = os.time(),
     attempts = 0,
   }
 
+  -- The claim above is taken BEFORE the job exists, which is the only order
+  -- that closes the race between two producers. So the failure path has to
+  -- give it back: held through a failed enqueue, the id reported "duplicate"
+  -- for the next hour about a job that was never queued.
+  local function release()
+    if options.id and supports(self.store, "unclaim") then
+      pcall(function() self.store:unclaim(self.key, options.id) end)
+    end
+  end
+
   if options.delay and options.delay > 0 then
     if not supports(self.store, "schedule") then
+      release()
       error("akkar.jobs: this store cannot delay a job; it implements no " ..
             ":schedule", 2)
     end
-    return self.store:schedule(self.key, encoded, os.time() + options.delay)
+    local ok, result = pcall(function()
+      return self.store:schedule(self.key, encoded, os.time() + options.delay)
+    end)
+    if not ok then release() ; error(result, 0) end
+    return result
   end
 
-  return self.store:enqueue(self.key, encoded)
+  local ok, result = pcall(function()
+    return self.store:enqueue(self.key, encoded)
+  end)
+  if not ok then release() ; error(result, 0) end
+  return result
 end
 
 --- Waits for one job, up to `timeout` seconds.  Returns nil on timeout.
@@ -229,6 +280,21 @@ function Queue:fail(job, err)
   return "buried"
 end
 
+-- `fail` writes to the store, and the store is a network. Called bare, a
+-- Redis blip on the failure path unwound the whole consume loop -- carrying
+-- the job in hand with it -- so one flaky moment stopped the worker entirely
+-- rather than costing one job. Reported and survived instead.
+local function settle(queue, job, err, log)
+  local ok, outcome, delay = pcall(queue.fail, queue, job, err)
+  if ok then return outcome, delay end
+  if log then
+    log:error("jobs: the store could not record a failed job; it is lost", {
+      kind = job.kind, detail = tostring(outcome),
+    })
+  end
+  return nil
+end
+
 --- Consumes until `should_stop()` returns true.
 function Queue:consume(handlers, options)
   options = options or {}
@@ -248,16 +314,18 @@ function Queue:consume(handlers, options)
         -- the same failure path rather than being dropped.  Dropping it
         -- loses work that finishing the deploy would have run.
         if log then log:warn("jobs: no handler", { kind = job.kind }) end
-        self:fail(job, "no handler registered for kind '" .. tostring(job.kind) .. "'")
+        settle(self, job,
+               "no handler registered for kind '" .. tostring(job.kind) .. "'", log)
       else
         local ok, err = pcall(handler, job.payload, job)
         if ok then
           handled = handled + 1
         else
           failed = failed + 1
-          local outcome, delay = self:fail(job, err)
-          if outcome == "retried" then retried = retried + 1 else buried = buried + 1 end
-          if log then
+          local outcome, delay = settle(self, job, err, log)
+          if outcome == "retried" then retried = retried + 1
+          elseif outcome then buried = buried + 1 end
+          if log and outcome then
             log:error("jobs: job failed", {
               kind = job.kind, attempt = job.attempts, outcome = outcome,
               retry_in_s = delay and math.floor(delay * 10) / 10 or nil,
