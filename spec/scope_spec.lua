@@ -20,7 +20,7 @@ describe("a scoped handle", function()
     db:scope("project_id", 7):many(sql.select("*"):from "documents")
 
     local issued = db.log[1]
-    assert.equal("select * from documents where project_id = $1", issued.sql)
+    assert.equal("select * from documents where (project_id = $1)", issued.sql)
     assert.equal(7, issued.args[1])
   end)
 
@@ -29,7 +29,7 @@ describe("a scoped handle", function()
     db:scope("project_id", 7):exec(
       sql.update("documents"):set("title", "new"):where("id = ?", 3))
 
-    assert.equal("update documents set title = $1 where id = $2 and project_id = $3",
+    assert.equal("update documents set title = $1 where (id = $2) and (project_id = $3)",
                  db.log[1].sql)
     assert.same({ "new", 3, 7 }, { table.unpack(db.log[1].args, 1, 3) })
   end)
@@ -37,7 +37,7 @@ describe("a scoped handle", function()
   it("adds the scope to a delete", function()
     local db = db_with_log()
     db:scope("project_id", 7):exec(sql.delete_from("documents"):where("id = ?", 3))
-    assert.equal("delete from documents where id = $1 and project_id = $2", db.log[1].sql)
+    assert.equal("delete from documents where (id = $1) and (project_id = $2)", db.log[1].sql)
   end)
 
   it("sets the scope column on an insert", function()
@@ -79,7 +79,7 @@ describe("a scoped handle", function()
     db:scope("org_id", 1):scope("project_id", 7):many(sql.select("*"):from "documents")
     -- Innermost scope lands first; both conditions are ANDed, so the order is
     -- cosmetic -- what matters is that neither was dropped.
-    assert.equal("select * from documents where project_id = $1 and org_id = $2",
+    assert.equal("select * from documents where (project_id = $1) and (org_id = $2)",
                  db.log[1].sql)
     assert.same({ 7, 1 }, { table.unpack(db.log[1].args, 1, 2) })
   end)
@@ -89,7 +89,7 @@ describe("a scoped handle", function()
     db:scope("project_id", 7):transaction(function(tx)
       tx:many(sql.select("*"):from "documents")
     end)
-    assert.equal("select * from documents where project_id = $1", db.log[2].sql)
+    assert.equal("select * from documents where (project_id = $1)", db.log[2].sql)
   end)
 
   it("makes crossing tenants greppable rather than silent", function()
@@ -121,6 +121,6 @@ describe("writes that would touch every row", function()
     -- The scope is what makes an otherwise table-wide delete safe.
     local db = db_with_log()
     db:scope("project_id", 7):exec(sql.delete_from "documents")
-    assert.equal("delete from documents where project_id = $1", db.log[1].sql)
+    assert.equal("delete from documents where (project_id = $1)", db.log[1].sql)
   end)
 end)

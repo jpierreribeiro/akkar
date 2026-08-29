@@ -122,6 +122,7 @@ local function new_query(kind)
     _select = "*",
     _from = nil,
     _joins = {},
+    _join_values = {},
     _where = {},
     _values = {},
     _set = {},
@@ -196,10 +197,30 @@ function Query:returning(columns)
   return self
 end
 
+--- A join's values live in their own list, not in the one `where` uses.
+---
+--- `build` emits every join before any condition, but both used to append to
+--- the same flat `_values`, so the numbering ran in call order while the text
+--- ran in clause order.  Confirmed:
+---
+---   :where("project_id = ?", 999):join("... acl.project_id = ?", 7)
+---   -> join ... acl.project_id = $1 where (project_id = $2)   VALUES: 999, 7
+---
+--- The ACL check ran against the tenant id and the tenant filter against the
+--- user id.  It survives review because the order only diverges when a
+--- conditional `where` precedes an unconditional `join`: with the optional
+--- filter absent the statement is correct, so the bug shows up as
+--- mis-authorisation on exactly the requests that carry a filter.
 function Query:join(clause, ...)
+  -- `build` writes joins only into a SELECT.  Accepting one anywhere else
+  -- would keep the values and drop the text they belong to, which is the same
+  -- mis-binding from the other direction.
+  if self._kind ~= "select" then
+    error("akkar.sql: join is only valid on select queries", 0)
+  end
   self._joins[#self._joins + 1] = { text = clause, n = select("#", ...) }
   for i = 1, select("#", ...) do
-    self._values[#self._values + 1] = (select(i, ...))
+    self._join_values[#self._join_values + 1] = (select(i, ...))
   end
   return self
 end
@@ -209,6 +230,47 @@ end
 ---
 --- There is no `where_raw`.  A raw-SQL escape hatch is exactly the door this
 --- module exists to close.
+-- A condition may describe a row.  It may not change the SHAPE of the clause
+-- it is joined into.
+--
+-- Wrapping each condition in parentheses stops a handler's own `or` from
+-- capturing the tenant scope by precedence, but parentheses supplied by the
+-- caller close the ones added here and reopen the hole:
+--
+--   :where "1=1) or (1=1"   ->   where (1=1) or (1=1) and (tenant_id = $1)
+--
+-- which is a scope bypass again, and was demonstrated returning other tenants'
+-- rows.  So the structural characters are refused outright.  Depth may never go
+-- negative and must end at zero, which every honest fragment satisfies -- and a
+-- comment introducer or a statement separator has no business in a condition at
+-- all.  This is the check the module's own "there is no where_raw" claim always
+-- needed: the previous test asserted only that no key by that name existed on
+-- the table, which checks the nameplate rather than the door.
+local function refuse_structure(condition)
+  local depth = 0
+  for index = 1, #condition do
+    local char = condition:sub(index, index)
+    if char == "(" then depth = depth + 1
+    elseif char == ")" then
+      depth = depth - 1
+      if depth < 0 then
+        error(("akkar.sql: condition closes a parenthesis it did not open, "
+            .. "which would restructure the where clause: %s"):format(condition), 0)
+      end
+    end
+  end
+  if depth ~= 0 then
+    error(("akkar.sql: condition leaves %d parenthesis/es open: %s")
+          :format(depth, condition), 0)
+  end
+  for _, forbidden in ipairs { "--", "/*", "*/", ";" } do
+    if condition:find(forbidden, 1, true) then
+      error(("akkar.sql: condition contains %q, which cannot appear in a "
+          .. "condition: %s"):format(forbidden, condition), 0)
+    end
+  end
+end
+
 function Query:where(condition, ...)
   local count = select("#", ...)
   local placeholders = 0
@@ -217,6 +279,7 @@ function Query:where(condition, ...)
     error(("akkar.sql: condition has %d placeholder(s) but %d value(s) were given: %s")
           :format(placeholders, count, tostring(condition)), 0)
   end
+  refuse_structure(tostring(condition))
 
   self._where[#self._where + 1] = condition
   for i = 1, count do
@@ -407,9 +470,24 @@ function Query:build()
   end
 
   if self._kind ~= "insert" then
+    -- Join values before where values, because the TEXT is emitted in that
+    -- order and `?` is numbered by position in the text.  Appending both to
+    -- one list in call order is what bound a join's parameter to a condition.
+    for i = 1, #self._join_values do values[#values + 1] = self._join_values[i] end
     for i = 1, #self._values do values[#values + 1] = self._values[i] end
     if #self._where > 0 then
-      parts[#parts + 1] = " where " .. table.concat(self._where, " and ")
+      -- Each condition is parenthesised before it is joined.  Without this,
+      -- a handler's own `or` silently captures everything appended after it:
+      -- `where("a = ? or b = ?")` plus a tenant scope builds
+      -- `a = $1 or b = $2 and tenant_id = $3`, and SQL binds `and` tighter than
+      -- `or`, so the scope applies to one branch and the other returns every
+      -- tenant's rows.  The scope is present in the text and absent from the
+      -- meaning -- which is the one failure akkar.scope exists to make
+      -- impossible.  Parenthesising is what makes appending a condition
+      -- actually mean "and also this".
+      local wrapped = {}
+      for i = 1, #self._where do wrapped[i] = "(" .. self._where[i] .. ")" end
+      parts[#parts + 1] = " where " .. table.concat(wrapped, " and ")
     end
   end
   if self._group then parts[#parts + 1] = " group by " .. self._group end

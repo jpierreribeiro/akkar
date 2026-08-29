@@ -18,7 +18,7 @@ describe("building a query", function()
       :where("name = ?", "ada")
       :where("age >= ?", 18)
     local text, a, b = q:build()
-    assert.equal("select id, name from users where name = $1 and age >= $2", text)
+    assert.equal("select id, name from users where (name = $1) and (age >= $2)", text)
     assert.equal("ada", a)
     assert.equal(18, b)
   end)
@@ -33,7 +33,7 @@ describe("building a query", function()
   it("expands IN with one placeholder per element", function()
     local q = sql.select("*"):from("users"):where_in("id", { 1, 2, 3 })
     local text = q:to_string()
-    assert.equal("select * from users where id in ($1, $2, $3)", text)
+    assert.equal("select * from users where (id in ($1, $2, $3))", text)
     assert.same({ 1, 2, 3 }, q:values())
   end)
 
@@ -41,7 +41,7 @@ describe("building a query", function()
     -- `in ()` is a syntax error, and dropping the condition would return
     -- everything instead of nothing -- the dangerous direction.
     local q = sql.select("*"):from("users"):where_in("id", {})
-    assert.equal("select * from users where false", q:to_string())
+    assert.equal("select * from users where (false)", q:to_string())
   end)
 
   it("casts a bound UUID without interpolating its value", function()
@@ -62,7 +62,7 @@ describe("building a query", function()
       :where("id = ?", sql.uuid(item_id))
       :scope("tenant_id", sql.uuid(tenant_id))
     assert.equal(
-      "select * from items where id = $1::uuid and tenant_id = $2::uuid",
+      "select * from items where (id = $1::uuid) and (tenant_id = $2::uuid)",
       q:to_string())
     assert.same({ item_id, tenant_id }, q:values())
   end)
@@ -79,7 +79,7 @@ describe("values can never become SQL", function()
     local hostile = "'; drop table users; --"
     local q = sql.select("*"):from("users"):where("name = ?", hostile)
 
-    assert.equal("select * from users where name = $1", q:to_string())
+    assert.equal("select * from users where (name = $1)", q:to_string())
     assert.same({ hostile }, q:values())
     -- The text contains no part of the attack.
     assert.is_nil(q:to_string():find("drop", 1, true))
@@ -87,7 +87,7 @@ describe("values can never become SQL", function()
 
   it("keeps a value that looks like a placeholder", function()
     local q = sql.select("*"):from("users"):where("name = ?", "$1 or 1=1")
-    assert.equal("select * from users where name = $1", q:to_string())
+    assert.equal("select * from users where (name = $1)", q:to_string())
     assert.same({ "$1 or 1=1" }, q:values())
   end)
 

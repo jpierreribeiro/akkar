@@ -162,7 +162,7 @@ describe("inventory-safe SQL", function()
   it("places FOR UPDATE after pagination", function()
     local query = sql.select("id, stock"):from("variants")
       :where("id = ?", "v-1"):limit(1):for_update()
-    assert.equal("select id, stock from variants where id = $1 limit $2 for update",
+    assert.equal("select id, stock from variants where (id = $1) limit $2 for update",
                  query:to_string())
     assert.same({ "v-1", 1 }, query:values())
   end)
