@@ -2206,37 +2206,125 @@ function App:run(config)
   --
   -- lua-http speaks HTTP/2, and left unsaid it ACCEPTS it: `h2` over ALPN on
   -- TLS, and the prior-knowledge preface in cleartext.  Nothing here asked
-  -- for that, nothing in akkar or docs/ mentioned it, and it silently removed
-  -- the only admission control the runtime has.
-  --
-  -- `max_concurrent` bounds CONNECTIONS.  HTTP/2 multiplexes streams inside
-  -- one connection, and lua-http sets MAX_CONCURRENT_STREAMS to math.huge, so
-  -- the ceiling stops bounding anything a client cares about.  Measured, with
-  -- `max_concurrent = 1`: forty requests over ONE h2c connection, peak
-  -- in-flight forty, all of them finishing in the time one takes.  The
-  -- descriptor ceiling above -- the reason `max_concurrent` exists, and a
-  -- machine was lost proving it -- is defeated by `--http2-prior-knowledge`.
-  --
-  -- Everything else in the runtime assumes one request per connection as
-  -- well: `in_flight` is counted per stream but the drain reasons about
-  -- connections, and `read_timeout` bounds a header block, not a settings
-  -- exchange.  So the version is now an explicit setting that defaults to
-  -- what the rest of this file actually implements, rather than a capability
-  -- nobody chose.
-  --
-  -- `http_version = 2` remains available for anyone who wants it, and says
-  -- what it costs rather than pretending the ceiling still holds.  Bounding
-  -- streams properly would mean an admission gate inside the h2 connection,
-  -- which lua-http exposes no hook for; until that exists, opting in means
-  -- opting out of the ceiling.
+  -- for that and nothing in akkar or docs/ mentioned it, so the version is an
+  -- explicit setting rather than a capability nobody chose.  1.1 is the
+  -- default because it is what the rest of this file was written against.
   local http_version = config.http_version
   if http_version == nil then http_version = akkar.defaults.http_version end
-  if http_version == 2 then
-    internal:warn("http_version = 2: max_concurrent bounds connections, not streams", {
-      max_concurrent = max_concurrent,
-      consequence = "one client can hold unbounded requests in flight on one connection",
-      measured = "40 streams in flight against max_concurrent = 1",
-    })
+
+  -- ============================== the ceiling has to count REQUESTS, not
+  --                                connections, and now does
+  --
+  -- `max_concurrent` above is handed to lua-http, which bounds CONNECTIONS.
+  -- The descriptor argument it comes from is about REQUESTS: two file
+  -- descriptors per request in flight, whichever connection carried it.  One
+  -- request per connection is an assumption, and both HTTP versions break it.
+  -- Measured here, `max_concurrent = 1`, forty requests, ONE connection:
+  --
+  --     http_version = 2      peak 40 in flight, 0.33 s   h2 multiplexing
+  --     http_version = 1.1    peak 40 in flight, 0.32 s   h1 pipelining
+  --
+  -- So this was never only an HTTP/2 hole; h2 makes it the ordinary case
+  -- rather than something only a pipelining client does.  lua-http will not
+  -- close it on either side: the h2 connection ships
+  -- `MAX_CONCURRENT_STREAMS = math.huge`, `server.listen` accepts no settings
+  -- table to change that (`wrap_socket` passes `nil` verbatim), and the two
+  -- places that would enforce a limit both carry the same line --
+  -- `-- TODO: check MAX_CONCURRENT_STREAMS`, h2_connection.lua:195 and
+  -- h2_stream.lua:149.  Neither the limit we announce nor the one a peer
+  -- announces to us is applied by the library.
+  --
+  -- Two things follow, and both are needed.
+  --
+  -- ONE, THE GUARANTEE: a gate here, counting requests, because that count is
+  -- the only one no peer gets a vote in.  It sits after the header read -- a
+  -- half-open socket is not a request yet, see below -- and before the count,
+  -- so a refusal costs one small response and no controller, no pool
+  -- checkout, no handler.
+  --
+  -- Refusal, not parking.  A parked request is work the server has accepted
+  -- and is not counting, and the drain in App:stop waits on exactly that
+  -- count: it would declare itself done with requests still queued, and they
+  -- would then run against the pools CLOSING has just closed.  Shedding keeps
+  -- the drain honest -- a refused request was never in flight, so it neither
+  -- extends a shutdown nor outlives one.
+  --
+  -- 503 with Retry-After, not an h2 REFUSED_STREAM.  REFUSED_STREAM is the
+  -- protocol's own words for "not processed, safe to retry", and it would be
+  -- the better answer to a client that then waits -- but nothing in it says
+  -- to wait, and a client that ignores our advertised ceiling (lua-http's own
+  -- h2 client does; the TODOs above cut both ways) retries into the same wall
+  -- at line speed.  A status with a delay in it says the same thing to both
+  -- protocols through one code path, and it is a number an operator can see
+  -- in the access log and in the metrics middleware.
+  --
+  -- TWO, THE COURTESY: advertise the number, so an h2 client that honours it
+  -- paces itself instead of collecting 503s.  Backpressure rather than
+  -- errors, which is the same trade the descriptor ceiling makes with
+  -- lua-http a few lines up.  Two honest limits on it.  It goes out on a
+  -- connection's FIRST STREAM, since lua-http exposes no per-connection hook,
+  -- so the opening burst on a fresh connection is already in the air when it
+  -- arrives -- `curl --parallel` was shed exactly this way.  And it is a
+  -- PER-CONNECTION cap where the gate is a whole-server one, so it
+  -- over-promises to a client holding several connections.  Neither weakens
+  -- the bound: both only decide whether a client is told politely or with a
+  -- status code.  It is worth the nine bytes because the client that matters
+  -- most -- a browser, one connection per origin -- is the case it fits.
+  --
+  -- Measured, forty requests over ONE connection, `max_concurrent = 1`:
+  --
+  --                          before            after
+  --     http_version = 2     peak 40, 0.33 s   peak 1, 1 x 200, 39 x 503
+  --     http_version = 1.1   peak 40, 0.32 s   peak 1, 1 x 200, 39 x 503
+  --
+  -- and the frame lands: a peer reading `MAX_CONCURRENT_STREAMS = inf` on
+  -- connect reads the configured number back after one response.
+  local advertised = setmetatable({}, { __mode = "k" })
+  local function advertise_ceiling(stream)
+    if not max_concurrent then return end
+    local conn = stream.connection
+    if not conn or conn.version ~= 2 or advertised[conn] then return end
+    advertised[conn] = true
+    -- The frame is written rather than sent through `conn:settings{}`, which
+    -- blocks for the peer's ACK and steps the connection itself -- that is
+    -- the server's reader loop's job, and two steppers on one connection is
+    -- a race.  A SETTINGS frame is true whether or not it has been ACKed.
+    -- If the write fails the gate is still the guarantee, so it is not worth
+    -- failing a request over.
+    pcall(function()
+      conn.stream0:write_settings_frame(false,
+        { MAX_CONCURRENT_STREAMS = max_concurrent }, 0, "f")
+    end)
+  end
+
+  -- A flood is exactly the condition an operator has to hear about and also
+  -- exactly the condition that would write a log line per refused request,
+  -- so it is said at most once a second, with the running total.
+  local shed_total, shed_said = 0, 0
+  local function shed(stream)
+    shed_total = shed_total + 1
+    local now = cqueues.monotime()
+    if now - shed_said >= 1 then
+      shed_said = now
+      internal:warn("at the concurrency ceiling; shedding", {
+        max_concurrent = max_concurrent, in_flight = self.in_flight,
+        shed_total = shed_total,
+      })
+    end
+    pcall(function()
+      local payload = cjson.encode {
+        error = "server is at its ceiling of " .. max_concurrent ..
+                " requests in flight",
+      }
+      local rh = headers.new()
+      rh:append(":status", "503")
+      rh:append("content-type", "application/json")
+      rh:append("content-length", tostring(#payload))
+      rh:append("retry-after", "1")
+      stream:write_headers(rh, false)
+      stream:write_chunk(payload, true)
+    end)
+    pcall(function() stream:shutdown() end)
   end
 
   local s = assert(server.listen {
@@ -2261,6 +2349,16 @@ function App:run(config)
       if not h then
         pcall(function() stream:shutdown() end)
         return
+      end
+
+      -- The two halves argued for above: announce the ceiling to this
+      -- connection, then hold it.  Under HTTP/1.1 without pipelining the gate
+      -- can never fire -- lua-http has already bounded connections to the
+      -- same number, and one connection cannot be serving two requests -- so
+      -- for the default configuration this is a branch and nothing else.
+      advertise_ceiling(stream)
+      if max_concurrent and self.in_flight >= max_concurrent then
+        return shed(stream)
       end
       self.in_flight = self.in_flight + 1
       local ok, err = xpcall(function()
@@ -2355,7 +2453,12 @@ function App:run(config)
       -- `error_kind=string` here is what made a live outage produce five
       -- identical lines and no cause.
       if not ok then internal:error("stream failed", diagnosis(err)) end
-      stream:shutdown()
+      -- The count is given back whatever the close does.  It was only the
+      -- drain's business before; now it is also the ceiling's, and a count
+      -- leaked by a raising `shutdown` would shrink the ceiling permanently
+      -- and stall every deploy after it.  lua-http closes the stream itself
+      -- when `onstream` returns, so nothing is left open by this.
+      pcall(function() stream:shutdown() end)
       self.in_flight = self.in_flight - 1
     end,
     onerror = function(_, _, op, e) internal:warn("transport", diagnosis_with(e, { op = op })) end,

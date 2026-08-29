@@ -286,16 +286,16 @@ function M.check_app(app, config, report)
               (unit == "" and "" or (" " .. unit)), source)
   end
 
-  -- HTTP/2 multiplexes streams inside one connection and lua-http leaves
-  -- MAX_CONCURRENT_STREAMS unbounded, so `max_concurrent` -- the only
-  -- admission control akkar has, and the thing standing between this process
-  -- and the descriptor ceiling -- stops bounding requests. Measured: 40
-  -- streams in flight against `max_concurrent = 1`.
-  if (config.http_version or defaults.http_version) == 2 then
-    report:warn("settings", "http_version = 2 bypasses max_concurrent",
-      "max_concurrent bounds connections; h2 puts unbounded streams inside one",
-      "put a proxy that bounds streams in front, or run http_version = 1.1")
-  end
+  -- `max_concurrent` is handed to lua-http, which bounds CONNECTIONS, and one
+  -- connection carries as many requests as the client cares to put in it --
+  -- h2 by multiplexing, 1.1 by pipelining. Measured both ways: 40 in flight
+  -- against `max_concurrent = 1`. App:run now gates on the request count
+  -- itself, so the ceiling holds on either protocol; this says so, because a
+  -- check that was here and then vanished reads like a check nobody wrote.
+  local version = config.http_version or defaults.http_version
+  report:ok("settings", "max_concurrent bounds requests, not connections",
+    "gated in onstream on either protocol" ..
+    (version == 2 and "; h2 clients are told the number in SETTINGS" or ""))
 
   -- `shutdown_grace` is the moment akkar starts SAYING the drain is slow; it
   -- forces nothing, by design.  What actually bounds a drain is how long a

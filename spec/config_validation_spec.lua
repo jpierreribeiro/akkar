@@ -14,9 +14,10 @@ else. Four more started a server that then did not work: `body_limit = -1`,
 where a list belongs, which trusts no proxy at all while looking configured.
 
 The second half of the file is the protocol. lua-http accepts HTTP/2 unless
-told otherwise, and `max_concurrent` -- the runtime's only admission control
--- bounds connections, not streams. Measured: `max_concurrent = 1`, forty
-requests over one h2c connection, peak in flight forty.
+told otherwise, so which version the server speaks is now something the
+application says rather than something it inherits. What the ceiling does
+about a client that puts many requests in one connection is measured next
+door, in http2_admission_spec.lua.
 ]]
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
@@ -163,17 +164,14 @@ local function speaks_h2(config)
 end
 
 describe("which HTTP version the server speaks", function()
-  it("is 1.1 by default, so max_concurrent still means something", function()
-    -- `max_concurrent` bounds connections. HTTP/2 puts unbounded streams
-    -- inside one, and lua-http sets MAX_CONCURRENT_STREAMS = math.huge, so
-    -- h2 removed the ceiling entirely: 40 in flight against a limit of 1.
-    -- It was on by default and mentioned in no document.
+  it("is 1.1 by default, because that is what the runtime was written for", function()
+    -- It used to be both, on by default, and mentioned in no document.
     assert.is_false(speaks_h2 { port = 8641 })
   end)
 
   it("is 2 when the application asks for it", function()
-    -- Available, deliberately, and warned about at boot -- rather than on by
-    -- accident.
+    -- Available, deliberately, and bounded when chosen: the ceiling counts
+    -- requests rather than connections, and h2 clients are told the number.
     assert.is_true(speaks_h2 { port = 8642, http_version = 2 })
   end)
 
