@@ -327,6 +327,15 @@ that accepts anything while looking validated.
   logged and dropped, because a retry policy nobody chose hides the failure
   and repeats the side effects.
 
+  **`akkar.jobs` is now that framework, and this paragraph no longer describes
+  it.** It has retries with backoff, scheduling, dead letters and idempotency,
+  and delivery moved from `BRPOP` to `BRPOPLPUSH` into an in-flight list with a
+  deadline: a job leaves that list only after its next copy exists, so a worker
+  that dies costs a duplicate delivery rather than the job. That makes it
+  at-least-once — a handler will sometimes run twice and must dedup on the
+  job's `uid`. `work.queue` is the smaller thing this paragraph is about, and
+  it still drops.
+
   **Neither fixes `bcrypt`.** A C function that runs 250 ms without returning
   to Lua cannot be yielded — there is no point where Lua regains control. The
   real answers are N processes, a lower cost factor chosen knowingly, or
@@ -503,6 +512,25 @@ that accepts anything while looking validated.
 Nothing here blocks using akkar. Two items are closed by measurement rather
 than by work, and the third is the milestone everything else was clearing the
 way for.
+
+- **lua-http's h2 CLIENT raises `COMPRESSION_ERROR` on two concurrent
+  responses.** `index N not found in table` from its HPACK decoder, reproduced
+  with no admission control involved: one connection, three requests, one
+  immediate response and two slow ones. The server's encode order was traced
+  frame by frame against its wire order and they agree, and curl is clean
+  against the same server, so this is the client's decoder rather than
+  akkar's output. It matters because lua-http's client is what `App:test` and
+  most of the specs use, so h2 tests have to be written around it.
+
+- **The drain does not refuse new requests, it only stops accepting.**
+  `server:pause()` stops `accept`, so a client on a connection established
+  before SIGTERM -- an h2 connection, or a 1.1 keep-alive -- can keep feeding
+  NEW requests into a shutdown that is trying to end. The request ceiling does
+  not make this worse (a shed request is never counted, so it neither extends
+  nor outlives the drain), and `read_timeout` bounds any single one, but a
+  determined client can still hold a drain open by asking for more work. The
+  fix is for `STOP_ACCEPTING` to mean what it says at the request level too,
+  which is a change to shutdown semantics rather than a bug fix.
 
 - **Port a real service off Gin.** `docs/PLAN.md` names this as the milestone
   never reached, and it is the only honest test of completeness — it will

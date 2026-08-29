@@ -67,13 +67,21 @@ routes someone thought worth protecting. `on_error` names the choice instead:
 
 ## The limit that must be stated
 
-These are only as strong as the store behind them. With `akkar.cache.memory`
-the counters are **per process**, so a fleet of six processes enforces six
-times the configured limit. That is a useful development default and it is
-not rate limiting. With Redis it is shared and real.
+**These require Redis.** Not "work better with"; require. The bucket is
+arithmetic done inside a server-side script so that the read and the write
+cannot be interleaved by another process, and `akkar.cache.memory` cannot run
+a script at all -- `akkar.limit.scriptable(cache)` answers false for it.
 
-`akkar.limit` says which one it is at boot rather than leaving it to be
-discovered under load.
+So on the memory adapter a limiter does not degrade to a weaker limit. It
+enforces NOTHING, and which way it fails is `on_error`: the default is open,
+so `per_second = 1, burst = 1` serves every request it is given, with a
+warning in the log. Measured, not inferred.
+
+That is a defensible development default and it is not rate limiting, and the
+distinction matters most in the deployment where somebody reaches for the
+memory adapter to avoid running Redis. `akkar.limit.scriptable(cache)` is
+there to be asked at boot; ask it, rather than discovering the answer from a
+bill.
 ]]
 
 local rand = require "openssl.rand"
