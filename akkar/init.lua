@@ -2327,6 +2327,44 @@ function App:run(config)
     pcall(function() stream:shutdown() end)
   end
 
+  -- STOP_ACCEPTING has to mean it at the REQUEST level, not only at accept().
+  --
+  -- `server:pause()` stops the listener and nothing else, so a client already
+  -- holding a connection -- an h2 stream, or a 1.1 keep-alive -- can keep
+  -- asking for NEW work while the drain is trying to end.  Each one extends
+  -- the drain by its own duration, so an ordinary busy client can hold a
+  -- shutdown open indefinitely without doing anything wrong, and a determined
+  -- one can hold it open on purpose.  Refusing here is what makes the drain
+  -- finite: what is left to wait for is exactly the requests that were already
+  -- in flight when the signal arrived.
+  --
+  -- `connection: close` matters as much as the status.  Without it a
+  -- keep-alive client takes the 503 and asks again on the same socket, and the
+  -- refusal becomes a loop instead of an ending.
+  local drained_total, drained_said = 0, 0
+  local function refuse_draining(stream)
+    drained_total = drained_total + 1
+    local now = cqueues.monotime()
+    if now - drained_said >= 1 then
+      drained_said = now
+      internal:info("shutting down; refusing new requests", {
+        state = self.state, in_flight = self.in_flight, refused_total = drained_total,
+      })
+    end
+    pcall(function()
+      local payload = cjson.encode { error = "server is shutting down" }
+      local rh = headers.new()
+      rh:append(":status", "503")
+      rh:append("content-type", "application/json")
+      rh:append("content-length", tostring(#payload))
+      rh:append("retry-after", "1")
+      rh:append("connection", "close")
+      stream:write_headers(rh, false)
+      stream:write_chunk(payload, true)
+    end)
+    pcall(function() stream:shutdown() end)
+  end
+
   local s = assert(server.listen {
     host = host, port = port, tls = config.tls or false, ctx = config.ctx,
     reuseport = config.reuseport,
@@ -2356,6 +2394,13 @@ function App:run(config)
       -- can never fire -- lua-http has already bounded connections to the
       -- same number, and one connection cannot be serving two requests -- so
       -- for the default configuration this is a branch and nothing else.
+      -- Before the ceiling, because a server that is going away should say so
+      -- rather than report how busy it is.
+      if self.state ~= "RUNNING" then
+        refuse_draining(stream)
+        return
+      end
+
       advertise_ceiling(stream)
       if max_concurrent and self.in_flight >= max_concurrent then
         return shed(stream)

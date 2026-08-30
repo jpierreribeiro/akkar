@@ -522,15 +522,13 @@ way for.
   akkar's output. It matters because lua-http's client is what `App:test` and
   most of the specs use, so h2 tests have to be written around it.
 
-- **The drain does not refuse new requests, it only stops accepting.**
-  `server:pause()` stops `accept`, so a client on a connection established
-  before SIGTERM -- an h2 connection, or a 1.1 keep-alive -- can keep feeding
-  NEW requests into a shutdown that is trying to end. The request ceiling does
-  not make this worse (a shed request is never counted, so it neither extends
-  nor outlives the drain), and `read_timeout` bounds any single one, but a
-  determined client can still hold a drain open by asking for more work. The
-  fix is for `STOP_ACCEPTING` to mean what it says at the request level too,
-  which is a change to shutdown semantics rather than a bug fix.
+- ~~**The drain does not refuse new requests, it only stops accepting.**~~
+  **Done.** `server:pause()` stopped `accept` and nothing else, so a client on
+  a connection established before SIGTERM could keep feeding NEW requests into
+  a shutdown trying to end, each extending it by its own duration.
+  `STOP_ACCEPTING` now means it at the request level: a request arriving after
+  the signal gets 503 with `connection: close` and never reaches its handler,
+  so the drain waits only for what was in flight when the signal arrived.
 
 - **Port a real service off Gin.** `docs/PLAN.md` names this as the milestone
   never reached, and it is the only honest test of completeness — it will
