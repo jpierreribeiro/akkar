@@ -134,6 +134,7 @@ local function new_query(kind)
     _limit = nil,
     _offset = nil,
     _for_update = false,
+    _skip_locked = false,
     _on_conflict = nil,
     _scoped = false,
   }, Query)
@@ -351,6 +352,26 @@ function Query:for_update()
   return self
 end
 
+--- Takes the rows nobody else is holding, instead of waiting behind them.
+---
+--- Only meaningful with `for_update`, and only correct for a claim whose mark
+--- is DURABLE -- a queue that, in the same transaction that locks the rows,
+--- writes something (a lease, a status) that removes them from its own
+--- predicate. Without that mark the two claimers read the same rows the moment
+--- the first one commits, and skipping buys nothing.
+---
+--- With it, a second claimer takes a DIFFERENT batch rather than blocking on
+--- the first and then finding its own rows filtered out by the re-evaluated
+--- predicate -- which is how a queue ends up serialising N workers into one and
+--- holding a pool connection to do it.
+function Query:skip_locked()
+  if self._kind ~= "select" then
+    error("akkar.sql: skip_locked is only valid on select queries", 0)
+  end
+  self._skip_locked = true
+  return self
+end
+
 --- Says out loud that every row is the intent, for the one case where it is.
 function Query:all_rows()
   self._all_rows = true
@@ -501,7 +522,14 @@ function Query:build()
     parts[#parts + 1] = " offset ?"
     values[#values + 1] = self._offset
   end
-  if self._for_update then parts[#parts + 1] = " for update" end
+  if self._for_update then
+    parts[#parts + 1] = self._skip_locked and " for update skip locked" or " for update"
+  elseif self._skip_locked then
+    -- Checked here rather than in `skip_locked` so the two calls can arrive in
+    -- either order: a builder that rejected `skip_locked():for_update()` would
+    -- be rejecting a query that is perfectly well formed by the time it runs.
+    error("akkar.sql: skip_locked requires for_update", 0)
+  end
   if self._on_conflict then parts[#parts + 1] = " on conflict " .. self._on_conflict end
   if self._returning then
     parts[#parts + 1] = " returning " .. self._returning

@@ -338,3 +338,62 @@ describe("the boot-time warning about unbounded statements", function()
     assert.is_truthy(boot(nil):find("WARN", 1, true))
   end)
 end)
+
+describe("akkar.sql claiming rows under contention", function()
+  -- `skip locked` is the one clause whose behaviour a fake cannot show: it is
+  -- defined entirely by what ANOTHER open transaction is holding at that
+  -- instant. Two real connections, one real lock.
+  local first, second
+
+  local function ids(rows)
+    local out = {}
+    for index, row in ipairs(rows) do out[index] = row.id end
+    return out
+  end
+
+  local function claim(conn, size, skip)
+    local query = sql.select("id"):from("akkar_claim_spec")
+      :where("available_at <= now()")
+      :order_by("id", { "id" }, "asc"):limit(size):for_update()
+    if skip then query = query:skip_locked() end
+    return ids(conn:many(query))
+  end
+
+  before_each(function()
+    first, second = db.connect(CONFIG)(), db.connect(CONFIG)()
+    first:exec "drop table if exists akkar_claim_spec"
+    first:exec [[create table akkar_claim_spec (
+      id int primary key, available_at timestamptz not null default now())]]
+    first:exec [[insert into akkar_claim_spec (id)
+      select i from generate_series(1, 4) i]]
+  end)
+
+  after_each(function()
+    if first then first:exec "drop table if exists akkar_claim_spec" first:close() end
+    if second then second:close() end
+  end)
+
+  it("gives a second claimer the rows the first is not holding", function()
+    local taken
+    first:transaction(function(tx)
+      assert.same({ 1, 2 }, claim(tx, 2, true))
+      -- Still inside the first transaction: rows 1 and 2 are locked right now.
+      taken = claim(second, 2, true)
+    end)
+    -- Without the clause this line would block until the transaction above
+    -- committed, and then come back EMPTY or short -- Postgres re-checks the
+    -- predicate on the rows it was waiting for, so a queue whose claim moves
+    -- `available_at` filters them out and the second worker earns nothing for
+    -- the wait.
+    assert.same({ 3, 4 }, taken)
+  end)
+
+  it("still refuses to hand the same row to two claimers", function()
+    local overlap
+    first:transaction(function(tx)
+      claim(tx, 4, true)
+      overlap = claim(second, 4, true)
+    end)
+    assert.same({}, overlap)
+  end)
+end)

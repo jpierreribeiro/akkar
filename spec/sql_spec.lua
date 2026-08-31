@@ -154,3 +154,44 @@ describe("identifiers are checked, because they cannot be parameterised", functi
     assert.is_false((pcall(function() sql.select("*"):from("u"):limit(1.5) end)))
   end)
 end)
+
+describe("claiming rows for a worker", function()
+  it("writes the lock clause last, after limit", function()
+    -- Postgres rejects `for update` before `limit`, and the builder is the
+    -- only thing deciding the order -- a caller cannot reach the suffix.
+    local text = sql.select("id"):from("jobs"):where("available_at <= now()")
+      :order_by("available_at", { "available_at" }, "asc"):limit(10)
+      :for_update():skip_locked():to_string()
+    assert.equal("select id from jobs where (available_at <= now()) " ..
+                 "order by available_at asc limit $1 for update skip locked", text)
+  end)
+
+  it("takes the calls in either order", function()
+    -- Both spellings describe the same query; rejecting one would be rejecting
+    -- a well-formed statement over the order two builder calls happened to
+    -- arrive in.
+    assert.equal(sql.select("*"):from("jobs"):for_update():skip_locked():to_string(),
+                 sql.select("*"):from("jobs"):skip_locked():for_update():to_string())
+  end)
+
+  it("refuses to skip locked rows without locking any", function()
+    -- `skip locked` alone is not valid SQL, and the mistake it hides is worse
+    -- than the syntax error: a claimer that never locked anything has nothing
+    -- to skip and takes the same rows as everyone else.
+    local ok, err = pcall(function() sql.select("*"):from("jobs"):skip_locked():build() end)
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):match "requires for_update")
+  end)
+
+  it("refuses to lock rows an update or delete never selected", function()
+    for _, kind in ipairs { "update", "delete_from" } do
+      assert.is_false((pcall(function() sql[kind]("jobs"):skip_locked() end)))
+    end
+  end)
+
+  it("stays out of a plain select", function()
+    assert.equal("select * from jobs", sql.select("*"):from("jobs"):to_string())
+    assert.equal("select * from jobs for update",
+                 sql.select("*"):from("jobs"):for_update():to_string())
+  end)
+end)
