@@ -43,27 +43,29 @@ each in the akkar tree, so none is estimated twice.
 | 4 | deterministic clock in test | **DONE** | `akkar.time.manual` + `akkar.time.set`; the L1 sim already depends on it |
 | 6 | `akkar build` single binary on the runner path | **DONE** | builds and serves; 6.4 MB scratch image (`docs/RUNTIME.md`, `docs/DEPLOY.md`) |
 | 5 | in-process metrics readable from `app:test()` | **PARTIAL** | `akkar.metrics` collects via `Registry:observe`; not surfaced to the test client. Small: expose a snapshot on the test handle |
-| 1 | fail/hang/drop parity on the cache adapter | **TODO** | the DB memory adapter has `:fail()/:hang()/:drop()`; the cache adapter does not. Copy the pattern from `akkar/db/memory.lua` |
-| 2 | capacity params on memory adapters (`max_qps`, `latency_ms`) | **TODO** | neither adapter takes them. **This is the one that closes the loop** — see below |
+| 1 | fail/hang/drop parity on the cache adapter | **DONE** 2026-09-01 | `akkar/cache/memory.lua` has `:on()/:fail()/:hang()/:drop()`, anchored in what `akkar/redis.lua` actually produces rather than copied: an error reply leaves a HEALTHY connection, a timeout leaves `broken`, a failed write leaves `broken` and `in_flight`. `spec/cache_fault_parity_spec.lua`, 20 cases |
+| 2 | capacity params on memory adapters (`max_qps`, `latency_ms`) | **DONE** 2026-09-01 | both adapters take them, honoured by advancing `akkar.time` rather than sleeping, so a manual clock collapses the wait and the real clock charges it. They are ONE queue, not two delays added. `spec/capacity_spec.lua`, 19 cases over both adapters from one options table |
 | 3 | a load generator inside `app:test()` | **TODO** | none. `bench/study/low-load-latency.lua` (written 2026-08-20) is the seed: it drives `app:test` in a tight loop and reports percentiles. Generalise it to `app:test():load { rps, duration, routes }` |
 
-Two done, one partial, three to build. **None blocks Phase 1, 2, or 3.** Items
+Four done, one partial, one to build. **None blocks Phase 1, 2, or 3.** Items
 1 and 2 are what Phase 4 needs first; item 3 is what makes "IMPLEMENT → MEASURE"
 run inside the jail instead of needing an external load tool.
 
 ### Why item 2 is the keystone
 
-Today the diagram says "capacity 1,500/s, service 8 ms" and the test adapter
-does not know it. If `akkar.db.memory { max_qps = 1500, latency_ms = 8 }`
-existed, **the same numbers would configure the simulation AND the real run** —
-the loop closes on itself. And item 3 then produces the best lesson in the
-product: the simulator predicted p95 33 ms, the real run gave 41 ms, and the
+The diagram said "capacity 1,500/s, service 8 ms" and the test adapter did not
+know it. `memory.new { max_qps = 1500, latency_ms = 8 }` exists now, on both
+adapters, so **the same numbers configure the simulation AND the real run** —
+the loop closes on itself. Item 3 is what turns that into the best lesson in the
+product: the simulator predicts p95 33 ms, the real run gives 41 ms, and the
 student sees *where the model is wrong*. A simulator that admits it is
 approximate teaches more than one that presents itself as truth (the plan's D1).
 
-The shape to copy is already in the tree: `akkar/db/memory.lua`'s `:on()`,
-`:fail()`, `:hang()`, `:drop()` are per-adapter behaviour toggles. `max_qps`
-and `latency_ms` are the same kind of thing — construction-time knobs on the
+That is why item 3 is now the only one left. Items 1 and 2 both landed on
+2026-09-01, and the shape they copied was already in the tree:
+`akkar/db/memory.lua`'s `:on()`, `:fail()`, `:hang()`, `:drop()` are per-adapter
+behaviour toggles. `max_qps` and `latency_ms` are the same kind of thing —
+construction-time knobs on the
 memory adapter, honoured by advancing the injectable clock (`akkar.time`, which
 already exists) rather than by real sleeping, so a test stays deterministic and
 fast.
