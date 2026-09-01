@@ -63,7 +63,7 @@ local function over_redis(extra, fn)
     local ok, err = pcall(fn, q)
     pcall(function()
       conn:del(q.key, q:dead_key(), q.key .. ":scheduled",
-               store:inflight_key(q.key), store:deadline_key(q.key))
+               store:processing_key(q.key), store:claimed_key(q.key))
     end)
     conn:close()
     if not ok then failure = err end

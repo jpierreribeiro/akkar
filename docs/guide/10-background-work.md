@@ -246,11 +246,25 @@ on" list, and it is only removed once the handler has finished. If the worker
 is killed halfway through, the job is still sitting in that list rather than
 gone.
 
-Nothing puts it back on its own. `queue:reap(older_than)` is the call that
-returns abandoned jobs to the queue, and it is yours to make, from a timer or
-at startup, because only you know how long one of your handlers may
-legitimately take. Set `older_than` too low and you will hand a live job to a
-second worker while the first is still working on it.
+A worker holds a job for `visibility` seconds -- five minutes by default -- and
+when that runs out the job goes back in the queue for somebody else. **The
+worker that puts it back is just another worker popping from the same queue**,
+so there is no janitor process to remember to deploy: the loop you already have
+recovers the fleet's abandoned jobs while it works.
+
+The one number you have to choose is `visibility`, and only you can, because
+only you know how long a handler of yours may legitimately take:
+
+```lua no-run
+local queue = jobs.new(redis.connect { port = 6379 }(), "email", {
+  visibility = 300,      -- seconds a worker may hold one job
+})
+```
+
+Set it below your slowest handler and you will hand a live job to a second
+worker while the first is still working on it -- so the same job runs twice at
+once, which is the failure this number exists to keep rare rather than
+impossible.
 
 The alternative design would be to delete the job the moment it is handed out.
 Then a worker that dies loses the job silently and forever, and nobody finds
@@ -333,6 +347,33 @@ five lines of SQL rather than a framework feature.
 in the database in a way that only one attempt can win. A column like this one,
 a unique index on a "we already did this" table, or an idempotency key that the
 outside service itself understands. Which one depends on what you are calling.
+
+**When there is no column to claim, claim the job.** Every job carries a `uid`,
+minted when it was pushed and unchanged by every retry and every redelivery of
+that job -- so it is the same string on the second run as on the first, and it
+is the key to write that "already did this" row under:
+
+```lua no-run
+local handlers = {
+  charge = function(payload, job)
+    local first = conn:one([[
+      insert into processed_jobs (uid) values ($1)
+      on conflict do nothing
+      returning uid ]], job.uid)
+
+    if not first then return end         -- some other run got there first
+    charge_the_card(payload)
+  end,
+}
+```
+
+Note the second argument: `consume` calls a handler with `(payload, job)`, and
+`job.uid` is on the second. Do not reach for `job.id` -- that one is optional,
+supplied by whoever pushed, and it stops a duplicate PUSH rather than a
+duplicate RUN. And do not reach for `job.attempts`: it changes every time.
+
+Write the marker in the same transaction as the side effect, or you have moved
+the race rather than closed it.
 
 ## Two more things the queue offers
 

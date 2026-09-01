@@ -103,6 +103,20 @@ function Store:claim(key, id, ttl)
   return true
 end
 
+--- Gives a claim back, so the id can be taken again.
+---
+--- The claim is taken before the job exists -- the only order that closes the
+--- race between two producers -- so something has to undo it when the job
+--- then fails to exist. Held, the id answers "duplicate" for an hour about a
+--- job that was never queued.
+function Store:unclaim(key, id)
+  local seen = self.claims[key]
+  if not seen then return false end
+  local held = seen[id] ~= nil
+  seen[id] = nil
+  return held
+end
+
 --- Claims the id and enqueues the job as one indivisible step.
 ---
 --- In one process with one coroutine at a time this is atomic by
@@ -111,12 +125,26 @@ end
 --- `Queue:push` fall back to two calls, because the two stores must answer
 --- the same contract -- a fake whose safety property differs from the real
 --- one is how a test proves the wrong thing.
+--- INDIVISIBLE MEANS INDIVISIBLE, AND A RAISE IS THE OTHER WAY TO DIVIDE IT.
+--- Nothing here yields, so no other coroutine can land between the claim and
+--- the push -- but the push can still fail, and a claim left behind by a job
+--- that does not exist is the exact defect this method exists to prevent, one
+--- cause further along. The Redis version cannot have this problem because a
+--- script either runs or does not; this one has to unwind by hand to answer
+--- the same contract.
 function Store:claim_and_enqueue(key, id, ttl, encoded, run_at)
   if not self:claim(key, id, ttl) then return false, "duplicate" end
-  if run_at and run_at > 0 then
-    return self:schedule(key, encoded, run_at)
+  local ok, result = pcall(function()
+    if run_at and run_at > 0 then
+      return self:schedule(key, encoded, run_at)
+    end
+    return self:enqueue(key, encoded)
+  end)
+  if not ok then
+    self:unclaim(key, id)
+    error(result, 0)
   end
-  return self:enqueue(key, encoded)
+  return result
 end
 
 -- ================================================== at-least-once delivery
@@ -157,24 +185,41 @@ function Store:ack(key, encoded)
   return false
 end
 
---- Returns everything claimed before `cutoff` to the queue.
+--- Everything whose lease ran out, oldest first.
 ---
 --- Oldest first, so a job abandoned twice does not overtake one abandoned
---- once -- the same ordering promise `promote` makes.
-function Store:reap(key, older_than)
-  local cutoff = time.now() - (older_than or 300)
+--- once -- the same ordering promise `promote` makes. `held` is appended to in
+--- claim order, so it is already in that order.
+---
+--- RE-LEASED, NOT HANDED OVER. Each entry returned is stamped `now` before it
+--- leaves, which gives the caller a fresh `visibility` window to write the
+--- job's next copy in and stops a second reaper arriving in the middle from
+--- collecting the same entry. The entry stays in flight until the caller
+--- `ack`s it, so a reaper that dies mid-pass costs a redelivery -- which is
+--- what this queue promises -- rather than the job, which is what it promises
+--- not to.
+---
+--- `now` is a test seam: leave it out and this store reads its own clock. See
+--- `Queue:reap`, and the header of `akkar/jobs/redis.lua` for why the store
+--- rather than the caller owns that reading.
+function Store:expired(key, visibility, now, limit)
+  -- The seam moves the CUTOFF and nothing else: a stamp is a claim time, and
+  -- it is always this store's own clock. Same rule as the Redis store, where
+  -- writing a claim time from the caller's clock is the defect its header is
+  -- about.
+  local cutoff = (now or time.now()) - (visibility or 300)
   local held = self.processing[key]
-  if not held or #held == 0 then return 0 end
+  if not held or #held == 0 then return {} end
 
-  local stale, fresh = {}, {}
+  local out = {}
   for _, entry in ipairs(held) do
-    if entry.at <= cutoff then stale[#stale + 1] = entry else fresh[#fresh + 1] = entry end
+    if entry.at <= cutoff then
+      entry.at = time.now()
+      out[#out + 1] = entry.encoded
+      if #out >= (limit or 500) then break end
+    end
   end
-  table.sort(stale, function(a, b) return a.at < b.at end)
-
-  for _, entry in ipairs(stale) do self:enqueue(key, entry.encoded) end
-  self.processing[key] = fresh
-  return #stale
+  return out
 end
 
 function Store:in_flight(key)
