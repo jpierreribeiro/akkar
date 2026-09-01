@@ -28,6 +28,8 @@ local KIND_TO_JSON = {
   number  = { type = "number" },
   boolean = { type = "boolean" },
   table   = { type = "object" },
+  object  = { type = "object" },
+  array   = { type = "array" },
 }
 
 local SHORTHAND = { string = true, integer = true, number = true,
@@ -43,6 +45,13 @@ local function expand(rule)
   return { kind = kind, optional = optional }
 end
 
+-- Declared ahead of `to_schema` because the two call each other: an object's
+-- field may be an array, and an array's element may be an object. A schema
+-- that stopped at the first level documented `{ items = v.array{...} }` as a
+-- string, which is a document describing something the validator does not
+-- enforce and the client cannot send.
+local object_schema
+
 local function to_schema(rule)
   local expanded = expand(rule)
   if not expanded then return { } end
@@ -52,21 +61,43 @@ local function to_schema(rule)
   end
   -- The constraints validation enforces are the constraints the document
   -- promises.  Reporting a `max` that is not applied would be a lie.
+  --
+  -- `min`/`max` mean a different keyword for each kind, and the fallthrough
+  -- that sent everything that was not a string to `minimum`/`maximum` sent
+  -- an ARRAY's length bounds there too. `minimum: 1` on an array is not a
+  -- constraint OpenAPI applies to arrays, so the one bound the validator
+  -- does enforce -- element count -- went undocumented while a bound nothing
+  -- enforces appeared in its place. Named explicitly, kind by kind, so a
+  -- kind added later has to say where its bounds go.
   if expanded.min then
     if expanded.kind == "string" then schema.minLength = expanded.min
-    else schema.minimum = expanded.min end
+    elseif expanded.kind == "integer" or expanded.kind == "number" then
+      schema.minimum = expanded.min
+    end
   end
   if expanded.max then
     if expanded.kind == "string" then schema.maxLength = expanded.max
-    else schema.maximum = expanded.max end
+    elseif expanded.kind == "integer" or expanded.kind == "number" then
+      schema.maximum = expanded.max
+    end
   end
   if expanded.one_of then schema["enum"] = expanded.one_of end
   if expanded.match then schema.pattern = expanded.match end
   if expanded.default ~= nil then schema.default = expanded.default end
+  if expanded.kind == "object" then
+    -- The whole schema is replaced rather than extended: an object's shape is
+    -- its `properties` and `required`, and the scalar keywords collected
+    -- above do not apply to one.
+    schema = object_schema(expanded.fields or {})
+  elseif expanded.kind == "array" then
+    schema.items = to_schema(expanded.items or "table")
+    if expanded.min then schema.minItems = expanded.min end
+    if expanded.max then schema.maxItems = expanded.max end
+  end
   return schema
 end
 
-local function object_schema(fields)
+object_schema = function(fields)
   local properties, required = {}, {}
   for name, rule in pairs(fields) do
     properties[name] = to_schema(rule)

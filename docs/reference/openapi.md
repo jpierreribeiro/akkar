@@ -117,10 +117,22 @@ assert(doc.paths["/health/live"].get.operationId == "get_health_live")
 | `one_of = { ... }` | `enum` |
 | `match = "..."` | `pattern` |
 | `default = value` | `default` |
+| `{ kind = "object", fields = {...} }` | `{ type = "object", properties = ... }` |
+| `{ kind = "array", items = rule }` | `{ type = "array", items = ... }` |
+| `{ kind = "array", min = N }` | `minItems = N` |
+| `{ kind = "array", max = N }` | `maxItems = N` |
 
-`min` and `max` become the length pair for `string` and the value pair for every
-other kind. A path parameter is `required` whatever the rule says, because a
-template variable cannot be absent.
+`min` and `max` go to a DIFFERENT pair of keywords for each kind: `minLength`
+and `maxLength` for a string, `minimum` and `maximum` for a number or an
+integer, `minItems` and `maxItems` for an array. They used to fall through to
+`minimum`/`maximum` for everything that was not a string, which put a keyword
+OpenAPI does not apply to arrays on an array and left the one bound the
+validator does enforce -- element count -- undocumented.
+
+Object and array rules nest to any depth: an object's field may be an array and
+an array's element may be an object, and each level is described rather than
+flattened to `{}` or to a string. A path parameter is `required` whatever the
+rule says, because a template variable cannot be absent.
 
 ```lua
 local akkar   = require "akkar"
