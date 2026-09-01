@@ -6,6 +6,89 @@ number rather than `1.0.0` is at the bottom and has not changed.
 The format follows [Keep a Changelog](https://keepachangelog.com/). Dates are
 the day the work landed on `main`.
 
+## Unreleased
+
+Reconciling `ecommerce-validation` into `main`. The two lines of work left the
+same base and never met: 216 commits one way, 15 the other. Each item below is
+one commit with a spec that failed before it and passes after.
+
+### Changed — these break code that works today
+
+- **`akkar.idempotency` requires `namespace`.** The idempotency key is a header
+  the CLIENT chooses, so one global keyspace let a tenant replay another
+  tenant's stored response body. Pass a resolver, or `namespace = false`
+  (`idempotency.GLOBAL`) to state that the application is single-tenant.
+- **`req.id` is akkar's own and is never the caller's `x-request-id`.** It is
+  the concurrency limiter's slot identity and every log line's `request_id`, so
+  a client choosing it collapsed limiter slots and wrote fields into the
+  operator's log. What the caller sent is `req.client_request_id`, validated.
+- **`Queue:reap(now)` takes an instant, not a window.** Staleness is the
+  queue's `visibility` setting now. `reap(300)` on a fresh claim becomes
+  `reap()`; `reap(-1)` becomes `visibility = 0` and a bare `reap()`. Omitted,
+  the store reads its own clock, so the NTP-step fix is the default rather than
+  something a caller can defeat.
+- **`db.connect { ssl = true }` now REQUIRES TLS.** Postgres negotiates in
+  cleartext and pgmoon continued over a plain socket unless `ssl_required` was
+  set, reporting success. `ssl_required` follows `ssl` unless given; opportunistic
+  TLS is `ssl_required = false`, said out loud.
+- **`strict.off()` needs the key `strict.on()` returned.** It was a
+  process-wide switch anything could throw.
+- **A multipart body with two parts under one name is refused** (400) instead of
+  last-wins, which is parameter pollution: the checker reads one, the handler
+  uses the other.
+- **`v.integer` refuses a float at or past 2^53**, and `inf`, `1e308` and `nan`.
+  The old test asked for a fractional part, which every large float passes.
+- **A job queue states its delivery guarantee.** `delivery` is a field; asking
+  for `at_least_once` over a store that cannot lease is refused rather than
+  silently becoming at-most-once.
+
+### Added
+
+- `job.uid`, stable across every retry and redelivery — the key a handler dedups
+  on, without which "your handler will sometimes run twice" is unusable advice.
+- `max_lifetime` and `idle_timeout` on the connection pool, so a socket the
+  other end has already closed is retired rather than handed out.
+- `read_timeout`, and `App:run` checking what every setting IS rather than only
+  that its name is allowed.
+- `name` and `namespace` on both rate limiters; `Registry:counter` on metrics;
+  `for_update`, `skip_locked` and typed casts on `akkar.sql`.
+
+### Fixed
+
+- **A tenant scope that was present in the text and absent from the meaning.**
+  Conditions were joined with " and " and never parenthesised, so a handler's
+  own `or` captured the scope. Reproduced against Postgres reading and deleting
+  another tenant's rows.
+- **Join values bound in call order while the text was emitted in clause
+  order**, so an ACL check ran against the tenant id.
+- **A mount cycle recursed until the process died**, on one unauthenticated
+  `GET /openapi.json`.
+- **A middleware's header writes landing on a hoisted response**, so one
+  client's `Set-Cookie` reached the next.
+- **A middleware that forgot to return became a silent 204** rather than a 500
+  naming it.
+- **A nested transaction that was no transaction**: the inner `commit` ended the
+  outer one and the outer `rollback` was a no-op. Savepoints now.
+- **The pool handing out connections that had died**, and a refused websocket
+  decrementing an in-flight count it never raised, which let a drain finish
+  early.
+- **`max_concurrent` counting connections rather than requests**, and
+  `STOP_ACCEPTING` that only stopped `accept()`, so a drain could not end.
+- **An unparseable RESP header read as a nil reply**, leaving the body in the
+  socket for the next caller's question.
+- **The rate limiter sharing one bucket across every route and tenant.**
+- **The logfmt writer having no escaping at all**, so any value reachable from a
+  request could forge fields, and a newline could forge a whole line.
+- **`work.chunked` building a yield and discarding it.**
+- **A multipart boundary matched as a substring of any parameter**, and parts
+  delimited by `--boundary` anywhere rather than at a line start.
+- **An unbounded `method` label on metrics**, chosen by the client.
+- **The in-memory database fake matching SQL needles as Lua patterns**, so
+  `count "insert into ledger (order_id, amount)"` answered 0 for a query that
+  ran.
+- **Idempotency answering 500 with no `retry-after`** when its store could not
+  answer, instead of 503.
+
 ## 0.1.0 — 2026-08-16
 
 ### Added

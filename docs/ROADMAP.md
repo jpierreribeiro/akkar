@@ -4,6 +4,16 @@
 > memory. `docs/PLAN.md` remains the statement of what akkar *is*; this is the
 > statement of what it does not yet *have*.
 
+> **Superseded in part, 1 Sep 2026.** Tier 0 and Tier 1 were built. `akkar.http`,
+> `akkar.crypto`, `akkar.jwt`, `akkar.auth`, `akkar.session` and `akkar.csrf` all
+> exist and are documented in `docs/reference/`; `req.http` is a capability like
+> any other. `docs/UNKNOWNS.md` section 9 already treated them as shipped code
+> needing an adversarial review, one day after this page was written, and the
+> README documented them the day after that. The diagnosis below is the state on
+> 16 August and is kept because the ORDER it argues for is what was followed.
+> Read the tier list as a record of the reasoning, not as a list of what is
+> missing.
+
 ## The diagnosis, in one line
 
 **akkar is complete on the inbound path and empty on the outbound path.**

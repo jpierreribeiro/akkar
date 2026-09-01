@@ -1,23 +1,30 @@
 # akkar.substrate
 
-Patches lua-http in place to repair one denial of service that cannot be
-worked around from outside it. Two functions and three fields of state.
+The written account of one denial of service in lua-http's HTTP/1.1 shutdown,
+and the repair for it.
 
-**When you need it.** `App:run` calls `substrate.apply()` for you, so an
-application never touches this module. You reach for it directly in two
-situations: a test that wants the unpatched behaviour and therefore must not
-let it be applied, and a running process where you want to know whether
-malformed request framing is arriving at all.
+**The repair no longer patches anything.** It was a monkey-patch over the
+upstream `http.h1_stream` until the HTTP stack was vendored; it is now eight
+lines inside `akkar/vendor/http/h1_stream.lua`, where it cannot silently stop
+applying because upstream changed shape. `substrate.apply()` still exists and
+`App:run` still calls it, and it now reports that there is nothing to do.
+
+**When you need it.** Almost never. This page is here because the module is the
+only written record of the wedge and how it was found, because `akkar.doctor`
+reports what the substrate applied, and because a running process may still want
+to know whether malformed request framing is arriving at all --
+`substrate.rescued` counts that, and it is the one field here that still moves.
 
 ```lua no-run
 local substrate = require "akkar.substrate"
 ```
 
-## What the patch changes
+## What the repair changes
 
-It replaces one function: `http.h1_stream`'s `methods.shutdown`.
-
-The replacement does three things around the original.
+It is one function: `h1_stream`'s `methods.shutdown`. What follows describes the
+monkey-patch, because that is the shape the mechanism was worked out in; the
+vendored version does the same three things without the instance overrides and
+the `rawset` juggling the patch needed to reach in from outside.
 
 **Before.** It installs a `step` on the stream **instance**, with `rawset`, so
 it shadows the metatable method for this stream and only for the duration of
