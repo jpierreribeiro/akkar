@@ -37,6 +37,27 @@ Pool.__index = Pool
 local MAX_LIFETIME = 1800   -- retire a connection this old on its way out of `idle`
 local IDLE_TIMEOUT = 600    -- retire one that has sat unused this long
 
+-- THE TWO BOUNDS ON A SLOT, and neither of them duplicates the request
+-- deadline.
+--
+-- `wait_timeout` is the OUTER bound on a park, and it exists because the inner
+-- bound is not always there. A request has `execution.remaining()`, and while
+-- it does, the ticket deadline below is the tighter and better number -- it
+-- refuses at the exact moment the caller stopped caring rather than at a
+-- number somebody guessed. But `remaining()` is nil for jobs, workers,
+-- `app:test` and the CLI, and a pool contract that reads "get returns or
+-- raises" must not become "unless the caller had no budget, in which case it
+-- may park for ever". The two compose as a minimum, so on the request path
+-- this is inert and on every other path it is the only bound there is.
+--
+-- `open_timeout` bounds a RESERVATION rather than a wait. `Pool:reap` finds a
+-- slot held by an abandoned `open` with the garbage collector, which cannot
+-- see a coroutine the controller is still holding -- a connect blackholed
+-- inside a live server's controller is referenced, so it is never collected
+-- and its slot is never returned. A clock can see it.
+local WAIT_TIMEOUT = 30     -- how long `get` may park before it gives up
+local OPEN_TIMEOUT = 15     -- an `open` outstanding longer than this is presumed abandoned
+
 local function setting(value, default)
   if value == nil then return default end
   if value == false or value == 0 then return nil end
@@ -48,9 +69,9 @@ end
 -- @param size      maximum live resources
 -- @param reusable  optional predicate; a resource it rejects is closed
 --                  instead of returned to the idle set
--- @param options   `max_lifetime` and `idle_timeout`, in seconds, each
---                  disabled by `false` or `0`; and `now`, the clock the
---                  ages are measured against
+-- @param options   `max_lifetime`, `idle_timeout`, `wait_timeout` and
+--                  `open_timeout`, in seconds, each disabled by `false` or
+--                  `0`; and `now`, the clock the ages are measured against
 function Pool.new(open, size, reusable, options)
   options = options or {}
   return setmetatable({
@@ -69,7 +90,12 @@ function Pool.new(open, size, reusable, options)
     now = options.now or time.monotime,
     max_lifetime = setting(options.max_lifetime, MAX_LIFETIME),
     idle_timeout = setting(options.idle_timeout, IDLE_TIMEOUT),
+    wait_timeout = setting(options.wait_timeout, WAIT_TIMEOUT),
+    open_timeout = setting(options.open_timeout, OPEN_TIMEOUT),
     retired = 0,
+
+    -- The generation half of ownership; see `Pool:_checkout`.
+    checkouts = 0,
     -- Slots taken by a coroutine that is still inside `open`. Weak keys: an
     -- abandoned coroutine is unreferenced by anything else, so a collection
     -- takes its reservation with it. See `Pool:reap`.
@@ -90,6 +116,55 @@ function Pool.new(open, size, reusable, options)
     queue = {},
     qhead = 1,
   }, Pool)
+end
+
+-- ================================================================= ownership
+--
+-- A BOOLEAN THE ACQUIRE PATH CLEARS CANNOT SAY WHO IS HOLDING THE RESOURCE.
+--
+-- `put` reads `resource.pooled`, and `get` clears it -- so
+-- `put -> get(by another coroutine) -> put` files the connection into `idle`
+-- while the second holder is still using it, which is verbatim the outcome
+-- `pooled` was added to eliminate. Verified before this fix: after that
+-- sequence the pool held `live=1 idle=1` with the idle entry being the object
+-- the second caller was still holding, and the next `get` handed the same
+-- socket to a third.
+--
+-- The resource cannot answer this on its own. Both holders reference the same
+-- table, so anything written on it is the LATEST holder's state, and the
+-- stale holder reads it and believes it. What can answer it is the checkout
+-- GENERATION each holder saw -- a monotonic number the pool stamps on the way
+-- out, recorded per coroutine on the resource, weakly, so a finished
+-- request's entry goes away with the request. A coroutine may return only the
+-- checkout it took; anything else is a release of somebody else's turn and is
+-- a no-op.
+--
+-- `pooled` and `discarded` STAY, and they are not redundant with this. They
+-- answer a different question -- "is this resource in the idle set, or already
+-- closed" -- which is what makes a release BY A COROUTINE THAT NEVER HELD IT
+-- safe: draining a request's capabilities from a supervising coroutine is a
+-- real pattern, and it is caught by the idle check rather than by ownership.
+local function generations(resource)
+  local held = rawget(resource, "held_by")
+  if not held then
+    held = setmetatable({}, { __mode = "k" })
+    resource.held_by = held
+  end
+  return held
+end
+
+--- Stamps a resource as handed out, to this coroutine, on this turn.
+function Pool:_checkout(resource)
+  self.checkouts = self.checkouts + 1
+  resource.pool = self
+  resource.pooled = nil
+  resource.checkout = self.checkouts
+  -- It is out of the idle set, so it is not accruing idle age any more. Only
+  -- `created_at` still bounds it, which is what keeps a long transaction from
+  -- being mistaken for a stale socket.
+  resource.idle_since = nil
+  generations(resource)[coroutine.running()] = self.checkouts
+  return resource
 end
 
 --- The oldest ticket still worth waking, dropping any that cannot take a
@@ -154,12 +229,26 @@ function Pool:_wake_next()
 end
 
 --- Joins the queue, at the back.
+---
+--- WHICHEVER BOUND COMES FIRST, and `reason` records which one it was so the
+--- refusal can name it. The request deadline is the better number whenever
+--- there is one -- it is the moment this caller genuinely stops caring -- and
+--- `wait_timeout` is the backstop for every caller that has no deadline at
+--- all. One `expires` for both, so `_head` keeps its single rule: a ticket
+--- past its expiry cannot take a resource and must not be handed one.
 function Pool:_enqueue()
+  local now = time.monotime()
+  local expires, reason
+
   local left = execution.remaining()
-  local ticket = {
-    cond = condition.new(),
-    expires = left and (time.monotime() + left) or nil,
-  }
+  if left then expires, reason = now + left, "deadline" end
+
+  if self.wait_timeout then
+    local bound = now + self.wait_timeout
+    if not expires or bound < expires then expires, reason = bound, "wait" end
+  end
+
+  local ticket = { cond = condition.new(), expires = expires, reason = reason }
   self.queue[#self.queue + 1] = ticket
   return ticket
 end
@@ -186,6 +275,23 @@ end
 function Pool:reap()
   local before = self:reserved()
   if before == 0 then return 0 end
+
+  -- BY THE CLOCK FIRST, because the collector cannot see all of them. The
+  -- weak table finds a coroutine nothing references any more, which is what an
+  -- ABANDONED handler becomes; it does not find one the controller is still
+  -- holding, and a connect blackholed inside a live server's controller is
+  -- exactly that -- suspended in `poll`, referenced by the scheduler, never
+  -- collected, and its slot never returned. `open_timeout` is how long an
+  -- `open` may plausibly take, so an outstanding one older than that is
+  -- presumed not to be coming back.
+  if self.open_timeout then
+    local now = self.now()
+    for co, started in pairs(self.opening) do
+      if type(started) == "number" and now - started > self.open_timeout then
+        self.opening[co] = nil
+      end
+    end
+  end
 
   -- TWICE, and the number is measured rather than defensive. An abandoned
   -- handler is held by its `cqueues` controller, and the controller has a
@@ -319,6 +425,15 @@ function Pool:get()
   end
 
   while true do
+    -- A CLOSED POOL HANDS NOTHING OUT. Checked inside the loop, not only on
+    -- entry, because `close()` is what wakes a parked waiter: it signals every
+    -- ticket, and the coroutine that comes back here must be told why rather
+    -- than take a slot out of a pool that has already reported itself drained.
+    if self.closed then
+      leave()
+      error("pool: the pool is closed", 0)
+    end
+
     if abandoned() then
       leave()
       -- Hand the turn on rather than swallowing it: another waiter may still
@@ -362,13 +477,7 @@ function Pool:get()
       if resource then
         leave()
         self:_wake_next()
-        resource.pool = self
-        resource.pooled = nil
-        -- It is out of the idle set, so it is not accruing idle age any more.
-        -- Only `created_at` still bounds it, which is what keeps a long
-        -- transaction from being mistaken for a stale socket.
-        resource.idle_since = nil
-        return resource
+        return self:_checkout(resource)
       end
     end
 
@@ -385,8 +494,10 @@ function Pool:get()
     -- recoverable rather than lost, and `live` goes back to meaning what it
     -- says: resources that exist.
     if self.live + self:reserved() < self.size then
+      -- Stamped with WHEN, not merely that it happened: `reap` needs the age
+      -- to write off an open that is never coming back.
       local co = coroutine.running()
-      if co then self.opening[co] = true end
+      if co then self.opening[co] = self.now() end
 
       local ok, resource_or_err = pcall(self.open)
 
@@ -403,8 +514,7 @@ function Pool:get()
       end
 
       self.live = self.live + 1
-      resource_or_err.pool = self
-      resource_or_err.pooled = nil
+      self:_checkout(resource_or_err)
       -- Stamped where the resource comes into existence, and nowhere else:
       -- `max_lifetime` is measured from the connect, not from the last time
       -- somebody borrowed it, or a busy pool would keep a socket for ever by
@@ -462,7 +572,19 @@ function Pool:get()
       -- resource sitting in `idle` -- allocates no ticket and no condition.
       if not ticket then ticket = self:_enqueue() end
       local started = time.monotime()
-      ticket.cond:wait()
+      -- BOUNDED BY THE TICKET, not left to somebody else's kindness.
+      --
+      -- `_head` drops a ticket whose expiry has passed and signals it on the
+      -- way out -- but `_head` only runs when something ELSE happens to the
+      -- pool. With a leaked slot and nothing ever released, nothing else
+      -- happens: an unbounded `wait()` here parks until the process ends,
+      -- however good the deadline recorded on the ticket was. So the wait
+      -- carries the same number the ticket does.
+      if ticket.expires then
+        ticket.cond:wait(math.max(0, ticket.expires - started))
+      else
+        ticket.cond:wait()
+      end
       local waited = time.monotime() - started
       -- Checked HERE as well as at the top of the loop, because this is the
       -- moment that matters: the deadline may have passed during the wait,
@@ -471,6 +593,20 @@ function Pool:get()
       self.waits = self.waits + 1
       self.waited = self.waited + waited
       if waited > self.waited_max then self.waited_max = waited end
+
+      -- The deadline case is handled by `abandoned()` at the top of the loop,
+      -- which says so in the caller's own terms. This is the other bound, and
+      -- it has to be refused HERE: the ticket is spent, so the next turn of
+      -- the loop would find it dropped from the queue and re-park on a
+      -- condition with nothing behind it.
+      if ticket.reason == "wait" and time.monotime() >= ticket.expires then
+        leave()
+        self:_wake()
+        error(("pool: timed out after %gs waiting for a slot " ..
+               "(size=%d live=%d idle=%d reserved=%d)")
+              :format(self.wait_timeout, self.size, self.live, #self.idle,
+                      self:reserved()), 0)
+      end
     end
   end
 end
@@ -494,9 +630,36 @@ function Pool:put(resource)
   -- `live + reserved < size`, so the pool then opens more connections than it
   -- was allowed. Found by `spec/properties_spec.lua` on its first run, at
   -- seed 7919 step 61, which is a schedule nobody would have written by hand.
-  if resource.pooled or resource.discarded then return end
+  --
+  -- AND THE GENERATION IS CHECKED FIRST, because `pooled` cannot see the case
+  -- above: `get` clears it, so `put -> get(by another coroutine) -> put` finds
+  -- it already cleared and files a resource somebody else is holding. See the
+  -- ownership section: a coroutine that took this resource may return only the
+  -- checkout it took, and a coroutine that never took it is judged by
+  -- `pooled`/`discarded` instead, so releasing on somebody's behalf still
+  -- works.
+  local mine = rawget(resource, "held_by")
+  mine = mine and mine[coroutine.running()]
+  if mine then
+    if mine ~= resource.checkout then return end
+  elseif resource.pooled or resource.discarded then
+    return
+  end
 
   resource.pool = nil
+  resource.checkout = nil
+
+  -- A POOL THAT HAS BEEN CLOSED IS CLOSED. Without this the late release filed
+  -- a connection into the idle set of a pool that had already reported itself
+  -- drained, and the pool then exceeded its own cap: measured, `size=2` and
+  -- three live connections handed out. The resource is closed rather than
+  -- kept, because nobody is ever going to come back for it.
+  if self.closed then
+    resource.discarded = true
+    pcall(function() resource:close() end)
+    return
+  end
+
   local keep = true
   if self.reusable then
     local ok, verdict = pcall(self.reusable, resource)
@@ -538,8 +701,13 @@ function Pool:put(resource)
 end
 
 function Pool:close()
+  -- Set before anything else: a resource released while this runs must be
+  -- closed, not filed into the idle set of a pool that is going away.
+  self.closed = true
   for _, resource in ipairs(self.idle) do
     resource.pooled = nil
+    resource.discarded = true
+    resource.checkout = nil
     pcall(function() resource:close() end)
   end
   self.idle, self.live = {}, 0

@@ -320,7 +320,16 @@ function M.connect(config)
   -- notice. Rejected here means closed and the slot freed.
   local pool = Pool.new(open, size, function(conn)
     return not conn.broken and not conn.in_flight and conn.sock ~= nil
-  end)
+  end, {
+    -- The same four numbers `akkar.db` forwards, for the same reason: they
+    -- were accepted on the config table here and never reached the pool, so
+    -- every one of them was a setting that did nothing. `nil` means unset and
+    -- leaves the pool's own default in place.
+    max_lifetime = config.max_lifetime,
+    idle_timeout = config.idle_timeout,
+    wait_timeout = config.pool_wait_timeout,
+    open_timeout = config.connect_timeout and config.connect_timeout * 2 or nil,
+  })
   return setmetatable({ pool = pool }, {
     __call = function() return pool:get() end,
   })

@@ -688,7 +688,23 @@ function M.connect(config)
   local pool = Pool.new(open, size, function(conn)
     return not conn.in_transaction and not conn.broken
        and not conn.in_flight and conn.pg ~= nil
-  end)
+  end, {
+    -- WHY THESE ARE FORWARDED AT ALL: they were accepted here and dropped on
+    -- the floor. An application that set `max_lifetime = 60` in front of a
+    -- proxy reaping at 90 seconds got the pool's 1800 and the corpses it was
+    -- configuring its way out of. The reasons for each bound live in
+    -- `akkar.pool`; only the numbers belong to the application, and the
+    -- default for each stays the pool's -- `nil` here means "unset", which is
+    -- exactly what `Pool.new` reads as "use mine".
+    max_lifetime = config.max_lifetime,
+    idle_timeout = config.idle_timeout,
+    wait_timeout = config.pool_wait_timeout,
+    -- A slot outstanding for much longer than a connect attempt can plausibly
+    -- take is a connect that is never coming back. Twice the connect timeout,
+    -- because the connect is only the first leg: Postgres then authenticates
+    -- and akkar sets `statement_timeout` before `open` returns.
+    open_timeout = config.connect_timeout and config.connect_timeout * 2 or nil,
+  })
   -- A callable table rather than a plain function, so the pool can be reached
   -- for shutdown and diagnostics.  Lua functions cannot carry fields.
   return setmetatable({ pool = pool }, {
