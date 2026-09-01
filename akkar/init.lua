@@ -199,6 +199,12 @@ akkar.defaults = {
   timeout        = 30,            -- seconds of wall clock per request
   shutdown_grace = 10,            -- seconds to drain before saying so
 
+  -- HOW LONG A CLIENT MAY TAKE TO FINISH ITS HEADER BLOCK, absolute and
+  -- measured from the first byte, so trickling cannot extend it. Distinct from
+  -- `timeout`, which bounds the HANDLER: this bounds the stranger who has not
+  -- asked for anything yet.
+  read_timeout   = 30,            -- seconds to send a request
+
   -- INSTRUCTIONS A HANDLER MAY RUN WITHOUT RETURNING. `nil` is no ceiling,
   -- which is what every akkar before this had and what a service that trusts
   -- its own code wants.
@@ -263,7 +269,7 @@ local SETTINGS = {
   host = true, port = true, tls = true, ctx = true,
   body_limit = true, timeout = true, shutdown_grace = true,
   check_capabilities = true, reuseport = true, strict = true,
-  max_concurrent = true, trusted_proxies = true,
+  max_concurrent = true, trusted_proxies = true, read_timeout = true,
   repair_substrate = true, socket_buffer = true, gc = true,
   cpu_limit = true, h2c = true, websocket_idle_timeout = true,
   websocket_max_message = true, websocket_max_connections = true,
@@ -2567,6 +2573,8 @@ function App:run(config)
   local max_concurrent = config.max_concurrent
   if max_concurrent == nil then max_concurrent = descriptor_ceiling() end
 
+  local read_timeout = config.read_timeout or akkar.defaults.read_timeout
+
   -- PUBLISHED ON THE APP, not merely handed to lua-http. `akkar.limit.shed`
   -- sheds low-priority work at a fraction of this number and reads it from
   -- here; while it was a local, that read returned nil and the shedder could
@@ -2740,6 +2748,98 @@ function App:run(config)
     require("cqueues.socket").setbufsiz(buffer, buffer)
   end
 
+  -- STOP_ACCEPTING has to mean it at the REQUEST level, not only at accept().
+  --
+  -- `server:pause()` stops the listener and nothing else, so a client already
+  -- holding a connection -- an h2 stream, or a 1.1 keep-alive -- can keep
+  -- asking for NEW work while the drain is trying to end. Each one extends the
+  -- drain by its own duration, so an ordinary busy client can hold a shutdown
+  -- open indefinitely without doing anything wrong, and a determined one can do
+  -- it on purpose. Refusing here is what makes the drain finite: what is left
+  -- to wait for is exactly the requests already in flight when the signal came.
+  --
+  -- `connection: close` matters as much as the status. Without it a keep-alive
+  -- client takes the 503 and asks again on the same socket, and the refusal
+  -- becomes a loop instead of an ending.
+  local function say_no(stream, why, close_it)
+    pcall(function()
+      local payload = cjson.encode { error = why }
+      local rh = headers.new()
+      rh:append(":status", "503")
+      rh:append("content-type", "application/json")
+      rh:append("content-length", tostring(#payload))
+      rh:append("retry-after", "1")
+      if close_it then rh:append("connection", "close") end
+      stream:write_headers(rh, false)
+      stream:write_chunk(payload, true)
+    end)
+    if close_it then pcall(function() stream:shutdown() end) end
+  end
+
+  -- Tell an h2 client the ceiling, so a polite one need never be refused.
+  --
+  -- The frame is written rather than sent through `conn:settings{}`, which
+  -- blocks for the peer's ACK and steps the connection itself -- that is the
+  -- reader loop's job, and two steppers on one connection is a race. A SETTINGS
+  -- frame is true whether or not it has been ACKed. If the write fails the gate
+  -- below is still the guarantee, so it is not worth failing a request over.
+  --
+  -- Advertised here rather than through `h2_max_concurrent_streams` on
+  -- `server.listen`, because that number is what the h2 layer ENFORCES: setting
+  -- it to the ceiling makes lua-http answer RST_STREAM(REFUSED_STREAM) before
+  -- akkar can answer anything. REFUSED_STREAM is the right word and carries no
+  -- delay, so a client that ignores it -- lua-http's own does -- retries into
+  -- the same wall at line speed. The advertisement informs; the gate refuses,
+  -- with a status and a Retry-After, on the one path that logs and metrics
+  -- already see.
+  local advertised = setmetatable({}, { __mode = "k" })
+  local function advertise_ceiling(stream)
+    if not max_concurrent then return end
+    local conn = stream.connection
+    if not conn or conn.version ~= 2 or advertised[conn] then return end
+    advertised[conn] = true
+    pcall(function()
+      conn.stream0:write_settings_frame(false,
+        { MAX_CONCURRENT_STREAMS = max_concurrent }, 0, "f")
+    end)
+  end
+
+  local drained_total, drained_said = 0, 0
+  local function refuse_draining(stream)
+    drained_total = drained_total + 1
+    local now = time.monotime()
+    if now - drained_said >= 1 then
+      drained_said = now
+      internal:info("shutting down; refusing new requests", {
+        state = self.state, in_flight = self.in_flight,
+        refused_total = drained_total,
+      })
+    end
+    say_no(stream, "server is shutting down", true)
+  end
+
+  -- The shed log is rate limited to a line a second with a running total,
+  -- because the flood that trips this is exactly the flood that would drown
+  -- the log it is being reported in.
+  local shed_total, shed_said = 0, 0
+  local function shed(stream)
+    shed_total = shed_total + 1
+    local now = time.monotime()
+    if now - shed_said >= 1 then
+      shed_said = now
+      internal:warn("at capacity; shedding", {
+        in_flight = self.in_flight, max_concurrent = max_concurrent,
+        shed_total = shed_total,
+      })
+    end
+    -- 503 with Retry-After rather than an h2 REFUSED_STREAM: REFUSED_STREAM is
+    -- the right word but carries no delay, so a client that ignores it --
+    -- lua-http's own does -- retries into the same wall at line speed. One
+    -- status works identically on both protocols, through the one path that
+    -- logs and metrics already see.
+    say_no(stream, "server is at capacity", false)
+  end
+
   local s = assert(server.listen {
     host = host, port = port, tls = tls_on, ctx = tls_ctx,
     -- HTTP/2 OVER TLS NEEDS NOTHING HERE: ALPN settles it, and a client that
@@ -2750,11 +2850,30 @@ function App:run(config)
     -- One connection must not be able to open unbounded requests. See the
     -- note in `vendor/http/server.lua`: `max_concurrent` counts connections,
     -- and 500 streams on one connection were measured going straight through.
+    -- This is what the h2 layer ENFORCES, and it stays a generous default
+    -- rather than tracking `max_concurrent`, on purpose: setting it to the
+    -- ceiling makes lua-http answer RST_STREAM(REFUSED_STREAM) before akkar
+    -- can answer anything, and REFUSED_STREAM carries no delay -- a client
+    -- that ignores it, lua-http's own included, retries into the same wall at
+    -- line speed. The ceiling is ADVERTISED separately, per connection, by
+    -- `advertise_ceiling` above, and enforced by the gate in `onstream` with a
+    -- 503 and a Retry-After.
     h2_max_concurrent_streams = config.h2_max_concurrent_streams or 100,
     reuseport = config.reuseport,
     max_concurrent = max_concurrent,
     onstream = function(_, stream)
-      self.in_flight = self.in_flight + 1
+      -- A connection that has not finished its header block is not a request
+      -- yet, and counting it as one is what makes a drain unable to end. One
+      -- half-open socket -- a port scanner, a slowloris, a phone that left the
+      -- network mid-request -- held `in_flight` above zero for as long as the
+      -- peer's kernel kept the socket, so every drain stalled until something
+      -- SIGKILLed the process. That kill truncates whatever was still being
+      -- written, which is the exact corruption App:stop's never-force policy
+      -- exists to prevent: an unbounded read HERE defeated the policy THERE.
+      --
+      -- So the header read carries a deadline and the count starts when there
+      -- is something to serve. A connection idling between keep-alive requests
+      -- is not inside this function and was never counted.
 
       -- Held out here because the WRITES BELOW CAN RAISE, and until they were
       -- allowed to raise past a release this was a capability leak on the
@@ -2783,7 +2902,7 @@ function App:run(config)
       -- accept loop. The client is told its request was malformed, which is
       -- true and is the whole of what akkar knows about it.
       local got_headers, headers_or_why = pcall(function()
-        return assert(stream:get_headers())
+        return assert(stream:get_headers(read_timeout))
       end)
 
       if not got_headers then
@@ -2800,10 +2919,23 @@ function App:run(config)
           stream:write_chunk(body, true)
         end)
         pcall(stream.shutdown, stream)
-        self.in_flight = self.in_flight - 1
         return
       end
 
+      -- The two refusals, in this order: a server that is going away should
+      -- say so rather than report how busy it is. Neither counts toward
+      -- `in_flight` -- work that was refused is not work being drained.
+      if self.state ~= "RUNNING" then
+        refuse_draining(stream)
+        return
+      end
+      advertise_ceiling(stream)
+      if max_concurrent and self.in_flight >= max_concurrent then
+        shed(stream)
+        return
+      end
+
+      self.in_flight = self.in_flight + 1
       local ok, err = pcall(function()
         local h = headers_or_why
         -- The socket's own idea of who connected. Everything else about the

@@ -64,8 +64,13 @@ local function burst(opts)
 
   cq:wrap(function()
     pcall(function()
+      -- Cleartext h2 is `h2c` here rather than a `http_version` setting: this
+      -- line of work supports h2 over ALPN and h2c deliberately, and a version
+      -- switch that defaults to 1.1 would turn a shipped feature off. The
+      -- client below still chooses the version it speaks; this only says the
+      -- server will answer h2 without TLS.
       app:run { port = opts.port, max_concurrent = opts.max_concurrent,
-                http_version = opts.version, check_capabilities = false,
+                h2c = opts.version == 2 or nil, check_capabilities = false,
                 log = akkar.log.new(QUIET) }
     end)
   end)
@@ -126,14 +131,28 @@ describe("the concurrency ceiling counts requests, not connections", function()
   end)
 
   it("holds under HTTP/1.1 pipelining, which was never safe either", function()
-    -- The default configuration. One connection, twenty requests written back
-    -- to back before the first response is read: the same forty-in-flight
-    -- measurement as h2, and the same gate stops it.
+    -- One connection, twenty requests written back to back before the first
+    -- response is read.
+    --
+    -- This case was written against a tree where h1 streams got a coroutine
+    -- each, so pipelining bypassed the ceiling exactly as h2 multiplexing did
+    -- and the expectation was 2 served and 18 shed. It does not bypass
+    -- anything here. `vendor/http/server.lua` runs an h1 stream INLINE --
+    -- `handle_stream(self, stream)` rather than `add_stream` -- so the accept
+    -- loop parks inside `get_next_incoming_stream` while the stream runs and a
+    -- connection cannot produce its next request until the current one is
+    -- answered. Measured: peak 1 against a ceiling of 2, with all twenty
+    -- served.
+    --
+    -- So the guarantee to assert is the one that holds: the ceiling is never
+    -- exceeded, and nothing is refused that the server was able to do. Shedding
+    -- here would mean answering 503 to work already in hand, one request at a
+    -- time, which is worse than the defect this file is about.
     local r = burst { port = 8652, version = 1.1, max_concurrent = 2, n = 20 }
     assert.is_true(r.peak <= 2,
       string.format("peak was %d against max_concurrent = 2", r.peak))
-    assert.equal(2, r.statuses["200"])
-    assert.equal(18, r.statuses["503"])
+    assert.equal(20, r.statuses["200"])
+    assert.is_nil(r.statuses["503"])
   end)
 
   it("refuses before the handler, so a shed request costs nothing", function()
