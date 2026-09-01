@@ -3003,6 +3003,131 @@ function App:stop(grace)
   return self.state
 end
 
+-- ================================================== the descriptor ceiling
+--
+-- An in-flight request holds ONE descriptor: the connection it arrived on.
+--
+-- It held three until F2, and the paragraph that used to stand here
+-- described why -- a `cqueues` controller per request for the deadline, at
+-- exactly two descriptors on epoll and three on kqueue, measured at 2.09,
+-- 2.02 and 2.01 per request across 64, 256 and 512 concurrent. Against the
+-- usual `ulimit -n 1024` that put the wall near 500, and hitting it was not
+-- a clean failure: `accept` began failing, every socket operation began
+-- failing, and a machine was lost that way during a 512-connection sweep.
+--
+-- IT ALSO PREDICTED, WORD FOR WORD, THE BUG THAT REMOVING IT CAUSED:
+--
+--     "today an abandoned handler sits in an orphaned controller nothing
+--      ever steps, so it is inert. Move it to the outer controller and it
+--      keeps running, wakes after the 503, and touches a connection that
+--      has already gone back to the pool"
+--
+-- That is precisely what happened, and it took an outage on the study box
+-- to find -- a pool of two going to zero in ten seconds and never
+-- recovering. The defence is in `akkar/pool.lua` and `akkar/db.lua` now:
+-- a caller whose `execution.remaining()` has gone negative is refused, at
+-- acquisition as well as at the query. The comment was right and nobody
+-- read it as an instruction.
+--
+-- The ceiling is still declared to lua-http, which stops accepting beyond
+-- it and lets the kernel queue instead. Backpressure rather than collapse:
+-- slow is a state a server can be in, out of descriptors is not.
+--- The soft and hard descriptor limits this process runs under, as two
+--- numbers, or nil where they cannot be read.
+---
+--- EXPORTED BECAUSE TWO CALLERS NEED THE SAME READ. `app:run` derives the
+--- ceiling below from the soft limit; `akkar.doctor` reports both numbers and
+--- the ceiling before anything binds a port, which is where an operator can
+--- still do something about a limit of 1024. A second reader with its own
+--- parse would be a second thing to get wrong.
+---
+--- `/proc/self/limits` in pure Lua, and no luaposix: the file carries both
+--- columns, and adding a C dependency to read a number the kernel already
+--- prints as text would be paying a rockspec argument for nothing.
+---
+--- The hard limit is `math.huge` when the kernel prints `unlimited`. A soft
+--- limit that is not a number yields nil, exactly as an unreadable file does,
+--- because a ceiling cannot be derived from either.
+function akkar.descriptor_limits()
+  local limits = io.open "/proc/self/limits"
+  if not limits then return nil end
+  local soft, hard
+  for line in limits:lines() do
+    if not soft then
+      -- Both columns, not just the first: `Max open files  1024  1048576`.
+      -- The hard column is what says whether `ulimit -n` can raise the soft
+      -- one without root, which is the difference between a fix an operator
+      -- can apply now and one that needs a systemd unit edited.
+      soft, hard = line:match "^Max open files%s+(%d+)%s+(%S+)"
+    end
+  end
+  limits:close()
+  if not soft then return nil end
+  return tonumber(soft), tonumber(hard) or math.huge
+end
+
+-- ONE PER IN-FLIGHT REQUEST, MEASURED -- the connection's own socket, and
+-- nothing else.
+--
+-- It was three until the deadline stopped needing a controller: the
+-- socket plus two descriptors for the nested `cqueues.new()` that
+-- arbitrated the deadline. `with_deadline` uses a bare number in
+-- `cqueues.poll` now, which allocates no descriptor at all, and
+-- `spec/concurrency_spec.lua` counts 1.00 where it counted 3.00.
+--
+-- The consequence is the whole of F2: on the usual `ulimit -n 1024` this
+-- promised 225 concurrent requests and now promises 675.
+--
+-- The history below is kept because the arithmetic was wrong twice, in
+-- opposite directions, and both mistakes are instructive.
+--
+-- Counted from inside a server process of its own, sampling /proc while N
+-- requests were held in a sleeping handler:
+--
+--     50 in flight    150 descriptors    3.00 each
+--    100 in flight    300 descriptors    3.00 each
+--    200 in flight    600 descriptors    3.00 each
+--
+-- Dead flat, which is what a per-request cost looks like. The controller
+-- is two of the three on epoll (`spec/support/portable.lua` measured that
+-- separately, and three on kqueue); the socket is the third.
+--
+-- The consequence of dividing by two was a ceiling FIFTY PERCENT HIGHER
+-- than the box could serve. On a machine with the usual `ulimit -n 1024`
+-- this promised 337 concurrent requests, which would need 1,011
+-- descriptors -- more than the whole limit, never mind the third held
+-- back. It now promises 225, which fits.
+--
+-- This is not hypothetical. `bench/runtime/run.sh` at 100 connections had
+-- akkar answering 18,640 of 111,651 requests with
+-- `unable to initialize continuation queue: Too many open files` -- one
+-- request in six, on the run that produced a published throughput number.
+-- Nobody saw it because that harness read the wrong awk field for the
+-- error count.
+--
+-- AND DARWIN IS NO LONGER A SPECIAL CASE, which is the quiet second win.
+-- The kqueue difference was entirely the controller's -- three
+-- descriptors there against two on epoll. A socket is a socket on both,
+-- so the number is now one everywhere. The function still reads /proc and
+-- still returns nil off Linux, so no ceiling is derived there; that is a
+-- separate gap, recorded in `docs/PLATFORMS.md`.
+
+--- The ceiling akkar derives from a soft descriptor limit: 66% of it, never
+--- below 16, nil when there is no limit to derive from.
+---
+--- A PURE FUNCTION OF THE NUMBER, deliberately. The soft limit on the machine
+--- running the suite is whatever that machine was configured with -- 1048576
+--- here -- so a test that wanted to check what akkar promises under the
+--- common `ulimit -n 1024` could never provoke it by reading /proc. Passing
+--- the number in means the arithmetic is testable at any limit, and the read
+--- above is the only part that depends on the box.
+function akkar.descriptor_ceiling(soft)
+  if not soft then return nil end
+  local ceiling = math.floor(tonumber(soft) * 0.66 / 1)
+  return math.max(ceiling, 16)
+end
+
+
 function App:run(config)
   config = config or {}
 
@@ -3098,96 +3223,14 @@ function App:run(config)
   -- Without it the second process dies with EADDRINUSE, and a benchmark that
   -- starts N processes silently measures one.  That is not hypothetical: it
   -- is what the first scaling run on a c5.2xlarge actually did.
-  -- ================================================== the descriptor ceiling
-  --
-  -- An in-flight request holds ONE descriptor: the connection it arrived on.
-  --
-  -- It held three until F2, and the paragraph that used to stand here
-  -- described why -- a `cqueues` controller per request for the deadline, at
-  -- exactly two descriptors on epoll and three on kqueue, measured at 2.09,
-  -- 2.02 and 2.01 per request across 64, 256 and 512 concurrent. Against the
-  -- usual `ulimit -n 1024` that put the wall near 500, and hitting it was not
-  -- a clean failure: `accept` began failing, every socket operation began
-  -- failing, and a machine was lost that way during a 512-connection sweep.
-  --
-  -- IT ALSO PREDICTED, WORD FOR WORD, THE BUG THAT REMOVING IT CAUSED:
-  --
-  --     "today an abandoned handler sits in an orphaned controller nothing
-  --      ever steps, so it is inert. Move it to the outer controller and it
-  --      keeps running, wakes after the 503, and touches a connection that
-  --      has already gone back to the pool"
-  --
-  -- That is precisely what happened, and it took an outage on the study box
-  -- to find -- a pool of two going to zero in ten seconds and never
-  -- recovering. The defence is in `akkar/pool.lua` and `akkar/db.lua` now:
-  -- a caller whose `execution.remaining()` has gone negative is refused, at
-  -- acquisition as well as at the query. The comment was right and nobody
-  -- read it as an instruction.
-  --
-  -- The ceiling is still declared to lua-http, which stops accepting beyond
-  -- it and lets the kernel queue instead. Backpressure rather than collapse:
-  -- slow is a state a server can be in, out of descriptors is not.
-  local function descriptor_ceiling()
-    local limits = io.open "/proc/self/limits"
-    if not limits then return nil end
-    local soft
-    for line in limits:lines() do
-      soft = soft or line:match "^Max open files%s+(%d+)"
-    end
-    limits:close()
-    if not soft then return nil end
 
-    -- ONE PER IN-FLIGHT REQUEST, MEASURED -- the connection's own socket, and
-    -- nothing else.
-    --
-    -- It was three until the deadline stopped needing a controller: the
-    -- socket plus two descriptors for the nested `cqueues.new()` that
-    -- arbitrated the deadline. `with_deadline` uses a bare number in
-    -- `cqueues.poll` now, which allocates no descriptor at all, and
-    -- `spec/concurrency_spec.lua` counts 1.00 where it counted 3.00.
-    --
-    -- The consequence is the whole of F2: on the usual `ulimit -n 1024` this
-    -- promised 225 concurrent requests and now promises 675.
-    --
-    -- The history below is kept because the arithmetic was wrong twice, in
-    -- opposite directions, and both mistakes are instructive.
-    --
-    -- Counted from inside a server process of its own, sampling /proc while N
-    -- requests were held in a sleeping handler:
-    --
-    --     50 in flight    150 descriptors    3.00 each
-    --    100 in flight    300 descriptors    3.00 each
-    --    200 in flight    600 descriptors    3.00 each
-    --
-    -- Dead flat, which is what a per-request cost looks like. The controller
-    -- is two of the three on epoll (`spec/support/portable.lua` measured that
-    -- separately, and three on kqueue); the socket is the third.
-    --
-    -- The consequence of dividing by two was a ceiling FIFTY PERCENT HIGHER
-    -- than the box could serve. On a machine with the usual `ulimit -n 1024`
-    -- this promised 337 concurrent requests, which would need 1,011
-    -- descriptors -- more than the whole limit, never mind the third held
-    -- back. It now promises 225, which fits.
-    --
-    -- This is not hypothetical. `bench/runtime/run.sh` at 100 connections had
-    -- akkar answering 18,640 of 111,651 requests with
-    -- `unable to initialize continuation queue: Too many open files` -- one
-    -- request in six, on the run that produced a published throughput number.
-    -- Nobody saw it because that harness read the wrong awk field for the
-    -- error count.
-    --
-    -- AND DARWIN IS NO LONGER A SPECIAL CASE, which is the quiet second win.
-    -- The kqueue difference was entirely the controller's -- three
-    -- descriptors there against two on epoll. A socket is a socket on both,
-    -- so the number is now one everywhere. The function still reads /proc and
-    -- still returns nil off Linux, so no ceiling is derived there; that is a
-    -- separate gap, recorded in `docs/PLATFORMS.md`.
-    local ceiling = math.floor(tonumber(soft) * 0.66 / 1)
-    return math.max(ceiling, 16)
-  end
-
+  -- The ceiling, derived from the soft limit this process actually has.
+  -- Both halves are module-level and exported: `akkar.doctor` reports the
+  -- same two numbers before anything binds a port.
   local max_concurrent = config.max_concurrent
-  if max_concurrent == nil then max_concurrent = descriptor_ceiling() end
+  if max_concurrent == nil then
+    max_concurrent = akkar.descriptor_ceiling(akkar.descriptor_limits())
+  end
 
   local read_timeout = config.read_timeout or akkar.defaults.read_timeout
 
