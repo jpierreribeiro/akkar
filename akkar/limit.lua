@@ -306,9 +306,26 @@ end
 --- Runs one limiter script, and ALLOWS the request when the store cannot
 --- answer.
 ---
---- Returns the reply, or nil when the store failed. Every caller reads a nil
---- as "allow": that is the fail-open decision, made in one place so no
---- limiter can forget it.
+--- Returns the reply, or `nil, refuse` when the store failed. `refuse` is the
+--- application's answer to the trade the header sets out, and the default is
+--- false: allow. Made in one place so no limiter can forget it.
+---
+--- `on_error = "closed"` INVERTS IT, and it is an option beside the default
+--- rather than a replacement for it. The header's argument -- that a total
+--- outage caused by a dependency which was never on the critical path is
+--- larger than a quota overrun by the whole size of the traffic -- holds for
+--- most services, so it stays the default. It does not hold for all of them:
+--- a limiter in front of an SMS gateway, a payment provider or anything else
+--- where a request costs real money is one where the overrun is the more
+--- expensive half, and the application is the only party that knows which it
+--- has. Hardcoding the answer meant the ones that needed the other one had to
+--- reimplement the limiter to get it.
+---
+--- Whichever way it goes, the outage is reported identically: the counter
+--- rises, the once-per-outage warning fires, and `on_store_error` is called.
+--- A fail-closed limiter is not a quiet one -- it is a limiter refusing
+--- traffic for a reason that has nothing to do with the traffic, which is if
+--- anything the more urgent thing to be paged about.
 ---
 --- `state` is the middleware instance's own table, and it holds nothing but
 --- the "have I already complained about this outage" flag. Kept per instance
@@ -334,16 +351,24 @@ local function attempt(run, cache, keys, args, options, req, state, where)
 
   M.store_failures = M.store_failures + 1
 
+  local refuse = options.on_error == "closed"
+
   if not state.blind then
     state.blind = true
     -- `req.log` always exists -- it is the one capability with a default --
     -- so this cannot be the thing that raises while reporting that something
     -- raised.
     local logged = pcall(function()
-      req.log:warn("rate limiter store is unreachable; ALLOWING requests", {
+      req.log:warn("rate limiter store is unreachable; " ..
+                   (refuse and "REFUSING requests" or "ALLOWING requests"), {
         limiter = where,
         detail  = tostring(reply),
-        effect  = "configured limits are not being enforced until this clears",
+        -- The effect is the half an operator acts on, so it says which of the
+        -- two outages is happening rather than assuming the default one.
+        effect  = refuse
+          and "every limited route is answering 429 until this clears"
+          or "configured limits are not being enforced until this clears",
+        on_error = refuse and "closed" or "open",
         store_failures = M.store_failures,
       })
     end)
@@ -354,7 +379,7 @@ local function attempt(run, cache, keys, args, options, req, state, where)
     pcall(options.on_store_error, reply, req)
   end
 
-  return nil
+  return nil, refuse
 end
 
 --- True when the store can run scripts at all.
@@ -386,6 +411,46 @@ function M.shared(cache)
 end
 
 -- ================================================================ middleware
+--
+-- WHOSE BUCKET IS IT. A bucket name answers three questions, and for a long
+-- time it answered only one. `prefix` was a constant default, so two
+-- `limit.rate{}` middlewares mounted on different routes shared one bucket
+-- and whichever was tighter silently governed both. There was no tenant
+-- component either, so in a multi-tenant application tenant `acme`'s user 7
+-- spent tenant `evil`'s user 7's allowance. The key is now, in order:
+--
+--     <prefix> <this limiter> <tenant> <caller>
+--
+-- and the pieces are LENGTH-PREFIXED rather than joined by a colon, because
+-- several different parties choose them. Plain concatenation makes tenant
+-- `acme` + caller `user:7` and tenant `ac` + caller `me:user:7` the same
+-- eleven characters, and lets a caller id that itself contains a colon spell
+-- somebody else's bucket.
+local function segment(value)
+  value = tostring(value or "")
+  return #value .. ":" .. value
+end
+
+--- Which tenant's budget this is.
+---
+--- Without it every tenant's user 7 spends one shared allowance -- the same
+--- collision `akkar.scope` exists to remove on the database side. A constant
+--- string or a resolver; absent means the application is single-tenant.
+---
+--- An empty resolution raises rather than falling back to the shared bucket:
+--- a namespace that silently resolves to "" is the multi-tenant collision
+--- coming back at exactly the moment the resolver stopped working.
+local function namespace_for(options, req)
+  local namespace = options.namespace
+  if namespace == nil then return "" end
+  local value = type(namespace) == "function" and namespace(req) or namespace
+  value = tostring(value or "")
+  if value == "" then
+    error("limit: namespace returned an empty value", 0)
+  end
+  return value
+end
+
 local function key_for(options, req)
   if options.key then return options.key(req) end
   -- The default is the authenticated caller when there is one and the client
@@ -412,6 +477,13 @@ local function key_for(options, req)
   -- limiter defeated by one header. Found by asking what a real admin IP
   -- allowlist would need and discovering the framework had no answer.
   return "ip:" .. tostring(req.ip or "unknown")
+end
+
+--- The whole bucket name, assembled once so the two limiters cannot drift.
+local function bucket_key(prefix, bucket, options, req)
+  return prefix .. segment(bucket)
+                .. segment(namespace_for(options, req))
+                .. segment(key_for(options, req))
 end
 
 -- ========================================================== response metadata
@@ -470,21 +542,28 @@ end
 --- with `x-request-id` and `traceparent`: a value the application set
 --- deliberately is the one it meant, and quietly replacing it is how
 --- middleware becomes untrustworthy.
+---
+--- READ THROUGH THE METATABLE, not around it. These were `rawget` calls, and
+--- what `next(req)` returns is no longer always a plain table: `akkar/init.lua`
+--- hands middleware a copy-on-write VIEW of the response, so that decorating
+--- it cannot write on a response the handler hoisted. A view carries none of
+--- these fields raw, so `rawget` read nil for every one of them and this
+--- built a response with no status and no body. `akkar.Response` declares no
+--- methods, so for a plain response the two spellings are the same read.
 local function copy_of(res, extra)
   local headers = {}
   for name, value in pairs(extra or {}) do headers[name] = value end
-  local existing = rawget(res, "headers")
+  local existing = res.headers
   if existing then
     for name, value in pairs(existing) do headers[name] = value end
   end
 
-  local copy = require("akkar").response(rawget(res, "status"),
-                                         rawget(res, "body"), headers)
-  copy.stream       = rawget(res, "stream")
-  copy.content_type = rawget(res, "content_type")
-  copy.raw          = rawget(res, "raw")
-  copy.release      = rawget(res, "release")
-  copy.__pending    = rawget(res, "__pending")
+  local copy = require("akkar").response(res.status, res.body, headers)
+  copy.stream       = res.stream
+  copy.content_type = res.content_type
+  copy.raw          = res.raw
+  copy.release      = res.release
+  copy.__pending    = res.__pending
   return copy
 end
 
@@ -516,12 +595,23 @@ end
 --- `headers = false` suppresses the `ratelimit-*` metadata, for a service
 --- that would rather not publish its quota. It is on by default because a
 --- client that cannot see the limit cannot respect it.
+---
+--- `namespace` is the tenant whose budget this is -- a constant string or a
+--- resolver called with the request; a single-tenant application leaves it
+--- out. `name` separates two limiters that are configured alike but meant to
+--- be counted apart.
 function M.rate(options)
   options = options or {}
   local per_second = options.per_second or 10
   local burst      = options.burst or per_second
   local cost       = options.cost or 1
   local prefix     = options.prefix or "akkar:rate:"
+  -- Unnamed, a limiter's bucket carries its own settings, which is what keeps
+  -- a one-per-second limiter on /reset out of a hundred-per-second limiter's
+  -- allowance. Two limiters deliberately configured alike but meant to be
+  -- counted apart need a `name`.
+  local bucket     = options.name
+                     or (per_second .. "/" .. burst .. "/" .. cost)
   local announce   = options.headers ~= false
   local run = evaluator(RATE_SCRIPT)     -- holds a SHA, never a connection
   local state = {}                       -- outage flag; never a connection
@@ -562,15 +652,21 @@ function M.rate(options)
     if is_exempt(req.path) then return next(req) end
 
     local cache = options.cache or req.cache
-    local reply = attempt(run, cache, { prefix .. key_for(options, req) },
+    local reply, refuse = attempt(run, cache,
+                          { bucket_key(prefix, bucket, options, req) },
                           { burst, per_second, cost }, options, req, state,
                           "rate")
 
-    -- nil is the store failing, and the answer is to serve the request. No
-    -- quota headers go out with it: the numbers are unknown, and inventing a
-    -- remaining count would be a lie a well-behaved client would then pace
-    -- itself against.
-    if reply == nil then return next(req) end
+    -- nil is the store failing, and the answer is the one the application
+    -- chose. No quota headers go out either way: the numbers are unknown, and
+    -- inventing a remaining count would be a lie a well-behaved client would
+    -- then pace itself against -- and on the refusal, a `ratelimit-reset` no
+    -- store agreed to would be worse still, since the wait is for Redis and
+    -- not for a bucket to refill.
+    if reply == nil then
+      if refuse then return too_many(options.retry_after_ms or 1000) end
+      return next(req)
+    end
 
     local remaining = tonumber(reply[2]) or 0
     if tonumber(reply[1]) ~= 1 then
@@ -593,26 +689,57 @@ end
 --- twenty is a p99 of 396ms for everybody.
 ---
 ---     app:use(akkar.limit.concurrent { limit = 5 })
+---
+--- Takes `name` and `namespace` on the same terms as `M.rate`.
 function M.concurrent(options)
   options = options or {}
   local limit  = options.limit or 10
   local ttl    = options.ttl or 30      -- a slot cannot be held longer
   local prefix = options.prefix or "akkar:concurrent:"
+  local bucket = options.name or (limit .. "/" .. ttl)
   local acquire = evaluator(CONCURRENT_SCRIPT)
   local release = evaluator(RELEASE_SCRIPT)
   local state = {}
 
+  -- THE SLOT'S NAME IS THE LIMITER'S, AND IT IS MINTED HERE.
+  --
+  -- It used to be `req.id`, and `req.id` is not this module's to depend on.
+  -- Two in-flight requests carrying one id `ZADD` the same ZSET member and
+  -- occupy ONE slot between them, so the limiter's own count disagrees with
+  -- how many requests it is actually holding; and the release deletes a member
+  -- BY NAME, so a repeated id frees somebody else's slot and lets a caller sit
+  -- above the limit while the count says it did not.
+  --
+  -- The server mints `req.id` itself now, which makes this sound settled. It
+  -- is not. That is an invariant maintained two modules away for a different
+  -- purpose -- tracing -- and `M.concurrent` is also called with a request
+  -- this module did not build: out of a job, a test, or an application's own
+  -- dispatch. A limiter whose count is only correct while a distant module
+  -- keeps a promise it made for other reasons is one that will be wrong on the
+  -- day that promise changes, and it will be wrong silently, because a slot
+  -- collision looks exactly like a caller under its limit.
+  --
+  -- Per INSTANCE rather than per process: two middlewares sharing one bucket
+  -- must not share a counter, or both would mint slot 1. Sixteen hex
+  -- characters drawn once, plus a counter, costs one string per request.
+  local nonce, minted = require("akkar.crypto").token(8), 0
+
   return function(req, next)
     local cache = options.cache or req.cache
-    local key = prefix .. key_for(options, req)
-    local reply = attempt(acquire, cache, { key }, { limit, ttl, req.id },
+    local key = bucket_key(prefix, bucket, options, req)
+    minted = minted + 1
+    local slot = nonce .. "-" .. minted
+    local reply, refuse = attempt(acquire, cache, { key }, { limit, ttl, slot },
                           options, req, state, "concurrent")
 
-    -- The store is down: serve, and do not try to release a slot that was
-    -- never taken. Releasing anyway would be a second failed call per
-    -- request, doubling the counter for one outage and making the metric
-    -- describe the code rather than the world.
-    if reply == nil then return next(req) end
+    -- The store is down: answer the way the application asked, and either way
+    -- do not try to release a slot that was never taken. Releasing anyway
+    -- would be a second failed call per request, doubling the counter for one
+    -- outage and making the metric describe the code rather than the world.
+    if reply == nil then
+      if refuse then return too_many(options.retry_after_ms or 1000) end
+      return next(req)
+    end
 
     if tonumber(reply[1]) ~= 1 then
       -- No `ratelimit-*` here, on purpose. Those headers describe a quota
@@ -637,7 +764,7 @@ function M.concurrent(options)
     -- sweep in the acquire script bounds the damage at one TTL, so this
     -- raises no error; it only makes sure the operator can see it happening.
     local function give_back()
-      local ok = pcall(function() release(cache, { key }, { req.id }) end)
+      local ok = pcall(function() release(cache, { key }, { slot }) end)
       if not ok then M.store_failures = M.store_failures + 1 end
     end
 
@@ -665,7 +792,9 @@ function M.concurrent(options)
     -- exactly the handler somebody hoists, because the producer closure is
     -- the interesting part and the response wrapper looks like a constant.
     if ok and type(result) == "table" and result.stream then
-      local deferred = rawget(result, "release")
+      -- Through the metatable, for the reason `copy_of` records: what came
+      -- back from `next` may be a copy-on-write view of the response.
+      local deferred = result.release
       local streamed = copy_of(result)
       streamed.release = function()
         if deferred then pcall(deferred) end

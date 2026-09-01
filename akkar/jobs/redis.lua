@@ -199,7 +199,7 @@ end
 --- Returns the depth after the push, or `false, "duplicate"`.
 function Store:claim_and_enqueue(key, id, ttl, encoded, delay)
   local reply = eval(self.cache, CLAIM_AND_PUSH_SCRIPT,
-                     { key .. ":claim:" .. id, key, self:scheduled_key(key) },
+                     { self:claim_key(key, id), key, self:scheduled_key(key) },
                      { encoded, ttl or 3600, delay or 0 })
   local n = tonumber(reply)
   if n == -1 then return false, "duplicate" end
@@ -237,32 +237,49 @@ redis.call('LREM', KEYS[1], 1, ARGV[1])
 return redis.call('ZREM', KEYS[2], ARGV[1])
 ]]
 
--- Everything claimed before the cutoff goes back, oldest first.
+-- Everything whose lease ran out, oldest first, RE-LEASED to whoever asked.
 --
--- Entries in the list with NO score are reaped too: that is a worker killed
--- between the `BLMOVE` and the `ZADD` below, and leaving them would make a
--- job invisible for ever -- the precise failure this whole mechanism exists
--- to remove.
-local REAP_SCRIPT = SERVER_NOW .. [[
+-- This used to push the stale bytes straight back to the queue and return a
+-- count, which was one round trip and could not survive the job growing a
+-- `redeliveries` counter: incrementing that means decoding the job, and the
+-- decision it feeds -- redeliver, or bury after `max_redeliveries` -- is
+-- policy, which `akkar/jobs.lua` owns. Duplicating the policy in a Lua script
+-- inside Redis would give the two stores two chances to disagree, and this
+-- module has already been bitten by exactly that.
+--
+-- So the script answers the question only the store can answer -- WHICH
+-- entries ran out of time -- and stamps each one it hands over, which is what
+-- keeps the hand-over safe:
+--
+--   * a second reaper arriving mid-pass sees a fresh stamp and takes nothing;
+--   * the entry stays in the processing list until the caller `ack`s it, so a
+--     reaper that dies after reading and before writing costs a redelivery
+--     one window later rather than the job.
+--
+-- Entries in the list with NO score are the other case, and the comment they
+-- carry is the whole reason this is not a two-line script.
+local EXPIRED_SCRIPT = SERVER_NOW .. [[
 local processing = KEYS[1]
 local claimed    = KEYS[2]
-local queue      = KEYS[3]
-local older_than = tonumber(ARGV[1])
-local cutoff     = now - older_than
+local visibility = tonumber(ARGV[1])
+local limit      = tonumber(ARGV[2])
 
-local moved = 0
-local stale = redis.call('ZRANGEBYSCORE', claimed, '-inf', cutoff)
-for i = 1, #stale do
-  if redis.call('LREM', processing, 1, stale[i]) > 0 then
-    redis.call('LPUSH', queue, stale[i])
-    moved = moved + 1
-  end
-  redis.call('ZREM', claimed, stale[i])
-end
+-- The override moves the CUTOFF and nothing else. A stamp is a claim time,
+-- and a claim time written from a caller's clock is the defect this store's
+-- header is about -- so `now` still comes from `TIME` wherever it is written
+-- down, and ARGV[3] only answers the hypothetical "what would be stale at
+-- this instant".
+local asked  = ARGV[3] ~= '' and tonumber(ARGV[3]) or now
+local cutoff = asked - visibility
 
-local held = redis.call('LRANGE', processing, 0, -1)
+-- From the TAIL: `claim_pop` pushes to the head, so the oldest lease is the
+-- last element and a job abandoned twice must not overtake one abandoned once.
+local held = redis.call('LRANGE', processing, -limit, -1)
+local out = {}
 for i = 1, #held do
-  if not redis.call('ZSCORE', claimed, held[i]) then
+  local entry = held[i]
+  local score = redis.call('ZSCORE', claimed, entry)
+  if not score then
     -- STAMPED, NOT SNATCHED. This branch used to move an unscored entry
     -- straight back to the queue, and the only way to be unscored is to be
     -- inside the window between `BLMOVE` and `ZADD` in `claim_pop` -- which
@@ -273,13 +290,16 @@ for i = 1, #held do
     --
     -- So it adopts instead: give it a timestamp now, and let the ordinary
     -- stale path reclaim it one window later if nobody acknowledges it. A
-    -- worker that really died between the two commands loses `cutoff`
-    -- seconds, once. A worker that is alive loses nothing.
-    redis.call('ZADD', claimed, now, held[i])
+    -- worker that really died between the two commands loses one window,
+    -- once. A worker that is alive loses nothing.
+    redis.call('ZADD', claimed, now, entry)
+  elseif tonumber(score) <= cutoff then
+    redis.call('ZADD', claimed, now, entry)
+    out[#out + 1] = entry
   end
 end
 
-return moved
+return out
 ]]
 
 -- The non-blocking claim, as one step.
@@ -345,24 +365,46 @@ function Store:ack(key, encoded)
   return tonumber(removed) == 1
 end
 
---- Reclaims anything claimed more than `older_than` seconds ago, by the
+--- Everything whose lease ran out more than `visibility` seconds ago, by the
 --- SERVER's clock rather than by this worker's.
-function Store:reap(key, older_than)
-  local moved = eval(self.cache, REAP_SCRIPT,
-                     { self:processing_key(key), self:claimed_key(key), key },
-                     { older_than })
-  return tonumber(moved) or 0
+---
+--- `now` overrides that reading and is a test seam, not the production path:
+--- a caller's clock is exactly what the server's `TIME` is here to replace.
+--- Sent as the empty string when absent, because Redis arguments are strings
+--- and there is no other way to say "not given".
+function Store:expired(key, visibility, now, limit)
+  local reply = eval(self.cache, EXPIRED_SCRIPT,
+                     { self:processing_key(key), self:claimed_key(key) },
+                     { visibility or 300, limit or 500, now and tostring(now) or "" })
+  if type(reply) ~= "table" then return {} end
+  return reply
 end
 
 function Store:in_flight(key)
   return tonumber(self.cache:command("LLEN", self:processing_key(key))) or 0
 end
 
+--- Where a dedup id lives. One name for it, because `claim`, `unclaim` and
+--- `claim_and_enqueue` all have to agree on the key or two of them are talking
+--- about different things.
+function Store:claim_key(key, id) return key .. ":claim:" .. id end
+
 --- `SET NX EX` -- atomic across every process, which is the whole point.
 function Store:claim(key, id, ttl)
-  local reply = self.cache:command("SET", key .. ":claim:" .. id, "1",
+  local reply = self.cache:command("SET", self:claim_key(key, id), "1",
                                    "NX", "EX", tostring(ttl or 3600))
   return reply == "OK"
+end
+
+--- Gives a claim back, so the id can be taken again.
+---
+--- For the two-step push path only. The claim is taken before the job exists,
+--- so an enqueue that raises would otherwise leave the id held for the full
+--- ttl about a job that was never queued -- and every retry for the next hour
+--- answered "duplicate". `claim_and_enqueue` needs none of this, and must not
+--- use it: a script either ran or did not.
+function Store:unclaim(key, id)
+  return tonumber(self.cache:command("DEL", self:claim_key(key, id))) == 1
 end
 
 --- Oldest first, matching the memory store, so a reader sees the same order

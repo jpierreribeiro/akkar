@@ -151,6 +151,7 @@ describe("how many sockets there may be", function()
     app:websocket("/ws", { message = function() end })
 
     local accepted, refused, ping_status = 0, 0, nil
+    local in_flight_serving
     local held = {}
 
     local cq = cqueues.new()
@@ -185,6 +186,13 @@ describe("how many sockets there may be", function()
         end
       end
 
+      -- What is in flight is exactly what is being served. A refusal is not
+      -- work, so it must leave the count where it found it -- and a refusal
+      -- that decrements a count it never incremented drives `in_flight`
+      -- NEGATIVE, which `App:stop` drains on (`while in_flight > 0`). A drain
+      -- would then declare itself finished with sockets still open.
+      in_flight_serving = app.in_flight
+
       -- The point of the ceiling: ordinary requests still get through.
       local ok, h, st = pcall(function()
         local hh, ss = request.new_from_uri(
@@ -205,6 +213,9 @@ describe("how many sockets there may be", function()
       ("%d sockets were accepted against a ceiling of %d")
         :format(accepted, CEILING))
     assert.equal(3, refused, "the sockets past the ceiling were not refused")
+    assert.equal(CEILING, in_flight_serving,
+      ("in_flight was %s while %d sockets were being served: a refusal moved "
+       .. "the count it never raised"):format(tostring(in_flight_serving), CEILING))
     -- A 503 is a refusal the client can act on. A stalled accept queue is not.
     assert.equal("200", ping_status,
       "HTTP stopped being answered while sockets were at capacity")

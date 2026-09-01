@@ -90,6 +90,31 @@ end
 
 M.identifier = checked_identifier
 
+-- PostgreSQL does not implicitly coerce a parameter declared as text into a
+-- UUID column.  pgmoon deliberately declares Lua strings as text, so UUIDs
+-- need an explicit SQL type while remaining bound values.  A small closed set
+-- avoids turning this into a raw-cast escape hatch.
+local CASTS = { uuid = true, jsonb = true, timestamptz = true }
+local TYPED_VALUE = {}
+
+function M.cast(value, postgres_type)
+  if not CASTS[postgres_type] then
+    error("akkar.sql: unsupported parameter cast: " .. tostring(postgres_type), 0)
+  end
+  return setmetatable({ value = value, postgres_type = postgres_type }, TYPED_VALUE)
+end
+
+function M.uuid(value) return M.cast(value, "uuid") end
+function M.jsonb(value) return M.cast(value, "jsonb") end
+function M.timestamptz(value) return M.cast(value, "timestamptz") end
+
+local function typed_value(value)
+  if type(value) == "table" and getmetatable(value) == TYPED_VALUE then
+    return value.value, value.postgres_type
+  end
+  return value, nil
+end
+
 -- ==================================================================== builder
 local function new_query(kind)
   return setmetatable({
@@ -97,6 +122,7 @@ local function new_query(kind)
     _select = "*",
     _from = nil,
     _joins = {},
+    _join_values = {},
     _where = {},
     _values = {},
     _set = {},
@@ -107,6 +133,9 @@ local function new_query(kind)
     _order = nil,
     _limit = nil,
     _offset = nil,
+    _for_update = false,
+    _skip_locked = false,
+    _on_conflict = nil,
     _scoped = false,
   }, Query)
 end
@@ -169,10 +198,30 @@ function Query:returning(columns)
   return self
 end
 
+--- A join's values live in their own list, not in the one `where` uses.
+---
+--- `build` emits every join before any condition, but both used to append to
+--- the same flat `_values`, so the numbering ran in call order while the text
+--- ran in clause order.  Confirmed:
+---
+---   :where("project_id = ?", 999):join("... acl.project_id = ?", 7)
+---   -> join ... acl.project_id = $1 where (project_id = $2)   VALUES: 999, 7
+---
+--- The ACL check ran against the tenant id and the tenant filter against the
+--- user id.  It survives review because the order only diverges when a
+--- conditional `where` precedes an unconditional `join`: with the optional
+--- filter absent the statement is correct, so the bug shows up as
+--- mis-authorisation on exactly the requests that carry a filter.
 function Query:join(clause, ...)
+  -- `build` writes joins only into a SELECT.  Accepting one anywhere else
+  -- would keep the values and drop the text they belong to, which is the same
+  -- mis-binding from the other direction.
+  if self._kind ~= "select" then
+    error("akkar.sql: join is only valid on select queries", 0)
+  end
   self._joins[#self._joins + 1] = { text = clause, n = select("#", ...) }
   for i = 1, select("#", ...) do
-    self._values[#self._values + 1] = (select(i, ...))
+    self._join_values[#self._join_values + 1] = (select(i, ...))
   end
   return self
 end
@@ -182,6 +231,47 @@ end
 ---
 --- There is no `where_raw`.  A raw-SQL escape hatch is exactly the door this
 --- module exists to close.
+-- A condition may describe a row.  It may not change the SHAPE of the clause
+-- it is joined into.
+--
+-- Wrapping each condition in parentheses stops a handler's own `or` from
+-- capturing the tenant scope by precedence, but parentheses supplied by the
+-- caller close the ones added here and reopen the hole:
+--
+--   :where "1=1) or (1=1"   ->   where (1=1) or (1=1) and (tenant_id = $1)
+--
+-- which is a scope bypass again, and was demonstrated returning other tenants'
+-- rows.  So the structural characters are refused outright.  Depth may never go
+-- negative and must end at zero, which every honest fragment satisfies -- and a
+-- comment introducer or a statement separator has no business in a condition at
+-- all.  This is the check the module's own "there is no where_raw" claim always
+-- needed: the previous test asserted only that no key by that name existed on
+-- the table, which checks the nameplate rather than the door.
+local function refuse_structure(condition)
+  local depth = 0
+  for index = 1, #condition do
+    local char = condition:sub(index, index)
+    if char == "(" then depth = depth + 1
+    elseif char == ")" then
+      depth = depth - 1
+      if depth < 0 then
+        error(("akkar.sql: condition closes a parenthesis it did not open, "
+            .. "which would restructure the where clause: %s"):format(condition), 0)
+      end
+    end
+  end
+  if depth ~= 0 then
+    error(("akkar.sql: condition leaves %d parenthesis/es open: %s")
+          :format(depth, condition), 0)
+  end
+  for _, forbidden in ipairs { "--", "/*", "*/", ";" } do
+    if condition:find(forbidden, 1, true) then
+      error(("akkar.sql: condition contains %q, which cannot appear in a "
+          .. "condition: %s"):format(forbidden, condition), 0)
+    end
+  end
+end
+
 function Query:where(condition, ...)
   local count = select("#", ...)
   local placeholders = 0
@@ -190,6 +280,7 @@ function Query:where(condition, ...)
     error(("akkar.sql: condition has %d placeholder(s) but %d value(s) were given: %s")
           :format(placeholders, count, tostring(condition)), 0)
   end
+  refuse_structure(tostring(condition))
 
   self._where[#self._where + 1] = condition
   for i = 1, count do
@@ -250,9 +341,62 @@ function Query:offset(n)
   return self
 end
 
+--- Locks the selected rows until the surrounding transaction completes.
+--- Only SELECT accepts the clause; making it a named builder operation keeps
+--- handlers from reaching for a raw SQL suffix during inventory reservation.
+function Query:for_update()
+  if self._kind ~= "select" then
+    error("akkar.sql: for_update is only valid on select queries", 0)
+  end
+  self._for_update = true
+  return self
+end
+
+--- Takes the rows nobody else is holding, instead of waiting behind them.
+---
+--- Only meaningful with `for_update`, and only correct for a claim whose mark
+--- is DURABLE -- a queue that, in the same transaction that locks the rows,
+--- writes something (a lease, a status) that removes them from its own
+--- predicate. Without that mark the two claimers read the same rows the moment
+--- the first one commits, and skipping buys nothing.
+---
+--- With it, a second claimer takes a DIFFERENT batch rather than blocking on
+--- the first and then finding its own rows filtered out by the re-evaluated
+--- predicate -- which is how a queue ends up serialising N workers into one and
+--- holding a pool connection to do it.
+function Query:skip_locked()
+  if self._kind ~= "select" then
+    error("akkar.sql: skip_locked is only valid on select queries", 0)
+  end
+  self._skip_locked = true
+  return self
+end
+
 --- Says out loud that every row is the intent, for the one case where it is.
 function Query:all_rows()
   self._all_rows = true
+  return self
+end
+
+--- Makes an INSERT idempotent without exposing a raw SQL suffix. Conflict
+--- columns are identifiers and therefore checked with the same discipline as
+--- every other client-selected identifier in this builder.
+function Query:on_conflict_do_nothing(columns, allowed)
+  if self._kind ~= "insert" then
+    error("akkar.sql: on_conflict_do_nothing is only valid on inserts", 0)
+  end
+  if columns ~= nil then
+    if type(columns) ~= "table" or #columns == 0 then
+      error("akkar.sql: conflict columns must be a non-empty list", 0)
+    end
+    local checked = {}
+    for index, column in ipairs(columns) do
+      checked[index] = checked_identifier(column, allowed, "conflict column")
+    end
+    self._on_conflict = "(" .. table.concat(checked, ", ") .. ") do nothing"
+  else
+    self._on_conflict = "do nothing"
+  end
   return self
 end
 
@@ -347,9 +491,24 @@ function Query:build()
   end
 
   if self._kind ~= "insert" then
+    -- Join values before where values, because the TEXT is emitted in that
+    -- order and `?` is numbered by position in the text.  Appending both to
+    -- one list in call order is what bound a join's parameter to a condition.
+    for i = 1, #self._join_values do values[#values + 1] = self._join_values[i] end
     for i = 1, #self._values do values[#values + 1] = self._values[i] end
     if #self._where > 0 then
-      parts[#parts + 1] = " where " .. table.concat(self._where, " and ")
+      -- Each condition is parenthesised before it is joined.  Without this,
+      -- a handler's own `or` silently captures everything appended after it:
+      -- `where("a = ? or b = ?")` plus a tenant scope builds
+      -- `a = $1 or b = $2 and tenant_id = $3`, and SQL binds `and` tighter than
+      -- `or`, so the scope applies to one branch and the other returns every
+      -- tenant's rows.  The scope is present in the text and absent from the
+      -- meaning -- which is the one failure akkar.scope exists to make
+      -- impossible.  Parenthesising is what makes appending a condition
+      -- actually mean "and also this".
+      local wrapped = {}
+      for i = 1, #self._where do wrapped[i] = "(" .. self._where[i] .. ")" end
+      parts[#parts + 1] = " where " .. table.concat(wrapped, " and ")
     end
   end
   if self._group then parts[#parts + 1] = " group by " .. self._group end
@@ -363,6 +522,15 @@ function Query:build()
     parts[#parts + 1] = " offset ?"
     values[#values + 1] = self._offset
   end
+  if self._for_update then
+    parts[#parts + 1] = self._skip_locked and " for update skip locked" or " for update"
+  elseif self._skip_locked then
+    -- Checked here rather than in `skip_locked` so the two calls can arrive in
+    -- either order: a builder that rejected `skip_locked():for_update()` would
+    -- be rejecting a query that is perfectly well formed by the time it runs.
+    error("akkar.sql: skip_locked requires for_update", 0)
+  end
+  if self._on_conflict then parts[#parts + 1] = " on conflict " .. self._on_conflict end
   if self._returning then
     parts[#parts + 1] = " returning " .. self._returning
   end
@@ -372,7 +540,9 @@ function Query:build()
   local index = 0
   text = text:gsub("%?", function()
     index = index + 1
-    return "$" .. index
+    local raw, cast = typed_value(values[index])
+    values[index] = raw
+    return "$" .. index .. (cast and "::" .. cast or "")
   end)
 
   if index ~= #values then

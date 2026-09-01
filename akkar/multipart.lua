@@ -24,11 +24,22 @@ local M = {}
 
 --- Pulls the boundary out of a Content-Type header.
 --- RFC 2046 allows it to be quoted, and browsers differ on whether it is.
+---
+--- Read as a PARAMETER rather than as a substring.  `boundary=` was matched
+--- anywhere in the header, so `multipart/form-data; name=xboundary=zzz` --
+--- or a filename parameter carrying those nine characters -- named the
+--- boundary, and this parser and whatever sits in front of it then disagreed
+--- about where the parts begin.  RFC 2045 also makes the parameter name
+--- case-insensitive, which the old match was not.
 function M.boundary(content_type)
   if not content_type then return nil end
-  local quoted = content_type:match 'boundary="([^"]+)"'
-  if quoted then return quoted end
-  return content_type:match "boundary=([^;%s]+)"
+  for parameter in tostring(content_type):gmatch "[^;]+" do
+    local quoted = parameter:match '^%s*[Bb][Oo][Uu][Nn][Dd][Aa][Rr][Yy]%s*=%s*"([^"]+)"%s*$'
+    if quoted then return quoted end
+    local bare = parameter:match "^%s*[Bb][Oo][Uu][Nn][Dd][Aa][Rr][Yy]%s*=%s*([^;%s]+)%s*$"
+    if bare then return bare end
+  end
+  return nil
 end
 
 -- Content-Disposition: form-data; name="avatar"; filename="cat.png"
@@ -54,15 +65,30 @@ function M.parse(body, boundary)
     return nil, "multipart body has no boundary"
   end
 
-  local delimiter = "--" .. boundary
+  -- RFC 2046: a delimiter is CRLF followed by `--boundary`.  The CRLF is part
+  -- of it, and searching for the bare `--boundary` anywhere -- which is what
+  -- this did -- lets the client plant those bytes MID-LINE inside a part and
+  -- split the body there.  Anything in front of akkar that parses multipart
+  -- correctly (a WAF, a gateway, an antivirus) then reads a different form
+  -- than the handler does, which is the whole point of planting it.
+  --
+  -- The opening delimiter is the exception: at the very start of the body
+  -- there is no preceding CRLF.
+  local delimiter = "\r\n--" .. boundary
+  local opening = "--" .. boundary
   local fields = {}
   local found = false
 
   -- Walk delimiter to delimiter.  `plain` find, because a boundary is chosen
   -- by the client and may contain characters Lua patterns treat as magic.
-  local position = body:find(delimiter, 1, true)
-  if not position then return nil, "multipart body has no opening boundary" end
-  position = position + #delimiter
+  local position
+  if body:sub(1, #opening) == opening then
+    position = 1 + #opening
+  else
+    local at = body:find(delimiter, 1, true)
+    if not at then return nil, "multipart body has no opening boundary" end
+    position = at + #delimiter
+  end
 
   while true do
     -- `--` right after the delimiter marks the end of the body.
@@ -82,11 +108,21 @@ function M.parse(body, boundary)
     local next_delimiter = body:find(delimiter, content_start, true)
     if not next_delimiter then return nil, "multipart part is not terminated" end
 
-    -- The CRLF before the delimiter belongs to the framing, not the content.
-    local content = body:sub(content_start, next_delimiter - 1):gsub("\r\n$", "")
+    -- The CRLF before the delimiter is part of the delimiter now, so the
+    -- content ends exactly where the delimiter begins.  Trimming a trailing
+    -- CRLF here as well would eat one the sender meant to send.
+    local content = body:sub(content_start, next_delimiter - 1)
 
     local name, filename = disposition(headers["content-disposition"] or "")
     if name then
+      -- Two parts under one name used to be last-wins, silently.  That is
+      -- parameter pollution: a form with two `amount` fields is read one way
+      -- here and the other way by anything in front of akkar, and nobody is
+      -- told.  It is refused instead, because there is no answer that is
+      -- right for both readers.
+      if fields[name] ~= nil then
+        return nil, "multipart body has two parts named '" .. name .. "'"
+      end
       found = true
       if filename then
         fields[name] = {

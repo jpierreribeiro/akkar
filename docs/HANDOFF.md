@@ -15,6 +15,12 @@ PR #7 was merged on 18 August and cannot be reused. Most of the work on this
 branch happened after that merge, so landing it requires a **new pull request
 from `f4-refused` to `main`**.
 
+> **Done, and not to be done again.** `f4-refused` (`7781c10`) is an ancestor of
+> `origin/main` as of `ec74364`, 22 August. It landed without changing a byte:
+> `git diff 7781c10 origin/main` covers only the two commits after it. This
+> paragraph is left standing because the rest of the section is still accurate;
+> only this item is closed.
+
 The current one-line state: akkar speaks HTTP/2 and WebSocket, passes all 146
 h2spec conformance cases, survives the recorded CONTINUATION-flood and
 decompression-bomb tests, and the complete Lua 5.4 suite at this tip passes

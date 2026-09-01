@@ -57,8 +57,9 @@ function M.new()
 end
 
 --- Programs a response.
---- `pattern` is a Lua pattern matched against the SQL; a plain string that
---- happens to contain no magic characters therefore works as a substring.
+--- `pattern` is matched against the SQL as plain text first and as a Lua
+--- pattern only if that finds nothing -- so `insert into ledger (order_id,
+--- amount)` means those characters, and `^insert into users` still anchors.
 --- `response` is a row, a list of rows, or a function receiving (sql, ...).
 function Memory:on(pattern, response)
   self.responses[#self.responses + 1] = { pattern = pattern, response = response }
@@ -108,9 +109,36 @@ function Memory:drop(pattern)
   end)
 end
 
+-- LITERAL FIRST, PATTERN SECOND.
+--
+-- Every needle written against this fake is a piece of the SQL itself, and
+-- SQL is made of Lua pattern magic: parentheses, `$1`, `%`, `-`, `.`. Matched
+-- as a pattern alone, `insert into ledger (order_id, amount)` is a capture of
+-- the text between the parentheses, so it matches only SQL that has no
+-- parentheses in it -- and `db:count "insert into ledger (order_id, amount)"`
+-- answered 0 for a query that WAS issued. An `assert.equal(0, ...)` meaning
+-- "we did not double-charge" then passed unconditionally: a fake proving the
+-- opposite of what the test says, which is the one thing a fake must never
+-- do. `"values ($1"` did worse and threw "unfinished capture" out of the fake
+-- and into the test.
+--
+-- Patterns stay, because `^insert into users` and `select .* from users` are
+-- deliberate and this module's own documentation promises them. So a needle
+-- is tried as plain text first and as a pattern only if that fails: every
+-- pattern that matched before still matches, and a needle that is literally
+-- in the SQL now always matches. `pcall` because a needle chosen as text is
+-- under no obligation to compile as a pattern.
+local function matches(sql, needle)
+  if sql:find(needle, 1, true) then return true end
+  local ok, found = pcall(sql.find, sql, needle)
+  return ok and found ~= nil
+end
+
+Memory._matches = matches       -- exposed for tests; not part of the contract
+
 local function find(self, sql)
   for _, entry in ipairs(self.responses) do
-    if sql:find(entry.pattern) then return entry end
+    if matches(sql, entry.pattern) then return entry end
   end
 end
 
@@ -135,8 +163,14 @@ function Memory:query(sql, ...)
   end
 
   -- Transaction control is answered by the adapter itself, so a test does not
-  -- have to program `begin` and `commit`.
-  if sql == "begin" or sql == "commit" or sql == "rollback" then return {} end
+  -- have to program `begin` and `commit` -- nor the savepoints a nested
+  -- `transaction` issues.
+  if sql == "begin" or sql == "commit" or sql == "rollback"
+     or sql:match "^savepoint "
+     or sql:match "^release savepoint "
+     or sql:match "^rollback to savepoint " then
+    return {}
+  end
 
   local entry = find(self, sql)
   if not entry then
@@ -168,11 +202,32 @@ end
 
 --- Same semantics as the real adapter: commit at the end, rollback on any
 --- error, and the error is re-raised so a thrown response still works.
+---
+--- Including the nesting semantics. `depth` was counted here and never used,
+--- so a nested block sent a second `begin` and an inner `commit` and then
+--- reported a clean rollback -- which is precisely what the real adapter does
+--- NOT do, and it meant no memory-backed test could catch the flat-transaction
+--- defect. A fake whose safety property differs from the real one is how a
+--- test proves the wrong thing, so the savepoints are mirrored exactly.
 function Memory:transaction(fn)
+  if self.depth > 0 then
+    local name = "akkar_sp_" .. (self.depth + 1)
+    self:query("savepoint " .. name)
+    self.depth = self.depth + 1
+    local ok, result = pcall(fn, self)
+    self.depth = self.depth - 1
+    if not ok then
+      self:query("rollback to savepoint " .. name)
+      error(result, 0)
+    end
+    self:query("release savepoint " .. name)
+    return result
+  end
+
   self:query "begin"
-  self.depth = self.depth + 1
+  self.depth = 1
   local ok, result = pcall(fn, self)
-  self.depth = self.depth - 1
+  self.depth = 0
   if not ok then
     self:query "rollback"
     self.rolled_back = true
@@ -196,7 +251,7 @@ function Memory:close() end
 --- Was a query matching this pattern issued?
 function Memory:received(pattern)
   for _, call in ipairs(self.log) do
-    if call.sql:find(pattern) then return true, call end
+    if matches(call.sql, pattern) then return true, call end
   end
   return false
 end
@@ -204,7 +259,7 @@ end
 function Memory:count(pattern)
   local n = 0
   for _, call in ipairs(self.log) do
-    if not pattern or call.sql:find(pattern) then n = n + 1 end
+    if not pattern or matches(call.sql, pattern) then n = n + 1 end
   end
   return n
 end

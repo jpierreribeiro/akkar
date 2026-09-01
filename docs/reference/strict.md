@@ -19,9 +19,9 @@ local strict = require "akkar.strict"
 ```lua
 local strict = require "akkar.strict"
 assert(strict.active() == false)
-strict.on()
+local key = strict.on()
 assert(strict.active() == true)
-strict.off()
+strict.off(key)
 assert(strict.active() == false)
 ```
 
@@ -39,12 +39,12 @@ undeclares another, and there is no way to undeclare one.
 ```lua
 local strict = require "akkar.strict"
 
-strict.on()
+local key = strict.on()
 strict.declare("counter", "registry")
 counter = 0
 registry = {}
 assert(counter == 0)
-strict.off()
+strict.off(key)
 ```
 
 ## strict.declared(name)
@@ -59,20 +59,30 @@ up before deciding to be strict.
 ```lua
 local strict = require "akkar.strict"
 
-strict.on()
+local key = strict.on()
 assert(strict.declared "print" == true)     -- already in _G at snapshot time
 assert(strict.declared "mystery" == false)
 strict.declare "mystery"
 assert(strict.declared "mystery" == true)
-strict.off()
+strict.off(key)
 ```
 
-## strict.off()
+## strict.off(key)
 
-Removes the metatable from `_G`.
+Puts back whatever metatable `_G` had before `strict.on()` installed its own.
+
+Takes the `key` that `strict.on()` returned and **raises** without it. Strict
+mode is process-wide, so `off` used to be a switch that every handler in the
+process could reach: any one of them could turn the check off for the whole
+server and for every other request in it. Turning it off now belongs to
+whoever turned it on.
 
 **Returns** the module, so calls chain. Returns immediately if the check is not
-active.
+active, key or no key.
+
+Only the metatable this module installed comes off. If something else replaced
+it in the meantime, that one is left where it is rather than removed -- the
+same restraint `strict.on()` shows on the way in.
 
 The declared set survives. Turning the check off and on again does not forget
 what was declared, and the second `strict.on()` takes a fresh snapshot of `_G`
@@ -81,8 +91,12 @@ on top of it.
 ```lua
 local strict = require "akkar.strict"
 
-strict.on()
-strict.off()
+local key = strict.on()
+assert(select(1, pcall(strict.off)) == false)        -- no key, no switch
+assert(select(1, pcall(strict.off, {})) == false)    -- and not just any table
+assert(strict.active() == true)
+
+strict.off(key)
 undeclared_and_fine = 1          -- no metatable, so no error
 assert(undeclared_and_fine == 1)
 ```
@@ -92,8 +106,15 @@ assert(undeclared_and_fine == 1)
 Snapshots the current contents of `_G` as declared, then installs `__newindex`
 and `__index` on `_G`.
 
-**Returns** the module. Idempotent: a second call while active does nothing at
-all, including taking a second snapshot.
+**Returns** the key that `strict.off` requires. Idempotent: a second call while
+active does nothing at all, including taking a second snapshot, and hands back
+the same key.
+
+**Raises** when `_G` already carries a metatable somebody else installed.
+Replacing it would silently break whatever was relying on it -- an ORM's lazy
+loader, a REPL's autocomplete -- somewhere far from here, so two libraries
+arguing over the global table is reported as the configuration error it is
+rather than won quietly.
 
 **Raises**, from the installed metamethods rather than from this call:
 
@@ -118,7 +139,7 @@ frame to read.
 ```lua
 local strict = require "akkar.strict"
 
-strict.on()
+local key = strict.on()
 
 local ok, why = pcall(function() undeclared = 1 end)
 assert(ok == false)
@@ -128,7 +149,7 @@ local read_ok, read_why = pcall(function() return also_undeclared end)
 assert(read_ok == false)
 assert(read_why:find("read of undeclared global 'also_undeclared'", 1, true))
 
-strict.off()
+strict.off(key)
 ```
 
 ## Not here

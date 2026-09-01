@@ -262,16 +262,75 @@ end
 -- attempt is the ordinary example. A rule that reads the status code would
 -- silently discard those writes instead, which is the same defect pointing the
 -- other way and harder to see.
+--
+-- NESTING. "No BEGIN stays open because someone forgot" was true and it was
+-- the wrong invariant, because it says nothing about a BEGIN opened while one
+-- is already open. A helper that owns a transaction -- `charge()` -- called
+-- from a handler that owns a bigger one -- `place_order()` -- is the most
+-- ordinary refactor there is, and Postgres answers the second `begin` with a
+-- warning and no transaction. Then the inner `commit` ENDS THE OUTER ONE,
+-- every statement after it autocommits, and the outer `rollback` is a no-op
+-- warning. Reproduced against a real server: an outer transaction that raised
+-- left all three rows committed, with `in_transaction` false, `broken` false,
+-- and the pool judging the connection fit for reuse.
+--
+-- SAVEPOINT rather than refusing the nested call, for two reasons. Refusing
+-- turns a correct-looking refactor into a runtime error on a path that may
+-- only be exercised in production -- and it pushes people towards threading a
+-- boolean like `already_in_transaction` down through the helpers, which is the
+-- bookkeeping this file exists to remove. A savepoint gives the inner block
+-- the only nesting semantics one connection can offer: its work is undone on
+-- its own failure, and made durable only when the outermost block commits.
+-- That is the semantics a caller wants from `charge()` anyway; a helper whose
+-- write must survive the caller's rollback needs a second connection, not a
+-- second BEGIN.
+--
+-- The savepoint is named per depth, which is enough: a name is released before
+-- the same depth can be entered again.
 function Db:transaction(fn)
+  local depth = self.tx_depth or 0
+
+  if depth > 0 then
+    local name = "akkar_sp_" .. (depth + 1)
+    self:query("savepoint " .. name)
+    self.tx_depth = depth + 1
+    local ok, result = pcall(fn, self)
+    self.tx_depth = depth
+
+    if not ok then
+      -- `rollback to savepoint` also clears the aborted state a failed
+      -- statement leaves behind, which is what lets the OUTER transaction
+      -- carry on after a helper failed. If it does not work, the outer
+      -- transaction is unrecoverable and the connection must not be reused.
+      if not pcall(function() self:query("rollback to savepoint " .. name) end) then
+        self.broken = true
+      end
+      error(result, 0)        -- the outer block still decides what to do
+    end
+
+    -- Releasing keeps the savepoint stack from growing for the length of a
+    -- long outer transaction; it commits nothing on its own.
+    if not pcall(function() self:query("release savepoint " .. name) end) then
+      self.broken = true
+      error("db: could not release " .. name, 0)
+    end
+    return result
+  end
+
   self:query "begin"
   self.in_transaction = true
+  self.tx_depth = 1
   local ok, result = pcall(fn, self)
+  self.tx_depth = 0
   if not ok then
     local rolled = pcall(function() self:query "rollback" end)
     -- A connection whose rollback failed is in an unknown state.  Marking it
     -- keeps the pool from handing that state to the next request.
     self.in_transaction = not rolled
-    self.broken = not rolled
+    -- Only ever set here, never cleared: a nested block whose `rollback to
+    -- savepoint` failed has already marked this connection, and the outer
+    -- rollback succeeding says nothing about that.
+    self.broken = self.broken or not rolled
     error(result, 0)          -- preserves response-as-error
   end
   self:query "commit"
@@ -419,6 +478,42 @@ end
 
 local M = {}
 
+-- ======================================================================== TLS
+-- Builds the OpenSSL client object pgmoon starts TLS with.  pgmoon's own
+-- `create_cqueues_openssl_context` sets no verification at all, so this exists
+-- to make `ssl_verify = true` mean something: a CA store, VERIFY_PEER, and a
+-- verify_param carrying the name the certificate has to match.
+--
+-- Name checking is on the params, not on the callback, so a certificate for
+-- the wrong host fails the handshake rather than being accepted and regretted.
+-- An IP literal goes to `setIP` and a hostname to `setHost`; SNI is sent only
+-- for a hostname, because a server name indication of an IP address is not a
+-- thing.  Both the context and the SSL object get the params: the context so
+-- the settings are in place before the handshake begins, the object because
+-- that is what actually verifies.
+local function tls_client(config)
+  local context_module = require "openssl.ssl.context"
+  local context = context_module.new(config.ssl_version or "TLS", false)
+  local store = context:getStore()
+  if config.cafile then store:add(config.cafile) else store:addDefaults() end
+  context:setVerify(context_module.VERIFY_PEER)
+  if config.cert then context:setCertificate(config.cert) end
+  if config.key then context:setPrivateKey(config.key) end
+
+  local params = require("openssl.x509.verify_param").new()
+  local host = assert(config.host, "db TLS verification needs host")
+  if host:match("^%d+%.%d+%.%d+%.%d+$") then params:setIP(host)
+  else params:setHost(host) end
+  context:setParam(params)
+
+  local ssl = require("openssl.ssl").new(context)
+  if not host:match("^%d+%.%d+%.%d+%.%d+$") then ssl:setHostName(host) end
+  ssl:setParam(params)
+  return ssl
+end
+
+M.tls_client = tls_client
+
 -- ==================================================================== connect
 -- Returns a factory: akkar calls it once per request.  `pool_size = 0` opts
 -- out and opens a connection per request, which is what the substrate proof
@@ -426,15 +521,42 @@ local M = {}
 function M.connect(config)
   local reset_on_release = config.reset_on_release == true
 
+  -- Asking for TLS means requiring it.
+  --
+  -- PostgreSQL's SSL negotiation happens in cleartext: the client asks, and
+  -- the server answers one byte, `S` or `N`.  pgmoon fails on an error reply
+  -- or when `ssl_required` is set, and otherwise -- on a plain `N` -- falls
+  -- through to `return true` and continues UNENCRYPTED.  So with
+  -- `ssl_required` defaulting to false, everything `tls_client` sets up is
+  -- skipped without a certificate ever being presented: VERIFY_PEER, the CA
+  -- store, setHost/setIP, SNI.  Anyone positioned to answer that byte strips
+  -- the TLS, and `ssl_verify = true` reports success.
+  --
+  -- So the default follows the request: a caller who said `ssl = true` gets an
+  -- error rather than a downgrade.  Opportunistic TLS is still available, and
+  -- now has to be said out loud -- `ssl_required = false` is a sentence
+  -- someone has to write, which is the point.
+  --
+  -- Computed once here rather than inside `open`, because it is a property of
+  -- the configuration and not of any one connection.
+  local ssl_required = config.ssl_required
+  if ssl_required == nil then ssl_required = config.ssl or false end
+
   local function open()
     if config.driver == "pq" then
-      return setmetatable({ pg = pq_open(config),
+      return setmetatable({ pg = pq_open(config), tx_depth = 0,
                             reset_on_release = reset_on_release }, Db)
     end
     if config.driver ~= nil and config.driver ~= "pgmoon" then
       error("db: unknown driver '" .. tostring(config.driver) ..
             "'; expected 'pgmoon' or 'pq'", 0)
     end
+
+    -- A caller may hand in its own OpenSSL object; otherwise `ssl_verify`
+    -- builds one here.  Without it pgmoon falls back to a context that
+    -- verifies nothing, which is why `ssl_verify` cannot be passed alone.
+    local tls = config.cqueues_openssl_context
+    if config.ssl and config.ssl_verify and not tls then tls = tls_client(config) end
 
     local pg = pgmoon.new {
       host = config.host or "127.0.0.1",
@@ -443,6 +565,14 @@ function M.connect(config)
       user = config.user,
       password = config.password,
       socket_type = "cqueues",
+      ssl = config.ssl or false,
+      ssl_required = ssl_required,     -- see the note above `open`
+      ssl_verify = config.ssl_verify,
+      cert = config.cert,
+      key = config.key,
+      cafile = config.cafile,
+      ssl_version = config.ssl_version,
+      cqueues_openssl_context = tls,
     }
     -- THE MESSAGE BELOW NEVER APPEARED, and that was the point of writing it.
     --
@@ -460,10 +590,17 @@ function M.connect(config)
     --
     -- So the call is wrapped, and both shapes -- raised and returned -- end
     -- in the same message, which names what was being connected to.
-    local ok, err = pcall(function() return pg:connect() end)
-    if ok and err == nil then ok = false end     -- `false, reason` from pgmoon
+    --
+    -- The REASON is the second return value, and it used to be thrown away.
+    -- `pcall` gives back every value the call produced, but only the first was
+    -- read, so pgmoon's returned-failure path -- the SSL refusal above is
+    -- exactly one of them -- reported `-- nil` where it had a sentence to
+    -- print. Both falsy shapes, `nil, reason` and `false, reason`, now carry
+    -- their reason through.
+    local ok, res, why = pcall(function() return pg:connect() end)
+    if ok and not res then ok, res = false, why end
     if not ok then
-      local reason = tostring(err)
+      local reason = tostring(res)
       -- The connection refused case is worth naming on its own, because it is
       -- almost always a database that is not running rather than one that is
       -- misconfigured, and those have different fixes.
@@ -533,7 +670,8 @@ function M.connect(config)
     --
     -- Nothing is lost: pgmoon leaves a SQL NULL out of the row table entirely
     -- unless `convert_null` is set, which akkar does not set.
-    return setmetatable({ pg = pg, reset_on_release = reset_on_release }, Db)
+    return setmetatable({ pg = pg, tx_depth = 0,
+                         reset_on_release = reset_on_release }, Db)
   end
 
   local size = config.pool_size == nil and 10 or config.pool_size
@@ -550,7 +688,23 @@ function M.connect(config)
   local pool = Pool.new(open, size, function(conn)
     return not conn.in_transaction and not conn.broken
        and not conn.in_flight and conn.pg ~= nil
-  end)
+  end, {
+    -- WHY THESE ARE FORWARDED AT ALL: they were accepted here and dropped on
+    -- the floor. An application that set `max_lifetime = 60` in front of a
+    -- proxy reaping at 90 seconds got the pool's 1800 and the corpses it was
+    -- configuring its way out of. The reasons for each bound live in
+    -- `akkar.pool`; only the numbers belong to the application, and the
+    -- default for each stays the pool's -- `nil` here means "unset", which is
+    -- exactly what `Pool.new` reads as "use mine".
+    max_lifetime = config.max_lifetime,
+    idle_timeout = config.idle_timeout,
+    wait_timeout = config.pool_wait_timeout,
+    -- A slot outstanding for much longer than a connect attempt can plausibly
+    -- take is a connect that is never coming back. Twice the connect timeout,
+    -- because the connect is only the first leg: Postgres then authenticates
+    -- and akkar sets `statement_timeout` before `open` returns.
+    open_timeout = config.connect_timeout and config.connect_timeout * 2 or nil,
+  })
   -- A callable table rather than a plain function, so the pool can be reached
   -- for shutdown and diagnostics.  Lua functions cannot carry fields.
   return setmetatable({ pool = pool }, {

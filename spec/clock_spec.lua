@@ -104,13 +104,13 @@ describe("a wall clock that jumps, over the in-memory store", function()
 
     -- A worker holding it for one second. Nothing is stale.
     clock.step(1)
-    assert.equal(0, queue:reap(300),
+    assert.equal(0, queue:reap(),
       "a one-second-old claim was reaped against a five-minute window")
 
     -- NTP corrects the clock forward by an hour.
     clock.step(3600)
 
-    local reclaimed = queue:reap(300)
+    local reclaimed = queue:reap()
     assert.equal(1, reclaimed,
       "the claim survived a forward clock step; the in-memory store is " ..
       "expected to follow its own clock")
@@ -133,7 +133,7 @@ describe("a wall clock that jumps, over the in-memory store", function()
 
     clock.step(-3600)
 
-    assert.equal(0, queue:reap(300),
+    assert.equal(0, queue:reap(),
       "an abandoned job was recovered despite the clock going back, which " ..
       "the in-memory store cannot do")
     assert.equal(1, queue:in_flight(),
@@ -225,7 +225,7 @@ describe("a fleet where one worker's clock is wrong", function()
     -- another worker was running.
     at = at + 3600
 
-    assert.equal(0, queue:reap(300),
+    assert.equal(0, queue:reap(),
       "a live claim was reclaimed because THIS worker's clock moved -- the " ..
       "store is reading the caller's clock again")
     assert.equal(1, queue:in_flight())
@@ -236,10 +236,14 @@ describe("a fleet where one worker's clock is wrong", function()
     -- The other half, and the one that makes the first meaningful: a fix that
     -- simply stopped reaping would pass the test above and lose every
     -- abandoned job for ever.
+    --
+    -- `visibility = 0` rather than an instant passed in: what has to be shown
+    -- is that the SERVER decides, so nothing here may hand the store a time.
+    queue = jobs_redis.new(queue.store.cache, "clockfleet", { visibility = 0 })
     queue:push("charge", { amount = 10 })
     queue:pop(0)                                   -- claimed, never acked
 
-    assert.equal(1, queue:reap(-1),
+    assert.equal(1, queue:reap(),
       "an abandoned claim was not recovered; reaping is broken rather than " ..
       "merely clock-independent")
     assert.equal(1, queue:depth())
@@ -247,12 +251,13 @@ describe("a fleet where one worker's clock is wrong", function()
   end)
 
   it("does not freeze reaping when the caller's clock jumps backwards", function()
+    queue = jobs_redis.new(queue.store.cache, "clockfleet", { visibility = 0 })
     queue:push("charge", { amount = 10 })
     queue:pop(0)
 
     at = at - 3600                                 -- NTP steps back an hour
 
-    assert.equal(1, queue:reap(-1),
+    assert.equal(1, queue:reap(),
       "nothing was reclaimed after the caller's clock went back, which is " ..
       "the old failure in the other direction")
   end)

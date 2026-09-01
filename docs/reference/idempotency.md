@@ -13,7 +13,7 @@ local idempotency = require "akkar.idempotency"
 ```
 
 The top-level spelling is the constructor, not the module: `akkar.idempotency`
-is `idempotency.new`, so `akkar.idempotency { ttl = 86400 }` and
+is `idempotency.new`, so `akkar.idempotency { namespace = false }` and
 `idempotency.new { ttl = 86400 }` build the same middleware. `fingerprint_of`
 and `CLAIM_SCRIPT` are reachable only through `require "akkar.idempotency"`.
 
@@ -34,8 +34,9 @@ assert(type(idempotency.CLAIM_SCRIPT) == "string")
 
 Builds the summary of a request that decides whether a reused key names the same
 request. It is
-`req.method .. " " .. req.path .. " " .. #body .. ":" .. body:sub(1, 512)`,
-where `body` is `json.encode(req.body)`, or `""` when `req.body` is nil.
+`req.method .. " " .. req.path .. " " .. #body .. ":" .. sha256_hex(body)`,
+where `body` is the canonical encoding of `req.body`, or `""` when `req.body`
+is nil. The whole body is hashed, so no part of it is outside the comparison.
 
 Not a cryptographic hash. It separates an honest client's retry from an honest
 client's mistake, and it is not a defence against somebody who already chooses
@@ -51,20 +52,33 @@ local idempotency = require "akkar.idempotency"
 local print_ = idempotency.fingerprint_of {
   method = "POST", path = "/charges", body = { amount = 100 },
 }
-assert(print_ == 'POST /charges 14:{"amount":100}')
+assert(print_ ==
+  "POST /charges 14:" ..
+  "4d4bbe59c6aad22442cde199a6a8a5f034405fcd78fb5a81c24ef249de1c45f1")
 
--- No body at all still fingerprints.
-assert(idempotency.fingerprint_of { method = "POST", path = "/charges" }
-       == "POST /charges 0:")
+-- No body at all still fingerprints -- the digest of the empty string.
+assert(idempotency.fingerprint_of { method = "POST", path = "/charges" } ==
+  "POST /charges 0:" ..
+  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
 ```
 
-Two limits follow from the shape and are worth knowing before you rely on it.
-Only the first 512 bytes of the encoded body are compared, so two long bodies
-of the same length that agree on their first 512 bytes fingerprint alike. And
-the encoding's key order is not stable between processes, so the same body
-encoded by two workers can produce two fingerprints and a retry that lands on
-the other worker is answered `422`. A body with one key is unaffected; a body
-with several is not.
+Two limits used to follow from the shape, and both are gone; they are recorded
+here because a reader who learned them elsewhere should know they no longer
+hold.
+
+Only the first 512 bytes of the encoded body were compared, so two long bodies
+of the same length agreeing on their first 512 bytes were one request -- and
+the second was answered with the first's stored response and
+`idempotent-replay: true`. The whole body is hashed now, so a difference
+anywhere in it is a difference here.
+
+And the encoding's key order was `cjson`'s, which is not stable between
+processes, so one body encoded by two workers produced two fingerprints and a
+retry landing on the other worker was answered `422`. `canonical` sorts keys,
+so it does not.
+
+What remains true is the sentence above: this is not a defence against
+somebody who already chooses the key.
 
 ## idempotency.new(options)
 
@@ -91,8 +105,17 @@ which is the double charge this module prevents.
 
 **Returns** middleware.
 
-**Raises** nothing at construction. At request time it raises whatever the store
+**Raises** without a `namespace`. The idempotency key is a header the client
+chooses, so one global keyspace lets a tenant replay another tenant's stored
+response body; pass `namespace = function(req) return req.tenant.id end`, or
+`namespace = idempotency.GLOBAL` (which is `false`) to state that the
+application is single-tenant. At request time it raises whatever the store
 raises when there is no store configured at all.
+
+A store that cannot answer -- one that cannot run the scripts, or a Redis that
+blinked -- gets **503** with `retry-after: 1`, and the handler does not run.
+Failing open here would be the double charge this middleware exists to prevent,
+so it fails closed and says which guarantee is unavailable.
 
 ```lua
 local akkar        = require "akkar"
@@ -100,7 +123,7 @@ local idempotency  = require "akkar.idempotency"
 local memory       = require "akkar.cache.memory"
 
 local app = akkar.new()
-app:use(idempotency.new { ttl = 60 })
+app:use(idempotency.new { ttl = 60, namespace = idempotency.GLOBAL })
 
 local runs = 0
 app:post("/charges", { body = { amount = "integer" } }, function(req)
@@ -150,7 +173,7 @@ local idempotency  = require "akkar.idempotency"
 local memory       = require "akkar.cache.memory"
 
 local app = akkar.new()
-app:use(idempotency.new())
+app:use(idempotency.new { namespace = idempotency.GLOBAL })
 app:post("/charges", { body = { amount = "integer" } }, function(req)
   return akkar.created { amount = req.body.amount }
 end)
@@ -174,7 +197,7 @@ local idempotency  = require "akkar.idempotency"
 local memory       = require "akkar.cache.memory"
 
 local app = akkar.new()
-app:use(idempotency.new())
+app:use(idempotency.new { namespace = idempotency.GLOBAL })
 
 local client
 app:post("/charges", function()
@@ -212,7 +235,7 @@ local idempotency  = require "akkar.idempotency"
 local memory       = require "akkar.cache.memory"
 
 local app = akkar.new()
-app:use(idempotency.new())
+app:use(idempotency.new { namespace = idempotency.GLOBAL })
 app:post("/tasks", function() return { tasks = json.array {} } end)
 
 local client = app:test { cache = memory.new() }

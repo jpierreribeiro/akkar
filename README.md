@@ -972,7 +972,8 @@ back", so it retries, and the card is charged twice. Only the server can tell
 the difference, and only if it remembers.
 
 ```lua
-app:use(akkar.idempotency { ttl = 86400 })
+app:use(akkar.idempotency { ttl = 86400,
+                            namespace = false })
 ```
 
 ```

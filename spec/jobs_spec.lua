@@ -141,11 +141,13 @@ local function behaves_like_a_queue(label, make)
       assert.equal(0, queue:depth(), "the job should be out of the queue")
       assert.equal(1, queue:in_flight(), "and accounted for as checked out")
 
-      -- `reap(n)` returns what was claimed more than n seconds ago, so a
-      -- generous window must reclaim nothing and a negative one -- everything
-      -- claimed before a moment in the future -- must reclaim this.
-      assert.equal(0, queue:reap(60), "a fresh claim must not be reclaimed")
-      assert.equal(1, queue:reap(-1), "the abandoned job was not returned")
+      -- `reap(now)` reclaims whatever has been held past the queue's
+      -- `visibility` window, which is five minutes here. So reaping at this
+      -- instant must reclaim nothing, and reaping at an instant past the
+      -- window must reclaim this. The instant is passed rather than slept
+      -- through: what is under test is the due check, not the clock.
+      assert.equal(0, queue:reap(), "a fresh claim must not be reclaimed")
+      assert.equal(1, queue:reap(os.time() + 301), "the abandoned job was not returned")
       assert.equal(1, queue:depth())
       assert.equal(0, queue:in_flight())
 
@@ -162,7 +164,7 @@ local function behaves_like_a_queue(label, make)
       assert.is_true(queue:ack(job))
 
       assert.equal(0, queue:in_flight())
-      assert.equal(0, queue:reap(-1), "an acknowledged job was reaped anyway")
+      assert.equal(0, queue:reap(os.time() + 301), "an acknowledged job was reaped anyway")
       assert.equal(0, queue:depth())
     end)
 
@@ -201,7 +203,7 @@ local function behaves_like_a_queue(label, make)
 
       assert.equal(0, queue:in_flight(), "the undecodable bytes stayed checked out")
       assert.equal(0, queue:depth())
-      assert.equal(0, queue:reap(-1), "reaping brought the poison back")
+      assert.equal(0, queue:reap(os.time() + 301), "reaping brought the poison back")
 
       -- Kept where someone can look at it, rather than dropped in silence.
       assert.equal(1, queue:dead_depth())
@@ -275,11 +277,22 @@ if redis_reachable() then
       queue = jobs_redis.new(cache, "spec-gap")
     end)
 
+    -- A REAL JOB, not the bare string this used to stage. `reap` decodes what
+    -- it reclaims now -- it has to, to count a redelivery and to bury a job
+    -- that has outlived too many workers -- so bytes that are not a job take
+    -- the dead-letter path instead, and would prove nothing about the window
+    -- these two tests are about.
+    local function stranded()
+      return require("akkar.json").encode {
+        uid = "stranded", kind = "charge", payload = { amount = 1 }, attempts = 0,
+      }
+    end
+
     it("adopts a claim in flight instead of reclaiming it", function()
       -- The window, staged exactly: in the processing list, no score.
-      queue.store.cache:command("LPUSH", "akkar:queue:spec-gap:processing", "in-flight")
+      queue.store.cache:command("LPUSH", "akkar:queue:spec-gap:processing", stranded())
 
-      assert.equal(0, queue:reap(-1),
+      assert.equal(0, queue:reap(os.time() + 301),
         "reap took a job away from a worker that was still holding it")
       assert.equal(0, queue:depth())
       assert.equal(1, queue:in_flight(), "the claim stopped being accounted for")
@@ -292,9 +305,9 @@ if redis_reachable() then
     end)
 
     it("still reclaims it once that stamp is old enough", function()
-      queue.store.cache:command("LPUSH", "akkar:queue:spec-gap:processing", "in-flight")
-      queue:reap(-1)                       -- stamps it
-      assert.equal(1, queue:reap(-1), "the adopted claim was never reclaimed")
+      queue.store.cache:command("LPUSH", "akkar:queue:spec-gap:processing", stranded())
+      queue:reap(os.time() + 301)                       -- stamps it
+      assert.equal(1, queue:reap(os.time() + 301), "the adopted claim was never reclaimed")
       assert.equal(1, queue:depth())
       assert.equal(0, queue:in_flight())
     end)
@@ -308,7 +321,7 @@ if redis_reachable() then
       assert.equal(1, tonumber(queue.store.cache:command(
         "ZCARD", "akkar:queue:spec-gap:processing:at")),
         "the non-blocking claim left the job unstamped")
-      assert.equal(0, queue:reap(60), "a fresh claim must not be reclaimed")
+      assert.equal(0, queue:reap(), "a fresh claim must not be reclaimed")
     end)
   end)
 else

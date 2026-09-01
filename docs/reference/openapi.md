@@ -23,16 +23,23 @@ Lua table ready for `json.encode`.
 | argument | type | default | meaning |
 |---|---|---|---|
 | `app` | application | required | the app to describe |
-| `info` | table | `{}` | `title`, `version` and `description` |
+| `info` | table | `{}` | `title`, `version`, `description` and `components` |
 
 | `info` field | type | default |
 |---|---|---|
 | `title` | string | `"akkar API"` |
 | `version` | string | `"0.0.0"` |
 | `description` | string | none, and the key is then absent |
+| `components` | table | none, and the key is then absent |
 
-**Returns** a table with three keys: `openapi` (always `"3.1.0"`), `info` and
-`paths`. An app with no routes gets an empty `paths`.
+`components` is passed through untouched. It is where `securitySchemes` lives,
+and akkar knows nothing about them — which header, which OAuth flow — so a
+route declaring `security = { { bearer = {} } }` without a `components` entry
+naming `bearer` produces a dangling reference in otherwise valid OpenAPI.
+
+**Returns** a table with `openapi` (always `"3.1.0"`), `info`, `paths`, and
+`components` when `info.components` was given. An app with no routes gets an
+empty `paths`.
 
 **Raises** nothing of its own. It reads `app.routes` and `app.mounts`, so a
 table that is not an akkar application raises where those are indexed.
@@ -42,15 +49,19 @@ What ends up in each operation:
 - `operationId`, built from the method and the path with every run of
   non-alphanumeric characters replaced by `_` and a trailing `_` removed:
   `GET /tasks/:id` becomes `get_tasks_id`
-- `parameters` from `options.params` (in `path`) and `options.query` (in
-  `query`), sorted by name. A route with `:id` and no `params` schema still gets
-  a required `string` path parameter, because OpenAPI requires every template
-  variable to be declared
+- `parameters` from `options.params` (in `path`), `options.query` (in `query`)
+  and `options.openapi.headers` (in `header`), sorted by location and then by
+  name. A route with `:id` and no `params` schema still gets a required
+  `string` path parameter, because OpenAPI requires every template variable to
+  be declared
 - `requestBody` from `options.body`, `required = true`, under
   `application/json`
-- `responses`: `200` always, carrying `options.response` as its schema when one
-  was declared; `422` when the route declares any of `params`, `query` or
-  `body`; `500` always
+- `responses`: one entry per status in `options.responses` when the route
+  declared them, otherwise `200`, carrying `options.response` as its schema
+  when one was declared; `422` when the route declares any of `params`, `query`
+  or `body`; `500` always
+- `summary`, `description` and `security`, each copied from `options.openapi`
+  when it is there
 
 A route with no schema still appears, without parameters. An undocumented
 endpoint is worse than a thinly documented one.
@@ -116,11 +127,32 @@ assert(doc.paths["/health/live"].get.operationId == "get_health_live")
 | `v.integer { max = N }` | `maximum = N` |
 | `one_of = { ... }` | `enum` |
 | `match = "..."` | `pattern` |
+| `openapi_pattern = "..."` | `pattern`, in place of `match` |
 | `default = value` | `default` |
+| `v.object { fields = {...} }` | `{ type = "object", properties = ... }` |
+| `v.array { items = rule }` | `{ type = "array", items = ... }` |
+| `v.array { min = N }` | `minItems = N` |
+| `v.array { max = N }` | `maxItems = N` |
+| `v.array {}` | `items` is `{ type = "object" }`, the widest rule |
 
-`min` and `max` become the length pair for `string` and the value pair for every
-other kind. A path parameter is `required` whatever the rule says, because a
-template variable cannot be absent.
+`min` and `max` go to a DIFFERENT pair of keywords for each kind: `minLength`
+and `maxLength` for a string, `minimum` and `maximum` for a number or an
+integer, `minItems` and `maxItems` for an array. They used to fall through to
+`minimum`/`maximum` for everything that was not a string, which put a keyword
+OpenAPI does not apply to arrays on an array and left the one bound the
+validator does enforce -- element count -- undocumented.
+
+Object and array rules nest to any depth: an object's field may be an array and
+an array's element may be an object, and each level is described rather than
+flattened to `{}` or to a string. A path parameter is `required` whatever the
+rule says, because a template variable cannot be absent.
+
+`body`, `response` and each entry of `responses` may be a **map of field name to
+rule**, which describes an object, or **one rule** describing the whole value —
+`v.object { fields = ... }`, or `v.array { items = ... }` for a route whose body
+or reply is a list. The validator tells the two apart the same way this module
+does, by the rule's `kind`, so a body documented as an object where the route
+enforces a list is not a mismatch that can happen.
 
 ```lua
 local akkar   = require "akkar"
@@ -147,13 +179,79 @@ assert(schema.required[1] == "name")
 assert(schema.required[2] == "role")         -- `age` is optional
 ```
 
-Two things this mapping does not do. `match` is copied through unchanged, and
-akkar's `match` is a Lua pattern while OpenAPI's `pattern` is an ECMA-262
-regular expression, so a rule like `match = "^%d+$"` produces a `pattern` no
-JSON Schema validator will read the way akkar does. And a rule this module does
-not recognise becomes an empty schema `{}` rather than an error, where a route
-declaring it raises `unknown schema type` at the line that declares it — so in
-practice a bad rule fails the boot long before this module sees it.
+One thing this mapping still does not do. A rule this module does not recognise
+becomes an empty schema `{}` rather than an error, where a route declaring it
+raises `unknown schema type` at the line that declares it — so in practice a bad
+rule fails the boot long before this module sees it.
+
+`match` is copied to `pattern` unchanged, and akkar's `match` is a Lua pattern
+while OpenAPI's `pattern` is an ECMA-262 regular expression, so `match =
+"^%d+$"` produces a `pattern` no JSON Schema validator will read the way akkar
+does. `openapi_pattern` on the same rule is where the author writes the
+constraint for that reader, and it replaces `match` in the document. The server
+still enforces `match`, so this can only ever be the more readable spelling of
+the same rule — never a second, looser one.
+
+### What a route can document that it does not validate
+
+`options.openapi` carries the parts of an operation that are not validation at
+all. Nothing in it is enforced; this module is its only reader.
+
+| `openapi` field | type | becomes |
+|---|---|---|
+| `summary` | string | `operation.summary` |
+| `description` | string | `operation.description` |
+| `security` | list | `operation.security`, referring to `info.components.securitySchemes` |
+| `headers` | map of name to declaration | `parameters` with `in = "header"` |
+
+A header declaration takes `required` (boolean, default `false`), `description`
+and `schema` (default `{ type = "string" }`). Headers are not validated — akkar
+has no header schema — which is why they are declared in their own shape rather
+than as rules.
+
+```lua
+local akkar   = require "akkar"
+local openapi = require "akkar.openapi"
+local v       = akkar.v
+
+local app = akkar.new()
+
+app:get("/ids/:id", { params = {
+  -- `%x` is a Lua character class; the second spelling is for the client
+  -- generator reading the document. Both mean "hexadecimal".
+  id = v.string { match = "^%x+$", openapi_pattern = "^[0-9a-fA-F]+$" },
+} }, function(req) return { id = req.params.id } end)
+
+app:post("/charges", {
+  responses = { [201] = v.object { fields = { id = "string" } } },
+  openapi = {
+    summary  = "Charge a card",
+    security = { { bearer = {} } },
+    headers  = { ["Idempotency-Key"] = { required = true } },
+  },
+}, function() return akkar.created { id = "ch-1" } end)
+
+local doc = openapi.document(app, {
+  components = { securitySchemes = { bearer = { type = "http", scheme = "bearer" } } },
+})
+
+assert(doc.paths["/ids/{id}"].get.parameters[1].schema.pattern == "^[0-9a-fA-F]+$")
+
+local post = doc.paths["/charges"].post
+assert(post.summary == "Charge a card")
+assert(post.security[1].bearer ~= nil)
+assert(post.parameters[1].name == "Idempotency-Key")
+assert(post.parameters[1]["in"] == "header")
+assert(post.parameters[1].required == true)
+assert(post.responses["201"].description == "Created")
+assert(post.responses["201"].content["application/json"].schema.type == "object")
+assert(post.responses["200"] == nil)         -- the route said which statuses it answers
+assert(doc.components.securitySchemes.bearer.scheme == "bearer")
+
+-- The document and the enforcement come from the same table.
+assert(app:test {}:get("/ids/deadbeef").status == 200)
+assert(app:test {}:get("/ids/not-hex").status == 422)
+```
 
 ## openapi.serve(app, path, info)
 
@@ -202,12 +300,12 @@ assert(client:get("/openapi.json").body.paths["/late"] == nil)
 
 ## Not here
 
-- **Response schemas beyond `200`.** `422` and `500` are described but not
-  shaped, and no other status is described at all. Declare
-  `options.response` for the success body.
-- **Tags, security schemes, servers, examples or `components`.** The document
-  has `openapi`, `info` and `paths` and nothing else. Add keys to the table
-  `document` returns if you need them.
+- **Shapes for the statuses akkar produces itself.** `422` and `500` are
+  described but not shaped. Every status the ROUTE answers can be shaped, with
+  `options.response` or `options.responses`.
+- **Tags, servers or examples.** Add keys to the table `document` returns if
+  you need them. `components` is passed through from `info`, and `security` is
+  declared per route on `options.openapi`.
 - **A UI.** `serve` answers JSON. Point Swagger UI or Redoc at it.
 - **Anything read from a comment.** The only source is the `options` table on
   the route.
@@ -215,8 +313,9 @@ assert(client:get("/openapi.json").body.paths["/late"] == nil)
 ## See also
 
 - [akkar](akkar.md) for `app:get(path, options, handler)`, whose `params`,
-  `query`, `body` and `response` are the whole input to this module, and for
-  `app:mount`, which decides the prefix a sub-app is documented at
+  `query`, `body`, `response`, `responses` and `openapi` are the whole input to
+  this module, and for `app:mount`, which decides the prefix a sub-app is
+  documented at
 - [akkar.json](json.md) for `json.encode`, which turns the returned table into
   the document a client fetches
 - the module source, `akkar/openapi.lua`, for why one declaration is reused

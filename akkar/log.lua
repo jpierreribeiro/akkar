@@ -71,16 +71,58 @@ local function render(value)
   return tostring(value)
 end
 
+-- logfmt separates fields with a space, so a value that CONTAINS one ends its
+-- field and starts another. Written raw, any value reachable from a request --
+-- a name, a search term, a user agent, the request id itself -- forged fields:
+-- an email of `a@b.test role=admin tenant=other` arrived at the log store as
+-- three fields, two of them invented by the caller. A newline forged a whole
+-- line, which is worse: it invents an event that never happened, at whatever
+-- level it likes.
+--
+-- Text is the DEFAULT format, so this was on by default. Values that are
+-- plainly safe are still written bare, because the point of logfmt is that a
+-- person can read it.
+local SAFE = "^[%w_%-%.:/@+]+$"
+
+local function escape(text)
+  return (text:gsub("[\\\"]", "\\%0")
+              :gsub("%c", function(char)
+                if char == "\n" then return "\\n" end
+                if char == "\r" then return "\\r" end
+                if char == "\t" then return "\\t" end
+                return string.format("\\x%02x", char:byte())
+              end))
+end
+
+-- `render` decides how a value READS; this decides whether it can escape its
+-- own field. Both, in that order.
+local function field_value(value)
+  local text = render(value)
+  if text:match(SAFE) then return text end
+  return '"' .. escape(text) .. '"'
+end
+
+-- A key with a space or an `=` in it forges just as well as a value does, and
+-- keys arrive from `bind` and from caller-supplied field tables.
+local function field_key(key)
+  key = tostring(key)
+  if key:match(SAFE) then return key end
+  return (key:gsub("[^%w_%-%.:/@+]", "_"))
+end
+
 local function format_text(entry)
-  local parts = { string.format("%-5s %s", entry.level:upper(), entry.message) }
+  -- The message is positional rather than quoted, so it cannot carry its own
+  -- `key=value` ambiguity away -- but a newline in it would still end the
+  -- line, so control characters go.
+  local parts = { string.format("%-5s %s", entry.level:upper(),
+                                escape(tostring(entry.message))) }
   local keys = {}
   for key in pairs(entry) do
     if key ~= "level" and key ~= "message" and key ~= "time" then keys[#keys + 1] = key end
   end
   table.sort(keys)
   for _, key in ipairs(keys) do
-    local value = entry[key]
-    parts[#parts + 1] = key .. "=" .. render(value)
+    parts[#parts + 1] = field_key(key) .. "=" .. field_value(entry[key])
   end
   return table.concat(parts, " ")
 end

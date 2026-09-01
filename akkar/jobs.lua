@@ -26,14 +26,24 @@ belongs here.
     store:schedule(key, encoded, delay)   -- hold for this many seconds
     store:promote(key, now)               -- move what is due into the queue
     store:claim(key, id, ttl)             -- false if this id was seen already
+    store:unclaim(key, id)                -- give a claim back
     store:peek(key, limit)                -- read without removing
     store:trim(key, keep)                 -- cap a list's length
+
+    store:claim_pop(key, timeout)         -- take a job AND hold it in flight
+    store:ack(key, encoded)               -- done with it; false if it was not ours
+    store:expired(key, visibility, now, limit)  -- what ran out of time
+    store:in_flight(key)                  -- how many are held
 
 Optional, because a store that cannot hold a job until Tuesday is still a
 useful store. But they are not optional *silently*: asking for retries with
 backoff, or for a delay, or for an idempotency key against a store that
 cannot do it is an error at the call rather than a feature that quietly does
 nothing.
+
+The last four are the delivery guarantee, and they come as a set: a store that
+leases without expiring holds jobs for ever, which is worse than not leasing
+at all.
 
 ## Retries, and why they were absent for so long
 
@@ -65,6 +75,57 @@ can: an id the store refuses to accept twice.
 The second push returns `false, "duplicate"`. That is deduplication at the
 door, which is a different thing from an idempotent handler and does not
 pretend to replace one.
+
+## What a delivery is worth, said before it is relied on
+
+**At least once, and that means AT LEAST.** A handler here will sometimes run
+twice for one job, and a caller who cannot survive that has a bug this module
+cannot fix for them.
+
+`pop` does not take a job off the queue; it takes a LEASE on one. The job
+moves to a processing list, `ack` retires it, and anything still in flight
+after `visibility` seconds is put back for another worker. So a worker that is
+SIGKILLed, OOM-killed or unplugged mid-handler costs a redelivery instead of
+the job -- but a worker that is merely SLOW, still working past its visibility
+timeout, also costs a redelivery, and then the same job is running twice at
+once. Set `visibility` above your slowest handler; the default is five minutes
+for that reason and not because five minutes is precise.
+
+    local queue = jobs.new(store, "email", {
+      visibility = 300,        -- seconds a worker may hold a job
+      max_redeliveries = 5,    -- then the dead letters
+      reap_every = 30,         -- how often a worker looks for lost jobs
+    })
+
+**And the guarantee is named rather than inferred.** Leasing used to be on
+wherever the store could do it and silently off where it could not, so a
+caller could end up at AT-MOST-ONCE by accident -- and at-most-once is not a
+configuration anybody picks on purpose. It means a worker killed mid-handler
+loses paid work with nothing anywhere recording that the job existed. So:
+
+  * `delivery = "at_least_once"` over a store that cannot lease is REFUSED at
+    construction. Accepting the setting and delivering at most once anyway is
+    the one outcome worse than not offering it.
+  * `delivery = "at_most_once"` buys the old behaviour back, out loud.
+  * A store that cannot lease still builds a queue, and that queue says
+    `delivery == "at_most_once"` rather than claiming otherwise.
+
+### How the two halves compose, because they are not the same tool
+
+The dedup id above stops a second PUSH. It does nothing about a redelivery,
+because a redelivery never goes through `push` -- it is the same job, with the
+same id, coming back around. The two solve different problems and a caller
+generally needs both:
+
+    push id   -- two producers, one job      (this module handles it)
+    job.uid   -- one job, two runs           (the handler has to handle it)
+
+Every job carries `uid`, and it is stable across every retry and every
+redelivery of that job. It is therefore the key to write an "already did this"
+marker under -- a unique index, a row in a `processed` table, an
+`akkar.idempotency` record -- inside the same transaction as the side effect.
+That is what makes a handler safe to run twice; nothing else does, and until
+`uid` existed this module documented the hazard without offering the key.
 ]]
 
 local cjson = require "akkar.json"
@@ -74,8 +135,36 @@ Queue.__index = Queue
 
 local time   = require "akkar.time"
 local random = require "akkar.random"
+local crypto = require "akkar.crypto"
 
 local M = {}
+
+-- THE ONE NAME A HANDLER CAN DEDUP ON, and it is not decoration.
+--
+-- This module's whole answer to "your handler will sometimes run twice" is
+-- "write an already-did-this marker and check it". That answer needs a key,
+-- and until now there was none to offer. `job.id` is optional and supplied by
+-- the CALLER, so most jobs have none; `job.attempts` changes on every retry;
+-- the encoded bytes change the moment anything is written into the job. A
+-- guarantee of at-least-once delivery with no stable identity is a guarantee
+-- the caller cannot act on.
+--
+-- `uid` is minted once, in `push`, and carried through every re-encode: a
+-- retry, a redelivery, a burial. It is therefore the key to write that marker
+-- under -- a unique index, a row in a `processed` table, an
+-- `akkar.idempotency` record -- inside the same transaction as the side
+-- effect.
+--
+-- Through `akkar.crypto` rather than `akkar.random`, and the two are not
+-- interchangeable here. `akkar.random` exists to be REPLAYABLE: seed it and
+-- it draws the same sequence twice, which is right for the backoff jitter
+-- below and catastrophic for an identity, because two workers replaying the
+-- same seed would mint the same uid for different jobs. `akkar/random.lua`
+-- says so itself: "if being able to GUESS the value matters, this is the
+-- wrong module".
+local function unique_id()
+  return crypto.token(12)
+end
 
 -- Exponential backoff with full jitter.  The jitter is not decoration: a
 -- hundred jobs that failed against a database which has just come back will
@@ -118,6 +207,31 @@ local function supports(store, method)
   return type(store[method]) == "function"
 end
 
+-- A store that can hold a job while a handler runs it. ALL FOUR OR NONE: a
+-- lease with no reaper behind it is a job that disappears permanently instead
+-- of temporarily, which is a worse failure than the one leasing was meant to
+-- fix. This used to ask for `claim_pop` and `ack` alone, which is the half of
+-- the set that takes a job out of circulation without the half that puts it
+-- back.
+local function can_lease(store)
+  for _, method in ipairs { "claim_pop", "ack", "expired", "in_flight" } do
+    if not supports(store, method) then return false end
+  end
+  return true
+end
+
+-- Five minutes, matching the backoff cap, and chosen from what this library
+-- says jobs are FOR: `akkar.work` gives "a report, an image, an email" as the
+-- motivating examples, and building a report takes minutes. A visibility
+-- shorter than the handler redelivers work that is still running.
+local DEFAULT_VISIBILITY = 300
+
+-- How many in-flight entries one reaper pass handles. A pass is repeatable, so
+-- the only thing this bounds is how long a single pass can block the worker
+-- that ran it; an in-flight list longer than this means a great many workers
+-- died at once, and recovering them 500 at a time is fine.
+local REAP_BATCH = 500
+
 --- Wraps a store with the queue semantics.
 function M.new(store, name, options)
   for _, method in ipairs { "enqueue", "dequeue", "depth" } do
@@ -139,6 +253,30 @@ function M.new(store, name, options)
           "run immediately, which hammers whatever just failed", 2)
   end
 
+  -- THE GUARANTEE IS NAMED, and it used to be inferred and never said.
+  --
+  -- Leasing was on wherever the store could do it and silently off where it
+  -- could not, which reads like a sensible default and is the wrong shape: it
+  -- makes AT-MOST-ONCE something a caller can end up with by accident. Nobody
+  -- picks at-most-once on purpose -- it means a worker killed mid-handler
+  -- loses paid work with nothing anywhere recording that the job existed -- so
+  -- it has to be asked for by name, and asking for at-least-once over a store
+  -- that cannot do it has to be refused rather than quietly downgraded.
+  local delivery = options.delivery
+  if delivery and delivery ~= "at_least_once" and delivery ~= "at_most_once" then
+    error("akkar.jobs: delivery must be 'at_least_once' or 'at_most_once', " ..
+          "not '" .. tostring(delivery) .. "'", 2)
+  end
+  if delivery == "at_least_once" and not can_lease(store) then
+    error("akkar.jobs: at-least-once delivery needs a store that can hold a " ..
+          "job in flight, and this one implements no :claim_pop -- accepting " ..
+          "the setting and delivering at most once anyway is the silent " ..
+          "degradation this module exists to avoid", 2)
+  end
+  local leasing = can_lease(store) and delivery ~= "at_most_once"
+
+  local visibility = options.visibility or DEFAULT_VISIBILITY
+
   return setmetatable({
     store = store,
     key = "akkar:queue:" .. (name or "default"),
@@ -147,12 +285,36 @@ function M.new(store, name, options)
     -- does not promise to serialise the same way twice -- so a job could be
     -- acknowledged with a string that does not match the one in the
     -- processing set, silently leaving it to be reaped and run again. Weak
-    -- keys because a job the caller drops is not our business.
+    -- keys because a job the caller drops -- which is precisely the case this
+    -- module is about -- must not pin its encoded form for the life of the
+    -- process.
     _claimed = setmetatable({}, { __mode = "k" }),
     retries = retries,
     backoff = options.backoff or {},
     dead_letter = options.dead_letter ~= false,
     max_dead = options.max_dead or 1000,
+
+    leasing = leasing,
+    -- Readable, because "what does this queue actually guarantee" is a
+    -- question a caller should be able to answer without reading the store.
+    delivery = leasing and "at_least_once" or "at_most_once",
+    visibility = visibility,
+    -- A job whose worker dies is redelivered; a job that kills every worker
+    -- that touches it would be redelivered for ever, taking the fleet down one
+    -- process at a time. Five means a poison pill is out of circulation after
+    -- five casualties, and a rolling restart that catches the same job twice
+    -- does not bury healthy work.
+    max_redeliveries = options.max_redeliveries or 5,
+    -- The automatic reap inside `pop` costs a read. Unthrottled, a
+    -- `timeout = 0` consume loop pays it on every iteration for a job that
+    -- cannot come due more than once per visibility window anyway.
+    reap_every = options.reap_every or math.max(1, math.floor(visibility / 10)),
+    -- Now, not zero: the first automatic reap is `reap_every` seconds into
+    -- this queue's life rather than on its first `pop`. A process that pops
+    -- once and exits -- a one-shot script, a test -- is not a worker, and
+    -- making it recover the whole fleet's abandoned jobs before it has done
+    -- any of its own is work nobody asked that process to do.
+    last_reap = time.now(),
   }, Queue)
 end
 
@@ -181,6 +343,21 @@ function Queue:push(kind, payload, options)
 
   local encoded = cjson.encode {
     id = options.id,
+    -- Minted here and never again. See `unique_id` at the top of this file:
+    -- it is the only field of a job that is both present on every job and
+    -- unchanged by every retry and redelivery, which is what makes it the
+    -- key a handler can dedup on.
+    --
+    -- It also, incidentally, ends a defect in the Redis store: `ZADD` makes
+    -- the ENCODED JOB the sorted-set member, so two byte-identical jobs due
+    -- in the same second were one member -- a customer double-clicking
+    -- "email me the receipt" got one email, and a hundred jobs failing
+    -- against a database that had just come back merged into a single retry.
+    -- The memory store appends to a list and did not collapse them, so the
+    -- two backends disagreed about how many jobs existed. Fixed here rather
+    -- than in the store, because uniqueness is a property of a job and a fix
+    -- in one store would have left the other still disagreeing.
+    uid = unique_id(),
     kind = kind,
     payload = payload,
     queued_at = time.now(),
@@ -207,17 +384,38 @@ function Queue:push(kind, payload, options)
   -- The two-step path, kept for a store that implements `claim` and not
   -- `claim_and_enqueue`. The window above is open here, and it is open in
   -- the direction of losing the job rather than running it twice.
+  --
+  -- AND THE FAILURE PATH HAS TO GIVE THE ID BACK. The claim is taken BEFORE
+  -- the job exists, which is the only order that closes the race between two
+  -- producers -- so an enqueue that raises leaves an id held for the full ttl
+  -- about a job that was never queued, and every retry for the next hour is
+  -- answered "duplicate". The mechanism that exists to make a retry safe was
+  -- the thing that made it useless.
+  --
+  -- Only on this path. The atomic path above needs nothing of the sort and
+  -- must not have it: there the claim and the push are one step, so either
+  -- both happened or neither did, and releasing after a lost REPLY would give
+  -- away an id whose job is sitting in the queue.
+  local function release()
+    if options.id and supports(self.store, "unclaim") then
+      pcall(function() return self.store:unclaim(self.key, options.id) end)
+    end
+  end
+
   if options.id then
     if not self.store:claim(self.key, options.id, options.id_ttl or 3600) then
       return false, "duplicate"
     end
   end
 
-  if delayed then
-    return self.store:schedule(self.key, encoded, delay)
-  end
-
-  return self.store:enqueue(self.key, encoded)
+  local ok, result = pcall(function()
+    if delayed then
+      return self.store:schedule(self.key, encoded, delay)
+    end
+    return self.store:enqueue(self.key, encoded)
+  end)
+  if not ok then release() error(result, 0) end
+  return result
 end
 
 --- Waits for one job, up to `timeout` seconds.  Returns nil on timeout.
@@ -231,9 +429,10 @@ function Queue:pop(timeout)
   if supports(self.store, "promote") then
     self.store:promote(self.key)
   end
+  self:_maybe_reap()
 
   local encoded
-  if supports(self.store, "claim_pop") then
+  if self.leasing then
     encoded = self.store:claim_pop(self.key, timeout or 5)
   else
     encoded = self.store:dequeue(self.key, timeout or 5)
@@ -252,18 +451,20 @@ function Queue:pop(timeout)
     --
     -- Worse than the old behaviour, which at least lost it once. A message
     -- that describes what the code used to do is how a defect hides.
-    if supports(self.store, "ack") then
-      pcall(function() return self.store:ack(self.key, encoded) end)
-    end
+    -- Kept rather than dropped: bytes nobody can decode are exactly what
+    -- somebody will need to look at, and a dead-letter queue is where this
+    -- module already puts work it cannot finish. Written BEFORE the lease is
+    -- given back, for the same reason every other path writes the next copy
+    -- first.
     if self.dead_letter then
-      -- Kept rather than dropped: bytes nobody can decode are exactly what
-      -- somebody will need to look at, and a dead-letter queue is where this
-      -- module already puts work it cannot finish.
       pcall(function() return self.store:enqueue(self:dead_key(), encoded) end)
+    end
+    if self.leasing then
+      pcall(function() return self.store:ack(self.key, encoded) end)
     end
     return nil, "akkar.jobs: undecodable job discarded"
   end
-  self._claimed[job] = encoded
+  if self.leasing then self._claimed[job] = encoded end
   return job
 end
 
@@ -291,8 +492,39 @@ function Queue:dead_letters(limit)
   return out
 end
 
+-- The one dead-letter path. Both callers -- a handler that ran out of retries
+-- and a job that outlived too many workers -- come through here, so there is
+-- one place where "finally failed" is written down and one place that has to
+-- be capped.
+local function bury(queue, encoded)
+  if not queue.dead_letter then return "dropped" end
+  queue.store:enqueue(queue:dead_key(), encoded)
+
+  -- An unbounded dead-letter queue is a memory leak with a respectable name.
+  if supports(queue.store, "trim") then
+    queue.store:trim(queue:dead_key(), queue.max_dead)
+  end
+  return "buried"
+end
+
+-- Gives the in-flight record back. Always called AFTER the job's next copy
+-- exists somewhere else -- scheduled, buried, dead-lettered -- and never
+-- before: a crash in that window then costs a REDELIVERY, which is what this
+-- queue promises, rather than the JOB, which is what it promises not to.
+function Queue:_release(job)
+  if not self.leasing then return end
+  local encoded = self._claimed[job]
+  if not encoded then return end
+  self._claimed[job] = nil
+  return self.store:ack(self.key, encoded)
+end
+
 --- Puts a failed job back after its backoff, or buries it.
 --- Returns "retried", "buried" or "dropped", plus the delay when retried.
+---
+--- Releases the lease as its last act, so a failed job is never both
+--- scheduled and in flight -- that pair is two copies of one job, delivered a
+--- backoff apart.
 function Queue:fail(job, err)
   job.attempts = (job.attempts or 0) + 1
   job.last_error = tostring(err)
@@ -301,103 +533,179 @@ function Queue:fail(job, err)
   if job.attempts <= self.retries then
     local delay = delay_for(job.attempts, self.backoff)
     self.store:schedule(self.key, cjson.encode(job), delay)
+    self:_release(job)
     return "retried", delay
   end
 
-  if not self.dead_letter then return "dropped" end
-
   job.died_at = time.now()
-  self.store:enqueue(self:dead_key(), cjson.encode(job))
-
-  -- An unbounded dead-letter queue is a memory leak with a respectable name.
-  if supports(self.store, "trim") then
-    self.store:trim(self:dead_key(), self.max_dead)
-  end
-  return "buried"
+  local outcome = bury(self, cjson.encode(job))
+  self:_release(job)
+  return outcome
 end
 
 
 --- True when this queue can survive a worker dying mid-job.
 ---
 --- Worth asking rather than assuming: the answer decides whether a job that
---- matters may go through here at all, and it depends on the store, not on
---- the queue.
+--- matters may go through here at all. It now answers what this queue DOES
+--- rather than what its store could do, because `delivery = "at_most_once"`
+--- makes those two different questions.
 function Queue:reliable()
-  return supports(self.store, "claim_pop") and supports(self.store, "ack")
+  return self.delivery == "at_least_once"
 end
 
 --- Marks a job finished, so it stops being recoverable.
 ---
---- Called by `consume` after the handler returns AND after a failure has been
---- retried or buried -- in both cases the job has been dealt with, and
---- leaving it in the processing set would make `reap` run it again.
+--- Called by `consume` after the handler returns. Returns false when the lease
+--- had already expired and the job was handed to somebody else -- meaning this
+--- run was a duplicate, and `visibility` is shorter than the handler's real
+--- runtime. True under at-most-once delivery, where there was never anything
+--- to retire.
 function Queue:ack(job)
-  if not supports(self.store, "ack") then return false end
-  local encoded = self._claimed[job] or cjson.encode(job)
+  if not self.leasing then return true end
+  local encoded = self._claimed[job]
+  -- No record means no lease: either this job never came from `pop`, or it has
+  -- already been released. Re-encoding to guess at the bytes is worse than
+  -- saying so -- a table does not promise to serialise the same way twice, so
+  -- the guess would sometimes name somebody else's entry.
+  if not encoded then return false end
   self._claimed[job] = nil
   return self.store:ack(self.key, encoded)
 end
 
---- Returns jobs abandoned by a worker that never came back.
+--- Returns to the queue every job whose worker stopped answering, and buries
+--- the ones that have outlived too many workers.
 ---
---- `older_than` is in seconds and must exceed the longest a handler may
---- legitimately take. Set it too low and a slow job is run twice while the
---- first attempt is still going; that is the trade this method makes and it
---- cannot be made safe from here, because only the application knows how long
---- its work takes.
+--- Returns how many were redelivered and how many were buried.
 ---
---- Returns how many were returned to the queue.
-function Queue:reap(older_than)
-  if not supports(self.store, "reap") then return 0 end
-  -- A WINDOW, NOT A CUTOFF, and the change is the whole clock fix.
-  --
-  -- This used to compute `now - older_than` here and send the answer. That
-  -- made every reap an assertion about time made by ONE worker, so a machine
-  -- whose clock had been stepped forward reclaimed jobs that other workers
-  -- were actively running -- at-least-once becoming at-least-twice because of
-  -- an NTP correction. Stepped backwards, nothing was ever reclaimed at all.
-  --
-  -- Sending the window instead lets the store answer with the clock every
-  -- worker shares. `spec/clock_spec.lua` holds both directions.
-  return self.store:reap(self.key, older_than or 300)
+--- `now` IS A TEST SEAM, NOT THE PRODUCTION PATH. Leave it out and the store
+--- answers with the clock every worker shares -- the Redis server's own
+--- `TIME`, read inside the script. That is the whole clock fix and it must
+--- stay the default: a cutoff computed by ONE worker made every reap an
+--- assertion about time made by a machine that might have just been stepped by
+--- NTP, so a correction forwards reclaimed jobs other workers were actively
+--- running, and a correction backwards reclaimed nothing ever again.
+--- `spec/clock_spec.lua` holds both directions.
+---
+--- Pass `now` only where waiting out a `visibility` window is not an option --
+--- a spec, an operator draining a queue by hand. What decides staleness is
+--- `visibility`, which is the queue's configuration rather than the caller's
+--- opinion, and it must exceed the longest a handler may legitimately take:
+--- set it too low and a slow job is run twice while the first attempt is still
+--- going.
+function Queue:reap(now)
+  if not self.leasing then return 0, 0 end
+  self.last_reap = time.now()
+
+  local redelivered, buried = 0, 0
+  local expired = self.store:expired(self.key, self.visibility, now, REAP_BATCH)
+
+  for _, encoded in ipairs(expired) do
+    local ok, job = pcall(cjson.decode, encoded)
+    if not ok then
+      -- Bytes nobody can decode, holding a lease that keeps coming back. The
+      -- dead letters are where everything else this module cannot finish goes.
+      pcall(function() return bury(self, encoded) end)
+      pcall(function() return self.store:ack(self.key, encoded) end)
+    else
+      job.redeliveries = (job.redeliveries or 0) + 1
+
+      -- COUNTED APART FROM `attempts`, on purpose. `attempts` is the handler
+      -- saying no; a worker being OOM-killed is not the handler saying
+      -- anything, and charging a redelivery to the retry budget would bury
+      -- healthy work after a deploy that restarted the fleet three times.
+      if job.redeliveries > self.max_redeliveries then
+        job.last_error = "the worker holding this job stopped answering, " ..
+                         job.redeliveries .. " times in a row"
+        job.died_at = time.now()
+        bury(self, cjson.encode(job))
+        buried = buried + 1
+      else
+        self.store:enqueue(self.key, cjson.encode(job))
+        redelivered = redelivered + 1
+      end
+      -- Only now, with the next copy already written.
+      self.store:ack(self.key, encoded)
+    end
+  end
+
+  return redelivered, buried
 end
 
---- How many jobs are currently checked out by a worker.
+-- The reaper runs off the back of `pop` rather than from a thread of its own:
+-- a queue that needs a separate janitor process to be correct is a queue that
+-- is incorrect on every deployment that forgot to run one. Any worker
+-- consuming from a queue is also recovering it.
+--
+-- Wrapped, because the store is a network and a blip in a chore must not
+-- unwind the worker loop that called it.
+function Queue:_maybe_reap()
+  if not self.leasing then return end
+  local now = time.now()
+  if now - self.last_reap < self.reap_every then return end
+  self.last_reap = now
+  pcall(self.reap, self)
+end
+
+--- How many jobs are currently checked out by a worker. Zero under
+--- at-most-once delivery, where nothing is ever held.
 function Queue:in_flight()
-  if not supports(self.store, "in_flight") then return 0 end
-  return self.store:in_flight(self.key)
+  if not self.leasing then return 0 end
+  return tonumber(self.store:in_flight(self.key)) or 0
+end
+
+-- `fail` writes to the store, and the store is a network. Called bare, a blip
+-- there unwound the whole consume loop -- carrying the job in hand with it --
+-- so one flaky moment stopped the worker entirely rather than costing one job.
+-- Reported and survived instead.
+local function settle(queue, job, err, log)
+  local ok, outcome, delay = pcall(queue.fail, queue, job, err)
+  if ok then return outcome, delay end
+  if log then
+    -- Under leasing the lease is still held, so this job comes back when it
+    -- expires instead of vanishing. That is the difference the in-flight list
+    -- buys on the one path where the store is already misbehaving.
+    log:error(queue.leasing
+                and "jobs: the store could not record a failed job; it stays " ..
+                    "in flight and will be redelivered"
+                or  "jobs: the store could not record a failed job; it is lost", {
+      kind = job.kind, detail = tostring(outcome),
+    })
+  end
+  return nil
 end
 
 --- Consumes until `should_stop()` returns true.
 ---
---- **AT LEAST ONCE where the store can do it, at most once where it cannot,
---- and `Queue:reliable()` says which one you have.**
+--- **AT LEAST ONCE unless this queue was told otherwise, and `queue.delivery`
+--- says which one you have.**
 ---
---- With a store that offers `claim_pop` and `ack` -- Redis and the in-memory
---- one both do -- a job moves to a processing set as it leaves the queue, in
---- one step, and is acknowledged only after the handler has finished or its
---- failure has been retried or buried. A worker killed in between leaves the
---- job recoverable: `Queue:reap(older_than)` puts it back.
+--- Under at-least-once delivery a job moves to a processing set as it leaves
+--- the queue, in one step, and is acknowledged only after the handler has
+--- finished or its failure has been retried or buried. A worker killed in
+--- between leaves the job recoverable: it goes back to the queue once its
+--- `visibility` window runs out and some worker reaps it.
 ---
---- Nothing reaps automatically. A timer that returned jobs on its own would
---- have to guess how long a handler may legitimately take, and guessing that
---- runs live jobs twice. Call `reap` from wherever your deployment knows the
---- answer -- a periodic task, a startup hook, an operator command.
+--- The reaper runs off the back of `pop`, so any worker consuming from a queue
+--- is also recovering it and there is no janitor process to forget to deploy.
+--- A job whose worker was killed is therefore back within
+--- `visibility + reap_every` seconds and not before, because there is no way
+--- to tell a dead worker from a slow one except by waiting.
 ---
---- With a store that offers neither, this is AT MOST ONCE and the loss is
---- silent: `pop` is destructive, so between it and the handler finishing the
---- job exists only in this worker's memory, and an ordinary deploy loses it.
---- The retry policy does not cover that -- retries are for a handler that
---- RAISED, and a worker that died raised nothing.
+--- Under `delivery = "at_most_once"` -- which has to be asked for by name --
+--- `pop` is destructive, so between it and the handler finishing the job
+--- exists only in this worker's memory, and an ordinary deploy loses it
+--- silently. The retry policy does not cover that: retries are for a handler
+--- that RAISED, and a worker that died raised nothing.
 ---
 --- At-least-once means a handler can run twice. That is the trade, and it is
---- the right way round: a job run twice is visible and fixable with an
---- idempotency key, and a job silently lost is neither.
+--- the right way round: a job run twice is visible and fixable with a marker
+--- written under `job.uid`, and a job silently lost is neither.
 function Queue:consume(handlers, options)
   options = options or {}
   local log = options.log
   local should_stop = options.should_stop or function() return false end
-  local handled, failed, retried, buried = 0, 0, 0, 0
+  local handled, failed, retried, buried, duplicated = 0, 0, 0, 0, 0
 
   -- AN EMPTY POLL THAT DID NOT WAIT MUST WAIT HERE, or this loop is a spin.
   --
@@ -435,7 +743,6 @@ function Queue:consume(handlers, options)
       log:warn("jobs: discarded an undecodable job")
     elseif job then
       local handler = handlers[job.kind]
-      local function done() self:ack(job) end
 
       if not handler then
         -- A job with no handler is usually a deployment in progress -- a
@@ -443,35 +750,51 @@ function Queue:consume(handlers, options)
         -- the same failure path rather than being dropped.  Dropping it
         -- loses work that finishing the deploy would have run.
         if log then log:warn("jobs: no handler", { kind = job.kind }) end
-        self:fail(job, "no handler registered for kind '" .. tostring(job.kind) .. "'")
-        done()
+        settle(self, job,
+               "no handler registered for kind '" .. tostring(job.kind) .. "'", log)
       else
         local ok, err = pcall(handler, job.payload, job)
         if ok then
           handled = handled + 1
           -- AFTER the handler, never before. The whole point is that a worker
           -- dying between the two leaves the job recoverable.
-          done()
+          --
+          -- A failed ack is not an error: the handler did its work. It means
+          -- the lease had already expired and this job is running somewhere
+          -- else too -- the one symptom of a `visibility` set below the
+          -- handler's real runtime, and otherwise completely invisible.
+          if not self:ack(job) then
+            duplicated = duplicated + 1
+            if log then
+              log:warn("jobs: finished a job whose lease had already expired; " ..
+                       "it is being run twice", {
+                kind = job.kind, uid = job.uid, visibility_s = self.visibility,
+              })
+            end
+          end
         else
           failed = failed + 1
-          local outcome, delay = self:fail(job, err)
-          if outcome == "retried" then retried = retried + 1 else buried = buried + 1 end
-          if log then
+          -- `fail` releases the lease itself, once the retry or the burial is
+          -- written: this attempt is finished even though the work is not.
+          local outcome, delay = settle(self, job, err, log)
+          if outcome == "retried" then retried = retried + 1
+          elseif outcome then buried = buried + 1 end
+          if log and outcome then
             log:error("jobs: job failed", {
               kind = job.kind, attempt = job.attempts, outcome = outcome,
               retry_in_s = delay and math.floor(delay * 10) / 10 or nil,
               detail = tostring(err),
             })
           end
-          -- The failure has been retried or buried, so this attempt is
-          -- finished even though the work is not.
-          done()
         end
       end
     end
   end
 
-  return { handled = handled, failed = failed, retried = retried, buried = buried }
+  return {
+    handled = handled, failed = failed, retried = retried, buried = buried,
+    duplicated = duplicated,
+  }
 end
 
 M.Queue = Queue

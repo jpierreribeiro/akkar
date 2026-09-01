@@ -204,3 +204,70 @@ describe("memory metrics", function()
     ballast = nil
   end)
 end)
+
+describe("application counters", function()
+  it("accumulates one series per label combination", function()
+    local registry = metrics.new()
+    registry:counter("commerce_checkouts_total", 1, { { "result", "created" } })
+    registry:counter("commerce_checkouts_total", 2, { { "result", "created" } })
+    registry:counter("commerce_checkouts_total", 5, { { "result", "declined" } })
+    registry:counter("commerce_retries_total")
+
+    local text = registry:render()
+    assert.is_truthy(text:find('commerce_checkouts_total{result="created"} 3', 1, true))
+    assert.is_truthy(text:find('commerce_checkouts_total{result="declined"} 5', 1, true))
+    -- No labels renders no brace, and an omitted delta is one.
+    assert.is_truthy(text:find("\ncommerce_retries_total 1\n", 1, true))
+    assert.is_truthy(text:find("# TYPE commerce_checkouts_total counter", 1, true))
+  end)
+
+  it("refuses a name Prometheus cannot parse, and a delta that would go back", function()
+    local registry = metrics.new()
+    assert.has_error(function() registry:counter("bad-name") end)
+    assert.has_error(function() registry:counter("good_name", -1) end)
+    assert.has_error(function() registry:counter("good_name", "1") end)
+    assert.has_error(function() registry:counter("good_name", 1, { { "bad-label", "x" } }) end)
+    -- A refused increment leaves nothing behind.
+    assert.equal("", (registry:render():match "good_name[^\n]*") or "")
+  end)
+
+  it("folds an unbounded label value instead of minting a series per call", function()
+    -- The route label is bounded because akkar knows the pattern.  An
+    -- application counter's label value is whatever the handler passes, so
+    -- the bound has to be on how many combinations one name may hold.
+    local registry = metrics.new()
+    for i = 1, 5000 do
+      registry:counter("orders_total", 1, { { "order_id", "o-" .. i } })
+    end
+    local text = registry:render()
+    assert.is_true(count_series(text, "orders_total") <= 65,
+      "orders_total minted " .. count_series(text, "orders_total") .. " series")
+    assert.is_truthy(text:find('orders_total{order_id="<other>"}', 1, true))
+  end)
+
+  it("keeps the total right when the breakdown stops growing", function()
+    local registry = metrics.new()
+    local total = 0
+    for i = 1, 500 do
+      registry:counter("events_total", 2, { { "kind", "k-" .. i } })
+      total = total + 2
+    end
+    local sum = 0
+    for value in registry:render():gmatch "\nevents_total{[^}]*} (%d+)" do
+      sum = sum + tonumber(value)
+    end
+    assert.equal(total, sum)
+  end)
+
+  it("never fails the request it is measuring", function()
+    -- Folding rather than raising is the whole point: a handler counting in a
+    -- loop must not turn into a 500 on the iteration that crosses the limit.
+    local registry = metrics.new()
+    local app = akkar.new()
+    app:get("/buy", function()
+      for i = 1, 200 do registry:counter("buys_total", 1, { { "sku", "s-" .. i } }) end
+      return { ok = true }
+    end)
+    assert.equal(200, app:test():get("/buy").status)
+  end)
+end)

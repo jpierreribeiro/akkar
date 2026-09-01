@@ -17,7 +17,8 @@ local redis = require "akkar.redis"
 
 local app = akkar.new()
 
-app:use(akkar.idempotency { ttl = 86400, required = true })
+app:use(akkar.idempotency { ttl = 86400, required = true,
+                            namespace = false })
 
 app:post("/charges", { body = { amount = "integer" } }, function(req)
   -- Stands in for the charge. It must run once however many times the client

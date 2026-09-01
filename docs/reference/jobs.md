@@ -24,7 +24,7 @@ Every public symbol on this page, in alphabetical order.
 | [`jobs.delay_for`](#jobsdelay_forattempt-backoff) | function |
 | [`jobs.new`](#jobsnewstore-name-options) | function |
 | [`jobs.Queue`](#queue) | table |
-| [`memory.new`](#memorynewname) | function |
+| [`memory.new`](#memorynewname-options) | function |
 | [`memory.Store`](#memorystore-metatable) | table |
 | [`memory.store`](#memorystore) | function |
 | [`queue:ack`](#queueackjob) | method |
@@ -37,9 +37,9 @@ Every public symbol on this page, in alphabetical order.
 | [`queue:in_flight`](#queuein_flight) | method |
 | [`queue:pop`](#queuepoptimeout) | method |
 | [`queue:push`](#queuepushkind-payload-options) | method |
-| [`queue:reap`](#queuereapolder_than) | method |
+| [`queue:reap`](#queuereapnow) | method |
 | [`queue:reliable`](#queuereliable) | method |
-| [`redis.new`](#redisnewcache-name) | function |
+| [`redis.new`](#redisnewcache-name-options) | function |
 | [`redis.Store`](#redisstore) | table |
 | [the store contract](#the-store-contract) | contract |
 
@@ -63,15 +63,30 @@ a feature that quietly does nothing.
 | `store:schedule(key, encoded, run_at)` | `push` with `options.delay`, and every retry |
 | `store:promote(key, now)` | a delayed or retried job actually becoming due |
 | `store:claim(key, id, ttl)` | `push` with `options.id` |
-| `store:claim_and_enqueue(key, id, ttl, encoded, run_at)` | the same, in one indivisible step |
-| `store:claim_pop(key, timeout, now)` | at-least-once delivery |
+| `store:unclaim(key, id)` | giving that id back when the push it was taken for fails |
+| `store:claim_and_enqueue(key, id, ttl, encoded, run_at)` | claim and push, in one indivisible step |
+| `store:claim_pop(key, timeout)` | at-least-once delivery |
 | `store:ack(key, encoded)` | at-least-once delivery |
-| `store:reap(key, cutoff, now)` | `queue:reap` returning anything but `0` |
-| `store:in_flight(key)` | `queue:in_flight` returning anything but `0` |
+| `store:expired(key, visibility, now, limit)` | at-least-once delivery |
+| `store:in_flight(key)` | at-least-once delivery |
 | `store:peek(key, limit)` | `queue:dead_letters` |
 | `store:trim(key, keep)` | the dead-letter list staying under `max_dead` |
 
 Both shipped stores implement all of them.
+
+**The last four come as a set.** `jobs.new` turns at-least-once delivery on
+only when all four are present, because a store that leases a job without
+being able to say which leases have expired holds that job for ever -- which
+is a worse failure than never leasing it. A store with three of the four gets
+at-most-once delivery and says so; see [`jobs.new`](#jobsnewstore-name-options).
+
+`store:expired` returns the encoded jobs whose lease has run out, and stamps
+each one it returns so a second reaper arriving mid-pass takes nothing. It does
+not remove them: they stay in flight until `queue:reap` has written the next
+copy and acknowledged the old one, so a reaper that dies in the middle costs a
+redelivery rather than the job. Its `now` is a test seam -- left out, the store
+answers with its own clock, which for Redis is the server's `TIME` and is the
+one clock every worker in a fleet shares.
 
 ## jobs.delay_for(attempt, backoff)
 
@@ -133,6 +148,10 @@ name. It defaults to `"default"`.
 | `backoff` | table | `{}` | passed to `jobs.delay_for`; see its fields above |
 | `dead_letter` | boolean | `true` | keep what finally failed in a second list. Only an explicit `false` turns it off. |
 | `max_dead` | number | `1000` | how many dead letters to keep, when the store can `trim` |
+| `delivery` | string | inferred | `"at_least_once"` or `"at_most_once"`. Left out, it is at-least-once wherever the store can lease. |
+| `visibility` | number | `300` | seconds a worker may hold a job before another may take it |
+| `max_redeliveries` | number | `5` | redeliveries before a job goes to the dead letters |
+| `reap_every` | number | `visibility / 10` | seconds between the automatic reaps `pop` runs |
 
 **Returns** a `Queue`. Its `key` field is `"akkar:queue:" .. name`, which is the
 Redis key when the store is Redis.
@@ -145,6 +164,19 @@ implements neither :schedule nor :promote ...` when `retries` is above zero and
 the store cannot hold a job until later. Refused at construction rather than at
 the first failure.
 
+**Raises** `akkar.jobs: delivery must be 'at_least_once' or 'at_most_once' ...`
+for any other value, so a typo is not silently a downgrade.
+
+**Raises** `akkar.jobs: at-least-once delivery needs a store that can hold a job
+in flight ...` when `delivery = "at_least_once"` is asked of a store that cannot
+lease. Accepting the setting and delivering at most once anyway is the one
+outcome worse than not offering it.
+
+A store that cannot lease still builds a queue. That queue reports
+`delivery == "at_most_once"` rather than claiming otherwise, and
+`delivery = "at_most_once"` over a store that CAN lease is how you ask for that
+behaviour on purpose.
+
 ```lua
 local jobs   = require "akkar.jobs"
 local memory = require "akkar.jobs.memory"
@@ -156,7 +188,13 @@ local queue = jobs.new(memory.store(), "ref_jobs_email", {
 
 print(queue.key)         --> akkar:queue:ref_jobs_email
 print(queue.retries)     --> 3
+print(queue.delivery)    --> at_least_once
 print(queue:reliable())  --> true
+
+-- The same store, told to be unreliable on purpose.
+local careless = jobs.new(memory.store(), "ref_jobs_careless",
+                          { delivery = "at_most_once" })
+print(careless.delivery)  --> at_most_once
 
 -- A store with only the three required methods cannot retry.
 local bare = {
@@ -175,12 +213,26 @@ A job travelling through it is a table with these fields:
 
 | field | meaning |
 |---|---|
+| `uid` | this job's identity, minted by `push` and unchanged by every retry and redelivery |
 | `kind` | the string given to `push`; a worker looks it up in its handler table |
 | `payload` | the second argument to `push`, after a round trip through JSON |
 | `id` | the deduplication id, when one was given |
 | `queued_at` | the time `push` was called |
 | `attempts` | how many times a handler has failed on this job |
+| `redeliveries` | how many times a worker took this job and stopped answering |
 | `last_error`, `first_failed_at`, `died_at` | added by `fail`, when they apply |
+
+**`uid` is the field to dedup on, and it is not `id`.** `id` stops a second
+PUSH and is optional; `uid` is on every job and identifies one job across
+however many times it runs. `attempts` and the encoded bytes both change on a
+retry, so neither can be that key. Write your "already did this" marker under
+`uid`, in the same transaction as the side effect, and a handler that runs
+twice does its work once.
+
+`redeliveries` is counted apart from `attempts` on purpose: `attempts` is the
+handler saying no, and a worker being OOM-killed is not the handler saying
+anything. Charging a redelivery to the retry budget would bury healthy work
+after a deploy that restarted the fleet three times.
 
 The payload goes through JSON, so a table comes back as a table and a number
 comes back as a Lua float. Do not put a database row in a payload: put an id,
@@ -188,11 +240,18 @@ and read the row fresh when the job runs.
 
 ### queue:ack(job)
 
-Marks a job finished so it stops being recoverable. `consume` calls it for you,
-after a handler returns and also after a failure has been retried or buried.
+Marks a job finished so it stops being recoverable. `consume` calls it for you
+after a handler returns; on the failure path [`queue:fail`](#queuefailjob-err)
+does it, once the retry or the burial is written.
 
-**Returns** `false` when the store has no `ack`, otherwise whatever the store
-answers (`true` when the job was still checked out).
+**Returns** `true` when the job was still checked out to you, and `false` when
+it was not -- meaning the lease had already expired and somebody else has the
+job, so this run was a duplicate and `visibility` is shorter than the handler's
+real runtime. That is the only symptom of a visibility timeout set too low, and
+`consume` counts it as `duplicated`.
+
+**Returns** `true` under at-most-once delivery, where there was never anything
+to retire.
 
 ```lua
 local memory = require "akkar.jobs.memory"
@@ -222,12 +281,19 @@ progress where the worker runs older code than the producer.
 | `timeout` | number | `1` | seconds to wait for a job on each pop |
 | `log` | table | none | an `akkar.log` logger. Without one, a failed job is silent. |
 
-**Returns** `{ handled, failed, retried, buried }`.
+**Returns** `{ handled, failed, retried, buried, duplicated }`. `duplicated`
+counts jobs whose handler finished after the lease had already expired, which
+means they were running twice.
 
-**Delivery is at-least-once when the store offers `claim_pop` and `ack`, and at
-most once when it does not.** [`queue:reliable()`](#queuereliable) says which
-one you have. Nothing reaps abandoned jobs on its own; see
-[`queue:reap`](#queuereapolder_than).
+**Delivery is at-least-once unless the queue was told otherwise**, and
+`queue.delivery` says which one you have.
+
+**The reaper runs off the back of `pop`**, so any worker consuming from a queue
+is also recovering it and there is no janitor process to forget to deploy. A
+job whose worker was killed is back in the queue within
+`visibility + reap_every` seconds and not before, because there is no way to
+tell a dead worker from a slow one except by waiting.
+[`queue:reap`](#queuereapnow) is public for anyone who wants one anyway.
 
 A `consume` with no `should_stop` never returns. In a server process, run it
 under `app:task` instead of calling it directly.
@@ -247,7 +313,7 @@ local stats = queue:consume({
   should_stop = function() rounds = rounds + 1 return rounds > 3 end,
 })
 
-print(stats.handled, stats.failed, stats.retried, stats.buried)   --> 2 0 0 0
+print(stats.handled, stats.failed, stats.duplicated)   --> 2 0 0
 ```
 
 ### queue:dead_depth()
@@ -331,8 +397,8 @@ print(queue:dead_depth())                   --> 1
 
 ### queue:in_flight()
 
-**Returns** how many jobs are currently checked out by a worker, or `0` when
-the store cannot say.
+**Returns** how many jobs are currently checked out by a worker, or `0` under
+at-most-once delivery, where nothing is ever held.
 
 ### queue:pop(timeout)
 
@@ -400,19 +466,32 @@ queue:push("digest", { account_id = 13 }, { delay = 3600 })
 print(queue:depth())                                --> 1
 ```
 
-### queue:reap(older_than)
+### queue:reap(now)
 
-Returns jobs abandoned by a worker that never came back. `older_than` is in
-seconds and defaults to `300`.
+Returns to the queue every job whose worker stopped answering, and buries the
+ones that have outlived `max_redeliveries` workers.
 
-**Returns** how many were put back on the queue, or `0` when the store has no
-`reap`.
+**Returns** how many were redelivered and how many were buried, or `0, 0` under
+at-most-once delivery, where nothing is ever held.
 
-**`older_than` must exceed the longest a handler may legitimately take.** Set
-it too low and a slow job is handed to a second worker while the first is still
-working on it. Nothing calls `reap` for you, because only the application knows
-that number. Call it from a periodic task, a startup hook or an operator
-command.
+**Leave `now` out.** Then the store answers with the clock every worker shares
+-- for Redis, the server's own `TIME`, read inside the script -- and that is
+the whole point: a cutoff computed by one worker made every reap an assertion
+about time made by a machine that might have just been stepped by NTP. A
+correction forwards reclaimed jobs other workers were actively running; a
+correction backwards reclaimed nothing ever again.
+
+What decides staleness is [`visibility`](#jobsnewstore-name-options), which is
+the queue's configuration rather than the caller's opinion, **and it must exceed
+the longest a handler may legitimately take.** Set it too low and a slow job is
+handed to a second worker while the first is still working on it.
+
+`now` is a test seam, for a spec or an operator who cannot wait out a window:
+it moves the cutoff and nothing else, so a claim time is still written from the
+store's clock.
+
+`pop` reaps for you every `reap_every` seconds, so calling this at all is
+optional.
 
 ```lua
 local memory = require "akkar.jobs.memory"
@@ -424,19 +503,26 @@ queue:push("slow", {})
 queue:pop(0)
 print(queue:depth(), queue:in_flight())   --> 0  1
 
--- Zero seconds, because this example cannot wait five minutes.
-print(queue:reap(0))                      --> 1
+-- Nothing is due yet: the lease has five minutes to run. Parenthesised
+-- because `reap` answers with two numbers, redelivered and buried.
+print((queue:reap()))                     --> 0
+
+-- An instant past the visibility window, because this example cannot wait
+-- five minutes. In a worker you would pass nothing and let time pass.
+print((queue:reap(os.time() + 301)))      --> 1
 print(queue:depth(), queue:in_flight())   --> 1  0
 ```
 
 ### queue:reliable()
 
-**Returns** `true` when this queue survives a worker dying mid-job, which means
-the store offers both `claim_pop` and `ack`.
+**Returns** `true` when this queue survives a worker dying mid-job, which is
+the same as `queue.delivery == "at_least_once"`.
+
+It answers what this queue DOES rather than what its store could do, because
+`delivery = "at_most_once"` makes those two different questions.
 
 Worth asking rather than assuming. The answer decides whether a job that
-matters may go through this queue at all, and it depends on the store, not on
-the queue.
+matters may go through this queue at all.
 
 ## akkar.jobs.memory
 
@@ -452,15 +538,11 @@ local memory = require "akkar.jobs.memory"
 this same process, so sleeping while waiting for it would be a deadlock rather
 than a wait.
 
-### memory.new(name)
+### memory.new(name, options)
 
 **Returns** a `Queue` over a fresh store, which is `jobs.new(memory.store(),
-name)`.
-
-**It takes no options.** A queue with `retries`, `backoff`, `dead_letter` or
-`max_dead` has to be built by calling `jobs.new` yourself, as in the
-[`queue:fail`](#queuefailjob-err) example above. A third argument here is
-accepted by Lua and ignored.
+name, options)`. `options` is forwarded whole, so everything under
+[`jobs.new`](#jobsnewstore-name-options) works here.
 
 ### memory.store()
 
@@ -497,16 +579,13 @@ second a job is due. Deduplication is `SET NX EX`, which is atomic across every
 process talking to that Redis, which is the reason deduplication belongs in the
 store and not in the worker.
 
-### redis.new(cache, name)
+### redis.new(cache, name, options)
 
 `cache` is a connection, not a connector: `akkar.redis.connect{}` returns a
 function that opens connections, so the call needs the extra `()`.
 
-**Returns** a `Queue`.
-
-**It takes no options**, the same as `memory.new`. For retries, build the store
-yourself and hand it to `jobs.new`; the shape is under
-[`redis.Store`](#redisstore) below.
+**Returns** a `Queue`. `options` is forwarded whole to
+[`jobs.new`](#jobsnewstore-name-options), the same as `memory.new`.
 
 ```lua no-run
 local redis = require "akkar.redis"
@@ -593,9 +672,10 @@ two workers.
 
 **No Postgres store.** The contract exists so one can be written; none ships.
 
-**No options on `memory.new` or `redis.new`.** Both take only a name, and for
-Redis a connection. Retries, backoff and dead-letter settings go through
-`jobs.new`.
+**No automatic dedup of a redelivery.** `push` with an `id` stops a second
+push; nothing stops the same job being delivered twice, because that is what
+at-least-once means. Write a marker under `job.uid` inside the transaction
+that does the work.
 
 ## See also
 
