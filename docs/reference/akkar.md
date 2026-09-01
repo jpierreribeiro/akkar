@@ -172,13 +172,28 @@ Registers one route. `options` may be omitted.
 | `query` | schema | checked against the query string, with coercion |
 | `body` | schema | checked against the decoded body, without coercion |
 | `response` | schema | checked against what the handler returned |
+| `responses` | table of status to schema | checked against what the handler returned, selected by the status it answered |
 | `before` | list of functions | route scoped middleware, run after the global chain |
+| `openapi` | table | documentation only: `summary`, `description`, `security`, `headers` |
 
 A request that fails `params`, `query` or `body` answers `422` with
 `{ error = "validation failed", fields = { ... } }` before the handler runs. The
 field names are prefixed with where they came from: `params.id`, `query.page`,
 `body.title`. A validated table replaces the raw one, so `req.params.id` is a
 number after `params = { id = "integer" }` rather than the string that arrived.
+
+A nested schema keeps naming the exact value: a bad `sku` in the third element
+of `items` is `body.items.3.sku`, not `body.items`. An error a client cannot
+locate is barely better than no error, because a form still cannot say which
+input to mark.
+
+`responses` is `response` stated per status, for the route whose `201` has a
+shape its `200` does not. The status the handler answered picks the schema, a
+status with no entry falls back to `response`, and the same table is what
+`akkar.openapi` documents — so the enforcement and the document cannot drift
+apart. `openapi` carries what a schema cannot, because it is not validation:
+prose, a `security` requirement, and `headers` the client must send. Nothing in
+it is enforced, and `akkar.openapi` is its only reader.
 
 Coercion is on for `params` and `query` because those arrive as text, and off
 for `body` because JSON already carries types.
@@ -657,7 +672,14 @@ one; prefer [`akkar.is_response`](#akkaris_responsevalue).
 ### akkar.v
 
 Builders for schema rules, one per type: `v.string`, `v.integer`, `v.number`,
-`v.boolean`, `v.table`. Each takes a table of constraints and returns a rule.
+`v.boolean`, `v.table`, `v.object`, `v.array`. Each takes a table of constraints
+and returns a rule.
+
+`v.table` is "any table, unexamined". `v.object` and `v.array` are the two
+shapes a table can actually be, and each carries the schema of what is inside
+it, so a nested value is validated and **filtered** rather than waved through.
+That matters most on `response`: a handler doing `select *` leaks whatever the
+row holds, and a nested object nobody filtered is that hole one level down.
 
 | constraint | applies to | meaning |
 |---|---|---|
@@ -665,15 +687,70 @@ Builders for schema rules, one per type: `v.string`, `v.integer`, `v.number`,
 | `default` | all | used when the field is absent |
 | `min`, `max` | number, integer | value bounds |
 | `min`, `max` | string | length bounds |
+| `min`, `max` | array | element count bounds |
 | `match` | string | a Lua pattern the value must match |
+| `openapi_pattern` | string | the same constraint written as an ECMA-262 regular expression, for `akkar.openapi` only |
 | `one_of` | string | a list of permitted values |
+| `fields` | object | a schema for the object's fields, required |
+| `items` | array | the rule every element must match, `"table"` when absent |
+
+A constraint that is not in this table raises where the rule is written, so
+`v.string { pattern = "@" }` — `match` is the real name — fails at the line
+that wrote it rather than accepting every string in silence. `fields` and
+`items` are accepted only by the kind that has them: `v.string { fields = ... }`
+raises too.
+
+`openapi_pattern` is documentation. `match` is still what runs, so the two can
+differ in syntax without differing in meaning — which is the point, because
+`^%x+$` is a Lua pattern no JSON Schema validator will read the way akkar does.
 
 There is a short spelling for the common case. `"string"` is the same rule as
 `v.string {}`, and a trailing `?` makes it optional: `"integer?"` is
-`v.integer { optional = true }`. The five type names are the only ones accepted.
+`v.integer { optional = true }`. The seven type names are the only ones
+accepted, and `"object"` raises: an object rule with no `fields` filters every
+field of the value away, so it would silently empty a body rather than refuse
+one. Write `v.object { fields = { ... } }`.
 
 ```lua no-run
 { title = "string", page = akkar.v.integer { min = 1, default = 1 } }
+```
+
+```lua
+local akkar = require "akkar"
+local v     = akkar.v
+
+local item = v.object { fields = {
+  sku      = v.string { min = 2 },
+  quantity = v.integer { min = 1, max = 10 },
+} }
+
+local app = akkar.new()
+app:post("/orders", {
+  body = v.object { fields = {
+    note  = "string?",
+    items = v.array { min = 1, max = 5, items = item },
+  } },
+}, function(req) return { items = req.body.items } end)
+
+local client = app:test {}
+
+-- Everything the schema does not name is dropped, at every level.
+local ok = client:post("/orders", { body = {
+  ignored = "outside the contract",
+  items   = { { sku = "CR-1", quantity = 2, cost_price = 1 } },
+} })
+assert(ok.status == 200)
+assert(ok.body.items[1].sku == "CR-1")
+assert(ok.body.items[1].cost_price == nil)
+
+-- A failure names the element it happened in.
+local bad = client:post("/orders", { body = {
+  items = { { sku = "x", quantity = 0 }, { sku = "ok" } },
+} })
+assert(bad.status == 422)
+assert(bad.body.fields["body.items.1.sku"] == "min length 2")
+assert(bad.body.fields["body.items.1.quantity"] == "min is 1")
+assert(bad.body.fields["body.items.2.quantity"] == "required")
 ```
 
 ### akkar.validate(input, schema, coerce)
@@ -683,18 +760,27 @@ Checks a table against a schema. This is what route validation calls.
 | argument | type | meaning |
 |---|---|---|
 | `input` | table | anything that is not a table is treated as absent |
-| `schema` | table | field names to rules |
+| `schema` | table | field names to rules, or one rule describing the whole value |
 | `coerce` | boolean | convert strings to numbers and booleans, and numbers to strings |
 
 Only fields named in the schema appear in the result. Anything else in `input`
 is dropped.
 
-**Returns** the cleaned table and `nil`, or `nil` and a table of field names to
+A schema is either a **map of field name to rule** — `{ id = "integer" }`, which
+describes an object — or **one rule** describing the whole value, which is what
+`v.object { fields = ... }` and `v.array { items = ... }` are. A rule is
+recognised by its `kind`, so a field map with a field genuinely called `kind`
+should be written through `v.string {}` rather than the shorthand, and a route
+that declares its schema is never ambiguous at all.
+
+**Returns** the cleaned table and `nil`, or `nil` and a table of paths to
 failure strings: `"required"`, `"expected integer"`, `"min length 3"`,
-`"must be one of: a, b"`.
+`"must be one of: a, b"`, `"expected array"`, `"min items 1"`. A path names the
+exact value — `items.3.sku` — and a failure of the whole value, rather than of a
+field of it, is reported under the empty path `""`.
 
 **Raises** `unknown schema type: 'strng'` for a shorthand that is not one of the
-five types, and `invalid schema rule: number` when a rule is neither a string
+seven types, and `invalid schema rule: number` when a rule is neither a string
 nor a table.
 
 A schema attached to a route never reaches this function in that state: routes

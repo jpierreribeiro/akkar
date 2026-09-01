@@ -281,6 +281,13 @@ local SETTINGS = {
 -- route then accepts anything while looking validated.
 local ROUTE_OPTIONS = {
   params = true, query = true, body = true, response = true, before = true,
+  -- `response` describes the success body whatever its status. `responses`
+  -- names one schema per status, for the route that answers 201 with a shape
+  -- its 200 does not have -- enforced AND documented from the same table.
+  responses = true,
+  -- Documentation the schemas cannot carry, because it is not validation:
+  -- a summary, a security requirement, a header the client must send.
+  openapi = true,
 }
 
 local function nearest(word, candidates)
@@ -466,17 +473,32 @@ akkar.v = v
 local CONSTRAINTS = {
   kind = true, optional = true, default = true,
   min = true, max = true, match = true, one_of = true,
+  -- `match` is a Lua pattern and `%x` is not what ECMA-262 calls a hex digit,
+  -- so the pattern this file ENFORCES is not always one an OpenAPI reader can
+  -- compile. `openapi_pattern` is the same constraint written for that reader
+  -- and is documentation only -- `match` is still the thing that runs, so the
+  -- two can differ in syntax without differing in meaning.
+  openapi_pattern = true,
 }
 
+-- Two constraints are a SHAPE rather than a bound, and exactly one kind can
+-- carry each: `fields` describes an object, `items` an array. Kept out of
+-- CONSTRAINTS so `v.string { fields = ... }` still raises -- a rule that reads
+-- as a validated shape and enforces nothing is the silence this table exists
+-- to end.
+local KIND_CONSTRAINTS = { object = { fields = true }, array = { items = true } }
+
 local function validator(kind)
+  local extra = KIND_CONSTRAINTS[kind]
   return function(opts)
     opts = opts or {}
     for key in pairs(opts) do
-      if not CONSTRAINTS[key] then
+      if not CONSTRAINTS[key] and not (extra and extra[key]) then
         local known = {}
         for name in pairs(CONSTRAINTS) do
           if name ~= "kind" then known[#known + 1] = name end
         end
+        for name in pairs(extra or {}) do known[#known + 1] = name end
         table.sort(known)
         error(("unknown constraint '%s' in v.%s{}; use %s")
               :format(tostring(key), kind, table.concat(known, ", ")), 2)
@@ -491,10 +513,15 @@ v.string  = validator "string"
 v.integer = validator "integer"
 v.number  = validator "number"
 v.boolean = validator "boolean"
+-- `table` is "any table, unexamined". `object` and `array` are the two shapes
+-- a table can actually be, each carrying the schema of what is inside it, so a
+-- nested value is validated and FILTERED rather than waved through.
 v.table   = validator "table"
+v.object  = validator "object"
+v.array   = validator "array"
 
 local SHORTHAND = { string = true, integer = true, number = true,
-                    boolean = true, table = true }
+                    boolean = true, table = true, object = true, array = true }
 
 local function expand(rule)
   if type(rule) == "table" then return rule end
@@ -505,7 +532,8 @@ local function expand(rule)
   local kind = optional and rule:sub(1, -2) or rule
   if not SHORTHAND[kind] then
     error("unknown schema type: '" .. rule ..
-          "'; use string, integer, number, boolean, table (with ? for optional)", 0)
+          "'; use string, integer, number, boolean, table, object, array " ..
+          "(with ? for optional)", 0)
   end
   return { kind = kind, optional = optional }
 end
@@ -531,13 +559,79 @@ end
 --- DECLARED instead of when it is first served. That matches what this file
 --- already does with a misspelled constraint and with a duplicate route, and
 --- a schema that can never validate anything is worth failing the boot for.
+--- `expand`, applied to the whole tree rather than to one level of it.
+---
+--- A rule may CONTAIN rules -- an object's `fields`, an array's `items` -- and
+--- a shorthand string in either position is the defect above again, one level
+--- down and multiplied by the array's length: `v.array { items = "string" }`
+--- built a table per ELEMENT per request.
+---
+--- Copied rather than written through, for the same reason `expand_schema`
+--- copies: one `item` rule is written once and shared by several routes.
+local function expand_rule(rule)
+  local expanded = expand(rule)
+  local kind = expanded.kind
+  if kind ~= "object" and kind ~= "array" then return expanded end
+
+  local out = {}
+  for key, value in pairs(expanded) do out[key] = value end
+
+  if kind == "object" then
+    -- Refused rather than defaulted to `{}`. An object rule with no fields
+    -- filters every field of the value away, so it would silently empty a
+    -- nested body or -- through the response filter -- a nested reply.
+    if type(expanded.fields) ~= "table" then
+      error("an object rule needs `fields`; write v.object { fields = { ... } }" ..
+            " rather than \"object\"", 0)
+    end
+    local fields = {}
+    for name, inner in pairs(expanded.fields) do
+      local ok, done = pcall(expand_rule, inner)
+      if not ok then error(("%s: %s"):format(tostring(name), tostring(done)), 0) end
+      fields[name] = done
+    end
+    out.fields = fields
+  else
+    -- An array with no `items` means the widest element rule. That is already
+    -- exactly what `akkar.openapi` documents for one, and defaulting here
+    -- rather than refusing keeps the document and the enforcement agreeing.
+    out.items = expand_rule(expanded.items or "table")
+  end
+  return out
+end
+
+-- Is a schema slot ONE rule describing the whole value, or a map of field name
+-- to rule? `kind` naming a real type is the signal, and on its own it is not
+-- quite enough: `{ kind = "string" }` is also a perfectly good field map with
+-- a single field called `kind`. So every other key has to be one that this
+-- rule's kind actually accepts -- `{ kind = "string", name = "string" }` has a
+-- `name`, which no rule takes, and is therefore a field map.
+local function is_root_rule(schema)
+  local kind = schema.kind
+  if type(kind) ~= "string" or not SHORTHAND[kind] then return false end
+  local extra = KIND_CONSTRAINTS[kind]
+  for key in pairs(schema) do
+    if not CONSTRAINTS[key] and not (extra and extra[key]) then return false end
+  end
+  return true
+end
+
 local function expand_schema(schema, what)
   if type(schema) ~= "table" then
     error(("%s must be a table of rules; got %s"):format(what, type(schema)), 0)
   end
+  -- A slot may be one rule rather than a map of them: `body = v.object {
+  -- fields = ... }` says the body IS that object, and `v.array { items = ... }`
+  -- says it is a list. Both come back expanded and keep their `kind`, which is
+  -- what tells `validate` apart from a field map at request time.
+  if is_root_rule(schema) then
+    local ok, expanded = pcall(expand_rule, schema)
+    if not ok then error(("%s: %s"):format(what, tostring(expanded)), 0) end
+    return expanded
+  end
   local out = {}
   for field, rule in pairs(schema) do
-    local ok, expanded = pcall(expand, rule)
+    local ok, expanded = pcall(expand_rule, rule)
     if not ok then
       -- Name the field. `unknown schema type: 'strng'` with no field is a
       -- message that sends the reader looking through every rule they wrote.
@@ -549,6 +643,22 @@ local function expand_schema(schema, what)
 end
 
 local SCHEMA_SLOTS = { "params", "query", "body", "response" }
+
+local validate, validate_rule
+
+-- Merges a nested failure map into its parent under `prefix`, so a bad field
+-- in the third element of a list reports as `body.items.3.sku` rather than as
+-- the whole array being wrong. That naming is the point of nesting: an error
+-- a client cannot locate is barely better than no error, because a form still
+-- cannot say which input to mark.
+--
+-- The empty path is the value ITSELF failing rather than a field of it, and
+-- becomes the parent's own name -- `body`, not `body.`.
+local function merge_under(failures, prefix, nested)
+  for path, why in pairs(nested) do
+    failures[path == "" and prefix or (prefix .. "." .. path)] = why
+  end
+end
 
 local function check_one(value, rule, coerce)
   if value == nil then
@@ -623,14 +733,84 @@ local function check_one(value, rule, coerce)
     if type(value) ~= "boolean" then return nil, "expected boolean" end
   elseif kind == "table" then
     if type(value) ~= "table" then return nil, "expected table" end
+  elseif kind == "object" then
+    -- A JSON array is a table too. Letting one through would hand the field
+    -- walk below a list, which finds none of its fields and filters the whole
+    -- thing away -- a silent emptying rather than a refusal.
+    if type(value) ~= "table" or value[1] ~= nil then return nil, "expected object" end
+    if type(rule.fields) ~= "table" then return nil, "object schema needs fields" end
+    local clean, failures = validate(value, rule.fields, coerce)
+    -- A TABLE of failures rather than a string, and every caller of
+    -- `check_one` knows the difference: that is what carries the path of the
+    -- field that failed back up to the top.
+    if failures then return nil, failures end
+    value = clean
+  elseif kind == "array" then
+    if type(value) ~= "table" then return nil, "expected array" end
+    -- `#value` on a table with holes or string keys is not the count anyone
+    -- means, so the shape is checked before the length is trusted: a decoded
+    -- JSON object reaching an array rule must be refused, not measured.
+    local count = #value
+    for key in pairs(value) do
+      if math.type(key) ~= "integer" or key < 1 or key > count then
+        return nil, "expected array"
+      end
+    end
+    if rule.min and count < rule.min then return nil, "min items " .. rule.min end
+    if rule.max and count > rule.max then return nil, "max items " .. rule.max end
+    if rule.items == nil then return nil, "array schema needs items" end
+    -- Marked as an array through `akkar.json`, so a list that is empty -- or
+    -- that the filter below emptied -- still encodes as `[]`. Without the
+    -- marker it goes back as `{}` and a client that declared a list gets an
+    -- object, which is exactly the ambiguity `cjson.array` exists to resolve.
+    local items, clean, failures = expand(rule.items), cjson.array {}, nil
+    for index, item in ipairs(value) do
+      local got, err = check_one(item, items, coerce)
+      if err == nil then clean[index] = got
+      else
+        failures = failures or {}
+        if type(err) == "table" then merge_under(failures, tostring(index), err)
+        else failures[tostring(index)] = err end
+      end
+    end
+    if failures then return nil, failures end
+    value = clean
   end
 
   if rule.default ~= nil and value == nil then value = rule.default end
   return value, nil
 end
 
+-- Returns (clean_value, nil) or (nil, failures_by_path) for a schema that is
+-- ONE rule rather than a map of fields.
+--
+-- The whole value can fail on its own -- "expected object", "min items 1" --
+-- and that failure has no field name to hang on, so it is reported under the
+-- empty path and `merge_under` gives it the slot's name.
+validate_rule = function(input, rule, coerce)
+  local clean, err = check_one(input, expand(rule), coerce)
+  if err == nil then return clean, nil end
+  if type(err) == "table" then return nil, err end
+  return nil, { [""] = err }
+end
+
 -- Returns (clean_table, nil) or (nil, failures_by_field)
-local function validate(input, schema, coerce)
+validate = function(input, schema, coerce)
+  -- A schema is EITHER a map of field name to rule -- the original spelling,
+  -- and still the common one -- or a single rule describing the whole value,
+  -- which is what `v.object { fields = ... }` and `v.array { items = ... }`
+  -- are.
+  --
+  -- `kind` holding a STRING is what tells them apart, and after
+  -- `expand_schema` that test is exact rather than a guess: every value of a
+  -- field map is a table by then, so a field genuinely named `kind` holds one
+  -- and cannot be read as a rule's own kind. Only a raw schema handed straight
+  -- to `akkar.validate` without registering a route can still be ambiguous,
+  -- and only in the single shape `{ kind = "string" }`.
+  --
+  -- Two cheap operations on a path that runs up to three times per request,
+  -- and neither allocates.
+  if type(schema.kind) == "string" then return validate_rule(input, schema, coerce) end
   -- Defensive: anything that is not a table is treated as absent, so a
   -- surprising body shape becomes a field-level error rather than a 500.
   if type(input) ~= "table" then input = {} end
@@ -649,7 +829,10 @@ local function validate(input, schema, coerce)
     local got, err = check_one(value, expanded, coerce)
     if err then
       failures = failures or {}
-      failures[field] = err
+      -- A nested rule reports a MAP of paths, not one string; carrying it up
+      -- under this field's name is what makes `items.3.sku` out of `3.sku`.
+      if type(err) == "table" then merge_under(failures, tostring(field), err)
+      else failures[field] = err end
     else
       cleaned[field] = got
     end
@@ -844,19 +1027,41 @@ for _, method in ipairs { "get", "post", "put", "patch", "delete" } do
     -- caller, who may be reusing it for another route or reading it back.
     if opts then
       local copied = false
+      local function own_opts()
+        if not copied then
+          local fresh = {}
+          for k, val in pairs(opts) do fresh[k] = val end
+          opts, copied = fresh, true
+        end
+      end
       for _, slot in ipairs(SCHEMA_SLOTS) do
         if opts[slot] ~= nil then
-          if not copied then
-            local fresh = {}
-            for k, val in pairs(opts) do fresh[k] = val end
-            opts, copied = fresh, true
-          end
+          own_opts()
           local ok, expanded = pcall(expand_schema, opts[slot], slot)
           if not ok then
             error(("%s %s: %s"):format(verb, path, tostring(expanded)), 2)
           end
           opts[slot] = expanded
         end
+      end
+      -- `responses` is a map of status to schema, so it is one level deeper
+      -- than the slots above; each schema is expanded exactly as they are.
+      if opts.responses ~= nil then
+        if type(opts.responses) ~= "table" then
+          error(("%s %s: responses must be a table of status to schema; got %s")
+                :format(verb, path, type(opts.responses)), 2)
+        end
+        own_opts()
+        local out = {}
+        for status, schema in pairs(opts.responses) do
+          local slot = "responses[" .. tostring(status) .. "]"
+          local ok, expanded = pcall(expand_schema, schema, slot)
+          if not ok then
+            error(("%s %s: %s"):format(verb, path, tostring(expanded)), 2)
+          end
+          out[status] = expanded
+        end
+        opts.responses = out
       end
     end
 
@@ -1498,9 +1703,11 @@ local function apply_response_schema(res, schema, where, app, req)
   if res.status < 200 or res.status >= 300 then return res end
   if res.raw then return res end
   if type(res.body) ~= "table" then return res end
-  -- An array body is out of scope: `response` describes an object, and a list
-  -- schema is a separate decision rather than an oversight.
-  if res.body[1] ~= nil then return res end
+  -- An array body is out of scope for a FIELD MAP: it describes an object, and
+  -- filtering a list through it would empty the list rather than refuse it.
+  -- A route that declares `v.array { items = ... }` has said the reply is a
+  -- list, so that one is validated -- which is the only way to say so.
+  if res.body[1] ~= nil and type(schema.kind) ~= "string" then return res end
 
   local cleaned, failures = validate(res.body, schema, false)
   if failures then
@@ -1589,17 +1796,17 @@ local function dispatch(app, req)
     local failures, any = {}, false
     if opts.params then
       local clean, err = validate(params, opts.params, true)
-      if err then for k, e in pairs(err) do failures["params." .. k] = e end any = true
+      if err then merge_under(failures, "params", err) any = true
       else req.params = clean end
     end
     if opts.query then
       local clean, err = validate(req.query, opts.query, true)
-      if err then for k, e in pairs(err) do failures["query." .. k] = e end any = true
+      if err then merge_under(failures, "query", err) any = true
       else req.query = clean end
     end
     if opts.body then
       local clean, err = validate(req.body, opts.body, false)
-      if err then for k, e in pairs(err) do failures["body." .. k] = e end any = true
+      if err then merge_under(failures, "body", err) any = true
       else req.body = clean end
     end
     if any then
@@ -1723,8 +1930,20 @@ local function dispatch(app, req)
     return pending_error(result)
   end
 
-  if opts and opts.response then
-    result = apply_response_schema(result, opts.response, route.where, app, req)
+  if opts then
+    -- A status-specific schema wins over the catch-all one, because it is the
+    -- more precise statement about this reply. Both spellings of the key are
+    -- accepted: `[201]` is what anyone writes, and `["201"]` is what a table
+    -- that has been through JSON comes back as.
+    local schema = opts.response
+    if opts.responses then
+      schema = opts.responses[result.status]
+            or opts.responses[tostring(result.status)]
+            or schema
+    end
+    if schema then
+      result = apply_response_schema(result, schema, route.where, app, req)
+    end
   end
   return result
 end
