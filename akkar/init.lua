@@ -3034,7 +3034,10 @@ function App:run(config)
             stream:write_headers(rh, false)
             stream:write_chunk(
               '{"error":"too many websocket connections"}', true)
-            self.in_flight = self.in_flight - 1
+            -- NOT decremented here. This `return` leaves the pcall'd function,
+            -- not `onstream`, so the decrement at the end of the stream still
+            -- runs: doing it twice drove `in_flight` negative and `App:stop`
+            -- drains on `while in_flight > 0`.
             return
           end
 
@@ -3058,7 +3061,8 @@ function App:run(config)
             internal:warn("websocket handshake refused",
                           { detail = tostring(why) })
           end
-          self.in_flight = self.in_flight - 1
+          -- Same as the refusal above: the decrement at the end of the stream
+          -- is the only one, because this `return` does not reach past it.
           return
         end
 
