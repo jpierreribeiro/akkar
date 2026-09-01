@@ -11,7 +11,10 @@ local akkar  = require "akkar"
 local strict = require "akkar.strict"
 
 describe("strict mode", function()
-  after_each(function() strict.off() end)
+  -- `off` takes the key `on` returned, so the teardown has to hold on to it.
+  local key
+  before_each(function() key = strict.on() end)
+  after_each(function() strict.off(key) end)
 
   it("raises on assignment to an undeclared global", function()
     strict.on()
@@ -57,7 +60,7 @@ describe("strict mode", function()
     strict.on()
     strict.on()
     assert.is_true(strict.active())
-    strict.off()
+    strict.off(key)
     assert.is_false(strict.active())
     local ok = pcall(function() load "akkar_spec_after_off = 1" () end)
     assert.is_true(ok)
