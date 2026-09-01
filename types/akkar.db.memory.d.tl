@@ -11,6 +11,10 @@ local record memory
    record Fake
       on: function(Fake, string, any): Fake
       fail: function(Fake, string, ?string): Fake
+      -- `fail` returns immediately; `hang` yields, which is what stages a
+      -- coroutine abandoned mid-query. `drop` kills the connection for good.
+      hang: function(Fake, string, ?number): Fake
+      drop: function(Fake, string): Fake
 
       one: function(Fake, string, ...: any): {string: any}
       many: function(Fake, string, ...: any): {{string: any}}
@@ -28,8 +32,17 @@ local record memory
       rolled_back: boolean
    end
 
-   new: function(): Fake
-   factory: function(?function(Fake)): any
+   record Options
+      -- The capacity model, honoured by advancing `akkar.time` rather than
+      -- by waiting: statements served per second, and service time each.
+      max_qps: number
+      latency_ms: number
+   end
+
+   new: function(?Options): Fake
+   -- A function programs the fake; a table is `new`'s options; both together
+   -- is `factory(options, program)`.
+   factory: function(?any, ?function(Fake)): any
 end
 
 return memory
