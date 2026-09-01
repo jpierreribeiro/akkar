@@ -1705,6 +1705,152 @@ local function in_cidr(address, cidr)
 end
 akkar.in_cidr = in_cidr
 
+-- ======================================= what a setting must actually BE
+--
+-- `check_config` checks the NAME of every option and stops there, and half a
+-- check turns out to be worth about half as much:
+--
+--     app:run { timeout = os.getenv "REQUEST_TIMEOUT" }
+--
+-- The name is spelled right, so it boots, and every request afterwards is a
+-- 500 -- the deadline compares a string to a number and raises -- while the
+-- only thing in the log is `error_kind=string`.  Four more passed the same
+-- way, each one a server that starts and then does not work:
+--
+--     body_limit = -1            rejects every body, including empty ones
+--     port = "not-a-port"        reaches server.listen as a string
+--     max_concurrent = 0         accepts no connection at all
+--     trusted_proxies = "10/8"   a string where a list belongs, so the walk
+--                                over it finds nothing and no proxy is
+--                                trusted -- while the config says one is
+--
+-- The whole argument for the name check applies unchanged: a mistake found at
+-- boot costs a second, and found in production costs an incident.  So the
+-- values are checked against what the code that reads them actually needs,
+-- and the message says what was passed rather than only what was wanted.
+--
+-- Each rule returns the expectation when the value is wrong, and nothing when
+-- it is fine.  A setting with no rule here is one whose value the framework
+-- genuinely cannot judge -- `ctx` is an OpenSSL object, `db` is checked
+-- against its contract instead, and `cpu_limit` answers for itself in
+-- `App:run` because "false, or a positive count" is not a shape any of these
+-- rules describes.
+--
+-- THERE IS DELIBERATELY NO `http_version` RULE, and no such setting: this
+-- runtime serves h2 over ALPN whenever a TLS client asks for it, and
+-- cleartext h2 behind `h2c = true`.  A version switch defaulting to 1.1 would
+-- turn a shipped feature off, so the flag says whether the server will answer
+-- h2 WITHOUT TLS and nothing says which version it may speak.
+local function valid_cidr(cidr)
+  local base, bits = cidr:match "^([%d%.]+)/(%d+)$"
+  if not base then base, bits = cidr, "32" end
+  bits = tonumber(bits)
+  return ipv4_to_int(base) ~= nil and bits ~= nil and bits >= 0 and bits <= 32
+end
+
+local function seconds(allow_zero)
+  local wanted = allow_zero and "a number of seconds, zero or more"
+                             or "a positive number of seconds"
+  return function(value)
+    if type(value) ~= "number" or value ~= value then return wanted end
+    if value < 0 or (not allow_zero and value == 0) then return wanted end
+  end
+end
+
+local function flag(value)
+  if type(value) ~= "boolean" then return "true or false" end
+end
+
+local SETTING_RULES = {
+  host = function(value)
+    if type(value) ~= "string" or value == "" then return "a non-empty string" end
+  end,
+  port = function(value)
+    if math.type(value) ~= "integer" or value < 0 or value > 65535 then
+      return "an integer from 0 to 65535 (0 asks the kernel for a free port)"
+    end
+  end,
+  body_limit = function(value)
+    if math.type(value) ~= "integer" or value < 1 then
+      return "a positive whole number of bytes"
+    end
+  end,
+  -- `false` and `0` both mean "no deadline" to `with_deadline`, and an
+  -- application that means it should be able to say so.
+  timeout = function(value)
+    if value == false then return nil end
+    if type(value) ~= "number" or value ~= value or value < 0 then
+      return "a number of seconds, or false for no deadline"
+    end
+  end,
+  read_timeout   = seconds(false),
+  shutdown_grace = seconds(true),
+  max_concurrent = function(value)
+    if math.type(value) ~= "integer" or value < 1 then
+      return "an integer of at least 1 (it is a ceiling on connections)"
+    end
+  end,
+  reuseport          = flag,
+  strict             = flag,
+  check_capabilities = flag,
+  repair_substrate   = flag,
+  -- Cleartext h2, which costs a preface sniff on every connection including
+  -- the h1 ones -- so it is a decision, and a decision made with a string is
+  -- not one.
+  h2c                = flag,
+  -- Not `flag`: this tree answers `tls = { certificate = ..., key = ... }`
+  -- itself, so a table is the ordinary way to serve HTTPS.  What is inside it
+  -- is checked where the context is built, which is where the failure can say
+  -- which PEM did not parse.
+  tls = function(value)
+    if type(value) ~= "boolean" and type(value) ~= "table" then
+      return "true, false, or { certificate = ..., key = ... }"
+    end
+  end,
+  log = function(value)
+    if type(value) ~= "table" then return "a logger, from akkar.log.new{}" end
+  end,
+  peer = function(value)
+    if type(value) ~= "string" then return "an address, as a string" end
+  end,
+  trusted_proxies = function(value)
+    local list = [[a LIST of CIDR strings, e.g. { "10.0.0.0/8" }]]
+    if type(value) ~= "table" then return list end
+    if next(value) ~= nil and value[1] == nil then return list end
+    for _, cidr in ipairs(value) do
+      if type(cidr) ~= "string" then return list end
+      -- A CIDR that does not parse matches nothing, so the proxy list looks
+      -- configured and trusts no hop -- failing closed, silently, which is
+      -- the failure mode this whole section exists to make loud.
+      if not valid_cidr(cidr) then
+        return "a list of IPv4 CIDRs; '" .. cidr .. "' is not one"
+      end
+    end
+  end,
+}
+
+local function describe_value(value)
+  if type(value) == "string" then return string.format("string %q", value) end
+  return type(value) .. " " .. tostring(value)
+end
+
+--- Raises on the first setting whose VALUE the runtime cannot use.
+--- Exported so a caller that must not bind a port -- `akkar.doctor`, a
+--- deployment preflight -- can report the same finding without booting.
+local function check_setting_values(config, what)
+  for key, value in pairs(config) do
+    local rule = SETTING_RULES[key]
+    if rule and value ~= nil then
+      local expected = rule(value)
+      if expected then
+        error(string.format("%s: %s must be %s; got %s",
+                            what, key, expected, describe_value(value)), 3)
+      end
+    end
+  end
+end
+akkar.check_settings = check_setting_values
+
 local function is_trusted(address, trusted)
   if not address or not trusted then return false end
   for _, cidr in ipairs(trusted) do
@@ -2401,6 +2547,11 @@ function App:run(config)
   for k in pairs(SETTINGS) do allowed[k] = true end
   for k in pairs(CAPABILITIES) do allowed[k] = true end
   check_config(config, allowed, "app:run{}")
+
+  -- And the same check for the VALUE, before anything binds a port: a setting
+  -- whose name is right and whose type is wrong starts a server that then
+  -- answers 500 to every request, far from the line that caused it.
+  check_setting_values(config, "app:run{}")
 
   if config.check_capabilities ~= false then
     check_capability_contracts(config)
@@ -3283,6 +3434,9 @@ function App:test(config)
                     peer = true, trusted_proxies = true }
   for k in pairs(CAPABILITIES) do allowed[k] = true end
   check_config(config, allowed, "app:test{}")
+  -- The test client shares `handle`, so it shares the failure: a string
+  -- timeout 500s here exactly as it would on a socket.
+  check_setting_values(config, "app:test{}")
 
   chains(self)
   local client = {}

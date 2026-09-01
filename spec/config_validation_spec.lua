@@ -13,11 +13,13 @@ else. Four more started a server that then did not work: `body_limit = -1`,
 `port = "not-a-port"`, `max_concurrent = 0`, and `trusted_proxies` as a string
 where a list belongs, which trusts no proxy at all while looking configured.
 
-The second half of the file is the protocol. lua-http accepts HTTP/2 unless
-told otherwise, so which version the server speaks is now something the
-application says rather than something it inherits. What the ceiling does
-about a client that puts many requests in one connection is measured next
-door, in http2_admission_spec.lua.
+The second half of the file is the protocol, and it is NOT a `http_version`
+setting. This runtime serves h2 over ALPN whenever a TLS client asks for it,
+and cleartext h2 behind `h2c = true`; a version switch defaulting to 1.1 would
+turn both off. So what the application says is whether the server will answer
+h2 WITHOUT TLS, and that flag is a setting with a value like any other. What
+the ceiling does about a client that puts many requests in one connection is
+measured next door, in http2_admission_spec.lua.
 ]]
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
@@ -99,7 +101,7 @@ describe("app:run{} checks what a setting IS, not only that it exists", function
       akkar.check_settings({
         host = "0.0.0.0", port = 0, body_limit = 1, timeout = 0.5,
         read_timeout = 15, shutdown_grace = 0, max_concurrent = 1,
-        reuseport = true, strict = false, tls = false, http_version = 1.1,
+        reuseport = true, strict = false, tls = false, h2c = true,
         trusted_proxies = { "10.0.0.0/8", "127.0.0.1" },
       }, "app:run{}")
     end)
@@ -163,20 +165,24 @@ local function speaks_h2(config)
   return reply ~= nil and #reply == 9 and reply:byte(4) == 4
 end
 
-describe("which HTTP version the server speaks", function()
-  it("is 1.1 by default, because that is what the runtime was written for", function()
-    -- It used to be both, on by default, and mentioned in no document.
+describe("whether the server answers h2 without TLS", function()
+  it("does not, by default, because the sniff costs every connection", function()
+    -- The preface sniff h2c needs is a read on every connection, h1 ones
+    -- included, so it is opt-in. Over TLS none of this applies: ALPN settles
+    -- the version and a client that never asks for h2 never pays for it.
     assert.is_false(speaks_h2 { port = 8641 })
   end)
 
-  it("is 2 when the application asks for it", function()
+  it("does when the application asks for it", function()
     -- Available, deliberately, and bounded when chosen: the ceiling counts
     -- requests rather than connections, and h2 clients are told the number.
-    assert.is_true(speaks_h2 { port = 8642, http_version = 2 })
+    assert.is_true(speaks_h2 { port = 8642, h2c = true })
   end)
 
-  it("refuses a version that is not a version", function()
-    refused({ http_version = 3 }, "http_version must be 1.0, 1.1 or 2")
-    refused({ http_version = "1.1" }, "http_version must be 1.0, 1.1 or 2")
+  it("refuses a value that is not an answer to that question", function()
+    -- `h2c = "yes"` is truthy, so it used to read as "on" -- which is right
+    -- by accident. `h2c = "no"` is truthy too, and reads as "on" as well.
+    refused({ h2c = "yes" }, "h2c must be true or false")
+    refused({ h2c = 1 }, "h2c must be true or false")
   end)
 end)
