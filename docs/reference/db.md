@@ -136,7 +136,7 @@ local db     = require "akkar.db"
 local memory = require "akkar.db.memory"
 local sql    = require "akkar.sql"
 
-local fake = memory.new():on("where project_id", { id = 1, title = "notes" })
+local fake = memory.new():on("project_id", { id = 1, title = "notes" })
 local scoped = db.scope(fake, "project_id", 42)
 
 print(scoped:one(sql.select("id, title"):from "ref_db_documents").title)
