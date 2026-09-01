@@ -38,6 +38,10 @@ one commit with a spec that failed before it and passes after.
   uses the other.
 - **`v.integer` refuses a float at or past 2^53**, and `inf`, `1e308` and `nan`.
   The old test asked for a fractional part, which every large float passes.
+  Note what this costs: JSON has one number type, so an id above 2^53 sent as a
+  JSON NUMBER is now refused rather than silently rounded. Send it as a string.
+  A Lua integer that arrived exactly -- out of a query string, say -- is still
+  accepted at any magnitude, because it is the integer it says it is.
 - **A job queue states its delivery guarantee.** `delivery` is a field; asking
   for `at_least_once` over a store that cannot lease is refused rather than
   silently becoming at-most-once.

@@ -506,13 +506,24 @@ describe("an integer that arrived as JSON", function()
     assert.equal("expected integer", err.n)
   end)
 
-  it("leaves a number too large for an integer alone rather than mangling it", function()
-    -- `math.tointeger(1e20)` is nil: it does not fit in a 64-bit integer.
-    -- Returning the float unchanged is the honest answer -- the alternative
-    -- is silently substituting a different number.
-    local out = akkar.validate(cjson.decode '{"n":1e20}', { n = v.integer {} })
-    assert.equal("float", math.type(out.n))
-    assert.equal(1e20, out.n)
+  it("refuses a number too large to be an exact integer", function()
+    -- This case used to assert that `1e20` came back untouched, as a float,
+    -- reasoning that the alternative was "silently substituting a different
+    -- number". That is a false choice -- refusing is the third option, and it
+    -- is the one this block's own premise argues for.
+    --
+    -- A float with no integer representation is precisely what makes `//`,
+    -- `%` and `string.format("%d", ...)` behave differently, and `%d` on one
+    -- RAISES, as the note at the top of this block says. Handing it to a
+    -- handler that asked for `v.integer` hands over the hazard the block is
+    -- about, one layer further in.
+    --
+    -- And a JSON number past 2^53 is ambiguous in the wire format itself: it
+    -- stands for a range of integers and cannot say which was meant. That is
+    -- why an id that large is sent as a string.
+    local out, err = akkar.validate(cjson.decode '{"n":1e20}', { n = v.integer {} })
+    assert.is_nil(out)
+    assert.equal("too large to be an exact integer", err.n)
   end)
 
   it("makes the ported money arithmetic exact", function()
