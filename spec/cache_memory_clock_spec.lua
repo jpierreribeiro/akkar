@@ -37,9 +37,29 @@ describe("the default clock", function()
   end)
 end)
 
+-- A store that genuinely cannot script.
+--
+-- This block used to use `akkar.cache.memory` itself, on the premise that it
+-- cannot `EVAL`. It can, deliberately: the scripts were added so `akkar.limit`
+-- and `akkar.idempotency` are testable on a machine with no Redis, and
+-- `akkar.limit.shared` reads `per_process` rather than `scriptable` precisely
+-- because the two stopped meaning the same thing. So the fixture moved to a
+-- store that really cannot, which is what these three cases were always about.
+local function unscriptable()
+  local store = memory.new()
+  store.command = function(_, verb, ...)
+    if verb == "EVAL" or verb == "EVALSHA" or verb == "SCRIPT" then
+      error("mock store: this store cannot run scripts", 0)
+    end
+    return memory.new().command(store, verb, ...)
+  end
+  store.scriptable = false
+  return store
+end
+
 describe("a store that cannot run the scripts", function()
   it("is what akkar.limit.scriptable is for", function()
-    assert.is_false(akkar.limit.scriptable(memory.new()))
+    assert.is_false(akkar.limit.scriptable(unscriptable()))
   end)
 
   it("makes the rate limiter serve unlimited rather than 500", function()
@@ -49,7 +69,7 @@ describe("a store that cannot run the scripts", function()
     app:use(akkar.limit.rate { per_second = 1, burst = 1,
                                key = function() return "user:7" end })
     app:get("/", function() return { ok = true } end)
-    local client = app:test { cache = memory.factory() }
+    local client = app:test { cache = function() return unscriptable() end }
     for i = 1, 4 do
       assert.equal(200, client:get("/").status, "request " .. i)
     end
@@ -62,7 +82,7 @@ describe("a store that cannot run the scripts", function()
     local app = akkar.new()
     app:use(akkar.idempotency { namespace = false })
     app:post("/charges", function() runs = runs + 1; return akkar.created { ok = true } end)
-    local client = app:test { cache = memory.factory() }
+    local client = app:test { cache = function() return unscriptable() end }
     local res = client:post("/charges", { body = {},
       headers = { ["idempotency-key"] = "charge-1" } })
 

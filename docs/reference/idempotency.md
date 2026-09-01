@@ -98,6 +98,11 @@ response body; pass `namespace = function(req) return req.tenant.id end`, or
 application is single-tenant. At request time it raises whatever the store
 raises when there is no store configured at all.
 
+A store that cannot answer -- one that cannot run the scripts, or a Redis that
+blinked -- gets **503** with `retry-after: 1`, and the handler does not run.
+Failing open here would be the double charge this middleware exists to prevent,
+so it fails closed and says which guarantee is unavailable.
+
 ```lua
 local akkar        = require "akkar"
 local idempotency  = require "akkar.idempotency"

@@ -313,7 +313,22 @@ function M.new(options)
     local record = prefix .. #scoped .. ":" .. scoped .. key
     local fingerprint = fingerprint_of(req)
 
-    local verdict = claim(cache, { record }, { lock_ttl, fingerprint })
+    -- A store that cannot answer is not a reason to run the handler.
+    --
+    -- The claim was unguarded, so a store that cannot `EVAL` -- or a Redis
+    -- that blinked -- raised straight out of the middleware and became a 500
+    -- with nothing in it: no `retry-after`, and no statement about what had
+    -- happened. Failing OPEN here would be worse, because failing open on a
+    -- double-charge guard is the double charge. So it fails closed and says
+    -- so: 503 means the guarantee is unavailable, and the client may retry.
+    local claimed, verdict = pcall(claim, cache, { record }, { lock_ttl, fingerprint })
+    if not claimed then
+      local res = akkar.response(503,
+        { error = "the idempotency store is unavailable, so this request "
+               .. "cannot be made safe to retry" })
+      res.headers = { ["retry-after"] = "1" }
+      return res
+    end
     local state = verdict[1]
 
     if state == "mismatch" then
