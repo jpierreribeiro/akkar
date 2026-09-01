@@ -15,6 +15,7 @@ package.path = "./?.lua;./?/init.lua;" .. package.path
 local akkar   = require "akkar"
 local redis   = require "akkar.redis"
 local cqueues = require "cqueues"
+local idempotency = require "akkar.idempotency"
 
 local function reachable()
   -- PING, not merely connect. `cqueues.socket.connect` builds the socket
@@ -285,6 +286,59 @@ describe("a request that never finished", function()
         "the stored response must live for the replay ttl, not the lock: " ..
         tostring(stored) .. "s")
       observer:close()
+    end)
+  end)
+end)
+
+describe("the promise about WHICH request this is", function()
+  it("reads the whole body, not the first 512 bytes of it", function()
+    -- The fingerprint stored a 512-byte PREFIX of the canonical body beside
+    -- its length. Two bodies that agree on both -- which a canonical form,
+    -- sorting its keys, makes ordinary: the differing field is simply late --
+    -- were one request. The retry was then answered with the FIRST request's
+    -- stored response and `idempotent-replay: true`, so a client that changed
+    -- the amount or the address was told the old one had succeeded.
+    local prefix_bytes = string.rep("x", 700)
+    local first = idempotency.fingerprint_of {
+      method = "POST", path = "/charges", body = { payload = prefix_bytes .. "a" },
+    }
+    local second = idempotency.fingerprint_of {
+      method = "POST", path = "/charges", body = { payload = prefix_bytes .. "b" },
+    }
+    assert.not_equal(first, second)
+  end)
+
+  it("answers 422 rather than replaying, end to end", function()
+    in_controller(function()
+      local shared = string.rep("y", 700)
+      local app, runs = charging_app { prefix = prefix() }
+      local client = app:test { cache = redis.connect { pool_size = 2 } }
+      local headers = { ["idempotency-key"] = "late-difference-1" }
+
+      assert.equal(201, client:post("/charges",
+        { body = { note = shared .. "a" }, headers = headers }).status)
+      local second = client:post("/charges",
+        { body = { note = shared .. "b" }, headers = headers })
+
+      assert.equal(422, second.status,
+        "a body differing past byte 512 was replayed as the same request")
+      assert.is_nil(second.headers["idempotent-replay"])
+      assert.equal(1, runs())
+    end)
+  end)
+
+  it("still calls an identical body the same request", function()
+    in_controller(function()
+      local shared = string.rep("z", 700)
+      local app, runs = charging_app { prefix = prefix() }
+      local client = app:test { cache = redis.connect { pool_size = 2 } }
+      local headers = { ["idempotency-key"] = "identical-1" }
+      local body = { note = shared, amount = 100 }
+
+      assert.equal(201, client:post("/charges", { body = body, headers = headers }).status)
+      local replay = client:post("/charges", { body = body, headers = headers })
+      assert.equal("true", replay.headers["idempotent-replay"])
+      assert.equal(1, runs())
     end)
   end)
 end)

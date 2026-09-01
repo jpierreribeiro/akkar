@@ -63,7 +63,8 @@ a repeat re-runs the handler. Refusing to store is better than an unbounded
 write into a shared cache, and it is stated rather than discovered.
 ]]
 
-local cjson = require "akkar.json"
+local cjson  = require "akkar.json"
+local crypto = require "akkar.crypto"
 
 local M = {}
 
@@ -84,16 +85,37 @@ local M = {}
 -- No code around the handler can fix that: an abandoned coroutine runs
 -- nothing, so nothing it would have released is ever released. The lock has
 -- to expire on its own, and it has to outlive a request rather than a day.
+--
+-- AND A CLAIM THAT CAN EXPIRE IS A CLAIM THAT CAN BE LOST, which the record
+-- had no way to notice. Once `lock_ttl` passes the key belongs to whoever
+-- claimed next, and the record is about THEIR request; the first handler,
+-- still running, held nothing but the belief that it owned the key.
+--
+--   1. A finishes late and STOREs. `HSET state=done, body=A` lands on B's
+--      record. B's own answer -- the one already on its way to the client --
+--      is replaced by A's, and every retry for the rest of the day replays a
+--      response to a request that was answered differently.
+--   2. A fails late and RELEASEs. `DEL` removes B's claim while B is still
+--      running, so the next retry claims a free key and the work runs a THIRD
+--      time. On a charge that is a third charge.
+--
+-- So the claim carries a token minted per request. Store and release are
+-- compare-and-set on it: the write lands only if this request is still the
+-- owner. The token is unguessable rather than a counter because it is the
+-- only thing standing between a late handler and a stranger's record, and it
+-- costs sixteen bytes per claim.
 local CLAIM_SCRIPT = [[
 local key         = KEYS[1]
 local lock_ttl    = tonumber(ARGV[1])
 local fingerprint = ARGV[2]
+local token       = ARGV[3]
 
 local found = redis.call('HMGET', key, 'state', 'fingerprint', 'status', 'body')
 local state = found[1]
 
 if not state then
-  redis.call('HSET', key, 'state', 'running', 'fingerprint', fingerprint)
+  redis.call('HSET', key, 'state', 'running', 'fingerprint', fingerprint,
+             'token', token)
   redis.call('EXPIRE', key, lock_ttl)
   return { 'run' }
 end
@@ -110,14 +132,24 @@ end
 return { 'done', found[3], found[4] }
 ]]
 
+-- Stores only under the token this request claimed with. A 0 back means the
+-- claim expired mid-handler and someone else owns the key now -- which is the
+-- double execution this module exists to prevent, so the caller is told rather
+-- than left to overwrite a stranger's record.
 local STORE_SCRIPT = [[
+if redis.call('HGET', KEYS[1], 'token') ~= ARGV[4] then return 0 end
 redis.call('HSET', KEYS[1], 'state', 'done', 'status', ARGV[1], 'body', ARGV[2])
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
 return 1
 ]]
 
--- A handler that failed must not poison the key: the retry is the point.
-local RELEASE_SCRIPT = [[ return redis.call('DEL', KEYS[1]) ]]
+-- A handler that failed must not poison the key: the retry is the point. Token
+-- guarded, so a late release cannot free the claim of the request that
+-- replaced it and hand a third copy of the work to the next retry.
+local RELEASE_SCRIPT = [[
+if redis.call('HGET', KEYS[1], 'token') ~= ARGV[1] then return 0 end
+return redis.call('DEL', KEYS[1])
+]]
 
 -- Reuses the evaluator discipline from `akkar.limit`: the cache handle is
 -- passed at call time and never captured, because a captured handle belongs
@@ -212,6 +244,33 @@ local function canonical(value, depth)
   return tostring(value)
 end
 
+--- THE FIRST 512 BYTES ARE NOT THE BODY.
+---
+--- The fingerprint truncated the canonical form and stored the prefix, so any
+--- two bodies agreeing on their first 512 bytes AND their total length were
+--- the same request as far as this module was concerned. That is not an
+--- exotic shape: a canonical body sorts its keys, so `{ amount = 100, ... }`
+--- and `{ amount = 999, ... }` share every byte up to wherever they first
+--- differ, and a body whose early fields are a customer id and an address --
+--- which is most of them -- differs only well past the cut.
+---
+--- What it does is the exact failure the fingerprint exists to catch, in
+--- reverse. The second request is judged identical, the module answers
+--- **200 with the FIRST request's stored response** and `idempotent-replay:
+--- true`, and the handler never runs. The client asked to ship to a new
+--- address, or to charge a different amount, and got told the old one
+--- succeeded. A silent 422 would be a nuisance; this is a silent wrong answer.
+---
+--- The length prefix hid it in testing: two bodies differing in length still
+--- differ here, and a body that differs only past byte 512 usually also
+--- differs in length. Usually.
+---
+--- Hashed instead of truncated, so the whole body is read and the record
+--- stays a fixed size. SHA-256 is not chosen for its collision resistance --
+--- the docstring above is still true, this is not a defence against someone
+--- who can already pick the key -- but because it is the digest already in
+--- `akkar.crypto` and no cheaper one is worth the argument. The length stays
+--- in front of it: it costs nothing and it makes the record readable.
 local function fingerprint_of(req)
   local body = ""
   if req.body ~= nil then
@@ -219,7 +278,7 @@ local function fingerprint_of(req)
     body = ok and encoded or tostring(req.body)
   end
   return req.method .. " " .. req.path .. " " .. #body .. ":" ..
-         tostring(body:sub(1, 512))
+         crypto.to_hex(crypto.sha256(body))
 end
 
 M.canonical = canonical
@@ -312,6 +371,11 @@ function M.new(options)
     -- assembled out of two legal values.
     local record = prefix .. #scoped .. ":" .. scoped .. key
     local fingerprint = fingerprint_of(req)
+    -- Minted per request, never derived from the key or the fingerprint: both
+    -- of those are the same for the retry that replaces this claim, so a
+    -- token derived from them would prove nothing about WHICH attempt is
+    -- holding the record.
+    local token = crypto.token(16)
 
     -- A store that cannot answer is not a reason to run the handler.
     --
@@ -321,7 +385,7 @@ function M.new(options)
     -- happened. Failing OPEN here would be worse, because failing open on a
     -- double-charge guard is the double charge. So it fails closed and says
     -- so: 503 means the guarantee is unavailable, and the client may retry.
-    local claimed, verdict = pcall(claim, cache, { record }, { lock_ttl, fingerprint })
+    local claimed, verdict = pcall(claim, cache, { record }, { lock_ttl, fingerprint, token })
     if not claimed then
       local res = akkar.response(503,
         { error = "the idempotency store is unavailable, so this request "
@@ -364,7 +428,7 @@ function M.new(options)
     -- support is refused for the whole TTL.
     local ok, result = pcall(next, req)
     if not ok then
-      pcall(function() release(cache, { record }, {}) end)
+      pcall(function() release(cache, { record }, { token }) end)
       error(result, 0)
     end
 
@@ -377,13 +441,13 @@ function M.new(options)
     --
     -- Not storable, so the claim goes back and a repeat re-runs the export.
     if result and result.stream then
-      pcall(function() release(cache, { record }, {}) end)
+      pcall(function() release(cache, { record }, { token }) end)
       return result
     end
 
     local status = result and result.status or 200
     if status < 200 or status >= 300 then
-      pcall(function() release(cache, { record }, {}) end)
+      pcall(function() release(cache, { record }, { token }) end)
       return result
     end
 
@@ -396,7 +460,7 @@ function M.new(options)
     if #encoded > max_bytes then
       -- Refusing to store beats an unbounded write into a shared cache. The
       -- guarantee is lost for this response and the caller is told so.
-      pcall(function() release(cache, { record }, {}) end)
+      pcall(function() release(cache, { record }, { token }) end)
       local log = rawget(req, "log")
       if log then
         log:warn("idempotency: response too large to store", {
@@ -406,7 +470,25 @@ function M.new(options)
       return result
     end
 
-    pcall(function() store(cache, { record }, { status, encoded, ttl }) end)
+    local stored, held = pcall(function()
+      return store(cache, { record }, { status, encoded, ttl, token })
+    end)
+    -- A zero back is not a store failure. It is this request discovering that
+    -- its claim expired while the handler ran, that a retry already claimed
+    -- the key and ran the work a second time, and that the response now on
+    -- the record is the retry's rather than this one's. Nothing here can undo
+    -- the second execution; the one thing it must not do is stay quiet about
+    -- it, because a double charge that nobody logged is a double charge
+    -- nobody finds.
+    if stored and tonumber(held) == 0 then
+      local log = rawget(req, "log")
+      if log then
+        log:error("idempotency: the in-flight claim expired before the handler "
+               .. "returned; the operation may have run twice", {
+          path = req.path, lock_ttl_s = lock_ttl,
+        })
+      end
+    end
     return result
   end
 end

@@ -34,8 +34,9 @@ assert(type(idempotency.CLAIM_SCRIPT) == "string")
 
 Builds the summary of a request that decides whether a reused key names the same
 request. It is
-`req.method .. " " .. req.path .. " " .. #body .. ":" .. body:sub(1, 512)`,
-where `body` is `json.encode(req.body)`, or `""` when `req.body` is nil.
+`req.method .. " " .. req.path .. " " .. #body .. ":" .. sha256_hex(body)`,
+where `body` is the canonical encoding of `req.body`, or `""` when `req.body`
+is nil. The whole body is hashed, so no part of it is outside the comparison.
 
 Not a cryptographic hash. It separates an honest client's retry from an honest
 client's mistake, and it is not a defence against somebody who already chooses
@@ -51,20 +52,33 @@ local idempotency = require "akkar.idempotency"
 local print_ = idempotency.fingerprint_of {
   method = "POST", path = "/charges", body = { amount = 100 },
 }
-assert(print_ == 'POST /charges 14:{"amount":100}')
+assert(print_ ==
+  "POST /charges 14:" ..
+  "4d4bbe59c6aad22442cde199a6a8a5f034405fcd78fb5a81c24ef249de1c45f1")
 
--- No body at all still fingerprints.
-assert(idempotency.fingerprint_of { method = "POST", path = "/charges" }
-       == "POST /charges 0:")
+-- No body at all still fingerprints -- the digest of the empty string.
+assert(idempotency.fingerprint_of { method = "POST", path = "/charges" } ==
+  "POST /charges 0:" ..
+  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
 ```
 
-Two limits follow from the shape and are worth knowing before you rely on it.
-Only the first 512 bytes of the encoded body are compared, so two long bodies
-of the same length that agree on their first 512 bytes fingerprint alike. And
-the encoding's key order is not stable between processes, so the same body
-encoded by two workers can produce two fingerprints and a retry that lands on
-the other worker is answered `422`. A body with one key is unaffected; a body
-with several is not.
+Two limits used to follow from the shape, and both are gone; they are recorded
+here because a reader who learned them elsewhere should know they no longer
+hold.
+
+Only the first 512 bytes of the encoded body were compared, so two long bodies
+of the same length agreeing on their first 512 bytes were one request -- and
+the second was answered with the first's stored response and
+`idempotent-replay: true`. The whole body is hashed now, so a difference
+anywhere in it is a difference here.
+
+And the encoding's key order was `cjson`'s, which is not stable between
+processes, so one body encoded by two workers produced two fingerprints and a
+retry landing on the other worker was answered `422`. `canonical` sorts keys,
+so it does not.
+
+What remains true is the sentence above: this is not a defence against
+somebody who already chooses the key.
 
 ## idempotency.new(options)
 

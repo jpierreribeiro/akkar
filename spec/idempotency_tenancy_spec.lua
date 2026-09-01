@@ -160,7 +160,7 @@ describe("the in-flight claim", function()
       local shared = prefix()
       local app = akkar.new()
       app:use(akkar.idempotency {
-        prefix = shared, namespace = "acme", running_ttl = 1,
+        prefix = shared, namespace = "acme", lock_ttl = 1,
       })
       app:post("/slow", function()
         cqueues.sleep(1.4)                    -- outlives its own claim
@@ -187,6 +187,57 @@ describe("the in-flight claim", function()
       assert.equal("true", results.replay.headers["idempotent-replay"])
       assert.equal("second", results.replay.body.run,
         "the late handler stored its answer over the record it no longer owned")
+    end)
+  end)
+
+  it("will not let a handler that lost its claim release the successor",
+     function()
+    -- The other half of the same ownership question, and the worse half. A
+    -- late handler that RAISES releases the key on its way out; unguarded,
+    -- that DELETEs the claim its successor is holding, and the next retry
+    -- finds a free key and runs the work a THIRD time. On a charge that is a
+    -- third charge.
+    in_controller(function()
+      local shared, quick_runs = prefix(), 0
+      local app = akkar.new()
+      app:use(akkar.idempotency {
+        prefix = shared, namespace = "acme", lock_ttl = 1,
+      })
+      app:post("/slow", function()
+        cqueues.sleep(1.4)                    -- outlives its own claim
+        error("the late handler failed", 0)   -- ... and then releases the key
+      end)
+      app:post("/quick", function()
+        quick_runs = quick_runs + 1
+        cqueues.sleep(0.6)                    -- still running when /slow fails
+        return akkar.created { run = "second" }
+      end)
+
+      local client = app:test { cache = redis.connect { pool_size = 6 } }
+      local headers = { ["idempotency-key"] = "expiring-2" }
+      local results = {}
+      local cq = cqueues.new()
+      cq:wrap(function()
+        results.slow = client:post("/slow", { body = {}, headers = headers })
+      end)
+      cq:wrap(function()
+        cqueues.sleep(1.1)                    -- the claim is gone by now
+        results.quick = client:post("/quick", { body = {}, headers = headers })
+      end)
+      cq:wrap(function()
+        cqueues.sleep(1.8)                    -- after /slow raised and released
+        results.retry = client:post("/quick", { body = {}, headers = headers })
+      end)
+      assert(cq:loop(20))
+
+      assert.equal(500, results.slow.status)
+      assert.equal("second", results.quick.body.run)
+      assert.equal(1, quick_runs,
+        "the late release freed the successor's claim and the work ran again")
+      assert.is_truthy(results.retry.status == 409
+                       or results.retry.headers["idempotent-replay"] == "true",
+        "the retry neither waited for nor replayed the successor; it got " ..
+        tostring(results.retry.status))
     end)
   end)
 end)
