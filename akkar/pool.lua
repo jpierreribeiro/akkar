@@ -14,6 +14,9 @@ is usually wrong:
 Nothing here knows what it is pooling.  Whether a returned resource is fit for
 reuse is the adapter's judgement, passed in as `reusable`, because "still
 inside a transaction" means something to Postgres and nothing to Redis.
+
+And nothing here knows how long a resource stays good, either, which is why
+`max_lifetime` and `idle_timeout` exist: see `Pool:reap_idle`.
 ]]
 
 local condition = require "cqueues.condition"
@@ -23,18 +26,50 @@ local time      = require "akkar.time"
 local Pool = {}
 Pool.__index = Pool
 
+-- Both overridable, both disabled by passing `false` or `0`.
+--
+-- These are the numbers HikariCP settled on after a decade of the same
+-- failures, and the reasoning carries: every connection has a third party
+-- that may kill it -- a failover, a load balancer's idle reap, a
+-- `pg_terminate_backend` -- and the pool should recycle first rather than find
+-- out by handing a corpse to a request. Keep `max_lifetime` under whatever
+-- reaps connections in front of the database.
+local MAX_LIFETIME = 1800   -- retire a connection this old on its way out of `idle`
+local IDLE_TIMEOUT = 600    -- retire one that has sat unused this long
+
+local function setting(value, default)
+  if value == nil then return default end
+  if value == false or value == 0 then return nil end
+  return value
+end
+
 --- Creates a pool.
 -- @param open      function returning a fresh resource, or raising
 -- @param size      maximum live resources
 -- @param reusable  optional predicate; a resource it rejects is closed
 --                  instead of returned to the idle set
-function Pool.new(open, size, reusable)
+-- @param options   `max_lifetime` and `idle_timeout`, in seconds, each
+--                  disabled by `false` or `0`; and `now`, the clock the
+--                  ages are measured against
+function Pool.new(open, size, reusable, options)
+  options = options or {}
   return setmetatable({
     open = open,
     size = size,
     reusable = reusable,
     idle = {},
     live = 0,
+
+    -- AGE IS READ FROM ITS OWN CLOCK, and only age is. A deadline and a
+    -- `waited` sample are measurements of the running scheduler and have to
+    -- come from the same monotonic clock the scheduler uses; how old a socket
+    -- is, is a fact about a timer somewhere else, and a spec that wants to
+    -- prove a thirty-minute connection gets retired cannot wait thirty
+    -- minutes to do it.
+    now = options.now or time.monotime,
+    max_lifetime = setting(options.max_lifetime, MAX_LIFETIME),
+    idle_timeout = setting(options.idle_timeout, IDLE_TIMEOUT),
+    retired = 0,
     -- Slots taken by a coroutine that is still inside `open`. Weak keys: an
     -- abandoned coroutine is unreferenced by anything else, so a collection
     -- takes its reservation with it. See `Pool:reap`.
@@ -171,6 +206,73 @@ function Pool:reap()
   return freed
 end
 
+--- Whether a resource sitting in `idle` is too old to hand out.
+---
+--- Two ages, because they answer different questions. `created_at` bounds how
+--- long a connection may exist at all, which is what a failover or a rolling
+--- restart needs; `idle_since` bounds how long it may sit unused, which is
+--- what a load balancer's idle reap needs. A resource that is merely BUSY has
+--- no `idle_since` -- a long transaction is not a stale socket -- so only the
+--- lifetime bound applies to it, and it is only ever consulted here, on the
+--- way back out of the idle set.
+local function expired(self, resource, now)
+  if self.max_lifetime and resource.created_at
+     and now - resource.created_at > self.max_lifetime then
+    return true
+  end
+  return self.idle_timeout ~= nil and resource.idle_since ~= nil
+     and now - resource.idle_since > self.idle_timeout
+end
+
+--- Closes the idle resources that have aged out, and frees their slots.
+---
+--- THE POOL HANDS A CONNECTION OUT OF `idle` WITHOUT VALIDATING IT, and the
+--- `reusable` predicate only runs on the return leg. So after a Postgres
+--- restart, a failover, or a load balancer reaping idle connections behind the
+--- pool's back, up to `size` corpses get dealt out, one failed request each --
+--- and the pool reports nothing wrong the whole time, because as far as it can
+--- see it is holding `size` perfectly good connections.
+---
+--- The fix is deliberately NOT a `select 1` on every acquire. That is a round
+--- trip on the hottest path in the framework, and it still races: the
+--- connection can die between the probe and the query. Age is free and catches
+--- the whole class, because every third party that kills connections from the
+--- outside does it on a timer.
+---
+--- Called from `get`, before the idle set is read, so a retired connection is
+--- never the one handed back. Public because a supervisor draining a pool that
+--- has gone quiet has no `get` to hang this off.
+function Pool:reap_idle()
+  if #self.idle == 0 then return 0 end
+  if not (self.max_lifetime or self.idle_timeout) then return 0 end
+
+  local now, kept, retired = self.now(), {}, 0
+  for _, resource in ipairs(self.idle) do
+    if expired(self, resource, now) then
+      -- `pooled` STAYS SET, and `discarded` joins it. Both are what `put`
+      -- reads to refuse a second release, and this resource is now closed:
+      -- a late `put` that got through would decrement `live` for a slot this
+      -- loop has already given back, which is the arithmetic that drove
+      -- `live` negative before.
+      resource.discarded = true
+      resource.pool = nil
+      pcall(function() resource:close() end)
+      self.live = self.live - 1
+      retired = retired + 1
+    else
+      kept[#kept + 1] = resource        -- order preserved: `idle` is LIFO
+    end
+  end
+  self.idle = kept
+  self.retired = self.retired + retired
+
+  -- Reaping frees CAPACITY, not a resource -- `live` went down, the idle set
+  -- did not grow -- and that is exactly the state `_wake_next` counts as
+  -- something to take: a woken waiter has permission to open one.
+  if retired > 0 then self:_wake_next() end
+  return retired
+end
+
 --- Refuses a caller whose execution is already over.
 ---
 --- THE HOLE F2 LEFT, and it cost an outage on the study box before anyone saw
@@ -225,6 +327,11 @@ function Pool:get()
       error("pool: the request deadline passed while waiting for a slot", 0)
     end
 
+    -- BEFORE THE IDLE SET IS READ, never after. A connection that has aged
+    -- out must not be the one this turn of the loop hands back, and the slot
+    -- it frees is capacity this same caller can immediately open into.
+    self:reap_idle()
+
     -- FIRST IN LINE, OR NOBODY IS. This one line is the fix.
     --
     -- `table.remove(self.idle)` used to run unconditionally, and that is how
@@ -257,6 +364,10 @@ function Pool:get()
         self:_wake_next()
         resource.pool = self
         resource.pooled = nil
+        -- It is out of the idle set, so it is not accruing idle age any more.
+        -- Only `created_at` still bounds it, which is what keeps a long
+        -- transaction from being mistaken for a stale socket.
+        resource.idle_since = nil
         return resource
       end
     end
@@ -294,6 +405,11 @@ function Pool:get()
       self.live = self.live + 1
       resource_or_err.pool = self
       resource_or_err.pooled = nil
+      -- Stamped where the resource comes into existence, and nowhere else:
+      -- `max_lifetime` is measured from the connect, not from the last time
+      -- somebody borrowed it, or a busy pool would keep a socket for ever by
+      -- refreshing its own clock.
+      resource_or_err.created_at = self.now()
 
       -- AND CHECKED AGAIN HERE, WHICH IS THE HOLE THE FIRST FIX MISSED.
       --
@@ -389,6 +505,7 @@ function Pool:put(resource)
 
   if keep then
     resource.pooled = true
+    resource.idle_since = self.now()
     self.idle[#self.idle + 1] = resource
   else
     resource.discarded = true
@@ -443,6 +560,10 @@ function Pool:stats()
   return {
     size = self.size, live = self.live, idle = #self.idle,
     reserved = self:reserved(), reaped = self.reaped,
+    -- Connections closed for age rather than for a verdict: a number that
+    -- rises steadily is the pool doing its job, and one that jumps is
+    -- something in front of the database reaping faster than `max_lifetime`.
+    retired = self.retired,
     -- How often a request had to queue for a connection, and for how long.
     waits = self.waits, waited = self.waited, waited_max = self.waited_max,
   }

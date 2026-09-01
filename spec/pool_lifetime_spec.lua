@@ -100,7 +100,13 @@ describe("a slot whose open never returned", function()
       local abandoned = coroutine.create(function() pool:get() end)
       coroutine.resume(abandoned)                          -- parks inside open()
     end
-    assert.equal(2, pool:stats().live, "the slots were taken")
+    -- `reserved`, not `live`: this pool counts a slot held by an `open` still
+    -- in flight separately from a resource that exists, because a pool
+    -- reporting one total cannot say whether it is busy or stuck. The claim
+    -- is unchanged -- both slots are taken and there is not one connection
+    -- behind them -- it is just spelled in the two numbers this pool keeps.
+    assert.equal(2, pool:stats().reserved, "the slots were taken")
+    assert.equal(0, pool:stats().live, "holding no connections at all")
     assert.equal(0, pool:stats().idle, "holding no connections at all")
 
     blackholed = false                                     -- the backend is back
