@@ -32,6 +32,8 @@ function M.new(options)
     gauges   = {},        -- [name|labels] = value
     counters = {},        -- [name|labels] = { name, labels, value }
     series   = {},        -- [name] = how many label combinations it holds
+    pools    = {},         -- list of { label, pool }, read at render time
+    pool_labels = {},      -- [label] = true, for the same bound counters have
     started  = time.now(),
   }, Registry)
 end
@@ -124,6 +126,142 @@ function Registry:counter(name, delta, labels)
 
   found.value = found.value + delta
   return found.value
+end
+
+-- ===================================================================== pools
+
+-- WHY A POOL IS READ AND NOT PUSHED.
+--
+-- `Pool` already keeps `waits`, `waited` and `waited_max` as plain fields and
+-- hands them out through `Pool:stats()`; nothing was missing from the pool.
+-- What was missing was a way for a scrape to reach them, and the two obvious
+-- ways to build one are both wrong here.
+--
+-- Pushing from `Pool:get` -- calling `registry:counter` on the wait path --
+-- would put a metrics call in the pool's hot path, which is measured: there
+-- is an allocation ceiling per request in `spec/allocation_spec.lua`, and a
+-- table per checkout to carry a label list would break it. It would also make
+-- the pool depend on the registry, so a pool could only be measured by a
+-- process that had one.
+--
+-- Sampling on a timer -- a coroutine reading `stats()` every second -- would
+-- be worse than either. `akkar/pool.lua` says in its own comment at the top of
+-- `Pool.new` that a `waited` sample is a measurement of the RUNNING
+-- SCHEDULER: a sampler is another thing on that scheduler, it reads while the
+-- numbers are moving, and it keeps reading on an idle process that nobody is
+-- scraping.
+--
+-- So the registry holds a reference and reads it inside `render()`, which is
+-- exactly what `serve`'s `sources` already does for a gauge -- the difference
+-- being that a pool answers with nine numbers at once and three of them are
+-- counters, which `sources` cannot express because a gauge is set and a
+-- counter is only ever incremented.
+--
+-- THE LABEL IS BOUNDED, for the reason `Registry:counter` bounds its own.
+-- A pool name is the application's string, so past `MAX_SERIES` distinct ones
+-- every further pool folds into `pool="<other>"` and its numbers are summed
+-- there. Two pools registered under one name sum as well, which is the right
+-- answer for both a counter and an occupancy gauge.
+local POOL_METRICS = {
+  { name = "akkar_pool_size", kind = "gauge", field = "size",
+    help = "Slots the pool may fill." },
+  { name = "akkar_pool_connections", kind = "gauge", field = "live",
+    help = "Connections that exist right now." },
+  { name = "akkar_pool_idle", kind = "gauge", field = "idle",
+    help = "Connections sitting in the idle set." },
+  { name = "akkar_pool_reserved", kind = "gauge", field = "reserved",
+    help = "Slots held by an open still in flight." },
+  { name = "akkar_pool_waits_total", kind = "counter", field = "waits",
+    help = "Checkouts that had to queue for a slot." },
+  { name = "akkar_pool_wait_seconds_total", kind = "counter", field = "waited",
+    help = "Seconds spent queued for a slot." },
+  { name = "akkar_pool_wait_seconds_max", kind = "gauge", field = "waited_max",
+    help = "Longest single wait for a slot observed so far." },
+  { name = "akkar_pool_retired_total", kind = "counter", field = "retired",
+    help = "Connections closed for age rather than for a verdict." },
+  { name = "akkar_pool_reaped_total", kind = "counter", field = "reaped",
+    help = "Slots recovered from an open nobody came back for." },
+}
+
+-- `waited_max` is a high-water mark, so pools sharing a label take the larger
+-- of the two rather than the sum of them.
+local POOL_MAX = { waited_max = true }
+
+--- Registers a pool to be READ at every scrape, under `pool="<name>"`.
+---
+--- The registry keeps a reference and calls `pool:stats()` from `render()`.
+--- Nothing is sampled, nothing is pushed, and the pool's checkout path is not
+--- touched -- see the note above for why each of those matters.
+---
+--- Anything with a `stats()` returning the fields `Pool:stats()` returns will
+--- do; the registry does not require `akkar.pool` specifically.
+---
+--- Returns the pool, so the call chains off a `db.connect{...}.pool`.
+function Registry:pool(name, pool)
+  if type(name) ~= "string" or name == "" then
+    error("akkar.metrics: pool name must be a non-empty string, got "
+          .. tostring(name), 2)
+  end
+  if type(pool) ~= "table" or type(pool.stats) ~= "function" then
+    error("akkar.metrics: " .. name .. " is not a pool: no stats() to read", 2)
+  end
+
+  -- Raised rather than folded, unlike a label value: registering a pool
+  -- happens once at boot, so a bad argument here is a startup failure the
+  -- author sees immediately, not a 500 in the middle of a request.
+  local label = name
+  if not self.pool_labels[label] then
+    local held = 0
+    for _ in pairs(self.pool_labels) do held = held + 1 end
+    if held >= MAX_SERIES then label = "<other>" end
+    self.pool_labels[label] = true
+  end
+
+  self.pools[#self.pools + 1] = { label = label, pool = pool }
+  return pool
+end
+
+-- Reads every registered pool once and folds them into one accumulator per
+-- label, sorted so two scrapes of unchanged state produce identical text.
+--
+-- A pool whose `stats()` raises is skipped rather than allowed to fail the
+-- scrape, for the reason `serve` already pcalls a gauge source: an
+-- instrument must not be able to take down the thing that reads it.
+function Registry:_pool_series()
+  local order, by_label = {}, {}
+  for _, entry in ipairs(self.pools) do
+    local ok, stats = pcall(entry.pool.stats, entry.pool)
+    if ok and type(stats) == "table" then
+      local acc = by_label[entry.label]
+      if not acc then
+        acc = { label = entry.label }
+        for _, metric in ipairs(POOL_METRICS) do acc[metric.field] = 0 end
+        by_label[entry.label] = acc
+        order[#order + 1] = entry.label
+      end
+      for _, metric in ipairs(POOL_METRICS) do
+        local value = tonumber(stats[metric.field]) or 0
+        if POOL_MAX[metric.field] then
+          if value > acc[metric.field] then acc[metric.field] = value end
+        else
+          acc[metric.field] = acc[metric.field] + value
+        end
+      end
+    end
+  end
+  table.sort(order)
+  local out = {}
+  for index, label in ipairs(order) do out[index] = by_label[label] end
+  return out
+end
+
+-- An integer renders bare and a float renders with six decimals, which is the
+-- resolution the histogram's `_sum` already uses. Without this a count that
+-- arrived as a float would scrape as `3.0`, and a sub-millisecond wait would
+-- scrape in Lua's scientific notation.
+local function number(value)
+  if math.type(value) == "integer" then return tostring(value) end
+  return string.format("%.6f", value)
 end
 
 function Registry:observe(method, route, status, seconds)
@@ -222,6 +360,22 @@ function Registry:render()
       local rendered = counter.labels and #counter.labels > 0
                        and labels_of(counter.labels) or ""
       line(counter.name .. rendered .. " " .. counter.value)
+    end
+  end
+
+  -- Read here, at scrape time. Grouped by metric name rather than by pool
+  -- because the exposition format requires every sample of one family to be
+  -- contiguous, and a scrape that interleaves two families is rejected.
+  local pools = self:_pool_series()
+  if #pools > 0 then
+    line ""
+    for _, metric in ipairs(POOL_METRICS) do
+      line("# HELP " .. metric.name .. " " .. metric.help)
+      line("# TYPE " .. metric.name .. " " .. metric.kind)
+      for _, acc in ipairs(pools) do
+        line(metric.name .. labels_of { { "pool", acc.label } } ..
+             " " .. number(acc[metric.field]))
+      end
     end
   end
 

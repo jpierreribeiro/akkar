@@ -724,6 +724,14 @@ end
 --- `live` is resources that EXIST; `reserved` is slots held by an open still
 --- in flight. Two numbers because a pool reporting one total cannot say
 --- whether it is busy or stuck.
+---
+--- READ, NOT PUSHED, and that is the whole reason the wait figures are plain
+--- fields incremented in `get` rather than a metrics call made there. The
+--- checkout path has a measured allocation ceiling (`spec/allocation_spec`),
+--- and a pool that had to hold a registry could only be measured by a process
+--- that had one. `Registry:pool` in `akkar/metrics.lua` keeps a reference and
+--- calls this from `render()`, so the numbers are read when a scrape asks for
+--- them and cost nothing when nobody does.
 function Pool:stats()
   return {
     size = self.size, live = self.live, idle = #self.idle,

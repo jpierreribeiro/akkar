@@ -19,6 +19,19 @@ local record memory
       ttl: function(Cache, string): integer
       command: function(Cache, string, ...: any): any
 
+      -- The fault surface. `fail` is an error reply and leaves the
+      -- connection healthy; `hang` is a command never answered; `drop` is the
+      -- transport gone, and everything after it fails.
+      on: function(Cache, string, function(Cache)): Cache
+      fail: function(Cache, string, ?string): Cache
+      hang: function(Cache, string, ?number): Cache
+      drop: function(Cache, string): Cache
+
+      -- What a pool's reuse predicate reads, with the meanings
+      -- `akkar.redis` gives them.
+      broken: boolean
+      in_flight: boolean
+
       sweep: function(Cache): integer
       size: function(Cache): integer
       reset: function(Cache): Cache
@@ -29,6 +42,11 @@ local record memory
    record Options
       -- Injectable so a test can move time without sleeping.
       now: function(): integer
+
+      -- The capacity model, honoured by advancing `akkar.time` rather than
+      -- by waiting: commands served per second, and service time each.
+      max_qps: number
+      latency_ms: number
    end
 
    new: function(?Options): Cache

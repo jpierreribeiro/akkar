@@ -18,8 +18,10 @@ local doctor = require "akkar.doctor"
 - [Levels](#levels)
 - [doctor.check_app(app, config, report)](#doctorcheck_appapp-config-report)
 - [doctor.check_capabilities(config, report)](#doctorcheck_capabilitiesconfig-report)
+- [doctor.check_descriptors(report)](#doctorcheck_descriptorsreport)
 - [doctor.check_environment(report)](#doctorcheck_environmentreport)
 - [doctor.cli(options)](#doctorclioptions)
+- [doctor.descriptor_finding(soft, hard)](#doctordescriptor_findingsoft-hard)
 - [doctor.format(report)](#doctorformatreport)
 - [doctor.new_report()](#doctornew_report)
 - [doctor.report(app, config, options)](#doctorreportapp-config-options)
@@ -92,9 +94,10 @@ that state anyway.
 ## doctor.check_app(app, config, report)
 
 Adds findings about an application: how many routes it has (counting mounted
-sub-apps and hosts), which routes can never match, and which of
-`body_limit`, `timeout` and `shutdown_grace` are in force, as numbers, with
-`configured` or `default` beside each.
+sub-apps and hosts), which routes can never match, every setting whose value
+the runtime would refuse, and which of `body_limit`, `timeout` and
+`shutdown_grace` are in force, as numbers, with `configured` or `default`
+beside each.
 
 A route can never match when an earlier dynamic route of the same method has a
 pattern that covers it. `/users/:id` followed by `/users/:name` is the usual
@@ -107,6 +110,31 @@ one is made when it is absent.
 
 **Adds a `fail`** with the title `not an akkar app` when `app` is not the value
 `akkar.new()` returned.
+
+**Adds a `fail` per setting whose value the runtime cannot use**, with the
+message `akkar.check_settings` itself produces — the same function
+`app:run{}` calls, which is exported precisely so a caller that must not bind a
+port can ask. One call per setting, because `check_settings` raises on the
+first value it rejects and a report that named only the first would cost a
+second deploy:
+
+```
+FAIL  timeout is not a value the runtime can use
+      app:run{}: timeout must be a number of seconds, or false for no deadline; got string "30"
+```
+
+**Adds a finding about the C driver when `AKKAR_DRIVER=pq`** — `ok` when
+`akkar.pq` loads, `warn` when it does not, because `db.connect` raises at the
+first *connection* rather than at load: a refusal to boot with
+`check_capabilities` on, and a 500 in the middle of a run with it off.
+
+That environment variable is the only driver signal this check can read.
+`driver = "pq"` is given to `db.connect{}`, and what reaches `check_app` is the
+factory that closed over it, so the name is not in the config — and a `driver`
+key on the run config is not an alternative, because `app:run{}` rejects any
+option it does not know. With `probe` on, the in-config case is still caught:
+acquiring the capability raises the rock's own install message and that is
+already a `fail`.
 
 ```lua
 local akkar  = require "akkar"
@@ -166,18 +194,50 @@ for _, finding in ipairs(report.findings) do
 end
 ```
 
+## doctor.check_descriptors(report)
+
+Adds exactly one finding, in the area `descriptors`, about the descriptor
+limits this process is running under and the `max_concurrent` akkar derives
+from them.
+
+This is the ceiling that decides how many requests the process can hold at
+once, and nothing printed it before. `akkar.descriptor_ceiling` caps
+`max_concurrent` at 66% of the **soft** limit, one descriptor per in-flight
+request, so the common `ulimit -n 1024` yields 675 — a number nobody chose,
+and the whole capacity of the process, pools and log files included.
+
+Never a `fail`: a descriptor limit is an operational fact, not a broken
+install, and a deploy gate should not refuse a service over it.
+
+**Returns** the report.
+
 ## doctor.check_environment(report)
 
 Adds findings about the machine: the Lua version, whether `math.type` exists,
-each required rock, each optional rock, and the OpenSSL version behind
-`luaossl`, decoded from its packed integer.
+each required rock, each optional rock, the OpenSSL version behind `luaossl`,
+decoded from its packed integer, and the descriptor limits
+([`check_descriptors`](#doctorcheck_descriptorsreport)).
 
 Required: `cqueues`, `lua-http`, `lua-cjson`. Absence is a `fail`.
 
-Optional: `pgmoon`, `luasocket` (for `mime`), `luaossl`, `tl`, `busted`.
-Absence is a `warn`, except that `mime` missing while `pgmoon` is installed is
-a `fail`: the first query would die with a `require` traceback naming a module
-nobody asked for.
+Optional: `pgmoon`, `luasocket` (for `mime`), `luaossl`, `tl`, `busted`,
+`akkar-pq`. Absence is a `warn`, except that `mime` missing while `pgmoon` is
+installed is a `fail`: the first query would die with a `require` traceback
+naming a module nobody asked for.
+
+`akkar-pq` is two halves and only one of them ships with akkar: `akkar/pq.lua`
+is always there, `pq_native.so` is a separate rock. So its two failures are
+told apart rather than both being called "not installed":
+
+| what happened | reported as |
+|---|---|
+| `pq_native.so` is not built | `warn akkar-pq` — the Lua half is here, `db.connect { driver = "pq" }` would raise at the first connection |
+| `pq_native.so` was built for a different Lua | `warn akkar-pq is built for the WRONG Lua`, with the marker check's own message |
+
+The second one matters because `akkar/pq.lua` refuses that `.so` at load
+rather than segfaulting on the first call — and telling somebody to install a
+rock they already have, for the Lua they already run, wastes the afternoon this
+file exists to save.
 
 A version is read from the module's own `VERSION`, `_VERSION`, `version` or
 `_version` field, and reported as `version not declared` where there is none.
@@ -199,6 +259,40 @@ Runs the examination, prints it, and exits.
 
 **Returns** the report, but only when `exit = false`. Otherwise it does not
 return: it calls `os.exit(0)` when healthy and `os.exit(1)` when not.
+
+## doctor.descriptor_finding(soft, hard)
+
+The rule [`check_descriptors`](#doctorcheck_descriptorsreport) applies, as a
+pure function of the two numbers from `/proc/self/limits`.
+
+**Returns** `level, title, detail, fix`.
+
+| given | level | says |
+|---|---|---|
+| `soft >= 4096` | `ok` | the derived ceiling, and that an in-flight request holds one descriptor |
+| `soft < 4096` | `warn` | that the soft limit is the whole capacity of the process, and the three ways to raise it: `ulimit -n`, `LimitNOFILE=` in a systemd unit, `--ulimit nofile=` on a container |
+| `soft = nil` | `warn` | that **akkar derives no ceiling either** — `akkar.descriptor_limits` returns nil off Linux, so `max_concurrent` is never set and the server accepts until the kernel refuses. `docs/PLATFORMS.md` carries this as an open decision |
+
+`hard` is used for one thing: whether `ulimit -n` can raise the soft limit
+without root, which decides whether the fix is a shell line or a unit file.
+
+Separate from the read because a test on a machine whose soft limit is
+1,048,576 can never provoke the warning that matters. The numbers go in, so the
+rule is checkable at any limit:
+
+```lua
+local doctor = require "akkar.doctor"
+
+-- What a machine at the usual `ulimit -n 1024` would be told.
+local level, title, _, fix = doctor.descriptor_finding(1024, 1048576)
+print(level, title)
+print(fix)
+```
+
+```
+warn	max_concurrent 675, from a soft limit of 1024
+`ulimit -n 8192` in the shell that starts it; `LimitNOFILE=8192` in the systemd unit; `--ulimit nofile=8192:8192` on the container
+```
 
 ## doctor.format(report)
 

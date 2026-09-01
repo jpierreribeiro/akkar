@@ -42,6 +42,12 @@ the app declares one **is**, because the server would refuse to boot anyway.
 local bitwise = require "akkar.bitwise"
 local M = {}
 
+-- `akkar` itself is required lazily, in one place, and not at the top of this
+-- file: the doctor's job is to run in a tree where something is missing, and
+-- a top-level require of the framework would make a broken install fail with
+-- a traceback instead of a report naming what is broken.
+local function akkar_module() return require "akkar" end
+
 -- ==================================================================== findings
 local Report = {}
 Report.__index = Report
@@ -103,6 +109,21 @@ end
 local REQUIRED = {
   { name = "cqueues",   why = "the event loop" },
   { name = "akkar.vendor.http.server", why = "the HTTP server (vendored)" },
+  -- LISTED SEPARATELY BECAUSE IT IS NO LONGER PROVED BY THE LINE ABOVE.
+  --
+  -- `server.lua` used to require `h2_connection` at the top, so loading the
+  -- server parsed the whole h2 half -- `h2_stream`, `hpack`, `h2_error`,
+  -- `vendor/http/bit` -- and any syntax or load error in it surfaced right
+  -- here. That require is now deferred to `new_server`, for ~19 ms of boot,
+  -- and the proof went with it.
+  --
+  -- This entry buys it back in the one place that already knows how to
+  -- report a module that will not load. It is REQUIRED rather than OPTIONAL
+  -- on purpose: h2 is not an optional install here, it is vendored in the
+  -- tree, so a copy that does not load is a broken checkout, not a missing
+  -- rock.
+  { name = "akkar.vendor.http.h2_connection",
+    why = "the HTTP/2 half (vendored), loaded lazily by the server" },
   { name = "cjson",     why = "JSON encoding", rock = "lua-cjson" },
 }
 
@@ -113,6 +134,34 @@ local OPTIONAL = {
   { name = "openssl",   why = "TLS", rock = "luaossl" },
   { name = "tl",        why = "Teal type checking", rock = "tl" },
   { name = "busted",    why = "the test suite" },
+  -- THE C DRIVER, WHICH IS TWO HALVES AND ONLY ONE OF THEM SHIPS HERE.
+  --
+  -- `akkar/pq.lua` is in every install; `pq_native.so` is a separate rock.
+  -- So "akkar.pq does not load" has two entirely different causes and one of
+  -- them is not "not installed" -- which is why this entry diagnoses its own
+  -- failure instead of taking the generic message below.
+  --
+  -- A `.so` BUILT FOR THE WRONG LUA is the one worth naming. `akkar/pq.lua`
+  -- refuses it at load with a marker check, because the alternative is a
+  -- segfault on the first call rather than an error -- and a doctor that
+  -- reported that as "not installed" would send somebody to rebuild a rock
+  -- they already have, for the version they already have.
+  { name = "akkar.pq",  rock = "akkar-pq",
+    why = "the C Postgres driver, db.connect { driver = 'pq' }",
+    diagnose = function(err)
+      if err:find("was built for Lua", 1, true) then
+        return "akkar-pq is built for the WRONG Lua",
+          err:match "^[^\n]*",
+          "luarocks install akkar-pq PQ_INCDIR=$(pg_config --includedir), " ..
+          "or remove the stale pq_native.so"
+      end
+      return "akkar-pq",
+        "the Lua half is here and pq_native.so is not, so " ..
+        "db.connect { driver = 'pq' } would raise at the first connection: " ..
+        (err:match "^[^\n]*"):gsub(":%s*$", ""),
+        "luarocks install akkar-pq PQ_INCDIR=$(pg_config --includedir) " ..
+        "-- or leave the default pgmoon driver, which needs no C module"
+    end },
 }
 
 local function present(name)
@@ -185,6 +234,10 @@ function M.check_environment(report)
         entry.why .. ", and " .. entry.critical_for ..
         " IS installed -- the first query will die with a require traceback",
         "luarocks install " .. (entry.rock or entry.name))
+    elseif entry.diagnose then
+      -- An entry that knows why its own load failed says so; "not installed"
+      -- is a guess, and here it would be the wrong one half the time.
+      report:warn("optional", entry.diagnose(tostring(mod)))
     else
       report:warn("optional", entry.rock or entry.name,
         "not installed -- " .. entry.why,
@@ -214,6 +267,94 @@ function M.check_environment(report)
     end
   end
 
+  M.check_descriptors(report)
+
+  return report
+end
+
+-- =============================================================== descriptors
+--
+-- THE LIMIT THAT DECIDES HOW MANY REQUESTS THIS PROCESS CAN HOLD AT ONCE, and
+-- nothing told an operator what it was.
+--
+-- `akkar.descriptor_ceiling` caps `max_concurrent` at 66% of the SOFT
+-- descriptor limit, one descriptor per in-flight request. On the common
+-- `ulimit -n 1024` that is 675 -- a number nobody chose, printed nowhere, and
+-- the whole capacity of the process. The consequence is not academic:
+-- `docs/HANDOFF.md` records the full spec suite failing on this laptop's
+-- default 1024 in a 42-error cascade, passing only after `ulimit -n 8192`.
+-- This check would have said so first.
+--
+-- Three ways to raise it, and which one applies depends on how the service is
+-- started, so all three are named rather than guessed at.
+local RAISE_IT =
+  "`ulimit -n 8192` in the shell that starts it; `LimitNOFILE=8192` in the " ..
+  "systemd unit; `--ulimit nofile=8192:8192` on the container"
+
+local function describe_limit(n)
+  if n == math.huge then return "unlimited" end
+  return tostring(math.floor(n))
+end
+
+--- What the descriptor limits mean, as a PURE FUNCTION OF THE TWO NUMBERS,
+--- returning `level, title, detail, fix`.
+---
+--- Pure on purpose. The soft limit on the machine running the suite is
+--- 1,048,576, so a test that reads `/proc` can never provoke the warning that
+--- matters -- the one about `ulimit -n 1024`. Handing the numbers in means the
+--- rule is testable at any limit, and `check_descriptors` below is the only
+--- part that depends on the box it runs on.
+---
+--- `soft = nil` is the off-Linux case, and it is a warning about akkar rather
+--- than about the machine: `akkar.descriptor_limits` reads `/proc/self/limits`
+--- and returns nil where there is none, so no ceiling is derived at all.
+function M.descriptor_finding(soft, hard)
+  local akkar = akkar_module()
+
+  if not soft then
+    return "warn", "no descriptor limit could be read",
+      "`/proc/self/limits` is not readable here, and akkar derives NO " ..
+      "ceiling from it either: `akkar.descriptor_limits` returns nil off " ..
+      "Linux, so `max_concurrent` is left unset and the server accepts " ..
+      "connections until the kernel refuses -- which is not a clean " ..
+      "failure. `docs/PLATFORMS.md` carries deriving a limit off Linux " ..
+      "(`ulimit -n` is POSIX) as an open decision",
+      "set `max_concurrent` explicitly in `app:run{}` on this platform"
+  end
+
+  local ceiling = akkar.descriptor_ceiling(soft)
+  local room = hard and hard > soft
+    and (" The hard limit is " .. describe_limit(hard) ..
+         ", so `ulimit -n` can raise the soft one without root.")
+    or ""
+
+  local title = ("max_concurrent %d, from a soft limit of %d")
+    :format(ceiling, soft)
+
+  if soft >= 4096 then
+    return "ok", title,
+      "akkar caps itself at 66% of the soft limit when the application " ..
+      "sets no `max_concurrent`; an in-flight request holds one descriptor, " ..
+      "its own connection, and the third held back is for everything else " ..
+      "-- pools, log files, the listening socket"
+  end
+
+  return "warn", title,
+    ("%d descriptors is the WHOLE capacity of this process, not a budget " ..
+     "for requests alone: the derived ceiling is %d, and the pools, the log " ..
+     "files and the listening socket come out of the same %d. 1024 is the " ..
+     "usual default and this project has already been bitten by it -- " ..
+     "`docs/HANDOFF.md` records the spec suite dying in a 42-error cascade " ..
+     "on exactly this number.%s"):format(soft, ceiling, soft, room),
+    RAISE_IT
+end
+
+--- The same finding, against the limits this process actually has.
+function M.check_descriptors(report)
+  report = report or new_report()
+  local akkar = akkar_module()
+  local level, title, detail, fix = M.descriptor_finding(akkar.descriptor_limits())
+  report:add(level, "descriptors", title, detail, fix)
   return report
 end
 
@@ -289,18 +430,59 @@ function M.check_app(app, config, report)
 
   shadowed_routes(app, report)
 
+  -- EVERY SETTING WHOSE VALUE THE RUNTIME CANNOT USE, checked here rather
+  -- than discovered at `app:run`.
+  --
+  -- `akkar.check_settings` is the same function the server calls, exported
+  -- precisely so a caller that must not bind a port can ask -- and the doctor,
+  -- which is the deploy gate this project tells people to gate on, was not
+  -- asking. `timeout = "30"` passed `akkar doctor` and failed the deploy.
+  --
+  -- ONE CALL PER SETTING, because `check_settings` raises on the FIRST value
+  -- it rejects: handing it the whole table reports one bad setting and hides
+  -- the rest, which is the shape that costs a second deploy. The keys are
+  -- sorted so a report of two failures reads the same way twice.
+  --
+  -- The message is the runtime's own, not a second wording of it. `error`
+  -- there is raised at level 3, so it arrives with the caller's position
+  -- glued to the front; the prefix is cut back to where the real sentence
+  -- starts rather than printing a line number inside this file.
+  local WHAT = "app:run{}"
+  local rejected = {}
+  local keys = {}
+  for key in pairs(config) do keys[#keys + 1] = tostring(key) end
+  table.sort(keys)
+  for _, key in ipairs(keys) do
+    local ok, message = pcall(akkar_module().check_settings,
+                              { [key] = config[key] }, WHAT)
+    if not ok then
+      rejected[key] = true
+      message = tostring(message)
+      local at = message:find(WHAT, 1, true)
+      report:fail("settings", key .. " is not a value the runtime can use",
+                  at and message:sub(at) or message,
+                  "fix it before deploying: `app:run{}` raises this at boot, " ..
+                  "so the server would not come up")
+    end
+  end
+
   -- Which production defaults are actually in force, stated as numbers rather
   -- than as "defaults applied". A limit nobody can see is a limit nobody
   -- checks against.
-  local defaults = require("akkar").defaults
+  local defaults = akkar_module().defaults
   local settings = {
     { "body_limit", "bytes" }, { "timeout", "s" }, { "shutdown_grace", "s" },
   }
   for _, entry in ipairs(settings) do
     local key, unit = entry[1], entry[2]
-    local value = config[key] or defaults[key]
-    local source = config[key] and "configured" or "default"
-    report:ok("settings", key .. " = " .. tostring(value) .. " " .. unit, source)
+    -- A value the runtime refuses is not "in force": the server would not
+    -- start with it. Printing `ok timeout = 30 s` under a FAIL about the same
+    -- setting is the doctor contradicting itself in the same paragraph.
+    if not rejected[key] then
+      local value = config[key] or defaults[key]
+      local source = config[key] and "configured" or "default"
+      report:ok("settings", key .. " = " .. tostring(value) .. " " .. unit, source)
+    end
   end
 
   if config.check_capabilities == false then
@@ -309,6 +491,43 @@ function M.check_app(app, config, report)
       "touches it rather than at boot",
       "leave it on unless this service must come up degraded")
   end
+
+  -- THE DRIVER THIS DEPLOYMENT ASKED FOR, AGAINST THE ONE THAT IS INSTALLED.
+  --
+  -- What the doctor can see here is limited, and naming the signal it does
+  -- read beats pretending to read the one it cannot. `driver = "pq"` is given
+  -- to `db.connect{}`; what arrives in this config is the factory that closed
+  -- over that table, so the driver name is not in it -- and a `driver` key on
+  -- the run config is not an alternative, because `app:run{}` rejects any
+  -- option it does not know. So the visible signal is `AKKAR_DRIVER`, which
+  -- `bench/study/apps/serve.lua` and the deploy scripts set, and if it does
+  -- not name pq nothing is reported and nothing is guessed.
+  --
+  -- The in-config case is not lost: with `probe` on, `check_capabilities`
+  -- acquires the db and `db.connect` raises the rock's own install message,
+  -- which is already reported as a failure. This covers `--no-probe` and the
+  -- bench path.
+  --
+  -- Worth reporting because of where the failure lands otherwise: at the
+  -- first CONNECTION, not at load. With `check_capabilities` on that is a
+  -- refusal to boot; with it off it is, in the words of the bench harness,
+  -- "a 500 in the middle of a timed run" -- after the time has been spent.
+  local wants_pq = os.getenv "AKKAR_DRIVER" == "pq"
+  if wants_pq then
+    local loaded, why = present "akkar.pq"
+    if loaded then
+      report:ok("settings", "driver = pq",
+        "akkar.pq loads, so the C driver is the one this app will use")
+    else
+      report:warn("settings", "driver = pq, and akkar.pq does not load",
+        "the driver was asked for and is not usable here: " ..
+        (tostring(why):match "^[^\n]*"):gsub(":%s*$", "") ..
+        " -- db.connect raises at the first connection, not at load",
+        "luarocks install akkar-pq PQ_INCDIR=$(pg_config --includedir), " ..
+        "or drop the driver option and use pgmoon")
+    end
+  end
+
   -- WHICH HTTP VERSIONS THIS SERVER WILL ACTUALLY SPEAK.
   --
   -- This check exists because of a failure that reports nothing. akkar builds
@@ -329,13 +548,32 @@ function M.check_app(app, config, report)
       "call ctx:setAlpnSelect(require('akkar.vendor.http.server').alpn_select) " ..
       "on it, or pass `tls = { certificate = ..., key = ... }` and let akkar " ..
       "build the context")
-  elseif config.tls then
-    report:ok("settings", "HTTP/1.1 and HTTP/2",
-      "h2 is negotiated by ALPN; a client that does not ask for it gets h1")
-  elseif config.h2c then
-    report:ok("settings", "HTTP/1.1 and cleartext HTTP/2",
-      "h2c costs one read per connection to sniff the preface, h1 " ..
-      "connections included")
+  elseif config.tls or config.h2c then
+    -- AND THE CLAIM IS CHECKED, NOT DEDUCED FROM THE CONFIG.
+    --
+    -- `server.lua` loads `h2_connection` lazily now -- at `new_server`, for
+    -- exactly these configurations -- so "this server speaks HTTP/2" is no
+    -- longer something the config alone can establish. Read off the config
+    -- it would be a claim about a tree whose `hpack.lua` might not parse,
+    -- and the doctor would be asserting the very thing it exists to catch.
+    -- So it is asked, here, of the module that would have to work.
+    local h2_ok, h2_err = present "akkar.vendor.http.h2_connection"
+    if not h2_ok then
+      report:fail("settings",
+        config.tls and "HTTP/2 is configured and the h2 half does not load"
+                    or "h2c is on and the h2 half does not load",
+        "the server would accept the connection and then fail it: " ..
+        (tostring(h2_err):match "^[^\n]*"):gsub(":%s*$", ""),
+        "this is vendored code, not a rock -- check the tree under " ..
+        "akkar/vendor/http/ is complete and parses")
+    elseif config.tls then
+      report:ok("settings", "HTTP/1.1 and HTTP/2",
+        "h2 is negotiated by ALPN; a client that does not ask for it gets h1")
+    else
+      report:ok("settings", "HTTP/1.1 and cleartext HTTP/2",
+        "h2c costs one read per connection to sniff the preface, h1 " ..
+        "connections included")
+    end
   else
     report:ok("settings", "HTTP/1.1 only",
       "no TLS, so there is no ALPN to negotiate h2 with; `h2c = true` " ..

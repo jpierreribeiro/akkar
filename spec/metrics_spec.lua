@@ -10,6 +10,8 @@ package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local akkar   = require "akkar"
 local metrics = require "akkar.metrics"
+local cqueues = require "cqueues"
+local Pool    = require "akkar.pool"
 
 local function count_series(text, name)
   local n = 0
@@ -202,6 +204,129 @@ describe("memory metrics", function()
     assert.is_true(after > before,
       string.format("heap did not grow: %.0f -> %.0f bytes", before, after))
     ballast = nil
+  end)
+end)
+
+describe("pool metrics", function()
+  --[[
+  THE MEASUREMENT THIS EXISTS TO MAKE.
+
+  `bench/study/RESULTS.md` records four predictions for the saturation sweep
+  and marks the third -- "time waiting for a connection becomes the majority
+  of p99 above 2x capacity" -- as **not measured**, because the counters added
+  to `Pool:get` for exactly that question were never published anywhere a
+  scrape could read them. `Pool:stats()` had them all along; the registry had
+  no way to ask.
+
+  So the case is the question: drive a pool until a checkout has to queue,
+  scrape, and read the wait back out.
+  ]]
+
+  --- A pool of `size` trivial resources, as `spec/pool_abandoned_wait_spec`
+  --- builds one: the mechanism under test is the pool's, not Postgres's.
+  local function pool_of(size)
+    local opened = 0
+    return Pool.new(function()
+      opened = opened + 1
+      return { id = opened }
+    end, size)
+  end
+
+  --- Holds the pool's only slot for `hold` seconds while a second caller
+  --- tries to take it, so the second caller must queue.
+  local function contend(pool, hold)
+    local cq = cqueues.new()
+    cq:wrap(function()
+      local held = pool:get()
+      cqueues.sleep(hold)
+      pool:put(held)
+    end)
+    cq:wrap(function()
+      cqueues.sleep(hold / 5)         -- let the holder take the slot first
+      pool:put(pool:get())
+    end)
+    assert(cq:loop(5))
+  end
+
+  it("publishes the wait a saturated pool imposed", function()
+    local pool = pool_of(1)
+    local registry = metrics.new()
+    registry:pool("db", pool)
+
+    -- Before any contention the series exist and are honestly zero: a scrape
+    -- that omits a counter until it fires reads as a gap in the graph.
+    assert.is_truthy(registry:render():find(
+      'akkar_pool_waits_total{pool="db"} 0', 1, true))
+
+    contend(pool, 0.05)
+
+    local text = registry:render()
+    assert.is_truthy(text:find('akkar_pool_waits_total{pool="db"} 1', 1, true),
+      "the checkout that queued was not counted")
+
+    local waited = tonumber(text:match 'akkar_pool_wait_seconds_total{pool="db"} (%S+)')
+    local longest = tonumber(text:match 'akkar_pool_wait_seconds_max{pool="db"} (%S+)')
+    assert.is_true((waited or 0) > 0,
+      "akkar_pool_wait_seconds_total scraped as " .. tostring(waited))
+    assert.is_true((longest or 0) > 0,
+      "akkar_pool_wait_seconds_max scraped as " .. tostring(longest))
+
+    -- Occupancy beside the wait, or the wait cannot be read: a queue against
+    -- one slot and a queue against fifty are different findings.
+    assert.is_truthy(text:find('akkar_pool_size{pool="db"} 1', 1, true))
+    assert.is_truthy(text:find('akkar_pool_idle{pool="db"} 1', 1, true))
+    assert.is_truthy(text:find("# TYPE akkar_pool_wait_seconds_total counter", 1, true))
+    assert.is_truthy(text:find("# TYPE akkar_pool_size gauge", 1, true))
+  end)
+
+  it("reads the pool at render time, not when it was registered", function()
+    -- The distinction the design turns on. A sampler or a push would have
+    -- fixed the number at some earlier moment; this has to answer for the
+    -- pool as it is when the scrape arrives.
+    local pool = pool_of(1)
+    local registry = metrics.new()
+    local app = akkar.new()
+    registry:pool("db", pool)
+    registry:serve(app, "/metrics")
+
+    local before = tonumber(app:test():get("/metrics").raw
+      :match 'akkar_pool_waits_total{pool="db"} (%S+)')
+    contend(pool, 0.05)
+    local after = tonumber(app:test():get("/metrics").raw
+      :match 'akkar_pool_waits_total{pool="db"} (%S+)')
+
+    assert.equal(0, before)
+    assert.equal(1, after)
+  end)
+
+  it("bounds the pool label the way a counter's label is bounded", function()
+    -- A pool name is the application's string, so it gets the same treatment
+    -- an application counter's label value gets: past the limit it folds, and
+    -- the folded pools sum rather than overwrite each other.
+    local registry = metrics.new()
+    for i = 1, 200 do
+      local pool = Pool.new(function() return {} end, 3)
+      registry:pool("pool-" .. i, pool)
+    end
+    local text = registry:render()
+    assert.is_true(count_series(text, "akkar_pool_size") <= 65,
+      "akkar_pool_size minted " .. count_series(text, "akkar_pool_size") .. " series")
+    -- 136 folded pools of three slots each, summed under one series.
+    assert.is_truthy(text:find('akkar_pool_size{pool="<other>"} 408', 1, true))
+  end)
+
+  it("does not let a broken pool fail the scrape", function()
+    local registry = metrics.new()
+    local app = akkar.new()
+    registry:pool("wedged", { stats = function() error "no" end })
+    registry:serve(app, "/metrics")
+    assert.equal(200, app:test():get("/metrics").status)
+  end)
+
+  it("refuses something that is not a pool, at the call site", function()
+    local registry = metrics.new()
+    assert.has_error(function() registry:pool("db", {}) end)
+    assert.has_error(function() registry:pool(nil, pool_of(1)) end)
   end)
 end)
 

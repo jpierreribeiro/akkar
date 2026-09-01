@@ -48,7 +48,7 @@ factory returns; `fake` is an `akkar.db.memory` instance.
 | [`fake:transaction`](#faketransactionfn) | method |
 | [`fake:unscoped`](#fakeunscoped) | method |
 | [`memory.factory`](#memoryfactoryconfigure) | function |
-| [`memory.new`](#memorynew) | function |
+| [`memory.new`](#memorynewoptions) | function |
 
 Also on this page: [The pool](#the-pool), [The pq driver](#the-pq-driver) and
 [Not here](#not-here).
@@ -555,6 +555,11 @@ the callable shape `app:run{}` and `app:test{}` expect for `db`.
 Every call returns the same instance, so a test can program it once and assert
 on it afterwards through `factory.instance`.
 
+`configure` is a function that programs the fake, as above. It may instead be a
+table, in which case it is [`memory.new`](#memorynewoptions)'s options — so
+`memory.factory { max_qps = 1500 }` reads the way the rest of the framework
+does. Both together is `memory.factory(options, program)`.
+
 **Returns** a callable table with an `instance` field.
 
 ```lua
@@ -576,20 +581,72 @@ print(res.status, res.body.title)
 print(factory.instance:received "ref_db_tasks")
 ```
 
-### memory.new()
+### memory.new(options)
 
-A fresh instance with nothing programmed.
+A fresh instance with nothing programmed. `options` may be omitted.
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `max_qps` | number | none | how many statements the server runs per second |
+| `latency_ms` | number | none | how long each statement takes |
 
 Passing the instance itself as `db` works too: `app:test{}` accepts a table as
 well as a factory, and every request then shares it.
 
 **Returns** a Memory instance.
 
+**Raises** when `max_qps` is not greater than zero, or `latency_ms` is
+negative.
+
 ```lua
 local memory = require "akkar.db.memory"
 
 local fake = memory.new()
 print(pcall(function() return fake:one "select 1" end))
+```
+
+#### Capacity: max_qps and latency_ms
+
+The two together are a database that is slow, or saturated, or both, without
+one existing — so a handler can be tested against the dependency a capacity
+diagram describes rather than against one that always answers instantly.
+
+They are **one queue, not two delays added together**. A statement occupies the
+server for `latency_ms`, and `max_qps` says how often a new one may start;
+whichever is the tighter constraint is the one a caller feels. At 1500/s and
+8 ms the service time binds, because 8 ms of work cannot be issued 1500 times a
+second. At 50/s and 8 ms the rate binds.
+
+`begin` and `commit` are charged like anything else, because they are round
+trips on a real server.
+
+**The wait goes through [akkar.time](time.md), never through a wall clock of
+its own.** Under `akkar.time.manual` a modelled second passes instantly, so a
+test stays deterministic and fast; under the real clock the same numbers cost
+real seconds. One configuration, and which behaviour you get is decided by
+which clock is installed. (`fake:hang` is deliberately the exception — see
+below.)
+
+It is a model and it says so. A real server's service time depends on the plan,
+the cache and the locks it is waiting on. This reproduces a queue with a fixed
+service rate, which is what a capacity diagram is drawn from — and the point of
+one number configuring both is that the prediction and the measurement can then
+be compared and found to disagree.
+
+```lua
+local memory = require "akkar.db.memory"
+local time   = require "akkar.time"
+
+local clock   = time.manual { monotime = 0 }
+local restore = time.set(clock)
+
+local fake = memory.new { max_qps = 1500, latency_ms = 8 }
+fake:on("^select", { { id = 1 } })
+
+for i = 1, 10 do fake:many "select 1" end
+
+print(("%.3f"):format(clock.monotime()))   --> 0.080, and nothing waited
+restore()
 ```
 
 ### Memory
@@ -682,6 +739,10 @@ Programs a matching query to wait `seconds` (60 by default) and then raise
 
 The wait is real and it yields, which is the point: it stages a coroutine
 abandoned mid-query, which raising immediately does not.
+
+**It waits on the real clock even when a manual one is installed**, which is
+the opposite of what `latency_ms` does. A manual clock would collapse the wait
+to nothing and `hang` would quietly become `fail` under another name.
 
 **Returns** the instance.
 

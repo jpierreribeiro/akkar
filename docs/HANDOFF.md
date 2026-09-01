@@ -105,6 +105,29 @@ stopped again after verification to restore the initial machine state.
    is not a security boundary. A process per tenant measured 28 ms to first
    response and 12.8 MB resident when idle; a process plus Landlock and
    seccomp-bpf is the direction if hostile code is in scope.
+
+> **Both numbers are withdrawn, 1 Sep 2026.** Neither survived being checked
+> against the tree.
+>
+> **28 ms has no source.** It appears in three handoffs and traces to nothing —
+> not to a bench script, not to a results file, not to the commit it is
+> attributed to. The measured figures are `bench/runtime/RESULTS.md:167-174`:
+> **21 ms** for `akkar` alone and **29 ms** for a complete application, five
+> runs each on the study box with a 2 ms poll. `docs/labs/DALIVIM-INTEGRATION.md`
+> already said 29. Nothing depended on the difference, which is why nobody
+> caught it.
+>
+> **12.8 MB is a PEAK under grading, relabelled as idle.** `4020210` measured
+> 12.8 MB *peak* RSS against a 256 MB address-space cap while grading, at
+> 40-100 ms per grading, in `~/Desktop/akkar-exercise-spike/` — a directory
+> outside this repository that no longer exists. Measured idle RSS (D2) is
+> 11.4 MB, 13.3 MB and 14.1 MB across three runs; 12.8 is none of them. A peak
+> and an idle figure are not interchangeable.
+>
+> And neither figure was ever about the thing being decided. Both describe an
+> akkar HTTP server booting and answering. The decision is about a forked child
+> under Landlock and seccomp, which has no implementation, so its cost has not
+> been measured by anyone.
 3. Decide the compatibility policy and publish to luarocks.org. Neither is a
    code defect, and no release was made here.
 
@@ -131,6 +154,46 @@ process is the boundary; `akkar.vm` remains for trusted in-application hooks.
 was deferred. Roughly 46 ms is in the HTTP server stack. The h2 connection and
 HPACK pieces are only needed after h2 negotiation, so the same deferral should
 be measured. The profiler is `bench/study/boot-profile.lua`.
+
+> **The 46 ms is not what a deferral would save, 1 Sep 2026.** It is the whole
+> HTTP server subtree, and most of that subtree is on the HTTP/1.1 path. The
+> deferrable part is `h2_connection`, `h2_stream`, `hpack`, `h2_error` and
+> `vendor/http/bit`: **five modules, and about 19 ms of 47.6** on the machine
+> this was re-profiled on.
+>
+> What stays is `lpeg_patterns`, 17.3 ms of it, and it is not deferrable as
+> written: `akkar/vendor/http/util.lua:2-4` and `h1_stream.lua:7` build their
+> grammars into module-level locals at load time, and every HTTP/1.1 request
+> goes through both. Deferring that means lazy pattern construction inside each
+> parse function -- a restructure of vendored upstream code that buys nothing
+> for any application that serves a single request.
+
+> **Done, and the 19 ms did not survive measurement, 1 Sep 2026.**
+> `akkar/vendor/http/server.lua` now reaches `h2_connection` through a memoised
+> file-local, in the shape `akkar/init.lua` uses for WebSocket, and forces the
+> load in `new_server` when `tbl.version == 2 or tbl.h2c or tbl.tls ~= false`.
+>
+> The forcing site is the whole design and is written up in the file. A
+> `require` inside `wrap_socket` would be swallowed by the `xpcall` in
+> `add_socket` -- h2 silently broken in production, HTTP/1.1 serving normally --
+> so the load happens where throwing is already the contract. `listen` was
+> rejected for it: its own comment says you need not call it.
+>
+> **The five modules are right and the milliseconds are not.** Measured here,
+> nine runs each, `os.clock`: 69 modules to 64, and a median of **43.0 ms to
+> 36.0 ms -- about 7 ms, not 19**. The 19 above was an estimate from a
+> self-time column that file itself warns overlaps; this is boot measured end
+> to end. An application with TLS or `h2c` pays the load at `new_server` and
+> saves nothing at all, by design.
+>
+> What the eager require also silently provided was a proof that the h2 half
+> parses, on every boot. `akkar/doctor.lua` gets that back explicitly:
+> `akkar.vendor.http.h2_connection` is now in REQUIRED, and the "HTTP/1.1 and
+> HTTP/2" finding is a `fail` carrying the load error unless the module
+> actually loads. `spec/boot_surface_spec.lua` names the five modules and boots
+> a second child that constructs an h2c server and a TLS server and asserts the
+> h2 half **is** loaded -- the one assertion in the suite that fails if the
+> forcing is ever optimised away.
 
 ### 3. Teach `akkar doctor` about descriptor limits
 

@@ -410,6 +410,15 @@ above turned on.
 Tarantool remains installed and unmeasured. D5 (saturation) and D7 (dependency
 down) remain a second pass. `/users/:id` was not loaded in this run.
 
+D8 (per-request HTTP/2 cost against HTTP/1.1) has no number at all. Its method
+is written — see the amendment at the end of `METHOD.md` — and the run is
+blocked only on a generator: `h2load` is not installed here, and lua-http's
+client is disqualified for it with the evidence recorded in
+`spec/http2_admission_spec.lua:32-37`. The benched service also speaks
+HTTP/1.1 only today, so D8 needs `h2c = true` before it can be run at all.
+When it is run it is **not a comparison row**: no other candidate here serves
+h2, so it is akkar against akkar and is labelled that way under Rule 7.
+
 ---
 
 ## The descriptor wall, closed — 18 August 2026, `bd567d1`

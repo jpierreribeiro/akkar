@@ -118,8 +118,11 @@ Measured on a c5.2xlarge, and reproducible from `bench/`:
 | idle WebSocket | 10.2 KB |
 | capacity model | one process per core, `reuseport = true` |
 
-Small enough that a hundred idle exercises fit in 1.2 GB, which is why the
-runtime is also the substrate for a teaching platform. Small enough that a
+Small enough that a hundred idle processes fit in 1.1 to 1.4 GB, which is why
+the runtime is also the substrate for a teaching platform. The range is the
+result: idle RSS was measured three times and came out 11.4, 13.3 and 14.1 MB,
+and a single figure was never available from three runs that differ by a
+quarter. Small enough that a
 container image is 6.4 MB.
 
 ---

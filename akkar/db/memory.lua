@@ -38,6 +38,15 @@ would surface as tests that pass and production that does not.
 Queries reaching it that were never programmed raise, naming the query. A test
 that silently gets nil back from an unplanned query is a test asserting the
 wrong thing.
+
+## Capacity
+
+`max_qps` and `latency_ms` are construction-time knobs of the same kind as
+`:fail`, `:hang` and `:drop` -- per-adapter behaviour, set once and honoured on
+every query. They model a database that is slow, or saturated, or both, without
+one existing. See the block above `serve`; the same model, with the same words,
+is in `akkar/cache/memory.lua`, and `spec/capacity_spec.lua` drives both from
+one table of numbers so they cannot drift apart.
 ]]
 
 local time  = require "akkar.time"
@@ -48,12 +57,76 @@ Memory.__index = Memory
 
 local M = {}
 
-function M.new()
+--- `options` may be omitted, and both of its fields are nil by default, so a
+--- fake nobody configured costs exactly what it cost before either existed.
+function M.new(options)
+  options = options or {}
+  if options.max_qps ~= nil and (tonumber(options.max_qps) or 0) <= 0 then
+    error("akkar.db.memory: max_qps must be a number greater than zero; a " ..
+          "capacity of zero is a database nothing can ever reach, and the " ..
+          "way to say that is :drop()", 0)
+  end
+  if options.latency_ms ~= nil and (tonumber(options.latency_ms) or -1) < 0 then
+    error("akkar.db.memory: latency_ms must be a number of milliseconds, " ..
+          "not negative", 0)
+  end
   return setmetatable({
     responses = {},     -- ordered: first matching pattern wins
     log = {},           -- every query received, for assertions
     depth = 0,          -- transaction nesting
+    -- The capacity model. See `serve`.
+    max_qps    = options.max_qps and tonumber(options.max_qps) or nil,
+    latency_ms = options.latency_ms and tonumber(options.latency_ms) or nil,
   }, Memory)
+end
+
+--- THE CAPACITY MODEL, and it is a model. It says what it is:
+---
+--- `latency_ms` is service time -- every statement takes that long.
+--- `max_qps` is throughput -- the server runs statements one after another at
+--- that rate, so statement N cannot finish before `start + N/max_qps` and a
+--- caller arriving into a saturated database waits for the queue ahead of it.
+---
+--- They are one queue and not two delays added together: WHICHEVER IS THE
+--- TIGHTER CONSTRAINT IS THE ONE A CALLER FEELS. A database at 1500/s and
+--- 8 ms is bounded by its service time, because 8 ms of work cannot be issued
+--- 1500 times a second by one server; the same database at 50/s and 8 ms is
+--- bounded by its rate. Adding the two would have invented a third database
+--- that is slower than either number describes.
+---
+--- What it does NOT claim: that this is what Postgres under that load would
+--- actually do. A real server's service time depends on the plan, the cache
+--- and the locks it is waiting on. This reproduces a queue with a fixed
+--- service rate -- the same model a capacity diagram is drawn from -- and the
+--- point of one number configuring both is that the prediction and the real
+--- run can then be compared and found to disagree. A model that presented
+--- itself as truth would teach less.
+---
+--- It waits through `akkar.time`, never through a wall clock of its own. Under
+--- `akkar.time.manual` a wait advances timestamps and returns immediately, so
+--- a test of a 1500/s database at 8 ms is deterministic and finishes now.
+--- Under the real clock the same numbers cost real seconds, which is what
+--- makes one configuration serve a simulation and a real run alike.
+---
+--- Transaction control is charged like anything else, because `begin` and
+--- `commit` are round trips on a real server and a transaction that came for
+--- free would make the cheapest thing in the model the one that is not.
+---
+--- STATED TWICE ON PURPOSE, once per adapter. `spec/capacity_spec.lua` drives
+--- both from the same numbers so the two cannot drift apart.
+local function serve(self)
+  if not self.max_qps and not self.latency_ms then return end
+
+  local wait = 0
+  if self.max_qps then
+    local now  = time.monotime()
+    local free = math.max(self.free_at or now, now)
+    wait = free - now
+    self.free_at = free + 1 / self.max_qps
+  end
+  wait = wait + (self.latency_ms or 0) / 1000
+
+  if wait > 0 then time.sleep(wait) end
 end
 
 --- Programs a response.
@@ -85,9 +158,16 @@ end
 --- waiting, but it deliberately does not move the event loop -- see that
 --- module's header -- and what has to happen here is a genuine yield, so
 --- that whatever is racing this query actually gets scheduled.
+---
+--- Which is why it is `time.real.sleep` and not `time.sleep`. Under a manual
+--- clock the second one advances timestamps and returns at once, so `:hang`
+--- would quietly stop hanging and become `:fail` under another name -- and a
+--- fault that silently turns into a different fault is the one thing a fake
+--- must never do. `latency_ms` wants exactly the opposite and gets it: that
+--- one goes through `akkar.time` precisely so a manual clock can collapse it.
 function Memory:hang(pattern, seconds)
   return self:on(pattern, function()
-    time.sleep(seconds or 60)
+    time.real.sleep(seconds or 60)
     error("db: query hung and was never answered", 0)
   end)
 end
@@ -161,6 +241,10 @@ function Memory:query(sql, ...)
   if self.dropped then
     error("db: connection reset by peer", 0)
   end
+
+  -- The round trip, charged before the answer is found and after the
+  -- connection is checked: a reset socket costs the server no work.
+  serve(self)
 
   -- Transaction control is answered by the adapter itself, so a test does not
   -- have to program `begin` and `commit` -- nor the savepoints a nested
@@ -267,13 +351,21 @@ end
 function Memory:reset()
   self.log, self.committed, self.rolled_back = {}, nil, nil
   self.dropped = nil
+  self.free_at = nil       -- the queue drains too; the capacity itself stays
   return self
 end
 
 --- The factory shape `app:run{}` and `app:test{}` expect.
-function M.factory(configure)
-  local instance = M.new()
-  if configure then configure(instance) end
+---
+--- A function programs the fake, as it always did. A table is `M.new`'s
+--- options, so `db.factory { max_qps = 1500 }` reads the way the rest of the
+--- framework does, and both together are `db.factory({ ... }, function ... end)`.
+function M.factory(configure, program)
+  local options = type(configure) == "table" and configure or nil
+  if type(configure) == "function" then program = configure end
+
+  local instance = M.new(options)
+  if program then program(instance) end
   return setmetatable({ instance = instance }, {
     __call = function() return instance end,
   })
