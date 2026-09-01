@@ -45,6 +45,7 @@ produced.
 | `namespace` | string or function | none | `namespace(req)` returns the tenant this key belongs to |
 | `key` | function | see below | `key(req)` returns the string to count against |
 | `cache` | cache | `req.cache` | the store to count in |
+| `on_error` | `"open"` or `"closed"` | `"open"` | what to do when the store cannot answer |
 | `retry_after_ms` | number | `1000` | the `retry-after` value on a refusal |
 | `on_store_error` | function | none | `on_store_error(err, req)` on a failed store call |
 
@@ -120,6 +121,7 @@ as it likes.
 | `namespace` | string or function | none | `namespace(req)` returns the tenant this key belongs to |
 | `key` | function | see below | `key(req)` returns the string to count against |
 | `cache` | cache | `req.cache` | the store to count in |
+| `on_error` | `"open"` or `"closed"` | `"open"` | what to do when the store cannot answer |
 | `headers` | boolean | `true` | send the `ratelimit-*` headers; `false` suppresses them |
 | `exempt` | list or `false` | `{ "/health", "/healthz", "/livez", "/readyz" }` | path prefixes that skip the limiter entirely |
 | `on_store_error` | function | none | `on_store_error(err, req)` on a failed store call |

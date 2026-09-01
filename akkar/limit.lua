@@ -306,9 +306,26 @@ end
 --- Runs one limiter script, and ALLOWS the request when the store cannot
 --- answer.
 ---
---- Returns the reply, or nil when the store failed. Every caller reads a nil
---- as "allow": that is the fail-open decision, made in one place so no
---- limiter can forget it.
+--- Returns the reply, or `nil, refuse` when the store failed. `refuse` is the
+--- application's answer to the trade the header sets out, and the default is
+--- false: allow. Made in one place so no limiter can forget it.
+---
+--- `on_error = "closed"` INVERTS IT, and it is an option beside the default
+--- rather than a replacement for it. The header's argument -- that a total
+--- outage caused by a dependency which was never on the critical path is
+--- larger than a quota overrun by the whole size of the traffic -- holds for
+--- most services, so it stays the default. It does not hold for all of them:
+--- a limiter in front of an SMS gateway, a payment provider or anything else
+--- where a request costs real money is one where the overrun is the more
+--- expensive half, and the application is the only party that knows which it
+--- has. Hardcoding the answer meant the ones that needed the other one had to
+--- reimplement the limiter to get it.
+---
+--- Whichever way it goes, the outage is reported identically: the counter
+--- rises, the once-per-outage warning fires, and `on_store_error` is called.
+--- A fail-closed limiter is not a quiet one -- it is a limiter refusing
+--- traffic for a reason that has nothing to do with the traffic, which is if
+--- anything the more urgent thing to be paged about.
 ---
 --- `state` is the middleware instance's own table, and it holds nothing but
 --- the "have I already complained about this outage" flag. Kept per instance
@@ -334,16 +351,24 @@ local function attempt(run, cache, keys, args, options, req, state, where)
 
   M.store_failures = M.store_failures + 1
 
+  local refuse = options.on_error == "closed"
+
   if not state.blind then
     state.blind = true
     -- `req.log` always exists -- it is the one capability with a default --
     -- so this cannot be the thing that raises while reporting that something
     -- raised.
     local logged = pcall(function()
-      req.log:warn("rate limiter store is unreachable; ALLOWING requests", {
+      req.log:warn("rate limiter store is unreachable; " ..
+                   (refuse and "REFUSING requests" or "ALLOWING requests"), {
         limiter = where,
         detail  = tostring(reply),
-        effect  = "configured limits are not being enforced until this clears",
+        -- The effect is the half an operator acts on, so it says which of the
+        -- two outages is happening rather than assuming the default one.
+        effect  = refuse
+          and "every limited route is answering 429 until this clears"
+          or "configured limits are not being enforced until this clears",
+        on_error = refuse and "closed" or "open",
         store_failures = M.store_failures,
       })
     end)
@@ -354,7 +379,7 @@ local function attempt(run, cache, keys, args, options, req, state, where)
     pcall(options.on_store_error, reply, req)
   end
 
-  return nil
+  return nil, refuse
 end
 
 --- True when the store can run scripts at all.
@@ -627,15 +652,21 @@ function M.rate(options)
     if is_exempt(req.path) then return next(req) end
 
     local cache = options.cache or req.cache
-    local reply = attempt(run, cache, { bucket_key(prefix, bucket, options, req) },
+    local reply, refuse = attempt(run, cache,
+                          { bucket_key(prefix, bucket, options, req) },
                           { burst, per_second, cost }, options, req, state,
                           "rate")
 
-    -- nil is the store failing, and the answer is to serve the request. No
-    -- quota headers go out with it: the numbers are unknown, and inventing a
-    -- remaining count would be a lie a well-behaved client would then pace
-    -- itself against.
-    if reply == nil then return next(req) end
+    -- nil is the store failing, and the answer is the one the application
+    -- chose. No quota headers go out either way: the numbers are unknown, and
+    -- inventing a remaining count would be a lie a well-behaved client would
+    -- then pace itself against -- and on the refusal, a `ratelimit-reset` no
+    -- store agreed to would be worse still, since the wait is for Redis and
+    -- not for a bucket to refill.
+    if reply == nil then
+      if refuse then return too_many(options.retry_after_ms or 1000) end
+      return next(req)
+    end
 
     local remaining = tonumber(reply[2]) or 0
     if tonumber(reply[1]) ~= 1 then
@@ -670,17 +701,45 @@ function M.concurrent(options)
   local release = evaluator(RELEASE_SCRIPT)
   local state = {}
 
+  -- THE SLOT'S NAME IS THE LIMITER'S, AND IT IS MINTED HERE.
+  --
+  -- It used to be `req.id`, and `req.id` is not this module's to depend on.
+  -- Two in-flight requests carrying one id `ZADD` the same ZSET member and
+  -- occupy ONE slot between them, so the limiter's own count disagrees with
+  -- how many requests it is actually holding; and the release deletes a member
+  -- BY NAME, so a repeated id frees somebody else's slot and lets a caller sit
+  -- above the limit while the count says it did not.
+  --
+  -- The server mints `req.id` itself now, which makes this sound settled. It
+  -- is not. That is an invariant maintained two modules away for a different
+  -- purpose -- tracing -- and `M.concurrent` is also called with a request
+  -- this module did not build: out of a job, a test, or an application's own
+  -- dispatch. A limiter whose count is only correct while a distant module
+  -- keeps a promise it made for other reasons is one that will be wrong on the
+  -- day that promise changes, and it will be wrong silently, because a slot
+  -- collision looks exactly like a caller under its limit.
+  --
+  -- Per INSTANCE rather than per process: two middlewares sharing one bucket
+  -- must not share a counter, or both would mint slot 1. Sixteen hex
+  -- characters drawn once, plus a counter, costs one string per request.
+  local nonce, minted = require("akkar.crypto").token(8), 0
+
   return function(req, next)
     local cache = options.cache or req.cache
     local key = bucket_key(prefix, bucket, options, req)
-    local reply = attempt(acquire, cache, { key }, { limit, ttl, req.id },
+    minted = minted + 1
+    local slot = nonce .. "-" .. minted
+    local reply, refuse = attempt(acquire, cache, { key }, { limit, ttl, slot },
                           options, req, state, "concurrent")
 
-    -- The store is down: serve, and do not try to release a slot that was
-    -- never taken. Releasing anyway would be a second failed call per
-    -- request, doubling the counter for one outage and making the metric
-    -- describe the code rather than the world.
-    if reply == nil then return next(req) end
+    -- The store is down: answer the way the application asked, and either way
+    -- do not try to release a slot that was never taken. Releasing anyway
+    -- would be a second failed call per request, doubling the counter for one
+    -- outage and making the metric describe the code rather than the world.
+    if reply == nil then
+      if refuse then return too_many(options.retry_after_ms or 1000) end
+      return next(req)
+    end
 
     if tonumber(reply[1]) ~= 1 then
       -- No `ratelimit-*` here, on purpose. Those headers describe a quota
@@ -705,7 +764,7 @@ function M.concurrent(options)
     -- sweep in the acquire script bounds the damage at one TTL, so this
     -- raises no error; it only makes sure the operator can see it happening.
     local function give_back()
-      local ok = pcall(function() release(cache, { key }, { req.id }) end)
+      local ok = pcall(function() release(cache, { key }, { slot }) end)
       if not ok then M.store_failures = M.store_failures + 1 end
     end
 

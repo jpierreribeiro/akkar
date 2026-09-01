@@ -199,19 +199,43 @@ describe("the slot a concurrency limiter hands out", function()
 end)
 
 describe("the load shedder", function()
-  it("refuses to be built without the app it sheds on", function()
+  it("refuses to be built with nothing to shed against", function()
     -- Its own docstring example passed neither `app` nor `capacity`, nothing
     -- in the repo set them, and there was no spec: the shedder as documented
     -- shed nothing, under any load, ever.
     local ok, err = pcall(akkar.limit.shed, { critical = function() return false end })
     assert.is_false(ok)
-    assert.is_truthy(tostring(err):find("app is required", 1, true))
+    assert.is_truthy(tostring(err):find("app = app", 1, true),
+      "the refusal must name the app it needs: " .. tostring(err))
   end)
 
-  it("refuses to be built without a capacity to be loaded against", function()
-    local ok, err = pcall(akkar.limit.shed, { app = { in_flight = 0 } })
+  it("names BOTH ways out, because either one is enough", function()
+    -- THE ASSERTION THIS REPLACED demanded `capacity` at construction, and
+    -- that is a requirement this framework cannot meet. The ceiling lives on
+    -- the app as `max_concurrent`, and `App:run` is what publishes it
+    -- (`akkar/init.lua:2981`) -- which happens AFTER every `app:use(...)` has
+    -- already run. Refusing `shed { app = app }` for lacking a number that
+    -- does not exist yet would refuse the ordinary spelling of the middleware,
+    -- and on any platform where the descriptor ceiling cannot be read it would
+    -- refuse it for ever. `spec/shed_spec.lua` pins the other half directly: a
+    -- shedder whose ceiling never arrives passes work through and says so
+    -- once, rather than failing at boot.
+    --
+    -- What IS owed at construction is a message that names both remedies, so
+    -- somebody holding an app with no derivable ceiling learns that `capacity`
+    -- is the other way out instead of being told only about the app they
+    -- already passed.
+    local ok, err = pcall(akkar.limit.shed, { critical = function() return false end })
     assert.is_false(ok)
-    assert.is_truthy(tostring(err):find("capacity is required", 1, true))
+    assert.is_truthy(tostring(err):find("capacity", 1, true),
+      "the refusal named only the app, so the second remedy is undiscoverable: "
+      .. tostring(err))
+
+    -- And each one alone is accepted, because each one alone is sufficient.
+    assert.has_no.errors(function() akkar.limit.shed { capacity = 10 } end)
+    assert.has_no.errors(function()
+      akkar.limit.shed { app = { in_flight = 0, max_concurrent = 100 } }
+    end)
   end)
 
   it("sheds once the app is past the ceiling", function()
