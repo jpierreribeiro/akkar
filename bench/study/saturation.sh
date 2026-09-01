@@ -29,8 +29,12 @@ PROCS=${PROCS:-$SERVER_CORES}
 DURATION=${DURATION:-30s}
 THREADS=${THREADS:-4}
 REPS=${REPS:-3}
-APPS=$HOME/study/apps
-TREE=$HOME/study/head
+# Overridable, like every other sweeper here -- `floors.sh:19`, `gc-cost.sh:24`,
+# `cpu-parity.sh` and `regression.sh` all take these from the environment. This
+# was the one that could not be pointed at a checkout, which is why the run it
+# owes has only ever happened on the study box.
+APPS=${APPS:-$HOME/study/apps}
+TREE=${TREE:-$HOME/study/head}
 
 CAPACITY=$((PROCS * POOL))
 
