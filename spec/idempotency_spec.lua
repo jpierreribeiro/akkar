@@ -54,6 +54,8 @@ local function prefix() return "akkar:spec:idem:" .. math.random(1, 1e9) .. ":" 
 local function charging_app(opts)
   local runs = 0
   local app = akkar.new()
+  -- These cases are about replay, not about tenancy, so they say so once here.
+  if opts.namespace == nil then opts.namespace = false end
   app:use(akkar.idempotency(opts))
   app:post("/charges", function(req)
     runs = runs + 1
@@ -100,7 +102,7 @@ describe("a retried request", function()
     -- Returning nothing is wrong and running it twice is worse.
     in_controller(function()
       local app = akkar.new()
-      app:use(akkar.idempotency { prefix = prefix() })
+      app:use(akkar.idempotency { prefix = prefix(), namespace = false })
       app:post("/slow", function()
         cqueues.sleep(0.3)
         return akkar.created { done = true }
@@ -172,7 +174,7 @@ describe("what must not be remembered", function()
     -- consequence -- the guarantee is lost for that response -- is real.
     in_controller(function()
       local app = akkar.new()
-      app:use(akkar.idempotency { prefix = prefix(), max_bytes = 64 })
+      app:use(akkar.idempotency { prefix = prefix(), max_bytes = 64, namespace = false })
       local runs = 0
       app:post("/big", function()
         runs = runs + 1
@@ -251,7 +253,7 @@ describe("a request that never finished", function()
     in_controller(function()
       local p = prefix()
       local app = akkar.new()
-      app:use(akkar.idempotency { prefix = p, ttl = 86400, lock_ttl = 90 })
+      app:use(akkar.idempotency { prefix = p, ttl = 86400, lock_ttl = 90, namespace = false })
       app:post("/slow", function()
         cqueues.sleep(0.3)
         return akkar.created { ok = true }
@@ -267,7 +269,9 @@ describe("a request that never finished", function()
       end)
       cq:wrap(function()
         cqueues.sleep(0.1)          -- the handler is still running here
-        in_flight = tonumber(observer:command("TTL", p .. "k1"))
+        -- The record is length-prefixed with its namespace, so a single
+        -- global keyspace is "0:" rather than nothing. See `M.new`.
+        in_flight = tonumber(observer:command("TTL", p .. "0:" .. "k1"))
       end)
       assert(cq:loop(20))
 
@@ -276,7 +280,7 @@ describe("a request that never finished", function()
         "an in-flight claim carried the full replay ttl: " .. tostring(in_flight) .. "s")
 
       -- Once there is a response to replay, the record earns the long ttl.
-      local stored = tonumber(observer:command("TTL", p .. "k1"))
+      local stored = tonumber(observer:command("TTL", p .. "0:" .. "k1"))
       assert.is_true(stored > 90,
         "the stored response must live for the replay ttl, not the lock: " ..
         tostring(stored) .. "s")

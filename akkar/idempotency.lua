@@ -244,6 +244,27 @@ function M.new(options)
   local header     = options.header or "idempotency-key"
   local max_bytes  = options.max_bytes or 64 * 1024
   local required   = options.required or false
+  local namespace  = options.namespace
+
+  -- The record is `prefix .. key` over a header the CLIENT chooses. With one
+  -- global keyspace, tenant `evil` sends tenant `acme`'s key and is handed
+  -- acme's stored 201 verbatim -- customer_email, card_last4 and all -- with
+  -- `idempotent-replay: true`. The namespace is what makes the keyspace the
+  -- server's rather than the caller's, so it is not optional; `akkar.scope`
+  -- raises on a nil tenant id for the same reason, and this is the same bug.
+  if namespace == nil then
+    error("idempotency: namespace is required. The idempotency key comes from "
+       .. "the client, so without a server-resolved namespace one tenant can "
+       .. "replay another tenant's stored response body. Pass "
+       .. "namespace = function(req) return req.tenant.id end, or "
+       .. "namespace = false to state that this application is single-tenant "
+       .. "and one global keyspace is intended.", 0)
+  end
+  if namespace ~= false and type(namespace) ~= "function"
+     and type(namespace) ~= "string" then
+    error("idempotency: namespace must be a function(req), a constant string, "
+       .. "or false", 0)
+  end
 
   local methods = {}
   for _, m in ipairs(options.methods or { "POST", "PATCH" }) do
@@ -274,7 +295,22 @@ function M.new(options)
     end
 
     local cache = options.cache or req.cache
-    local record = prefix .. key
+    local scoped = ""
+    if namespace then
+      scoped = type(namespace) == "function" and namespace(req) or namespace
+      scoped = tostring(scoped or "")
+      if scoped == "" then
+        error("idempotency: namespace returned an empty value", 0)
+      end
+      if #scoped > 255 then
+        error("idempotency: namespace must be at most 255 characters", 0)
+      end
+    end
+    -- Length-prefixed rather than joined by a colon: the namespace and the key
+    -- are both caller-influenced strings, and `"a:b" .. ":" .. "c"` and
+    -- `"a" .. ":" .. "b:c"` are the same record -- a cross-tenant replay
+    -- assembled out of two legal values.
+    local record = prefix .. #scoped .. ":" .. scoped .. key
     local fingerprint = fingerprint_of(req)
 
     local verdict = claim(cache, { record }, { lock_ttl, fingerprint })
@@ -359,6 +395,10 @@ function M.new(options)
     return result
   end
 end
+
+-- The single-tenant opt-out, with a name, so the call site reads as a statement
+-- about the application rather than as a bare `false` someone has to look up.
+M.GLOBAL = false
 
 M.CLAIM_SCRIPT = CLAIM_SCRIPT
 return M

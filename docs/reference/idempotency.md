@@ -13,7 +13,7 @@ local idempotency = require "akkar.idempotency"
 ```
 
 The top-level spelling is the constructor, not the module: `akkar.idempotency`
-is `idempotency.new`, so `akkar.idempotency { ttl = 86400 }` and
+is `idempotency.new`, so `akkar.idempotency { namespace = false }` and
 `idempotency.new { ttl = 86400 }` build the same middleware. `fingerprint_of`
 and `CLAIM_SCRIPT` are reachable only through `require "akkar.idempotency"`.
 
@@ -91,7 +91,11 @@ which is the double charge this module prevents.
 
 **Returns** middleware.
 
-**Raises** nothing at construction. At request time it raises whatever the store
+**Raises** without a `namespace`. The idempotency key is a header the client
+chooses, so one global keyspace lets a tenant replay another tenant's stored
+response body; pass `namespace = function(req) return req.tenant.id end`, or
+`namespace = idempotency.GLOBAL` (which is `false`) to state that the
+application is single-tenant. At request time it raises whatever the store
 raises when there is no store configured at all.
 
 ```lua
@@ -100,7 +104,7 @@ local idempotency  = require "akkar.idempotency"
 local memory       = require "akkar.cache.memory"
 
 local app = akkar.new()
-app:use(idempotency.new { ttl = 60 })
+app:use(idempotency.new { ttl = 60, namespace = idempotency.GLOBAL })
 
 local runs = 0
 app:post("/charges", { body = { amount = "integer" } }, function(req)
@@ -150,7 +154,7 @@ local idempotency  = require "akkar.idempotency"
 local memory       = require "akkar.cache.memory"
 
 local app = akkar.new()
-app:use(idempotency.new())
+app:use(idempotency.new { namespace = idempotency.GLOBAL })
 app:post("/charges", { body = { amount = "integer" } }, function(req)
   return akkar.created { amount = req.body.amount }
 end)
@@ -174,7 +178,7 @@ local idempotency  = require "akkar.idempotency"
 local memory       = require "akkar.cache.memory"
 
 local app = akkar.new()
-app:use(idempotency.new())
+app:use(idempotency.new { namespace = idempotency.GLOBAL })
 
 local client
 app:post("/charges", function()
@@ -212,7 +216,7 @@ local idempotency  = require "akkar.idempotency"
 local memory       = require "akkar.cache.memory"
 
 local app = akkar.new()
-app:use(idempotency.new())
+app:use(idempotency.new { namespace = idempotency.GLOBAL })
 app:post("/tasks", function() return { tasks = json.array {} } end)
 
 local client = app:test { cache = memory.new() }

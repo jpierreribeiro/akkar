@@ -181,7 +181,8 @@ against both stores from one description, exactly as `akkar.jobs` already does.
 is application knowledge.
 
 ```lua
-app:use(akkar.idempotency { ttl = 86400, methods = { "POST" } })
+app:use(akkar.idempotency { ttl = 86400, methods = { "POST" },
+                            namespace = false })
 ```
 
 First request with a given key runs and its response is stored. A repeat
