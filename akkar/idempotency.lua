@@ -64,7 +64,6 @@ write into a shared cache, and it is stated rather than discovered.
 ]]
 
 local cjson  = require "akkar.json"
-local crypto = require "akkar.crypto"
 
 local M = {}
 
@@ -271,6 +270,18 @@ end
 --- who can already pick the key -- but because it is the digest already in
 --- `akkar.crypto` and no cheaper one is worth the argument. The length stays
 --- in front of it: it costs nothing and it makes the record readable.
+-- `akkar.crypto` is reached lazily, and the reason is the boot path rather
+-- than taste. `akkar/init.lua` exposes `akkar.idempotency` with an eager
+-- require, so THIS module loads in every application -- including every one
+-- that never writes an idempotent route. Requiring crypto at the top pulled
+-- OpenSSL's digest, hmac and kdf in behind it: seven modules on every boot, for
+-- a capability most processes never reach. Resolved once, on first use.
+local crypto_module
+local function crypto()
+  crypto_module = crypto_module or require "akkar.crypto"
+  return crypto_module
+end
+
 local function fingerprint_of(req)
   local body = ""
   if req.body ~= nil then
@@ -278,7 +289,7 @@ local function fingerprint_of(req)
     body = ok and encoded or tostring(req.body)
   end
   return req.method .. " " .. req.path .. " " .. #body .. ":" ..
-         crypto.to_hex(crypto.sha256(body))
+         crypto().to_hex(crypto().sha256(body))
 end
 
 M.canonical = canonical
@@ -375,7 +386,7 @@ function M.new(options)
     -- of those are the same for the retry that replaces this claim, so a
     -- token derived from them would prove nothing about WHICH attempt is
     -- holding the record.
-    local token = crypto.token(16)
+    local token = crypto().token(16)
 
     -- A store that cannot answer is not a reason to run the handler.
     --
