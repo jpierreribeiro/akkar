@@ -62,17 +62,41 @@ local function read_reply(sock)
   if tag == "-" then return nil, rest, "reply" end
   if tag == ":" then return tonumber(rest) end
 
+  -- A HEADER THAT DOES NOT PARSE IS A PROTOCOL FAILURE, NOT A NIL REPLY.
+  --
+  -- `$-1` is the nil reply and it parses; `$xx` does not, and the two were
+  -- collapsed into the same `return nil`. That is the desync above read from
+  -- the other end: the call returned successfully, so `broken` was never set,
+  -- `in_flight` was cleared, the body stayed unread in the socket, and the
+  -- reuse predicate then judged the connection healthy and pooled it. The
+  -- next borrower's first `GET` read a nil (a cache miss that never was) and
+  -- its second read somebody else's value.
+  --
+  -- Reported as an error the stream cannot be trusted after, which is what
+  -- `command` turns into `broken = true`.
   if tag == "$" then
     local length = tonumber(rest)
-    if not length or length < 0 then return nil end     -- $-1 is a nil reply
+    if not length then return nil, "malformed bulk length '" .. rest .. "'" end
+    if length < 0 then return nil end                   -- $-1 is a nil reply
     local data, read_err = sock:read(length + 2)        -- payload plus CRLF
     if not data then return nil, read_err or "truncated bulk reply" end
+    -- AND THE LENGTH IS CHECKED, NOT TRUSTED. `sock:read(n)` is a request for
+    -- n bytes, not a promise of them: an EOF part-way through hands back what
+    -- arrived, and `data:sub(1, length)` then padded the hole with silence --
+    -- an `INCR` for `limit.rate` reading 4 where the wire carried 42, a rate
+    -- limit quietly not firing. If the CRLF is not exactly where the header
+    -- said it would be, the header was not the truth and everything after it
+    -- is misaligned.
+    if #data < length + 2 or data:sub(length + 1) ~= CRLF then
+      return nil, "truncated bulk reply"
+    end
     return data:sub(1, length)
   end
 
   if tag == "*" then
     local count = tonumber(rest)
-    if not count or count < 0 then return nil end       -- *-1 is a nil array
+    if not count then return nil, "malformed array length '" .. rest .. "'" end
+    if count < 0 then return nil end                    -- *-1 is a nil array
     local out = {}
     for i = 1, count do
       local value, item_err = read_reply(sock)
