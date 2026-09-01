@@ -1326,6 +1326,15 @@ end
 --
 -- It names the file and line the middleware was DEFINED at, the way a route
 -- carries `route.where`, because a middleware has no name to print.
+local function forgot_return(mw)
+  local info = debug.getinfo(mw, "S")
+  error(string.format(
+    "middleware defined at %s:%d called next() and returned nothing, so the " ..
+    "handler's response was discarded and the client would have received an " ..
+    "empty 204; middleware must `return next(req)`",
+    info and info.short_src or "?", info and info.linedefined or 0), 0)
+end
+
 -- Applies a route's `response` schema to what the handler produced.
 --
 -- Filtering first is the part that earns its keep: a handler doing `select *`
@@ -1534,10 +1543,16 @@ local function dispatch(app, req)
   if opts and opts.before then
     for i = #opts.before, 1, -1 do
       local mw, nxt = opts.before[i], run
-      -- `decorable` is what stops the decoration landing on a response the
-      -- handler hoisted. A route middleware is the same leak as a global one,
-      -- one layer in.
-      run = function() return mw(req, function() return decorable(nxt()) end) end
+      run = function()
+        -- `reached` is what tells "returned nothing after calling next" from
+        -- "answered 204 without calling it"; `decorable` is what stops the
+        -- decoration landing on a response the handler hoisted. A route
+        -- middleware is the same leak as a global one, one layer in.
+        local reached = false
+        local value = mw(req, function() reached = true; return decorable(nxt()) end)
+        if value == nil and reached then forgot_return(mw) end
+        return value
+      end
     end
   end
 
@@ -1559,10 +1574,14 @@ local function dispatch(app, req)
       for j = #mws, 1, -1 do
         local mw, nxt = mws[j], run
         run = function()
-          return normalize(mw(req, function(r)
+          local reached = false
+          local value = mw(req, function(r)
+            reached = true
             if r then req = r end
             return decorable(nxt())
-          end))
+          end)
+          if value == nil and reached then forgot_return(mw) end
+          return normalize(value)
         end
       end
     end
@@ -1646,9 +1665,13 @@ local function build_chain(app, terminal)
   for i = #app.middleware, 1, -1 do
     local mw, next_fn = app.middleware[i], chain
     chain = function(a, req)
-      return normalize(mw(req, function(r)
+      local reached = false
+      local value = mw(req, function(r)
+        reached = true
         return decorable(next_fn(a, r or req))
-      end))
+      end)
+      if value == nil and reached then forgot_return(mw) end
+      return normalize(value)
     end
   end
   return chain
