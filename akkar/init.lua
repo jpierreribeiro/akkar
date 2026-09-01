@@ -1561,19 +1561,47 @@ local function one_header(source, name)
   return nil
 end
 
-local function request_id(headers)
-  local given = headers and headers["x-request-id"]
-  if given and #given > 0 and #given <= 200 then return given end
+-- `req.id` is akkar's own, always.
+--
+-- It used to be whatever arrived in `x-request-id`, length-checked and nothing
+-- else, and three things read it. `akkar.limit.concurrent` uses it as the ZSET
+-- member for a slot, so every caller sending one constant header collapsed onto
+-- a single member and the ceiling stopped counting -- measured at peak 46
+-- against a limit of 2. `akkar.log` writes it into a logfmt line, which
+-- separates fields with spaces, so one header wrote four fields into the
+-- operator's log with three of them invented. And it is echoed back on the
+-- response.
+--
+-- So it is unique by construction now, and made of characters no log format can
+-- be steered with. What the caller sent survives as `req.client_request_id`,
+-- validated, and named so that trusting it is a decision an application makes
+-- rather than one it inherits. Correlation that has to be trusted across
+-- services is what `traceparent` is for, and that one is parsed rather than
+-- echoed.
+local function request_id(_headers)
   return execution.id()
 end
+
+-- Length is capped at a UUID with room to spare, and anything outside the set
+-- is DROPPED rather than stripped or truncated: an id sanitised into a
+-- different id correlates to the wrong request, which is worse than not
+-- correlating at all.
+local CLIENT_REQUEST_ID_MAX = 128
+
+local function client_request_id(headers)
+  local given = headers and headers["x-request-id"]
+  if type(given) ~= "string" then return nil end
+  if #given == 0 or #given > CLIENT_REQUEST_ID_MAX then return nil end
+  if given:match "^[%w%._:%-]+$" then return given end
+  return nil
+end
+akkar.client_request_id = client_request_id
 
 --- The same rule, against raw transport headers rather than a normalised copy.
 ---
 --- Kept separate rather than folded into `request_id`, because `request_id` is
 --- exported and `spec/` calls it with a plain normalised table.
-local function request_id_from(source)
-  local given = one_header(source, "x-request-id")
-  if type(given) == "string" and #given > 0 and #given <= 200 then return given end
+local function request_id_from(_source)
   return execution.id()
 end
 
@@ -1790,6 +1818,16 @@ local REQUEST_MT = {
         local parsed = trace_context(self.headers)
         if parsed then rawset(self, "trace", parsed) end
         return parsed
+      end
+
+      -- Lazy for the same reason `trace` and `ip` are, and the reason is the
+      -- allocation ceiling: another field in the constructor grows `req`'s hash
+      -- part on EVERY request, including the overwhelming majority that never
+      -- look at this one.
+      if key == "client_request_id" then
+        local given = client_request_id(self.headers)
+        if given then rawset(self, "client_request_id", given) end
+        return given
       end
 
       -- `user` is resolved here rather than written into the constructor,

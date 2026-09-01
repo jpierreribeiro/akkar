@@ -174,7 +174,13 @@ function M.acquire(carrier, record, key)
     -- `log` is the one capability with a default, because diagnostics that
     -- need configuring before they appear are diagnostics nobody sees. Bound
     -- to the execution's id, so `log:info(...)` correlates for free.
-    value = (provided or default_log):with { request_id = carrier.id }
+    -- Both ids, when the caller sent one worth carrying: `request_id` is
+    -- akkar's own and is what a slot or a rate limit may be keyed on, and
+    -- `client_request_id` is the caller's, there to join a line against an
+    -- upstream's logs without ever being trusted for identity.
+    local bound = { request_id = carrier.id }
+    bound.client_request_id = carrier.client_request_id
+    value = (provided or default_log):with(bound)
   elseif provided == nil then
     value = M.guard("req." .. key,
                     "req." .. key .. " is not configured; pass " ..
