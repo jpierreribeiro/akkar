@@ -517,21 +517,28 @@ end
 --- with `x-request-id` and `traceparent`: a value the application set
 --- deliberately is the one it meant, and quietly replacing it is how
 --- middleware becomes untrustworthy.
+---
+--- READ THROUGH THE METATABLE, not around it. These were `rawget` calls, and
+--- what `next(req)` returns is no longer always a plain table: `akkar/init.lua`
+--- hands middleware a copy-on-write VIEW of the response, so that decorating
+--- it cannot write on a response the handler hoisted. A view carries none of
+--- these fields raw, so `rawget` read nil for every one of them and this
+--- built a response with no status and no body. `akkar.Response` declares no
+--- methods, so for a plain response the two spellings are the same read.
 local function copy_of(res, extra)
   local headers = {}
   for name, value in pairs(extra or {}) do headers[name] = value end
-  local existing = rawget(res, "headers")
+  local existing = res.headers
   if existing then
     for name, value in pairs(existing) do headers[name] = value end
   end
 
-  local copy = require("akkar").response(rawget(res, "status"),
-                                         rawget(res, "body"), headers)
-  copy.stream       = rawget(res, "stream")
-  copy.content_type = rawget(res, "content_type")
-  copy.raw          = rawget(res, "raw")
-  copy.release      = rawget(res, "release")
-  copy.__pending    = rawget(res, "__pending")
+  local copy = require("akkar").response(res.status, res.body, headers)
+  copy.stream       = res.stream
+  copy.content_type = res.content_type
+  copy.raw          = res.raw
+  copy.release      = res.release
+  copy.__pending    = res.__pending
   return copy
 end
 
@@ -726,7 +733,9 @@ function M.concurrent(options)
     -- exactly the handler somebody hoists, because the producer closure is
     -- the interesting part and the response wrapper looks like a constant.
     if ok and type(result) == "table" and result.stream then
-      local deferred = rawget(result, "release")
+      -- Through the metatable, for the reason `copy_of` records: what came
+      -- back from `next` may be a copy-on-write view of the response.
+      local deferred = result.release
       local streamed = copy_of(result)
       streamed.release = function()
         if deferred then pcall(deferred) end

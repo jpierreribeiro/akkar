@@ -1201,6 +1201,131 @@ local function normalize(value)
   return response(200, value)
 end
 
+-- ================================ decorating a response without owning it
+--
+-- A middleware that decorates the response on its way out -- session, CORS,
+-- cache headers -- writes onto the table `next(req)` handed back to it. That
+-- table may be the handler's own module-level constant:
+--
+--     local UP = akkar.ok { status = "up" }
+--     app:get("/health", function() return UP end)
+--
+-- and then the write stays on it forever, for every later request that
+-- reaches the same route. Reproduced with a real server and separate TCP
+-- connections: after alice logged in, an anonymous probe received
+-- `set-cookie: session=TOKEN-FOR-alice`.
+--
+-- This is the same aliasing the stamp site in `handle` refuses to commit for
+-- `x-request-id`, arriving through the application instead of through the
+-- framework -- and it cannot be fixed the same way. The id could travel
+-- BESIDE the response because akkar owns it and akkar writes the wire; a
+-- middleware's header has to reach the wire through the response itself.
+--
+-- Freezing the table is not the fix either: middleware decorating the
+-- response it was given is the whole point of middleware, and
+-- `spec/response_isolation_spec.lua` holds that an
+-- `access-control-allow-origin` still lands.
+--
+-- So: COPY ON WRITE. `next()` hands back a VIEW -- an empty table that reads
+-- through to the response behind it. Passing the response along costs one
+-- table with one key and no copy at all. The first WRITE builds the private
+-- copy, and every read and write after it goes to the copy; the shared
+-- response is never touched. That is what keeps this off the allocation
+-- ceiling: copying every response on every request is the shape that was
+-- measured at +264 bytes and refused, and a route with no middleware -- which
+-- is the route `spec/allocation_spec.lua` measures -- never builds a view at
+-- all.
+local View = {}
+
+--- The private copy, built on first write and reused after it.
+---
+--- `headers` is copied as well as referenced. It is the one table on a
+--- response that middleware mutates IN PLACE -- `res.headers[k] = v` -- so a
+--- copy that shared it would leak exactly what this exists to stop.
+local function materialise(view)
+  local own = rawget(view, "__own")
+  if own then return own end
+  local base = rawget(view, "__base")
+  own = setmetatable({}, Response)
+  for key, value in pairs(base) do own[key] = value end
+  local headers = rawget(base, "headers")
+  if headers then
+    local copy = {}
+    for name, value in pairs(headers) do copy[name] = value end
+    own.headers = copy
+  end
+  rawset(view, "__own", own)
+  return own
+end
+
+--- Reading `headers` IS a write, when the response already carries one.
+---
+--- `res.headers["set-cookie"] = ...` never reaches `__newindex` -- the write
+--- lands on whatever table the read handed out. So a read of `headers` that
+--- would hand out the shared one materialises instead. Every other read is
+--- free.
+View.__index = function(view, key)
+  local own = rawget(view, "__own")
+  if own then return own[key] end
+  local base = rawget(view, "__base")
+  if key == "headers" and rawget(base, "headers") ~= nil then
+    return materialise(view).headers
+  end
+  return base[key]
+end
+
+View.__newindex = function(view, key, value)
+  materialise(view)[key] = value
+end
+
+--- Walking a view walks the response, not the two keys that implement it.
+--- Middleware written against a response has every right to iterate one, and
+--- `__pairs` is honoured in Lua 5.4.
+View.__pairs = function(view)
+  return next, rawget(view, "__own") or rawget(view, "__base"), nil
+end
+
+--- The response a middleware may decorate: a view onto it.
+---
+--- Idempotent, so a chain of ten middleware builds ONE view: the outer layers
+--- see the view the innermost one made and hand it straight along. A value
+--- that is not a response -- the plain table a handler returned, which
+--- `normalize` will wrap in a fresh response of its own -- is passed through
+--- untouched.
+local function decorable(res)
+  if not is_response(res) or getmetatable(res) == View then return res end
+  return setmetatable({ __base = res }, View)
+end
+
+--- What actually goes on the wire: the private copy if a middleware wrote,
+--- the shared response itself if nobody did.
+---
+--- Called where the value leaves the middleware region, so nothing downstream
+--- -- `apply_response_schema`, the `__pending` check, the stream writer, the
+--- test client -- ever sees a view.
+local function settled(res)
+  if getmetatable(res) ~= View then return res end
+  return rawget(res, "__own") or rawget(res, "__base")
+end
+
+-- ========================================= middleware that forgets to return
+--
+--     app:use(function(req, next) next(req) end)      -- one missing `return`
+--
+-- The handler ran, its answer was thrown away, and `normalize(nil)` turned
+-- that into a 204: an empty SUCCESS. Every signal an operator has said the
+-- request was fine -- 2xx in the access log, 2xx in the metrics -- and the
+-- client received nothing. Written into a logging middleware it blanks every
+-- response in the application at once, and explains itself nowhere.
+--
+-- Returning nothing WITHOUT calling `next` is a different thing and stays
+-- legal: that is a middleware deciding to answer 204. Only the pair -- `next`
+-- was called, nothing came back -- has no correct reading. The two are told
+-- apart by a flag set inside the `next` closure itself, which is the only
+-- thing that knows whether it ran.
+--
+-- It names the file and line the middleware was DEFINED at, the way a route
+-- carries `route.where`, because a middleware has no name to print.
 -- Applies a route's `response` schema to what the handler produced.
 --
 -- Filtering first is the part that earns its keep: a handler doing `select *`
@@ -1409,7 +1534,10 @@ local function dispatch(app, req)
   if opts and opts.before then
     for i = #opts.before, 1, -1 do
       local mw, nxt = opts.before[i], run
-      run = function() return mw(req, function() return nxt() end) end
+      -- `decorable` is what stops the decoration landing on a response the
+      -- handler hoisted. A route middleware is the same leak as a global one,
+      -- one layer in.
+      run = function() return mw(req, function() return decorable(nxt()) end) end
     end
   end
 
@@ -1431,7 +1559,10 @@ local function dispatch(app, req)
       for j = #mws, 1, -1 do
         local mw, nxt = mws[j], run
         run = function()
-          return normalize(mw(req, function(r) if r then req = r end return nxt() end))
+          return normalize(mw(req, function(r)
+            if r then req = r end
+            return decorable(nxt())
+          end))
         end
       end
     end
@@ -1440,7 +1571,11 @@ local function dispatch(app, req)
   install_watchdog(route.where)
   -- `normalize` runs INSIDE the pcall: a handler returning an invalid value
   -- must become a 500 with a clear log, not escape as an unhandled error.
-  local ok, result = pcall(function() return normalize(run()) end)
+  -- `settled` INSIDE the pcall, at the edge of the route's own middleware:
+  -- the schema filter, the `__pending` check and the global chain above all
+  -- work on a real response, and a global middleware that decorates gets a
+  -- view of its own rather than writing into one a route middleware built.
+  local ok, result = pcall(function() return settled(normalize(run())) end)
   remove_watchdog()
 
   if not ok then
@@ -1511,7 +1646,9 @@ local function build_chain(app, terminal)
   for i = #app.middleware, 1, -1 do
     local mw, next_fn = app.middleware[i], chain
     chain = function(a, req)
-      return normalize(mw(req, function(r) return next_fn(a, r or req) end))
+      return normalize(mw(req, function(r)
+        return decorable(next_fn(a, r or req))
+      end))
     end
   end
   return chain
@@ -2170,7 +2307,11 @@ local function handle(app, input)
       })
       return response(503, { error = "request deadline exceeded" })
     end
-    return value
+    -- The view collapses HERE, at the outer edge of every chain: to the
+    -- private copy if a middleware decorated the response, and to the shared
+    -- response itself if none did. Everything below -- the `__pending` check,
+    -- the stream copy, the writer, the test client -- sees a plain response.
+    return settled(value)
   end)
   -- A streamed body has not been produced yet, so its capabilities cannot be
   -- released here.  Releasing a database connection at this point would hand
@@ -2210,7 +2351,9 @@ local function handle(app, input)
   end
 
   if not ok then
-    if is_response(res) then return res, req.id, trace_parent end
+    -- A response RAISED out of the chain skipped the collapse above, and it
+    -- may be the view a middleware was holding when it threw.
+    if is_response(res) then return settled(res), req.id, trace_parent end
     internal:error("middleware raised", { request_id = req.id, detail = tostring(res) })
     return internal_error(app, res, req), req.id, trace_parent
   end
