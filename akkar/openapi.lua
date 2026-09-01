@@ -101,13 +101,35 @@ end
 
 -- Walks an app and every sub-app mounted under it, so a mounted health app is
 -- documented at the prefix it actually answers on.
-local function collect(app, prefix, out)
+--
+-- `chain` is the apps between the root and here, and it is a CHAIN rather than
+-- a set of everything seen: mounting one sub-app under two prefixes is a
+-- diamond and is fine, while an app that appears twice on the way down is a
+-- cycle. `App:mount` accepts a cycle without complaint, so two feature apps
+-- that mount each other start and serve traffic normally -- until the first
+-- `GET /openapi.json`, which recursed forever and took the process out. It is
+-- one unauthenticated request.
+--
+-- Raised rather than quietly truncated: a document missing half an API is
+-- wrong in a way its readers cannot see, and the mount graph is something the
+-- application has to fix.
+local function collect(app, prefix, out, chain)
+  if chain[app] then
+    error(("akkar.openapi: the mount graph is a cycle -- the app at '%s' is "
+        .. "mounted inside itself. Two apps that mount each other serve "
+        .. "traffic normally and only fail here, on the document.")
+        :format(prefix == "" and "/" or prefix), 0)
+  end
+  chain[app] = true
+
   for _, route in ipairs(app.routes) do
     out[#out + 1] = { route = route, path = prefix .. route.path }
   end
   for _, mount in ipairs(app.mounts) do
-    collect(mount.app, prefix .. mount.prefix, out)
+    collect(mount.app, prefix .. mount.prefix, out, chain)
   end
+
+  chain[app] = nil
   return out
 end
 
@@ -118,7 +140,7 @@ function M.document(app, info)
   info = info or {}
   local paths = {}
 
-  for _, entry in ipairs(collect(app, "", {})) do
+  for _, entry in ipairs(collect(app, "", {}, {})) do
     local route, opts = entry.route, entry.route.opts or {}
     local template = to_template(entry.path)
     paths[template] = paths[template] or {}
