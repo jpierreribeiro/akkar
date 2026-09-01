@@ -90,6 +90,31 @@ end
 
 M.identifier = checked_identifier
 
+-- PostgreSQL does not implicitly coerce a parameter declared as text into a
+-- UUID column.  pgmoon deliberately declares Lua strings as text, so UUIDs
+-- need an explicit SQL type while remaining bound values.  A small closed set
+-- avoids turning this into a raw-cast escape hatch.
+local CASTS = { uuid = true, jsonb = true, timestamptz = true }
+local TYPED_VALUE = {}
+
+function M.cast(value, postgres_type)
+  if not CASTS[postgres_type] then
+    error("akkar.sql: unsupported parameter cast: " .. tostring(postgres_type), 0)
+  end
+  return setmetatable({ value = value, postgres_type = postgres_type }, TYPED_VALUE)
+end
+
+function M.uuid(value) return M.cast(value, "uuid") end
+function M.jsonb(value) return M.cast(value, "jsonb") end
+function M.timestamptz(value) return M.cast(value, "timestamptz") end
+
+local function typed_value(value)
+  if type(value) == "table" and getmetatable(value) == TYPED_VALUE then
+    return value.value, value.postgres_type
+  end
+  return value, nil
+end
+
 -- ==================================================================== builder
 local function new_query(kind)
   return setmetatable({
@@ -108,6 +133,9 @@ local function new_query(kind)
     _order = nil,
     _limit = nil,
     _offset = nil,
+    _for_update = false,
+    _skip_locked = false,
+    _on_conflict = nil,
     _scoped = false,
   }, Query)
 end
@@ -313,9 +341,62 @@ function Query:offset(n)
   return self
 end
 
+--- Locks the selected rows until the surrounding transaction completes.
+--- Only SELECT accepts the clause; making it a named builder operation keeps
+--- handlers from reaching for a raw SQL suffix during inventory reservation.
+function Query:for_update()
+  if self._kind ~= "select" then
+    error("akkar.sql: for_update is only valid on select queries", 0)
+  end
+  self._for_update = true
+  return self
+end
+
+--- Takes the rows nobody else is holding, instead of waiting behind them.
+---
+--- Only meaningful with `for_update`, and only correct for a claim whose mark
+--- is DURABLE -- a queue that, in the same transaction that locks the rows,
+--- writes something (a lease, a status) that removes them from its own
+--- predicate. Without that mark the two claimers read the same rows the moment
+--- the first one commits, and skipping buys nothing.
+---
+--- With it, a second claimer takes a DIFFERENT batch rather than blocking on
+--- the first and then finding its own rows filtered out by the re-evaluated
+--- predicate -- which is how a queue ends up serialising N workers into one and
+--- holding a pool connection to do it.
+function Query:skip_locked()
+  if self._kind ~= "select" then
+    error("akkar.sql: skip_locked is only valid on select queries", 0)
+  end
+  self._skip_locked = true
+  return self
+end
+
 --- Says out loud that every row is the intent, for the one case where it is.
 function Query:all_rows()
   self._all_rows = true
+  return self
+end
+
+--- Makes an INSERT idempotent without exposing a raw SQL suffix. Conflict
+--- columns are identifiers and therefore checked with the same discipline as
+--- every other client-selected identifier in this builder.
+function Query:on_conflict_do_nothing(columns, allowed)
+  if self._kind ~= "insert" then
+    error("akkar.sql: on_conflict_do_nothing is only valid on inserts", 0)
+  end
+  if columns ~= nil then
+    if type(columns) ~= "table" or #columns == 0 then
+      error("akkar.sql: conflict columns must be a non-empty list", 0)
+    end
+    local checked = {}
+    for index, column in ipairs(columns) do
+      checked[index] = checked_identifier(column, allowed, "conflict column")
+    end
+    self._on_conflict = "(" .. table.concat(checked, ", ") .. ") do nothing"
+  else
+    self._on_conflict = "do nothing"
+  end
   return self
 end
 
@@ -441,6 +522,15 @@ function Query:build()
     parts[#parts + 1] = " offset ?"
     values[#values + 1] = self._offset
   end
+  if self._for_update then
+    parts[#parts + 1] = self._skip_locked and " for update skip locked" or " for update"
+  elseif self._skip_locked then
+    -- Checked here rather than in `skip_locked` so the two calls can arrive in
+    -- either order: a builder that rejected `skip_locked():for_update()` would
+    -- be rejecting a query that is perfectly well formed by the time it runs.
+    error("akkar.sql: skip_locked requires for_update", 0)
+  end
+  if self._on_conflict then parts[#parts + 1] = " on conflict " .. self._on_conflict end
   if self._returning then
     parts[#parts + 1] = " returning " .. self._returning
   end
@@ -450,7 +540,9 @@ function Query:build()
   local index = 0
   text = text:gsub("%?", function()
     index = index + 1
-    return "$" .. index
+    local raw, cast = typed_value(values[index])
+    values[index] = raw
+    return "$" .. index .. (cast and "::" .. cast or "")
   end)
 
   if index ~= #values then

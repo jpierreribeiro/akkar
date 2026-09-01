@@ -19,29 +19,67 @@ Every public symbol on this page, in alphabetical order.
 |---|---|
 | [`query:all_rows`](#queryall_rows) | method |
 | [`query:build`](#querybuild) | method |
+| [`query:for_update`](#queryfor_update) | method |
 | [`query:from`](#queryfromtable_name-allowed) | method |
 | [`query:group_by`](#querygroup_bycolumn-allowed) | method |
 | [`query:is_scoped`](#queryis_scoped) | method |
 | [`query:join`](#queryjoinclause-) | method |
 | [`query:limit`](#querylimitn) | method |
 | [`query:offset`](#queryoffsetn) | method |
+| [`query:on_conflict_do_nothing`](#queryon_conflict_do_nothingcolumns-allowed) | method |
 | [`query:order_by`](#queryorder_bycolumn-allowed-direction) | method |
 | [`query:returning`](#queryreturningcolumns) | method |
 | [`query:scope`](#queryscopecolumn-value-allowed) | method |
 | [`query:set`](#querysetcolumn-value-allowed) | method |
+| [`query:skip_locked`](#queryskip_locked) | method |
 | [`query:to_string`](#queryto_string) | method |
 | [`query:values`](#queryvalues) | method |
 | [`query:where`](#querywherecondition-) | method |
 | [`query:where_in`](#querywhere_incolumn-values-allowed) | method |
+| [`sql.cast`](#sqlcastvalue-postgres_type) | function |
 | [`sql.delete_from`](#sqldelete_fromtable_name-allowed) | function |
 | [`sql.identifier`](#sqlidentifiername-allowed-what) | function |
 | [`sql.insert_into`](#sqlinsert_intotable_name-row-allowed_columns-allowed_table) | function |
+| [`sql.jsonb`](#sqlcastvalue-postgres_type) | function |
 | [`sql.Query`](#sqlquery) | table |
 | [`sql.select`](#sqlselectcolumns) | function |
+| [`sql.timestamptz`](#sqlcastvalue-postgres_type) | function |
 | [`sql.update`](#sqlupdatetable_name-allowed) | function |
+| [`sql.uuid`](#sqlcastvalue-postgres_type) | function |
 
 Also on this page: [Identifiers and values](#identifiers-and-values), and
 [Not here](#not-here).
+
+## sql.cast(value, postgres_type)
+
+Marks a bound value with an explicit SQL type, so its placeholder is emitted as
+`$N::type` while the value itself stays bound. `sql.uuid(v)`, `sql.jsonb(v)` and
+`sql.timestamptz(v)` are the three named spellings.
+
+PostgreSQL does not coerce a parameter declared as text into a `uuid` column,
+and pgmoon declares Lua strings as text. Without the cast the comparison is a
+type error at the server, and the reach for a fix is string interpolation --
+which is the door this module exists to close.
+
+The set of types is closed on purpose. It is a typed value, not a raw-cast
+escape hatch: only the type name reaches the SQL text, and only from that list.
+
+**Returns** an opaque typed value, usable anywhere a bound value is: `where`,
+`scope`, `set` and an `insert_into` row.
+
+**Raises** `akkar.sql: unsupported parameter cast: <name>` for anything else.
+
+```lua
+local sql = require "akkar.sql"
+
+local id = "5b06ddf5-4158-45e8-9726-60e064478cac"
+local q = sql.select("*"):from("ref_sql_items")
+  :where("id = ?", sql.uuid(id))
+print(q:to_string())                     --> ... where (id = $1::uuid)
+print(q:values()[1] == id)               --> true
+
+print(pcall(sql.cast, "x", "uuid); drop table t; --"))
+```
 
 ## sql.delete_from(table_name, allowed)
 
@@ -234,6 +272,24 @@ print(q:build())
 print(fake:one(q).title)
 ```
 
+### query:for_update()
+
+Locks the selected rows until the surrounding transaction completes. The clause
+is written last, after `limit`, because PostgreSQL rejects it anywhere else --
+and the builder is the only thing that decides the order, so a caller cannot
+get it wrong.
+
+**Returns** the query.
+
+**Raises** `akkar.sql: for_update is only valid on select queries`.
+
+```lua
+local sql = require "akkar.sql"
+
+print(sql.select("id, stock"):from("ref_sql_variants")
+        :where("id = ?", "v-1"):limit(1):for_update():to_string())
+```
+
 ### query:from(table_name, allowed)
 
 Sets the table. `allowed` is an optional list of table names.
@@ -354,6 +410,30 @@ for index, value in ipairs(q:values()) do
 end
 ```
 
+### query:on_conflict_do_nothing(columns, allowed)
+
+Makes an `insert` idempotent. With `columns` it emits a conflict target,
+`on conflict (a, b) do nothing`; without one, a bare `on conflict do nothing`.
+The clause is written before `returning`, and a row that conflicted returns
+nothing -- which is how the caller tells "inserted" from "already there".
+
+`columns` are identifiers, not values, so they are checked exactly as every
+other caller-chosen identifier on this page is.
+
+**Returns** the query.
+
+**Raises** `akkar.sql: on_conflict_do_nothing is only valid on inserts`,
+`akkar.sql: conflict columns must be a non-empty list`, and the identifier
+errors from [`sql.identifier`](#sqlidentifiername-allowed-what).
+
+```lua
+local sql = require "akkar.sql"
+
+print(sql.insert_into("ref_sql_event_ids", { event_id = "e-1" })
+        :on_conflict_do_nothing({ "tenant_id", "event_id" })
+        :returning("event_id"):scope("tenant_id", "t-1"):to_string())
+```
+
 ### query:order_by(column, allowed, direction)
 
 Sets `order by`. `direction` is `"asc"` (the default) or `"desc"`, in any case.
@@ -442,6 +522,31 @@ q:set("done", true, { "done", "title" })
 q:set("title", "buy oat milk", { "done", "title" })
 q:where("id = ?", 3)
 print(q:to_string())
+```
+
+### query:skip_locked()
+
+Takes the rows nobody else is holding instead of waiting behind them. Only
+meaningful with [`for_update`](#queryfor_update), and the pairing is checked at
+`build` rather than here, so `skip_locked():for_update()` and
+`for_update():skip_locked()` both work -- rejecting one would be rejecting a
+statement that is perfectly well formed by the time it runs.
+
+Correct only for a claim whose mark is durable: a queue that, in the same
+transaction that locks the rows, writes something that removes them from its
+own predicate. Without that mark, both claimers read the same rows the moment
+the first commits and skipping buys nothing.
+
+**Returns** the query.
+
+**Raises** `akkar.sql: skip_locked is only valid on select queries` here, and
+`akkar.sql: skip_locked requires for_update` from `build`.
+
+```lua
+local sql = require "akkar.sql"
+
+print(sql.select("id"):from("ref_sql_jobs"):where("available_at <= now()")
+        :limit(10):for_update():skip_locked():to_string())
 ```
 
 ### query:to_string()

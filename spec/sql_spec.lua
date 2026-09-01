@@ -43,6 +43,52 @@ describe("building a query", function()
     local q = sql.select("*"):from("users"):where_in("id", {})
     assert.equal("select * from users where (false)", q:to_string())
   end)
+
+  it("casts a bound UUID without interpolating its value", function()
+    local id = "5b06ddf5-4158-45e8-9726-60e064478cac"
+    local q = sql.insert_into("memberships", {
+      tenant_id = sql.uuid(id), role = "owner",
+    }, { "tenant_id", "role" })
+    assert.equal(
+      "insert into memberships (role, tenant_id) values ($1, $2::uuid)",
+      q:to_string())
+    assert.same({ "owner", id }, q:values())
+  end)
+
+  it("supports typed UUIDs in composed conditions and tenant scopes", function()
+    local tenant_id = "5b06ddf5-4158-45e8-9726-60e064478cac"
+    local item_id = "746c24d7-f2da-4fe4-872c-1809b527a75c"
+    local q = sql.select("*"):from("items")
+      :where("id = ?", sql.uuid(item_id))
+      :scope("tenant_id", sql.uuid(tenant_id))
+    assert.equal(
+      "select * from items where (id = $1::uuid) and (tenant_id = $2::uuid)",
+      q:to_string())
+    assert.same({ item_id, tenant_id }, q:values())
+  end)
+
+  it("casts in a set clause and in an insert row, not only in a where", function()
+    -- Three named spellings and four places a bound value can appear. A cast
+    -- that only worked in `where` would be found by the first UPDATE.
+    local update = sql.update("items"):set("meta", sql.jsonb("{}"), { "meta" })
+      :where("id = ?", 1)
+    assert.equal("update items set meta = $1::jsonb where (id = $2)", update:to_string())
+    assert.same({ "{}", 1 }, update:values())
+
+    local insert = sql.insert_into("items", { id = sql.uuid("u-1") }, { "id" })
+    assert.equal("insert into items (id) values ($1::uuid)", insert:to_string())
+    assert.same({ "u-1" }, insert:values())
+
+    assert.equal("select * from events where (at = $1::timestamptz)",
+      sql.select("*"):from("events")
+        :where("at = ?", sql.timestamptz("2026-01-01")):to_string())
+  end)
+
+  it("rejects arbitrary cast text", function()
+    local ok, err = pcall(sql.cast, "x", "uuid); drop table users; --")
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):match("unsupported parameter cast"))
+  end)
 end)
 
 describe("values can never become SQL", function()
@@ -123,5 +169,81 @@ describe("identifiers are checked, because they cannot be parameterised", functi
     assert.is_false((pcall(function() sql.select("*"):from("u"):limit("10; drop") end)))
     assert.is_false((pcall(function() sql.select("*"):from("u"):limit(-1) end)))
     assert.is_false((pcall(function() sql.select("*"):from("u"):limit(1.5) end)))
+  end)
+end)
+
+describe("claiming rows for a worker", function()
+  it("writes the lock clause last, after limit", function()
+    -- Postgres rejects `for update` before `limit`, and the builder is the
+    -- only thing deciding the order -- a caller cannot reach the suffix.
+    local text = sql.select("id"):from("jobs"):where("available_at <= now()")
+      :order_by("available_at", { "available_at" }, "asc"):limit(10)
+      :for_update():skip_locked():to_string()
+    assert.equal("select id from jobs where (available_at <= now()) " ..
+                 "order by available_at asc limit $1 for update skip locked", text)
+  end)
+
+  it("takes the calls in either order", function()
+    -- Both spellings describe the same query; rejecting one would be rejecting
+    -- a well-formed statement over the order two builder calls happened to
+    -- arrive in.
+    assert.equal(sql.select("*"):from("jobs"):for_update():skip_locked():to_string(),
+                 sql.select("*"):from("jobs"):skip_locked():for_update():to_string())
+  end)
+
+  it("refuses to skip locked rows without locking any", function()
+    -- `skip locked` alone is not valid SQL, and the mistake it hides is worse
+    -- than the syntax error: a claimer that never locked anything has nothing
+    -- to skip and takes the same rows as everyone else.
+    local ok, err = pcall(function() sql.select("*"):from("jobs"):skip_locked():build() end)
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):match "requires for_update")
+  end)
+
+  it("refuses to lock rows an update or delete never selected", function()
+    for _, kind in ipairs { "update", "delete_from" } do
+      assert.is_false((pcall(function() sql[kind]("jobs"):skip_locked() end)))
+      assert.is_false((pcall(function() sql[kind]("jobs"):for_update() end)))
+    end
+  end)
+
+  it("stays out of a plain select", function()
+    assert.equal("select * from jobs", sql.select("*"):from("jobs"):to_string())
+    assert.equal("select * from jobs for update",
+                 sql.select("*"):from("jobs"):for_update():to_string())
+  end)
+end)
+
+describe("an insert that may already have happened", function()
+  it("emits the conflict target before returning", function()
+    local q = sql.insert_into("event_ids", { event_id = "e-1" })
+      :on_conflict_do_nothing({ "tenant_id", "event_id" }):returning("event_id")
+      :scope("tenant_id", "t-1")
+    assert.equal("insert into event_ids (event_id, tenant_id) values ($1, $2) " ..
+                 "on conflict (tenant_id, event_id) do nothing returning event_id",
+                 q:to_string())
+    assert.same({ "e-1", "t-1" }, q:values())
+  end)
+
+  it("accepts a bare do nothing with no target", function()
+    assert.equal("insert into events (id) values ($1) on conflict do nothing",
+                 sql.insert_into("events", { id = "e-1" })
+                   :on_conflict_do_nothing():to_string())
+  end)
+
+  it("checks conflict columns like every other identifier", function()
+    assert.is_false((pcall(function()
+      sql.insert_into("events", { id = "e-1" })
+        :on_conflict_do_nothing { "id) do nothing; drop table events; --" }
+    end)))
+    assert.is_false((pcall(function()
+      sql.insert_into("events", { id = "e-1" }):on_conflict_do_nothing {}
+    end)))
+  end)
+
+  it("refuses a conflict clause on a query that is not an insert", function()
+    assert.is_false((pcall(function()
+      sql.update("events"):set({ id = "x" }):where("id = ?", 1):on_conflict_do_nothing()
+    end)))
   end)
 end)
