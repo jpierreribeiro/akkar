@@ -18,6 +18,7 @@ local metrics = require "akkar.metrics"
 - [metrics.new(options)](#metricsnewoptions)
 - [metrics.Registry](#metricsregistry)
 - [Registry](#registry)
+  - [registry:counter(name, delta, labels)](#registrycountername-delta-labels)
   - [registry:gauge(name, value, labels)](#registrygaugename-value-labels)
   - [registry:memory()](#registrymemory)
   - [registry:middleware()](#registrymiddleware)
@@ -64,6 +65,49 @@ The metatable every registry shares. Exported for a test that wants to
 identify one.
 
 ## Registry
+
+### registry:counter(name, delta, labels)
+
+Increments an application counter, creating it at zero on first use. `delta`
+defaults to `1` and may be fractional; `labels` is a list of `{ name, value }`
+pairs, in the order they should be rendered.
+
+`name` is used verbatim as the Prometheus metric name, so it must already be a
+valid one. Nothing here prefixes it with `akkar_`.
+
+**Returns** the new value.
+
+**Raises** on a `name` that is not a Prometheus metric name, on a `delta` that
+is not a non-negative number, and on a label name that is not a Prometheus
+label name. Each is a mistake at the call site, fixed once.
+
+Does NOT raise when a counter name accumulates too many distinct label
+combinations. Past 64 of them, every further combination folds into a single
+series whose label values are `<other>` -- the same answer
+`registry:middleware()` gives a method it does not recognise, and for the same
+reason. The total stays correct and the breakdown stops growing.
+
+That bound exists because this is the one place in the module where the label
+values are yours rather than akkar's. The `route` label is bounded because
+akkar knows the pattern that matched; a counter labelled with an order id is
+a series per order, which is how a metrics backend falls over. Folding rather
+than raising is deliberate: a counter must not be able to fail the request it
+is measuring.
+
+```lua
+local metrics = require "akkar.metrics"
+
+local registry = metrics.new()
+
+registry:counter("commerce_checkouts_total", 1, { { "result", "created" } })
+registry:counter("commerce_checkouts_total", 2, { { "result", "created" } })
+registry:counter("commerce_checkouts_total", 1, { { "result", "declined" } })
+registry:counter("commerce_retries_total")            -- no labels, delta 1
+
+local text = registry:render()
+assert(text:find('commerce_checkouts_total{result="created"} 3', 1, true))
+assert(text:find("\ncommerce_retries_total 1\n", 1, true))
+```
 
 ### registry:gauge(name, value, labels)
 
@@ -156,8 +200,8 @@ Always present:
 | `akkar_request_duration_seconds_count` | histogram | `method`, `route` |
 | `akkar_uptime_seconds` | gauge | none |
 
-Gauges are rendered only when at least one has been set, each with a `# TYPE`
-line written once per name.
+Counters and gauges are rendered only when at least one has been set, each
+with a `# TYPE` line written once per name.
 
 **Returns** a string.
 
@@ -216,9 +260,8 @@ registry is a value you hold.
 
 - **Summaries and quantiles.** They cannot be aggregated across processes, and
   this runtime's answer to more CPU is more processes.
-- **Counters and gauges of your own naming, beyond `gauge`.** There is no
-  `registry:counter(name)`. Application counters go in a gauge, or in whatever
-  the scrape reads through `sources`.
+- **An unbounded label space.** `registry:counter` takes labels of your own
+  naming, and stops at 64 combinations per counter name. See it above for why.
 - **Labels on a gauge.** See `registry:gauge` above.
 - **Pushing.** Nothing is sent anywhere. Something scrapes the endpoint.
 - **Aggregation across processes.** Each process has its own registry and its

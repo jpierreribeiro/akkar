@@ -30,12 +30,100 @@ function M.new(options)
     requests = {},        -- [method|route|status] = count
     duration = {},        -- [method|route] = { counts = {}, sum, total }
     gauges   = {},        -- [name|labels] = value
+    counters = {},        -- [name|labels] = { name, labels, value }
+    series   = {},        -- [name] = how many label combinations it holds
     started  = time.now(),
   }, Registry)
 end
 
 local function key(...)
   return table.concat({ ... }, "\1")
+end
+
+-- A metric name and a label name are both fixed by the Prometheus text format
+-- and neither can be repaired at scrape time, so both are checked where they
+-- are written rather than where they are rendered.
+local METRIC_NAME = "^[a-zA-Z_:][a-zA-Z0-9_:]*$"
+local LABEL_NAME  = "^[a-zA-Z_][a-zA-Z0-9_]*$"
+
+-- WHY THE COMBINATIONS ARE COUNTED.
+--
+-- The route label is bounded because akkar knows the pattern that matched,
+-- and the method label is bounded because there are nine verbs.  An
+-- application counter has neither guarantee: its label values are whatever
+-- the handler passes, and a handler that reaches for an order id -- or a
+-- customer id, or a client-supplied `result` string -- mints a series per
+-- request.  That is the same failure the route label exists to prevent,
+-- arriving through the door this method opens.
+--
+-- So the bound is on the number of distinct label combinations one counter
+-- name may hold.  Past it every further combination folds into a single
+-- `<other>` series, keeping the label NAMES so the series set stays uniform.
+-- That is the answer `middleware` already gives an unrecognised method, and
+-- it is chosen for the same reason: the total stays correct while the
+-- breakdown stops growing.
+--
+-- Folded rather than raised.  A counter is measurement, and measurement must
+-- not be able to fail the request it is measuring -- a handler incrementing a
+-- counter in a loop should not become a 500 on the iteration that crosses a
+-- limit it never knew about.  A bad NAME or a negative delta does raise: those
+-- are programming mistakes, fixed once, at the call site.
+local MAX_SERIES = 64
+
+--- Increments an application counter, creating it at zero on first use.
+---
+--- `labels` is a LIST OF PAIRS, exactly as `gauge` takes them, because
+--- Prometheus renders labels in order and a Lua map would order them
+--- differently in every process.
+---
+--- Returns the new value, so a caller can assert on it without reaching into
+--- the registry.
+function Registry:counter(name, delta, labels)
+  if type(name) ~= "string" or not name:match(METRIC_NAME) then
+    error("akkar.metrics: invalid counter name " .. tostring(name), 2)
+  end
+  delta = delta == nil and 1 or delta
+  if type(delta) ~= "number" or delta ~= delta or delta < 0 then
+    error("akkar.metrics: counter delta must be a non-negative number, got "
+          .. tostring(delta), 2)
+  end
+
+  local pairs_list = {}
+  for index, pair in ipairs(labels or {}) do
+    local label = tostring(pair[1])
+    if not label:match(LABEL_NAME) then
+      error("akkar.metrics: invalid label name " .. tostring(pair[1])
+            .. " at position " .. index, 2)
+    end
+    pairs_list[index] = { label, tostring(pair[2]) }
+  end
+
+  local parts = {}
+  for index, pair in ipairs(pairs_list) do
+    parts[index] = pair[1] .. "=" .. pair[2]
+  end
+  local storage_key = key(name, table.concat(parts, ","))
+
+  local found = self.counters[storage_key]
+  if not found then
+    local held = self.series[name] or 0
+    if held >= MAX_SERIES then
+      for index, pair in ipairs(pairs_list) do
+        pairs_list[index] = { pair[1], "<other>" }
+        parts[index] = pair[1] .. "=<other>"
+      end
+      storage_key = key(name, table.concat(parts, ","))
+      found = self.counters[storage_key]
+    end
+    if not found then
+      found = { name = name, labels = pairs_list, value = 0 }
+      self.counters[storage_key] = found
+      self.series[name] = held + 1
+    end
+  end
+
+  found.value = found.value + delta
+  return found.value
 end
 
 function Registry:observe(method, route, status, seconds)
@@ -117,6 +205,24 @@ function Registry:render()
     line("akkar_requests_total" ..
          labels_of { { "method", method }, { "route", route }, { "status", status } } ..
          " " .. self.requests[k])
+  end
+
+  if next(self.counters) then
+    line ""
+    local counter_keys = {}
+    for k in pairs(self.counters) do counter_keys[#counter_keys + 1] = k end
+    table.sort(counter_keys)
+    local declared = {}
+    for _, k in ipairs(counter_keys) do
+      local counter = self.counters[k]
+      if not declared[counter.name] then
+        line("# TYPE " .. counter.name .. " counter")
+        declared[counter.name] = true
+      end
+      local rendered = counter.labels and #counter.labels > 0
+                       and labels_of(counter.labels) or ""
+      line(counter.name .. rendered .. " " .. counter.value)
+    end
   end
 
   line ""
