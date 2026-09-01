@@ -386,6 +386,46 @@ function M.shared(cache)
 end
 
 -- ================================================================ middleware
+--
+-- WHOSE BUCKET IS IT. A bucket name answers three questions, and for a long
+-- time it answered only one. `prefix` was a constant default, so two
+-- `limit.rate{}` middlewares mounted on different routes shared one bucket
+-- and whichever was tighter silently governed both. There was no tenant
+-- component either, so in a multi-tenant application tenant `acme`'s user 7
+-- spent tenant `evil`'s user 7's allowance. The key is now, in order:
+--
+--     <prefix> <this limiter> <tenant> <caller>
+--
+-- and the pieces are LENGTH-PREFIXED rather than joined by a colon, because
+-- several different parties choose them. Plain concatenation makes tenant
+-- `acme` + caller `user:7` and tenant `ac` + caller `me:user:7` the same
+-- eleven characters, and lets a caller id that itself contains a colon spell
+-- somebody else's bucket.
+local function segment(value)
+  value = tostring(value or "")
+  return #value .. ":" .. value
+end
+
+--- Which tenant's budget this is.
+---
+--- Without it every tenant's user 7 spends one shared allowance -- the same
+--- collision `akkar.scope` exists to remove on the database side. A constant
+--- string or a resolver; absent means the application is single-tenant.
+---
+--- An empty resolution raises rather than falling back to the shared bucket:
+--- a namespace that silently resolves to "" is the multi-tenant collision
+--- coming back at exactly the moment the resolver stopped working.
+local function namespace_for(options, req)
+  local namespace = options.namespace
+  if namespace == nil then return "" end
+  local value = type(namespace) == "function" and namespace(req) or namespace
+  value = tostring(value or "")
+  if value == "" then
+    error("limit: namespace returned an empty value", 0)
+  end
+  return value
+end
+
 local function key_for(options, req)
   if options.key then return options.key(req) end
   -- The default is the authenticated caller when there is one and the client
@@ -412,6 +452,13 @@ local function key_for(options, req)
   -- limiter defeated by one header. Found by asking what a real admin IP
   -- allowlist would need and discovering the framework had no answer.
   return "ip:" .. tostring(req.ip or "unknown")
+end
+
+--- The whole bucket name, assembled once so the two limiters cannot drift.
+local function bucket_key(prefix, bucket, options, req)
+  return prefix .. segment(bucket)
+                .. segment(namespace_for(options, req))
+                .. segment(key_for(options, req))
 end
 
 -- ========================================================== response metadata
@@ -516,12 +563,23 @@ end
 --- `headers = false` suppresses the `ratelimit-*` metadata, for a service
 --- that would rather not publish its quota. It is on by default because a
 --- client that cannot see the limit cannot respect it.
+---
+--- `namespace` is the tenant whose budget this is -- a constant string or a
+--- resolver called with the request; a single-tenant application leaves it
+--- out. `name` separates two limiters that are configured alike but meant to
+--- be counted apart.
 function M.rate(options)
   options = options or {}
   local per_second = options.per_second or 10
   local burst      = options.burst or per_second
   local cost       = options.cost or 1
   local prefix     = options.prefix or "akkar:rate:"
+  -- Unnamed, a limiter's bucket carries its own settings, which is what keeps
+  -- a one-per-second limiter on /reset out of a hundred-per-second limiter's
+  -- allowance. Two limiters deliberately configured alike but meant to be
+  -- counted apart need a `name`.
+  local bucket     = options.name
+                     or (per_second .. "/" .. burst .. "/" .. cost)
   local announce   = options.headers ~= false
   local run = evaluator(RATE_SCRIPT)     -- holds a SHA, never a connection
   local state = {}                       -- outage flag; never a connection
@@ -562,7 +620,7 @@ function M.rate(options)
     if is_exempt(req.path) then return next(req) end
 
     local cache = options.cache or req.cache
-    local reply = attempt(run, cache, { prefix .. key_for(options, req) },
+    local reply = attempt(run, cache, { bucket_key(prefix, bucket, options, req) },
                           { burst, per_second, cost }, options, req, state,
                           "rate")
 
@@ -593,18 +651,21 @@ end
 --- twenty is a p99 of 396ms for everybody.
 ---
 ---     app:use(akkar.limit.concurrent { limit = 5 })
+---
+--- Takes `name` and `namespace` on the same terms as `M.rate`.
 function M.concurrent(options)
   options = options or {}
   local limit  = options.limit or 10
   local ttl    = options.ttl or 30      -- a slot cannot be held longer
   local prefix = options.prefix or "akkar:concurrent:"
+  local bucket = options.name or (limit .. "/" .. ttl)
   local acquire = evaluator(CONCURRENT_SCRIPT)
   local release = evaluator(RELEASE_SCRIPT)
   local state = {}
 
   return function(req, next)
     local cache = options.cache or req.cache
-    local key = prefix .. key_for(options, req)
+    local key = bucket_key(prefix, bucket, options, req)
     local reply = attempt(acquire, cache, { key }, { limit, ttl, req.id },
                           options, req, state, "concurrent")
 

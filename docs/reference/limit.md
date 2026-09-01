@@ -41,6 +41,8 @@ produced.
 | `limit` | number | `10` | slots one caller may hold at once |
 | `ttl` | number | `30` | seconds a slot may be held before it is swept |
 | `prefix` | string | `"akkar:concurrent:"` | prepended to the key |
+| `name` | string | its own settings | identifies this limiter's bucket; two limiters configured alike need one |
+| `namespace` | string or function | none | `namespace(req)` returns the tenant this key belongs to |
 | `key` | function | see below | `key(req)` returns the string to count against |
 | `cache` | cache | `req.cache` | the store to count in |
 | `retry_after_ms` | number | `1000` | the `retry-after` value on a refusal |
@@ -114,6 +116,8 @@ as it likes.
 | `burst` | number | `per_second` | bucket capacity, the largest run allowed |
 | `cost` | number | `1` | tokens one request takes |
 | `prefix` | string | `"akkar:rate:"` | prepended to the key |
+| `name` | string | its own settings | identifies this limiter's bucket; two limiters configured alike need one |
+| `namespace` | string or function | none | `namespace(req)` returns the tenant this key belongs to |
 | `key` | function | see below | `key(req)` returns the string to count against |
 | `cache` | cache | `req.cache` | the store to count in |
 | `headers` | boolean | `true` | send the `ratelimit-*` headers; `false` suppresses them |
