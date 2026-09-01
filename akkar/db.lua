@@ -478,12 +478,69 @@ end
 
 local M = {}
 
+-- ======================================================================== TLS
+-- Builds the OpenSSL client object pgmoon starts TLS with.  pgmoon's own
+-- `create_cqueues_openssl_context` sets no verification at all, so this exists
+-- to make `ssl_verify = true` mean something: a CA store, VERIFY_PEER, and a
+-- verify_param carrying the name the certificate has to match.
+--
+-- Name checking is on the params, not on the callback, so a certificate for
+-- the wrong host fails the handshake rather than being accepted and regretted.
+-- An IP literal goes to `setIP` and a hostname to `setHost`; SNI is sent only
+-- for a hostname, because a server name indication of an IP address is not a
+-- thing.  Both the context and the SSL object get the params: the context so
+-- the settings are in place before the handshake begins, the object because
+-- that is what actually verifies.
+local function tls_client(config)
+  local context_module = require "openssl.ssl.context"
+  local context = context_module.new(config.ssl_version or "TLS", false)
+  local store = context:getStore()
+  if config.cafile then store:add(config.cafile) else store:addDefaults() end
+  context:setVerify(context_module.VERIFY_PEER)
+  if config.cert then context:setCertificate(config.cert) end
+  if config.key then context:setPrivateKey(config.key) end
+
+  local params = require("openssl.x509.verify_param").new()
+  local host = assert(config.host, "db TLS verification needs host")
+  if host:match("^%d+%.%d+%.%d+%.%d+$") then params:setIP(host)
+  else params:setHost(host) end
+  context:setParam(params)
+
+  local ssl = require("openssl.ssl").new(context)
+  if not host:match("^%d+%.%d+%.%d+%.%d+$") then ssl:setHostName(host) end
+  ssl:setParam(params)
+  return ssl
+end
+
+M.tls_client = tls_client
+
 -- ==================================================================== connect
 -- Returns a factory: akkar calls it once per request.  `pool_size = 0` opts
 -- out and opens a connection per request, which is what the substrate proof
 -- measured and what a one-off script wants.
 function M.connect(config)
   local reset_on_release = config.reset_on_release == true
+
+  -- Asking for TLS means requiring it.
+  --
+  -- PostgreSQL's SSL negotiation happens in cleartext: the client asks, and
+  -- the server answers one byte, `S` or `N`.  pgmoon fails on an error reply
+  -- or when `ssl_required` is set, and otherwise -- on a plain `N` -- falls
+  -- through to `return true` and continues UNENCRYPTED.  So with
+  -- `ssl_required` defaulting to false, everything `tls_client` sets up is
+  -- skipped without a certificate ever being presented: VERIFY_PEER, the CA
+  -- store, setHost/setIP, SNI.  Anyone positioned to answer that byte strips
+  -- the TLS, and `ssl_verify = true` reports success.
+  --
+  -- So the default follows the request: a caller who said `ssl = true` gets an
+  -- error rather than a downgrade.  Opportunistic TLS is still available, and
+  -- now has to be said out loud -- `ssl_required = false` is a sentence
+  -- someone has to write, which is the point.
+  --
+  -- Computed once here rather than inside `open`, because it is a property of
+  -- the configuration and not of any one connection.
+  local ssl_required = config.ssl_required
+  if ssl_required == nil then ssl_required = config.ssl or false end
 
   local function open()
     if config.driver == "pq" then
@@ -495,6 +552,12 @@ function M.connect(config)
             "'; expected 'pgmoon' or 'pq'", 0)
     end
 
+    -- A caller may hand in its own OpenSSL object; otherwise `ssl_verify`
+    -- builds one here.  Without it pgmoon falls back to a context that
+    -- verifies nothing, which is why `ssl_verify` cannot be passed alone.
+    local tls = config.cqueues_openssl_context
+    if config.ssl and config.ssl_verify and not tls then tls = tls_client(config) end
+
     local pg = pgmoon.new {
       host = config.host or "127.0.0.1",
       port = config.port or 5432,
@@ -502,6 +565,14 @@ function M.connect(config)
       user = config.user,
       password = config.password,
       socket_type = "cqueues",
+      ssl = config.ssl or false,
+      ssl_required = ssl_required,     -- see the note above `open`
+      ssl_verify = config.ssl_verify,
+      cert = config.cert,
+      key = config.key,
+      cafile = config.cafile,
+      ssl_version = config.ssl_version,
+      cqueues_openssl_context = tls,
     }
     -- THE MESSAGE BELOW NEVER APPEARED, and that was the point of writing it.
     --
@@ -519,10 +590,17 @@ function M.connect(config)
     --
     -- So the call is wrapped, and both shapes -- raised and returned -- end
     -- in the same message, which names what was being connected to.
-    local ok, err = pcall(function() return pg:connect() end)
-    if ok and err == nil then ok = false end     -- `false, reason` from pgmoon
+    --
+    -- The REASON is the second return value, and it used to be thrown away.
+    -- `pcall` gives back every value the call produced, but only the first was
+    -- read, so pgmoon's returned-failure path -- the SSL refusal above is
+    -- exactly one of them -- reported `-- nil` where it had a sentence to
+    -- print. Both falsy shapes, `nil, reason` and `false, reason`, now carry
+    -- their reason through.
+    local ok, res, why = pcall(function() return pg:connect() end)
+    if ok and not res then ok, res = false, why end
     if not ok then
-      local reason = tostring(err)
+      local reason = tostring(res)
       -- The connection refused case is worth naming on its own, because it is
       -- almost always a database that is not running rather than one that is
       -- misconfigured, and those have different fixes.

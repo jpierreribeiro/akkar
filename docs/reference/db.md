@@ -69,6 +69,13 @@ factory is called, and nothing in `config` is checked until then either.
 | `statement_timeout` | number | none | seconds, set on the connection with `set statement_timeout` |
 | `driver` | string | `"pgmoon"` | `"pgmoon"` or `"pq"` |
 | `buffered_reads` | boolean | `true` | pgmoon only; `false` puts pgmoon's own per-message socket reads back |
+| `ssl` | boolean | `false` | pgmoon only; ask the server for TLS |
+| `ssl_required` | boolean | **follows `ssl`** | pgmoon only; refuse to continue if the server declines TLS |
+| `ssl_verify` | boolean | `false` | pgmoon only; verify the server certificate against a CA store and the host name |
+| `cafile` | string | none | pgmoon only; a CA bundle to trust instead of the system defaults |
+| `cert` / `key` | string | none | pgmoon only; a client certificate and its key |
+| `ssl_version` | string | `"TLS"` | pgmoon only; the OpenSSL protocol name |
+| `cqueues_openssl_context` | object | none | pgmoon only; your own OpenSSL object, used as-is |
 
 `statement_timeout` is what stops the query, as opposed to stopping the wait
 for it. akkar can abandon a slow query, but only Postgres can stop running one,
@@ -88,6 +95,8 @@ at shutdown.
 - `db: could not set statement_timeout: <reason>`, after disconnecting
 - `db: unknown driver '<name>'; expected 'pgmoon' or 'pq'`
 - `db: driver 'pq' needs the C module akkar.pq_native, which is a separate rock: luarocks install akkar-pq ...`
+- `the server does not support SSL connections`, wrapped in the same
+  `db: could not connect to ...` sentence, when TLS was asked for and refused
 
 ```lua
 local db = require "akkar.db"
@@ -105,6 +114,56 @@ local conn = open()
 print(conn:one("select 1 as n").n)
 conn:close()
 ```
+
+### TLS to Postgres
+
+pgmoon only — the `pq` driver takes libpq's `sslmode` instead.
+
+```lua no-run
+local open = db.connect {
+  host     = "db.internal",
+  database = "akkar",
+  user     = "postgres",
+  password = "akkar",
+  ssl        = true,
+  ssl_verify = true,
+  cafile     = "/etc/ssl/certs/internal-ca.pem",   -- optional; system store otherwise
+}
+```
+
+**`ssl_required` defaults to whatever `ssl` is.** Asking for TLS means
+requiring it, and the reason is the shape of the protocol: PostgreSQL
+negotiates TLS **in cleartext**. The client sends an SSLRequest and the server
+answers a single byte, `S` for yes or `N` for no. A driver that treats `N` as
+"fine, carry on" continues on the plain socket — and everything `ssl_verify`
+set up is then skipped, because no handshake ever happens: no certificate is
+presented, no CA is consulted, no host name is checked. Anyone able to answer
+that byte strips the encryption, and the connection reports success.
+
+So `ssl = true` alone refuses a server that declines, with `the server does not
+support SSL connections`. Opportunistic TLS — try it, accept cleartext if the
+server says no — is still available and has to be said out loud:
+
+```lua no-run
+local open = db.connect {
+  host = "127.0.0.1", database = "akkar", user = "postgres", password = "akkar",
+  ssl = true, ssl_required = false,       -- deliberately allows a downgrade
+}
+```
+
+`ssl_verify = true` is what makes the certificate mean anything. It builds an
+OpenSSL client with `VERIFY_PEER`, a CA store (`cafile`, or the system
+defaults), and a verify parameter carrying the name the certificate has to
+match — `setHost` for a host name, with SNI sent, and `setIP` for an IP
+literal, without. Without it pgmoon's own context verifies nothing, so
+`ssl = true` on its own gets you an encrypted connection to whoever answered.
+`cert` and `key` add a client certificate; `cqueues_openssl_context` replaces
+the whole construction with an object you built yourself. `db.tls_client(config)`
+is that construction, exposed so it can be inspected in a test.
+
+`spec/db_tls_downgrade_spec.lua` is the proof: a fake server that answers `N`
+and nothing else. The required case must refuse; the opportunistic case must
+get *further*, as far as a startup response that never comes.
 
 ## db.Pool
 
