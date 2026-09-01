@@ -4,6 +4,8 @@
 --   /ping        the framework alone
 --   /users/:id   one indexed query
 --   /rows/:n     a payload sweep, straight from the database
+--   /heap        the Lua heap, for the soak
+--   /metrics     the pool, for the saturation sweep
 --
 -- `AKKAR_ROOT` selects the tree, `AKKAR_LEAN` turns off the two features the
 -- peers do not have, so akkar can be reported as-shipped AND like for like.
@@ -15,8 +17,9 @@ package.path = root .. "/?.lua;" .. root .. "/?/init.lua;" .. package.path
 -- install and is actually a search path nobody stated.
 package.cpath = root .. "/?.so;" .. package.cpath
 
-local akkar = require "akkar"
-local db    = require "akkar.db"
+local akkar   = require "akkar"
+local db      = require "akkar.db"
+local metrics = require "akkar.metrics"
 
 io.stderr:write(("tree=%s\n"):format(package.searchpath("akkar", package.path)))
 
@@ -51,6 +54,16 @@ elseif gc == "gen" then collectgarbage "generational"
 elseif gc == "lazy" then collectgarbage("incremental", 400, 400, 13)
 end
 if gc then io.stderr:write(("gc=%s\n"):format(gc)) end
+
+-- The pool is built HERE rather than inline in `app:run` below, because
+-- `/metrics` has to be able to reach it. `db.connect` returns a callable table
+-- carrying `.pool` for exactly this -- "so the pool can be reached for
+-- shutdown and diagnostics", `akkar/db.lua` says at the return.
+local database = db.connect {
+  port = 55432, database = "akkar", user = "postgres", password = "akkar",
+  pool_size = tonumber(arg[2]) or 10,
+  driver = os.getenv "AKKAR_DRIVER",
+}
 
 local app = akkar.new()
 app:get("/ping", function() return { pong = true } end)
@@ -93,6 +106,39 @@ app:get("/rows/:n", { params = { n = akkar.v.integer { min = 1, max = 2000 } } }
       req.params.n) }
   end)
 
+-- WHY THIS SERVER HAS A /metrics AND WHAT IT DELIBERATELY DOES NOT MEASURE.
+--
+-- `bench/study/saturation.sh` records four predictions before it runs, and the
+-- third of them -- "time waiting for a connection becomes the majority of p99
+-- above 2x capacity" -- is the only one that cannot be answered by wrk.
+-- Throughput, p50, p99 and errors all come off the load generator; the SHARE
+-- of that p99 which is queueing for a pool slot is inside this process, and
+-- `bench/study/RESULTS.md` had to publish that prediction as "Not measured"
+-- because this file mounted no route a scrape could reach. The counters were
+-- there the whole time -- `Pool:stats()` has had `waits`, `waited` and
+-- `waited_max` for as long as the pool has queued -- with nothing to read them.
+--
+-- ONLY THE POOL IS REGISTERED, and no middleware is installed. That is the
+-- point rather than an omission:
+--
+--   * `registry:middleware()` would put a `pcall`, a monotonic clock read and
+--     a histogram update on every request, on the exact routes whose cost is
+--     what this study publishes. `/ping` is the framework-alone floor -- the
+--     number every peer is compared against -- and it must not pay for an
+--     instrument the peers are not carrying. `/ping` and `/users/:id` do not
+--     touch this registry at all;
+--   * the request rate is already measured, better, from outside. wrk counts
+--     what it received; a counter inside one of several `reuseport` processes
+--     counts a share of it and has to be summed across them.
+--
+-- So the endpoint reports the pool and nothing else, and it costs this server
+-- nothing until the sweep curls it once at the end of the run. `Registry:pool`
+-- keeps a reference and reads `stats()` inside `render()`; there is no sampler
+-- on the scheduler competing with the load for it.
+local registry = metrics.new()
+registry:pool("db", database.pool)
+registry:serve(app, "/metrics")
+
 app:run {
   port = tonumber(arg[1]) or 8500,
   reuseport = true,
@@ -111,8 +157,6 @@ app:run {
   --
   -- `AKKAR_DRIVER=pq` makes the same server, the same routes and the same
   -- harness answer the question end to end.
-  db = db.connect { port = 55432, database = "akkar", user = "postgres",
-                    password = "akkar", pool_size = tonumber(arg[2]) or 10,
-                    driver = os.getenv "AKKAR_DRIVER" },
+  db = database,
   log = akkar.log.new { level = "error" },
 }

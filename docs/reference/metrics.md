@@ -23,6 +23,7 @@ local metrics = require "akkar.metrics"
   - [registry:memory()](#registrymemory)
   - [registry:middleware()](#registrymiddleware)
   - [registry:observe(method, route, status, seconds)](#registryobservemethod-route-status-seconds)
+  - [registry:pool(name, pool)](#registrypoolname-pool)
   - [registry:render()](#registryrender)
   - [registry:serve(app, path, sources)](#registryserveapp-path-sources)
 - [What is exported](#what-is-exported)
@@ -118,13 +119,20 @@ value.
 `name` is used verbatim as the Prometheus metric name, so it must already be a
 valid one. Nothing here prefixes it with `akkar_`.
 
+`labels` is a list of `{ name, value }` pairs, in the order they should be
+rendered, exactly as `registry:counter` takes them. It used to raise on every
+call -- the storage key was built by concatenating the arguments, and a table
+cannot be concatenated -- so a whole documented branch was unreachable in a
+tested module. It works.
+
+Nothing bounds a gauge's label values. `registry:counter` folds past 64
+combinations because a counter is incremented from a handler; a gauge is set
+from a scrape, where the values are yours and few. Setting one per customer
+id is still the mistake it always was.
+
 **Returns** nothing.
 
-**Raises** `invalid value (table) at index 2 in table for 'concat'` when
-`labels` is given. The third argument is not usable: the key the gauge is
-stored under is built by concatenating the arguments, and a table cannot be
-concatenated. `render()` does know how to emit labels, so this is a defect and
-not a design. Until it is fixed, put anything distinguishing into `name`.
+**Raises** nothing.
 
 ```lua
 local metrics = require "akkar.metrics"
@@ -133,11 +141,14 @@ local registry = metrics.new()
 
 registry:gauge("akkar_pool_in_use", 3)
 registry:gauge("akkar_pool_in_use", 4)   -- same name, replaced
+registry:gauge("queue_depth", 12, { { "queue", "emails" } })
+
+local text = registry:render()
+assert(text:find("\nakkar_pool_in_use 4\n", 1, true))
+assert(text:find('queue_depth{queue="emails"} 12', 1, true))
 
 local lua_bytes, rss_bytes = registry:memory()
 print(lua_bytes > 0, rss_bytes >= 0)     --> true  true
-
-io.write(registry:render())
 ```
 
 ### registry:memory()
@@ -185,6 +196,71 @@ histogram.
 
 **Returns** nothing.
 
+### registry:pool(name, pool)
+
+Registers a connection pool to be READ at every scrape, under the label
+`pool="<name>"`. The registry keeps a reference and calls `pool:stats()` from
+inside `render()`.
+
+| argument | type | meaning |
+|---|---|---|
+| `name` | string | the `pool` label value, non-empty |
+| `pool` | pool | anything with a `stats()` returning the fields below |
+
+**Returns** the pool, so the call chains off `db.connect{...}.pool`.
+
+**Raises** on a `name` that is not a non-empty string, and on a `pool` with no
+`stats()` to read. Registering a pool happens once at boot, so both are
+startup failures the author sees immediately rather than a 500 later.
+
+Nine series per pool, each one field of `Pool:stats()`:
+
+| metric | type | from |
+|---|---|---|
+| `akkar_pool_size` | gauge | slots the pool may fill |
+| `akkar_pool_connections` | gauge | connections that exist right now |
+| `akkar_pool_idle` | gauge | connections in the idle set |
+| `akkar_pool_reserved` | gauge | slots held by an open still in flight |
+| `akkar_pool_waits_total` | counter | checkouts that had to queue |
+| `akkar_pool_wait_seconds_total` | counter | seconds spent queued |
+| `akkar_pool_wait_seconds_max` | gauge | longest single wait so far |
+| `akkar_pool_retired_total` | counter | connections closed for age |
+| `akkar_pool_reaped_total` | counter | slots recovered from an abandoned open |
+
+Read, not pushed, and not sampled. Pushing would mean a metrics call on
+`Pool:get`, which is a measured hot path with an allocation ceiling, and it
+would make a pool unmeasurable except by a process holding a registry.
+Sampling on a timer would be worse: a wait is a measurement of the running
+scheduler, so a sampler is another thing on that scheduler reading while the
+numbers move, and it keeps reading on an idle process nobody is scraping.
+
+The `pool` label is bounded the way an application counter's labels are: past
+64 distinct names every further pool folds into `pool="<other>"`, and folded
+pools are summed there rather than overwriting one another. Two pools
+registered under one name sum for the same reason. A pool whose `stats()`
+raises is skipped and does not fail the scrape.
+
+Each process has its own pool and its own registry, so a scrape is one
+process's numbers. Summing across them is the scraper's job, as it is for
+every other metric here.
+
+```lua
+local metrics = require "akkar.metrics"
+local Pool    = require "akkar.pool"
+
+local registry = metrics.new()
+local pool     = Pool.new(function() return { open = true } end, 10)
+
+registry:pool("db", pool)
+
+local text = registry:render()
+print((text:match "akkar_pool_size{[^\n]*"))         --> akkar_pool_size{pool="db"} 10
+assert(text:find('akkar_pool_waits_total{pool="db"} 0', 1, true))
+```
+
+With a real pool it is `registry:pool("db", db.connect({ ... }).pool)`, and
+the same `db.connect` value goes to `app:run { db = ... }`.
+
 ### registry:render()
 
 The whole registry in Prometheus text format, ending with a newline. Series
@@ -201,7 +277,13 @@ Always present:
 | `akkar_uptime_seconds` | gauge | none |
 
 Counters and gauges are rendered only when at least one has been set, each
-with a `# TYPE` line written once per name.
+with a `# TYPE` line written once per name. Every pool registered with
+`registry:pool` is READ here, at render time, and contributes the nine
+families listed under that method, grouped by metric name -- the exposition
+format requires every sample of one family to be contiguous.
+
+An integer renders bare; anything fractional renders with six decimals, so a
+sub-millisecond wait does not scrape in Lua's scientific notation.
 
 **Returns** a string.
 
@@ -261,9 +343,12 @@ registry is a value you hold.
 - **Summaries and quantiles.** They cannot be aggregated across processes, and
   this runtime's answer to more CPU is more processes.
 - **An unbounded label space.** `registry:counter` takes labels of your own
-  naming, and stops at 64 combinations per counter name. See it above for why.
-- **Labels on a gauge.** See `registry:gauge` above.
+  naming, and stops at 64 combinations per counter name. `registry:pool` stops
+  at 64 pool names the same way. See them above for why.
 - **Pushing.** Nothing is sent anywhere. Something scrapes the endpoint.
+- **Sampling.** Nothing reads a pool on a timer. `registry:pool` reads inside
+  `render()`, so an unscraped process pays nothing and a scrape never reads a
+  number some sampler took at a different moment.
 - **Aggregation across processes.** Each process has its own registry and its
   own uptime. Summing them is the scraper's job.
 

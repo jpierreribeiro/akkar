@@ -13,7 +13,8 @@
 #   2. p50 stays near the service time; p99 grows roughly linearly with
 #      offered concurrency once past capacity.
 #   3. Time spent waiting for a connection becomes the majority of p99 above
-#      2x, which is the thing `akkar_pool_waited` was added to show.
+#      2x, which is the thing `akkar_pool_wait_seconds_total` was added to
+#      show.
 #   4. Errors stay at zero throughout: queuing is not failing, and the point
 #      of the deadline is that it converts a queue into a refusal rather than
 #      into a timeout.
@@ -93,5 +94,24 @@ for mult in 0.5 0.75 1 1.25 1.5 2 3 4; do
 done
 
 echo
-echo "# pool waits, summed across the server processes:"
-curl -s "http://127.0.0.1:$PORT/metrics" 2>/dev/null | grep -E "akkar_pool|akkar_requests_total" | head -20
+# PREDICTION 3 IS READ HERE, and until `serve.lua` mounted `/metrics` this
+# curl went to a route that did not exist -- which is why `RESULTS.md` records
+# that prediction as "Not measured" while the counters behind it had been in
+# `Pool:stats()` all along.
+#
+# ONE PROCESS OUT OF $PROCS. `reuseport` gives every server its own pool and
+# its own registry, so this is a sample, not a total: the connection wrk
+# opened lands on whichever process the kernel chose. The shape is what the
+# prediction is about -- whether waiting dominates -- and for that a single
+# process past the knee is representative, since all $PROCS see the same
+# offered load. Summing needs a scrape per process and a port per process,
+# which is a scraper's job and not this script's.
+#
+# `wait_seconds_total / waits` is the mean wait; compare it against the p99
+# column above. `wait_seconds_max` is the worst single wait the run produced.
+# The request counter is deliberately absent -- `serve.lua` installs no
+# metrics middleware, because wrk already counts requests from outside and
+# without paying for it on the measured path.
+echo "# pool, from one of the $PROCS server processes (see the note in this script):"
+curl -s "http://127.0.0.1:$PORT/metrics" 2>/dev/null |
+  grep -E '^akkar_pool_' || echo "# no /metrics on port $PORT -- prediction 3 unmeasured"
