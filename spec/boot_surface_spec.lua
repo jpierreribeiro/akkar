@@ -42,10 +42,14 @@ local portable = require "spec.support.portable"
 --- to append to its own, and it is reached through `portable.lua`. Both for the
 --- reason `spec/docs_spec.lua` gives at length: a child that cannot find
 --- cqueues fails in a way that blames the code for the harness.
-local function boot_modules()
+--- @param body string|nil Lua source to run before the module set is read.
+---   Defaults to a bare `require "akkar"`. Passed in rather than hard-coded
+---   because the h2 assertions below have to ask what a boot that BUILDS A
+---   SERVER loads, which is a different question from what `require` loads.
+local function boot_modules(body)
   local script = ("package.path = %q\npackage.cpath = %q\n"):format(
-    "./?.lua;./?/init.lua;" .. package.path, "./?.so;" .. package.cpath) .. [[
-    require "akkar"
+    "./?.lua;./?/init.lua;" .. package.path, "./?.so;" .. package.cpath)
+    .. (body or 'require "akkar"\n') .. [[
     local names = {}
     for name in pairs(package.loaded) do names[#names + 1] = name end
     table.sort(names)
@@ -83,6 +87,23 @@ describe("what booting akkar loads", function()
     ["openssl.kdf"]    = "pulled in by akkar.crypto",
     ["akkar.websocket"] = "deferred deliberately; it was measured at 96 ms and "
                        .. "65 modules on boots that never open a socket",
+    -- THE h2 HALF. `akkar/vendor/http/server.lua` used to require
+    -- `h2_connection` at the top of the file for two per-connection call
+    -- sites, both of them already guarded. It is now loaded in `new_server`,
+    -- and only for a server that could actually speak h2 -- `version == 2`,
+    -- `h2c`, or anything but `tls = false`. The four below arrive behind it
+    -- and nowhere else on the boot path, so they are the evidence that the
+    -- deferral is really deferring rather than moving the require one file up.
+    ["akkar.vendor.http.h2_connection"] =
+      "deferred to `new_server`; ~19 ms of 47.6 and 5 modules of 69, on every "
+      .. "boot of every application, most of which never see an h2 connection",
+    ["akkar.vendor.http.h2_stream"] = "reached only through h2_connection",
+    ["akkar.vendor.http.hpack"] =
+      "HPACK's static table and huffman codes are built at load time, and "
+      .. "reached only through h2_connection",
+    ["akkar.vendor.http.h2_error"] = "reached only through h2_connection",
+    ["akkar.vendor.http.bit"] =
+      "the bit shim the h2 framing uses; reached only through h2_connection",
   }
 
   for name, why in pairs(MUST_NOT_LOAD) do
@@ -116,5 +137,85 @@ describe("what booting akkar loads", function()
     assert.is_truthy(loaded["akkar.execution"])
     assert.is_truthy(loaded["akkar.vendor.http.server"])
     assert.is_truthy(loaded["cqueues"])
+    -- ALPN STAYS EAGER, and this is where that is written down.
+    --
+    -- `alpn_select` in `server.lua` is a pure function over strings, and the
+    -- context that installs it is built from `akkar.vendor.http.tls`. Neither
+    -- touches `h2_connection`, so h2 is still OFFERED over TLS from the first
+    -- handshake -- what got deferred is the connection machinery, not the
+    -- negotiation. A "tidy-up" that deferred this module too would take h2
+    -- off the wire while every h2 test that dials in explicitly kept passing.
+    assert.is_truthy(loaded["akkar.vendor.http.tls"])
+  end)
+end)
+
+--[[
+The other side of the deferral, and the one assertion here that protects
+production rather than boot time.
+
+`server.lua` documents `wrap_socket` as a function that *should never throw*,
+and `add_socket` runs it under an `xpcall` -- so a `require` that failed inside
+it would be swallowed, reported as one connection's error, and h2 would be
+silently broken while HTTP/1.1 kept serving. That is why the load is forced in
+`new_server`, which already throws twice, and not lazily at the call sites.
+
+A change that quietly removed that forcing -- inlining it back into
+`wrap_socket`, moving it to `listen`, or making it conditional on
+`http_tls.has_alpn` -- would pass every other test in this file and in the
+suite. It would fail only here.
+]]
+describe("constructing a server that could speak h2", function()
+  -- `tls = false` and no `h2c`, so nothing forces the load: the counterweight
+  -- for the two cases below, and the configuration the saving is actually for.
+  local CLEARTEXT = [[
+    require "akkar"
+    require("akkar.vendor.http.server").new {
+      tls = false, onstream = function() end,
+    }
+  ]]
+
+  local H2C = [[
+    require "akkar"
+    require("akkar.vendor.http.server").new {
+      tls = false, h2c = true, onstream = function() end,
+    }
+  ]]
+
+  local TLS = [[
+    require "akkar"
+    require("akkar.vendor.http.server").new {
+      tls = true, onstream = function() end,
+      ctx = require("akkar.vendor.http.tls").new_server_context(),
+    }
+  ]]
+
+  it("loads h2 for h2c = true, before any connection arrives", function()
+    local loaded = boot_modules(H2C)
+    assert.is_truthy(loaded["akkar.vendor.http.h2_connection"],
+      "a cleartext h2c server was constructed and the h2 half was NOT loaded. "
+      .. "The load must be forced in `new_server`, where throwing is already "
+      .. "the contract -- deferred into `wrap_socket` it is caught by the "
+      .. "`xpcall` in `add_socket`, and h2 fails silently in production while "
+      .. "HTTP/1.1 keeps working.")
+  end)
+
+  it("loads h2 for a TLS server, because ALPN can hand it one", function()
+    local loaded = boot_modules(TLS)
+    assert.is_truthy(loaded["akkar.vendor.http.h2_connection"],
+      "a TLS server was constructed and the h2 half was NOT loaded. ALPN can "
+      .. "settle on h2 at any handshake, and there is no honest way to be "
+      .. "ready for that without the module. An application with TLS pays the "
+      .. "~19 ms here and saves nothing; that is the design, not a defect.")
+  end)
+
+  it("does not load h2 for a cleartext server without h2c", function()
+    local loaded = boot_modules(CLEARTEXT)
+    assert.is_truthy(loaded["akkar.vendor.http.server"],
+      "the child did not build a server at all")
+    assert.is_nil(loaded["akkar.vendor.http.h2_connection"],
+      "a cleartext, non-h2c server loaded the h2 half. This is the one shape "
+      .. "the deferral exists for -- the process-per-tenant case `akkar/init.lua` "
+      .. "names as the reason boot time matters -- so if the forcing predicate "
+      .. "now covers it, the deferral saves nobody anything.")
   end)
 end)

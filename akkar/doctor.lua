@@ -109,6 +109,21 @@ end
 local REQUIRED = {
   { name = "cqueues",   why = "the event loop" },
   { name = "akkar.vendor.http.server", why = "the HTTP server (vendored)" },
+  -- LISTED SEPARATELY BECAUSE IT IS NO LONGER PROVED BY THE LINE ABOVE.
+  --
+  -- `server.lua` used to require `h2_connection` at the top, so loading the
+  -- server parsed the whole h2 half -- `h2_stream`, `hpack`, `h2_error`,
+  -- `vendor/http/bit` -- and any syntax or load error in it surfaced right
+  -- here. That require is now deferred to `new_server`, for ~19 ms of boot,
+  -- and the proof went with it.
+  --
+  -- This entry buys it back in the one place that already knows how to
+  -- report a module that will not load. It is REQUIRED rather than OPTIONAL
+  -- on purpose: h2 is not an optional install here, it is vendored in the
+  -- tree, so a copy that does not load is a broken checkout, not a missing
+  -- rock.
+  { name = "akkar.vendor.http.h2_connection",
+    why = "the HTTP/2 half (vendored), loaded lazily by the server" },
   { name = "cjson",     why = "JSON encoding", rock = "lua-cjson" },
 }
 
@@ -533,13 +548,32 @@ function M.check_app(app, config, report)
       "call ctx:setAlpnSelect(require('akkar.vendor.http.server').alpn_select) " ..
       "on it, or pass `tls = { certificate = ..., key = ... }` and let akkar " ..
       "build the context")
-  elseif config.tls then
-    report:ok("settings", "HTTP/1.1 and HTTP/2",
-      "h2 is negotiated by ALPN; a client that does not ask for it gets h1")
-  elseif config.h2c then
-    report:ok("settings", "HTTP/1.1 and cleartext HTTP/2",
-      "h2c costs one read per connection to sniff the preface, h1 " ..
-      "connections included")
+  elseif config.tls or config.h2c then
+    -- AND THE CLAIM IS CHECKED, NOT DEDUCED FROM THE CONFIG.
+    --
+    -- `server.lua` loads `h2_connection` lazily now -- at `new_server`, for
+    -- exactly these configurations -- so "this server speaks HTTP/2" is no
+    -- longer something the config alone can establish. Read off the config
+    -- it would be a claim about a tree whose `hpack.lua` might not parse,
+    -- and the doctor would be asserting the very thing it exists to catch.
+    -- So it is asked, here, of the module that would have to work.
+    local h2_ok, h2_err = present "akkar.vendor.http.h2_connection"
+    if not h2_ok then
+      report:fail("settings",
+        config.tls and "HTTP/2 is configured and the h2 half does not load"
+                    or "h2c is on and the h2 half does not load",
+        "the server would accept the connection and then fail it: " ..
+        (tostring(h2_err):match "^[^\n]*"):gsub(":%s*$", ""),
+        "this is vendored code, not a rock -- check the tree under " ..
+        "akkar/vendor/http/ is complete and parses")
+    elseif config.tls then
+      report:ok("settings", "HTTP/1.1 and HTTP/2",
+        "h2 is negotiated by ALPN; a client that does not ask for it gets h1")
+    else
+      report:ok("settings", "HTTP/1.1 and cleartext HTTP/2",
+        "h2c costs one read per connection to sniff the preface, h1 " ..
+        "connections included")
+    end
   else
     report:ok("settings", "HTTP/1.1 only",
       "no TLS, so there is no ALPN to negotiate h2 with; `h2c = true` " ..

@@ -168,6 +168,33 @@ be measured. The profiler is `bench/study/boot-profile.lua`.
 > parse function -- a restructure of vendored upstream code that buys nothing
 > for any application that serves a single request.
 
+> **Done, and the 19 ms did not survive measurement, 1 Sep 2026.**
+> `akkar/vendor/http/server.lua` now reaches `h2_connection` through a memoised
+> file-local, in the shape `akkar/init.lua` uses for WebSocket, and forces the
+> load in `new_server` when `tbl.version == 2 or tbl.h2c or tbl.tls ~= false`.
+>
+> The forcing site is the whole design and is written up in the file. A
+> `require` inside `wrap_socket` would be swallowed by the `xpcall` in
+> `add_socket` -- h2 silently broken in production, HTTP/1.1 serving normally --
+> so the load happens where throwing is already the contract. `listen` was
+> rejected for it: its own comment says you need not call it.
+>
+> **The five modules are right and the milliseconds are not.** Measured here,
+> nine runs each, `os.clock`: 69 modules to 64, and a median of **43.0 ms to
+> 36.0 ms -- about 7 ms, not 19**. The 19 above was an estimate from a
+> self-time column that file itself warns overlaps; this is boot measured end
+> to end. An application with TLS or `h2c` pays the load at `new_server` and
+> saves nothing at all, by design.
+>
+> What the eager require also silently provided was a proof that the h2 half
+> parses, on every boot. `akkar/doctor.lua` gets that back explicitly:
+> `akkar.vendor.http.h2_connection` is now in REQUIRED, and the "HTTP/1.1 and
+> HTTP/2" finding is a `fail` carrying the load error unless the module
+> actually loads. `spec/boot_surface_spec.lua` names the five modules and boots
+> a second child that constructs an h2c server and a TLS server and asserts the
+> h2 half **is** loaded -- the one assertion in the suite that fails if the
+> forcing is ever optimised away.
+
 ### 3. Teach `akkar doctor` about descriptor limits
 
 There is no RLIMIT check in `akkar/doctor.lua`. akkar intentionally caps itself

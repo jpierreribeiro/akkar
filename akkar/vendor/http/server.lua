@@ -7,7 +7,6 @@ local cs = require "cqueues.socket"
 local connection_common = require "akkar.vendor.http.connection_common"
 local onerror = connection_common.onerror
 local h1_connection = require "akkar.vendor.http.h1_connection"
-local h2_connection = require "akkar.vendor.http.h2_connection"
 local http_tls = require "akkar.vendor.http.tls"
 local http_util = require "akkar.vendor.http.util"
 local openssl_bignum = require "openssl.bignum"
@@ -20,6 +19,28 @@ local name = require "openssl.x509.name"
 local altname = require "openssl.x509.altname"
 
 local hang_timeout = 0.03
+
+--- The h2 half, LOADED WHEN A SERVER THAT COULD SPEAK IT IS CONSTRUCTED, and
+--- not at `require` time.
+---
+--- `h2_connection` has exactly two uses in this file, both per-connection and
+--- both already guarded -- the preface sniff under `self.h2c`, and
+--- `h2_connection.new` under `version == 2`. `h2_stream`, `hpack`, `h2_error`
+--- and `vendor/http/bit` arrive only behind it, so deferring this one require
+--- drops all five: **~19 ms of 47.6 and 5 modules of 69**, measured, on every
+--- boot of every application.
+---
+--- ALPN IS NOT AFFECTED AND MUST NOT BE. `alpn_select` below is a pure
+--- function over strings and never touches this module, so a TLS server still
+--- offers h2 exactly as before -- it is the connection machinery that waits,
+--- not the negotiation.
+---
+--- WHERE IT IS FORCED IS THE WHOLE DESIGN; see `new_server`.
+local h2_module_
+local function h2_module()
+	h2_module_ = h2_module_ or require "akkar.vendor.http.h2_connection"
+	return h2_module_
+end
 
 -- Sense for TLS or SSL client hello
 -- returns `true`, `false` or `nil, err`
@@ -96,7 +117,11 @@ local function wrap_socket(self, socket, timeout)
 	-- is rejected as one. Wrong protocol, clean refusal, no hang.
 	if version == nil then
 		if self.h2c then
-			local is_h2, sniff_err, sniff_errno = h2_connection.socket_has_preface(
+			-- Already loaded: `self.h2c` is one of the three conditions that
+			-- force it in `new_server`, so this call cannot be the one that
+			-- pays for the require -- which matters because this function
+			-- *should never throw* and a `require` can.
+			local is_h2, sniff_err, sniff_errno = h2_module().socket_has_preface(
 				socket, true, deadline and (deadline-monotime()))
 			if is_h2 == nil then
 				return nil, sniff_err or ce.EPIPE, sniff_errno
@@ -120,7 +145,11 @@ local function wrap_socket(self, socket, timeout)
 		-- CONNECTIONS and this is one.
 		--
 		-- 100 is what nginx and most servers advertise. A browser opens six.
-		conn, err, errno = h2_connection.new(socket, "server",
+		-- Also already loaded. `version == 2` here arrives from
+		-- `tbl.version == 2`, from ALPN (which needs `tbl.tls ~= false`), or
+		-- from the h2c preface sniff -- and every one of those three is a
+		-- condition `new_server` forced the load on.
+		conn, err, errno = h2_module().new(socket, "server",
 			self.h2_max_concurrent_streams and
 			{ [0x3] = self.h2_max_concurrent_streams } or nil)
 	else
@@ -358,6 +387,40 @@ local function new_server(tbl)
 	local onstream = assert(tbl.onstream, "missing 'onstream'")
 	if tbl.ctx == nil and tbl.tls ~= false then
 		error("OpenSSL context required if .tls isn't false")
+	end
+
+	-- FORCE THE h2 LOAD HERE, AND HERE SPECIFICALLY.
+	--
+	-- The deferral above is only safe if the require happens somewhere a
+	-- raise is already the contract. `wrap_socket` is documented as a
+	-- function that *should never throw*, and it is called under the `xpcall`
+	-- in `add_socket` -- so a `require` that failed in there would be caught,
+	-- turned into a per-connection error, and h2 would be SILENTLY BROKEN in
+	-- production while HTTP/1.1 kept working perfectly. Today a broken h2
+	-- half fails loudly at `require "akkar"`; that is the property being
+	-- preserved.
+	--
+	-- `new_server` is the funnel -- `listen(tbl)` comes through it and so
+	-- does a direct `server.new{}` -- and it ALREADY throws, twice, in the
+	-- ten lines above. `listen` was the tempting alternative and is the wrong
+	-- one: its own comment says you need not call it.
+	--
+	-- THE COST IS REAL AND IT IS THE DESIGN. An application with TLS pays the
+	-- full ~19 ms right here and saves nothing, because ALPN can hand it an
+	-- h2 connection at any moment and there is no honest way to be ready for
+	-- that without the module. What is saved is the cleartext, non-h2c
+	-- server -- which is exactly the process-per-tenant shape `akkar/init.lua`
+	-- names as the reason boot time is worth anything at all. Nobody should
+	-- "optimise" this forcing away to widen the saving; the saving is not the
+	-- point, a server that quietly cannot speak h2 is the thing being
+	-- prevented.
+	--
+	-- NOT conditioned on `http_tls.has_alpn`. Predicting "h2 is unreachable
+	-- because this OpenSSL lacks ALPN" is the same class of silently-no-h2
+	-- that the export note at the bottom of this file and `akkar/init.lua`
+	-- both exist at length to prevent.
+	if tbl.version == 2 or tbl.h2c or tbl.tls ~= false then
+		h2_module()
 	end
 
 	local self = setmetatable({
