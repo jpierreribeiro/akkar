@@ -155,6 +155,19 @@ was deferred. Roughly 46 ms is in the HTTP server stack. The h2 connection and
 HPACK pieces are only needed after h2 negotiation, so the same deferral should
 be measured. The profiler is `bench/study/boot-profile.lua`.
 
+> **The 46 ms is not what a deferral would save, 1 Sep 2026.** It is the whole
+> HTTP server subtree, and most of that subtree is on the HTTP/1.1 path. The
+> deferrable part is `h2_connection`, `h2_stream`, `hpack`, `h2_error` and
+> `vendor/http/bit`: **five modules, and about 19 ms of 47.6** on the machine
+> this was re-profiled on.
+>
+> What stays is `lpeg_patterns`, 17.3 ms of it, and it is not deferrable as
+> written: `akkar/vendor/http/util.lua:2-4` and `h1_stream.lua:7` build their
+> grammars into module-level locals at load time, and every HTTP/1.1 request
+> goes through both. Deferring that means lazy pattern construction inside each
+> parse function -- a restructure of vendored upstream code that buys nothing
+> for any application that serves a single request.
+
 ### 3. Teach `akkar doctor` about descriptor limits
 
 There is no RLIMIT check in `akkar/doctor.lua`. akkar intentionally caps itself
