@@ -216,6 +216,17 @@ end
 --- route is recorded as `<unmatched>` rather than by its path, for the same
 --- reason: otherwise a scanner probing random URLs would create a series per
 --- probe.
+---
+--- The METHOD label beside it needed the same treatment and did not have it.
+--- The route was bounded exactly as documented while `req.method` -- which is
+--- whatever token the client put on the request line -- went straight into a
+--- label, so a caller sending a fresh verb per request minted a fresh series
+--- per request.  Bounding one of two labels bounds nothing.
+local METHODS = {
+  GET = true, HEAD = true, POST = true, PUT = true, PATCH = true,
+  DELETE = true, OPTIONS = true, TRACE = true, CONNECT = true,
+}
+
 function Registry:middleware()
   local cqueues = require "cqueues"
   local akkar = require "akkar"
@@ -243,7 +254,9 @@ function Registry:middleware()
     else
       status = 500                -- a raised error, which dispatch turns into one
     end
-    self:observe(req.method, req.route or "<unmatched>", status, elapsed)
+    local method = req.method
+    self:observe(METHODS[method] and method or "<other>",
+                 req.route or "<unmatched>", status, elapsed)
 
     if not ok then error(res, 0) end
     return res

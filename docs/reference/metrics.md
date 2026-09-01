@@ -113,6 +113,13 @@ The route label is `req.route`, the pattern that matched, so the label set
 stays bounded however many distinct paths are requested. A request that
 matched no route is recorded as `<unmatched>` rather than by its path.
 
+The method label is bounded the same way, and needed to be: `req.method` is
+whatever token the client put on the request line, so it went straight into a
+label and a caller sending a fresh verb per request minted a fresh series per
+request. Bounding one of two labels bounds nothing. Anything outside the nine
+HTTP methods -- `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`,
+`TRACE`, `CONNECT` -- is recorded as `<other>`.
+
 Both outcomes are recorded. A handler that returns gives its response status;
 a handler that throws a response gives that response's status; a raised error
 is recorded as `500`, and then re-raised unchanged.
