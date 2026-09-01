@@ -1196,7 +1196,14 @@ outruns the sampler, the shared string metatable.
 
 So what decides it is the price of a process per tenant, and that is measured:
 **28 ms to first response, 12.8 MB resident idle** — 1.22 GB for a hundred
-idle exercises, 6.09 GB for five hundred. Cheap, and the only option that *is*
+idle exercises, 6.09 GB for five hundred.
+
+> **The arithmetic above is withdrawn with the number under it.** Idle RSS was
+> measured three times and came out 11.4, 13.3 and 14.1 MB (D2), so a hundred
+> idle processes is **1.1 to 1.4 GB** and five hundred is **5.7 to 7.1 GB**. The
+> range is the result. Three significant figures were never available from three
+> runs that differ by a quarter, and 6.09 is not even 500 x 12.8, which is 6.10 —
+> the arithmetic on the wrong number was also wrong. Cheap, and the only option that *is*
 a boundary. `akkar.vm` keeps the smaller case: a hook published inside an
 application that is otherwise trusted.
 

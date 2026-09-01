@@ -82,8 +82,11 @@ workload, and here is why, measured:
 | service time per request at low load | 14.5 µs (`GET /ping`), 21 µs (validated POST) |
 
 For a per-tenant, per-exercise model billed by GB-second, the two numbers that
-matter are **12.8 MB resident** and **29 ms boot**: a hundred idle exercises fit
-in ~1.2 GB, five hundred in ~6 GB. That is the density the teaching platform was
+matter are **11.4 to 14.1 MB resident** and **29 ms boot**: a hundred idle
+exercises fit in ~1.1 to 1.4 GB, five hundred in ~5.7 to 7.1 GB. (The 12.8 MB
+this page used to give was the spike's PEAK under grading, which the row two
+above still reports correctly as a peak. Idle RSS is the D2 measurement, and it
+is a range.) That is the density the teaching platform was
 always designed around, and it is why a process-per-student model is affordable
 where a container-per-student one is not. The runner already imposes CPU,
 memory, output and deadline caps per tenant, so the cost ceiling is enforced
