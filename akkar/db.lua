@@ -262,16 +262,75 @@ end
 -- attempt is the ordinary example. A rule that reads the status code would
 -- silently discard those writes instead, which is the same defect pointing the
 -- other way and harder to see.
+--
+-- NESTING. "No BEGIN stays open because someone forgot" was true and it was
+-- the wrong invariant, because it says nothing about a BEGIN opened while one
+-- is already open. A helper that owns a transaction -- `charge()` -- called
+-- from a handler that owns a bigger one -- `place_order()` -- is the most
+-- ordinary refactor there is, and Postgres answers the second `begin` with a
+-- warning and no transaction. Then the inner `commit` ENDS THE OUTER ONE,
+-- every statement after it autocommits, and the outer `rollback` is a no-op
+-- warning. Reproduced against a real server: an outer transaction that raised
+-- left all three rows committed, with `in_transaction` false, `broken` false,
+-- and the pool judging the connection fit for reuse.
+--
+-- SAVEPOINT rather than refusing the nested call, for two reasons. Refusing
+-- turns a correct-looking refactor into a runtime error on a path that may
+-- only be exercised in production -- and it pushes people towards threading a
+-- boolean like `already_in_transaction` down through the helpers, which is the
+-- bookkeeping this file exists to remove. A savepoint gives the inner block
+-- the only nesting semantics one connection can offer: its work is undone on
+-- its own failure, and made durable only when the outermost block commits.
+-- That is the semantics a caller wants from `charge()` anyway; a helper whose
+-- write must survive the caller's rollback needs a second connection, not a
+-- second BEGIN.
+--
+-- The savepoint is named per depth, which is enough: a name is released before
+-- the same depth can be entered again.
 function Db:transaction(fn)
+  local depth = self.tx_depth or 0
+
+  if depth > 0 then
+    local name = "akkar_sp_" .. (depth + 1)
+    self:query("savepoint " .. name)
+    self.tx_depth = depth + 1
+    local ok, result = pcall(fn, self)
+    self.tx_depth = depth
+
+    if not ok then
+      -- `rollback to savepoint` also clears the aborted state a failed
+      -- statement leaves behind, which is what lets the OUTER transaction
+      -- carry on after a helper failed. If it does not work, the outer
+      -- transaction is unrecoverable and the connection must not be reused.
+      if not pcall(function() self:query("rollback to savepoint " .. name) end) then
+        self.broken = true
+      end
+      error(result, 0)        -- the outer block still decides what to do
+    end
+
+    -- Releasing keeps the savepoint stack from growing for the length of a
+    -- long outer transaction; it commits nothing on its own.
+    if not pcall(function() self:query("release savepoint " .. name) end) then
+      self.broken = true
+      error("db: could not release " .. name, 0)
+    end
+    return result
+  end
+
   self:query "begin"
   self.in_transaction = true
+  self.tx_depth = 1
   local ok, result = pcall(fn, self)
+  self.tx_depth = 0
   if not ok then
     local rolled = pcall(function() self:query "rollback" end)
     -- A connection whose rollback failed is in an unknown state.  Marking it
     -- keeps the pool from handing that state to the next request.
     self.in_transaction = not rolled
-    self.broken = not rolled
+    -- Only ever set here, never cleared: a nested block whose `rollback to
+    -- savepoint` failed has already marked this connection, and the outer
+    -- rollback succeeding says nothing about that.
+    self.broken = self.broken or not rolled
     error(result, 0)          -- preserves response-as-error
   end
   self:query "commit"
@@ -428,7 +487,7 @@ function M.connect(config)
 
   local function open()
     if config.driver == "pq" then
-      return setmetatable({ pg = pq_open(config),
+      return setmetatable({ pg = pq_open(config), tx_depth = 0,
                             reset_on_release = reset_on_release }, Db)
     end
     if config.driver ~= nil and config.driver ~= "pgmoon" then
@@ -533,7 +592,8 @@ function M.connect(config)
     --
     -- Nothing is lost: pgmoon leaves a SQL NULL out of the row table entirely
     -- unless `convert_null` is set, which akkar does not set.
-    return setmetatable({ pg = pg, reset_on_release = reset_on_release }, Db)
+    return setmetatable({ pg = pg, tx_depth = 0,
+                         reset_on_release = reset_on_release }, Db)
   end
 
   local size = config.pool_size == nil and 10 or config.pool_size

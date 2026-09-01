@@ -135,8 +135,14 @@ function Memory:query(sql, ...)
   end
 
   -- Transaction control is answered by the adapter itself, so a test does not
-  -- have to program `begin` and `commit`.
-  if sql == "begin" or sql == "commit" or sql == "rollback" then return {} end
+  -- have to program `begin` and `commit` -- nor the savepoints a nested
+  -- `transaction` issues.
+  if sql == "begin" or sql == "commit" or sql == "rollback"
+     or sql:match "^savepoint "
+     or sql:match "^release savepoint "
+     or sql:match "^rollback to savepoint " then
+    return {}
+  end
 
   local entry = find(self, sql)
   if not entry then
@@ -168,11 +174,32 @@ end
 
 --- Same semantics as the real adapter: commit at the end, rollback on any
 --- error, and the error is re-raised so a thrown response still works.
+---
+--- Including the nesting semantics. `depth` was counted here and never used,
+--- so a nested block sent a second `begin` and an inner `commit` and then
+--- reported a clean rollback -- which is precisely what the real adapter does
+--- NOT do, and it meant no memory-backed test could catch the flat-transaction
+--- defect. A fake whose safety property differs from the real one is how a
+--- test proves the wrong thing, so the savepoints are mirrored exactly.
 function Memory:transaction(fn)
+  if self.depth > 0 then
+    local name = "akkar_sp_" .. (self.depth + 1)
+    self:query("savepoint " .. name)
+    self.depth = self.depth + 1
+    local ok, result = pcall(fn, self)
+    self.depth = self.depth - 1
+    if not ok then
+      self:query("rollback to savepoint " .. name)
+      error(result, 0)
+    end
+    self:query("release savepoint " .. name)
+    return result
+  end
+
   self:query "begin"
-  self.depth = self.depth + 1
+  self.depth = 1
   local ok, result = pcall(fn, self)
-  self.depth = self.depth - 1
+  self.depth = 0
   if not ok then
     self:query "rollback"
     self.rolled_back = true
