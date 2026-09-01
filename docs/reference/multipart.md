@@ -28,7 +28,14 @@ local size         = req.body.avatar.size
 
 Pulls the boundary out of a `Content-Type` header value. RFC 2046 allows the
 boundary to be quoted and browsers differ on whether it is, so both spellings
-are accepted; the quoted form is tried first.
+are accepted; the quoted form is tried first. The parameter name is matched
+case-insensitively, as RFC 2045 requires.
+
+It is read as a **parameter**, not as a substring of the header. `boundary=`
+used to be matched anywhere in the value, so
+`multipart/form-data; name=xboundary=zzz` named `zzz` as the boundary -- and
+this parser then disagreed with anything in front of it about where the parts
+begin.
 
 **Returns** the boundary string, or `nil` when `content_type` is `nil` or names
 no boundary.
@@ -39,6 +46,13 @@ Parses a whole multipart body that is already in memory. Parts are walked
 delimiter to delimiter with plain (non-pattern) string search, so a boundary
 containing characters Lua patterns treat as magic is handled literally.
 
+The delimiter is `CRLF` followed by `--boundary`, which is what RFC 2046
+describes, and only the opening one may appear without a preceding `CRLF`.
+Searching for a bare `--boundary` anywhere -- which is what this did -- let the
+client plant those bytes mid-line inside a part and split the body there, so a
+gateway that parses multipart correctly read a different form than the handler
+did.
+
 A part with a `filename` parameter in its `Content-Disposition` becomes a
 table:
 
@@ -46,11 +60,17 @@ table:
 |---|---|---|
 | `filename` | string | the name as the client sent it, not sanitised |
 | `content_type` | string | the part's own `Content-Type`, or `application/octet-stream` |
-| `data` | string | the bytes, with the framing CRLF before the next delimiter removed |
+| `data` | string | the bytes, ending where the next delimiter's leading CRLF begins |
 | `size` | number | `#data` |
 
 A part without a `filename` becomes a plain string. A part whose
 `Content-Disposition` names no `name` is skipped entirely.
+
+**Two parts under one name are refused**, rather than the last one winning
+silently. That is parameter pollution: a form with two `amount` fields is read
+one way here and the other way by anything sitting in front, and nobody is
+told. There is no answer that is right for both readers, so the body is
+rejected and the caller gets a 400.
 
 **Returns** `fields` on success, or `nil, message`. The messages, in full:
 
@@ -58,6 +78,7 @@ A part without a `filename` becomes a plain string. A part whose
 - `multipart body has no opening boundary`
 - `multipart part has no header block`
 - `multipart part is not terminated`
+- `multipart body has two parts named 'NAME'`
 - `multipart body contained no named parts`
 
 It never raises.
