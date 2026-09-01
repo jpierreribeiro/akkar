@@ -1200,6 +1200,29 @@ idle exercises, 6.09 GB for five hundred. Cheap, and the only option that *is*
 a boundary. `akkar.vm` keeps the smaller case: a hook published inside an
 application that is otherwise trusted.
 
+> **Both numbers are withdrawn, 1 Sep 2026.** Neither survived being checked
+> against the tree.
+>
+> **28 ms has no source.** It appears in three handoffs and traces to nothing —
+> not to a bench script, not to a results file, not to the commit it is
+> attributed to. The measured figures are `bench/runtime/RESULTS.md:167-174`:
+> **21 ms** for `akkar` alone and **29 ms** for a complete application, five
+> runs each on the study box with a 2 ms poll. `docs/labs/DALIVIM-INTEGRATION.md`
+> already said 29. Nothing depended on the difference, which is why nobody
+> caught it.
+>
+> **12.8 MB is a PEAK under grading, relabelled as idle.** `4020210` measured
+> 12.8 MB *peak* RSS against a 256 MB address-space cap while grading, at
+> 40-100 ms per grading, in `~/Desktop/akkar-exercise-spike/` — a directory
+> outside this repository that no longer exists. Measured idle RSS (D2) is
+> 11.4 MB, 13.3 MB and 14.1 MB across three runs; 12.8 is none of them. A peak
+> and an idle figure are not interchangeable.
+>
+> And neither figure was ever about the thing being decided. Both describe an
+> akkar HTTP server booting and answering. The decision is about a forked child
+> under Landlock and seccomp, which has no implementation, so its cost has not
+> been measured by anyone.
+
 ### 12.7 LAB L2–L5
 
 Structured concurrency, adaptive CoDel, and a profiler. GC tuning already came
