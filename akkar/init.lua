@@ -561,7 +561,33 @@ local function check_one(value, rule, coerce)
     -- Route and query values arrive as strings; coercing is right there.
     if coerce and type(value) == "string" then value = tonumber(value) end
     if type(value) ~= "number" then return nil, "expected " .. kind end
-    if kind == "integer" and value % 1 ~= 0 then return nil, "expected integer" end
+    -- `value % 1 ~= 0` IS A TEST FOR A FRACTIONAL PART, NOT FOR AN INTEGER.
+    --
+    -- `1e308` has no fractional part and passed. So does `inf`. So does every
+    -- float above 2^53, which is the point at which a double stops being able
+    -- to represent every integer: `9007199254740993` is not a representable
+    -- double, so it arrives as `...992` and `% 1` calls it whole. Accepting
+    -- that rounds somebody's amount by one and calls it valid. `nan % 1` is
+    -- `nan`, which is `~= 0`, so that one case was refused by accident.
+    --
+    -- `math.tointeger` is the real question -- "is there an integer this
+    -- value exactly is?" -- and it answers no for a fraction, for infinity,
+    -- for nan and for anything outside the integer range, which is `1e308`.
+    --
+    -- The cliff is asked of FLOATS ONLY, and the distinction is the whole
+    -- point rather than an exemption. A float at or past 2^53 is ambiguous:
+    -- it stands for a range of integers and cannot say which one was meant.
+    -- A Lua integer at 2^60 arrived exactly and IS the integer it says it is
+    -- -- an id out of a query string, say -- so there is nothing to refuse.
+    if kind == "integer" then
+      if value ~= value then return nil, "expected integer" end   -- nan
+      -- `inf` and `1e308` land here too, and "too large" is what they are.
+      if math.type(value) == "float"
+         and (value >= 9007199254740992.0 or value <= -9007199254740992.0) then
+        return nil, "too large to be an exact integer"
+      end
+      if not math.tointeger(value) then return nil, "expected integer" end
+    end
     -- AN INTEGER RULE PRODUCES A LUA INTEGER, not merely an integral float.
     --
     -- JSON has one number type, so `cjson` hands back `120000.0` -- subtype
@@ -1190,6 +1216,49 @@ function App:methods_for(path)
   return list
 end
 
+-- ============================================= the frame an error came from
+--
+-- A 500 named what was raised and never where it was raised, and the reason
+-- is `pcall`: it returns AFTER the stack has unwound, so by the time the
+-- error value is in hand the frames that produced it are gone and no amount
+-- of care at the catch site can recover them. `debug.traceback` there
+-- describes the catcher, not the culprit.
+--
+-- `xpcall`'s message handler runs at the point of the raise, with those
+-- frames still live. That moment is the only one in which the stack exists,
+-- so the handler takes the traceback and puts it somewhere the catch site
+-- can read it.
+--
+-- ONE function and ONE slot, both module-level, rather than a closure per
+-- call: these wrap every request, and a closure with an upvalue box is an
+-- allocation on the hot path that `spec/allocation_spec.lua` prices to the
+-- byte. The slot is safe despite cqueues, because nothing yields between the
+-- handler running and the `xpcall` that armed it returning -- the unwind is
+-- not a yield point -- so no second coroutine can reach it in between. Every
+-- reader below takes it as its first act after a failed `xpcall`.
+--
+-- The error itself is returned UNTOUCHED. Response-as-error is how a deep
+-- layer signals HTTP without threading a return value back through every
+-- frame, and wrapping a thrown `akkar.forbidden()` would turn a deliberate
+-- 403 into a 500. `debug.traceback` already leaves a non-string message
+-- alone; returning `err` rather than its result makes that explicit and
+-- keeps `on_error` receiving the original.
+local raised_at
+local function trap(err)
+  raised_at = debug.traceback(nil, 2)
+  return err
+end
+
+--- Folds a traceback onto one line, because a logfmt record is one line.
+---
+--- `akkar/log.lua` escapes control characters, so a raw traceback would
+--- survive as `\n`-laden quoted text rather than breaking the record -- but
+--- an operator greps for one line, not for ten fragments, and a collector
+--- that splits on newlines before it parses would still lose the tail.
+local function one_line(text)
+  return (text:gsub("%s*\n%s*", " | "))
+end
+
 -- ================================================================== dispatch
 local function normalize(value)
   if value == nil then return response(204, nil) end
@@ -1594,10 +1663,13 @@ local function dispatch(app, req)
   -- the schema filter, the `__pending` check and the global chain above all
   -- work on a real response, and a global middleware that decorates gets a
   -- view of its own rather than writing into one a route middleware built.
-  local ok, result = pcall(function() return settled(normalize(run())) end)
+  local ok, result = xpcall(function() return settled(normalize(run())) end, trap)
   remove_watchdog()
 
   if not ok then
+    -- Read first: the slot holds the stack this raise came from, and only
+    -- until the next raise anywhere in the process arms it again.
+    local where_from = raised_at
     -- Response-as-error: a deep layer can signal HTTP without threading a
     -- return value back through every frame.
     if is_response(result) then return result end
@@ -1646,6 +1718,7 @@ local function dispatch(app, req)
 
     internal:error("handler raised", {
       request_id = req.id, at = route.where, detail = detail,
+      traceback = where_from and one_line(where_from) or nil,
     })
     return pending_error(result)
   end
@@ -2299,7 +2372,7 @@ local function handle(app, input)
   local chain = input.short and short or normal
   if input.short then req.__short = input.short end
 
-  local ok, res = pcall(function()
+  local ok, res = xpcall(function()
     -- `with_deadline` publishes the budget to the coroutine it runs this in,
     -- so every capability the handler touches can read how long it has left.
     -- That is what stops `req.http` from calling the service below with a
@@ -2335,7 +2408,11 @@ local function handle(app, input)
     -- response itself if none did. Everything below -- the `__pending` check,
     -- the stream copy, the writer, the test client -- sees a plain response.
     return settled(value)
-  end)
+  end, trap)
+  -- Taken HERE and not at the log site below: `execution.release` and
+  -- `internal_error` both run in between, either may raise, and the slot
+  -- holds only the most recent raise in the process.
+  local where_from = (not ok) and raised_at or nil
   -- A streamed body has not been produced yet, so its capabilities cannot be
   -- released here.  Releasing a database connection at this point would hand
   -- a live cursor to the next request.  The writer calls this instead, once
@@ -2377,7 +2454,10 @@ local function handle(app, input)
     -- A response RAISED out of the chain skipped the collapse above, and it
     -- may be the view a middleware was holding when it threw.
     if is_response(res) then return settled(res), req.id, trace_parent end
-    internal:error("middleware raised", { request_id = req.id, detail = tostring(res) })
+    internal:error("middleware raised", {
+      request_id = req.id, detail = tostring(res),
+      traceback = where_from and one_line(where_from) or nil,
+    })
     return internal_error(app, res, req), req.id, trace_parent
   end
   return res, req.id, trace_parent
@@ -3253,7 +3333,7 @@ function App:run(config)
       end
 
       self.in_flight = self.in_flight + 1
-      local ok, err = pcall(function()
+      local ok, err = xpcall(function()
         local h = headers_or_why
         -- The socket's own idea of who connected. Everything else about the
         -- client's identity is something the client typed.
@@ -3409,11 +3489,16 @@ function App:run(config)
 
           if not is_head then
             local wrote = false
-            local produced, failure = pcall(res.stream, function(chunk)
+            local produced, failure = xpcall(res.stream, trap, function(chunk)
               if chunk == nil or chunk == "" then return end
               wrote = true
               assert(stream:write_chunk(tostring(chunk), false))
             end)
+            -- The log is the ONLY record a failed stream leaves -- the status
+            -- went out with the first byte, so this can never become a 500 --
+            -- which makes the frame it came from worth more here than
+            -- anywhere else.
+            local where_from = (not produced) and raised_at or nil
 
             if produced then
               stream:write_chunk("", true)          -- the terminating chunk
@@ -3426,6 +3511,7 @@ function App:run(config)
                 request_id = request_id,
                 wrote_bytes = wrote,
                 detail = tostring(failure),
+                traceback = where_from and one_line(where_from) or nil,
                 hint = wrote and "response already committed; connection dropped"
                               or "nothing was written yet, but the status was",
               })
@@ -3444,12 +3530,20 @@ function App:run(config)
           stream:write_headers(rh, not send_body)
           if send_body then stream:write_chunk(payload, true) end
         end
-      end)
+      end, trap)
+      -- Taken before `pending_release` runs: that is a pcall, and a release
+      -- that raises would overwrite the slot with its own stack.
+      local where_from = (not ok) and raised_at or nil
 
       -- On EVERY path, including the writes raising above.
       if pending_release then pcall(pending_release) end
 
-      if not ok then internal:error("stream failed", { detail = tostring(err) }) end
+      if not ok then
+        internal:error("stream failed", {
+          detail = tostring(err),
+          traceback = where_from and one_line(where_from) or nil,
+        })
+      end
 
       -- `shutdown` guarded, and the count decremented behind nothing that can
       -- raise. `App:stop` drains on `while in_flight > 0`, so a single raise

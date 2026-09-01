@@ -154,24 +154,43 @@ describe("what a 500 leaves behind", function()
 end)
 
 describe("app:use() after the first request", function()
-  it("raises rather than being dropped", function()
+  it("runs rather than being dropped", function()
+    -- WHAT THIS ASSERTS WAS WEAKENED DELIBERATELY -- from `pcall` catching a
+    -- raise to a status code -- and the weaker-looking assertion is the
+    -- stronger repair.
+    --
+    -- Refusing a late `app:use` fixes the silence and keeps the loss: the
+    -- author still does not get the middleware they registered, and now they
+    -- get a crash for asking. The cause was never the timing, it was the
+    -- memo: the chain is built once and cached, and `use` appended to a list
+    -- nobody read again. Invalidating that cache -- `self._chain,
+    -- self._chain_short = nil, nil` in `App:use` -- makes the next request
+    -- rebuild, so the middleware the author registered is the middleware
+    -- that runs. Auth added one line late now authenticates instead of
+    -- raising, and nothing has to be reordered to make it work.
+    --
+    -- So the test is that it RUNS. A version that raises fails here, which is
+    -- the guard: refusing the call must not come back as a fix.
     local app = akkar.new()
     app:get("/x", function() return { ok = true } end)
     local client = app:test()
-    client:get "/x"
+    assert.equal(200, client:get("/x").status)
 
-    local ok, err = pcall(function()
-      app:use(function(req, next) return akkar.unauthorized() end)
-    end)
-    assert.is_false(ok, "the late middleware was accepted and would never run")
-    assert.is_truthy(tostring(err):find("after the first request", 1, true))
+    app:use(function(req, next) return akkar.unauthorized() end)
+    assert.equal(401, client:get("/x").status,
+                 "the late middleware was accepted and never ran")
   end)
 
-  it("raises after app:test{} builds the chain, before any request", function()
+  it("runs after app:test{} builds the chain, before any request", function()
+    -- `app:test()` builds the chain, so this is the same defect with no
+    -- request in it: the memo exists, and the middleware registered against
+    -- it must still reach the first request that arrives.
     local app = akkar.new()
     app:get("/x", function() return { ok = true } end)
-    app:test()
-    assert.has_error(function() app:use(function() end) end)
+    local client = app:test()
+    app:use(function(req, next) return akkar.unauthorized() end)
+    assert.equal(401, client:get("/x").status,
+                 "the chain app:test{} built was never rebuilt")
   end)
 
   it("still allows every middleware registered before the first request", function()
