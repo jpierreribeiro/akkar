@@ -62,12 +62,28 @@ end
 --- integer, so `%d` on one would print a number that was never the value;
 --- those keep their float rendering, where the exponent at least admits the
 --- imprecision.
+--- A decimal point, whatever LC_NUMERIC says. `akkar/metrics.lua` carries the
+--- same three lines and the long version of why; the short version is that
+--- Lua renders a float through C's `printf`, so under a comma locale
+--- `tostring(0.0134)` is `0,0134`, and a duration written that way reaches the
+--- log store as a string rather than as a number. Lower stakes than the
+--- metrics case -- logfmt does not separate on a comma, so nothing is
+--- MISPARSED -- but a `duration_s` that stops being numeric stops being
+--- graphable, and the repair is the same three lines.
+---
+--- Under "C" this substitutes `.` for `.` and every log line is byte-identical.
+local function decimal(rendered)
+  if not rendered:find "%d" then return rendered end
+  return (rendered:gsub("[^-+0-9eE]", "."))
+end
+
 local function render(value)
   if type(value) == "table" then return cjson.encode(value) end
   if math.type(value) == "float" and value == math.floor(value)
      and math.abs(value) < 2 ^ 53 then
     return string.format("%d", value)
   end
+  if type(value) == "number" then return decimal(tostring(value)) end
   return tostring(value)
 end
 
