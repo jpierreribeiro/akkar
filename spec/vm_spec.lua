@@ -146,10 +146,37 @@ describe("budgets", function()
   end)
 
   it("bounds a single allocation that would outrun the sampler", function()
-    -- One instruction, a gigabyte: the hook never fires in between.
-    local ok, err = vm.eval("return ('x'):rep(2^30)", { limits = { memory_kb = 1024 } })
+    -- ONE INSTRUCTION, A GIGABYTE: the hook never fires in between, so the
+    -- memory ceiling -- which is a COUNT hook, and can only look BETWEEN
+    -- instructions -- cannot be what stops this. The bound on the real
+    -- `string.rep` is.
+    --
+    -- This test used to be byte-identical to "catches method syntax" below,
+    -- which is a different claim about a different defence, so the sampler
+    -- claim had no test at all. What makes this one about the sampler is that
+    -- it pins WHICH defence fired: the sampler took ZERO samples.
+    local ok, err, report = vm.eval("return string.rep('x', 2^30)",
+                                    { limits = { memory_kb = 1024 } })
     assert.is_false(ok)
-    assert.is_truthy(tostring(err):match "string.rep would build")
+    assert.is_truthy(tostring(err):match "string.rep would build",
+      "expected the rep bound to refuse it; got: " .. tostring(err))
+    assert.is_nil(report.exceeded,
+      "the memory ceiling claims it caught this, so the test is not about " ..
+      "the sampler being outrun after all")
+    assert.equal(0, report.instructions,
+      "the hook fired " .. report.instructions .. " times, so there WAS a " ..
+      "sample between the start and the gigabyte")
+
+    -- And the contrast that gives the above its meaning: the same gigabyte,
+    -- built in steps the hook does get to fire between, IS the sampler's job
+    -- and is caught by the ceiling rather than by the bound.
+    local stepped, _, stepped_report = vm.eval([[
+      local t = {}
+      for i = 1, 1e9 do t[i] = ('x'):rep(64) end
+    ]], { limits = { memory_kb = 1024, instructions = 1e9 } })
+    assert.is_false(stepped)
+    assert.equal("memory ceiling", stepped_report.exceeded)
+    assert.is_true(stepped_report.instructions > 0)
   end)
 
   it("needs no help with a wide format field", function()

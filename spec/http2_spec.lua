@@ -204,17 +204,37 @@ describe("HTTP/2", function()
         local conn = socket.connect("127.0.0.1", port)
         conn:setmode("bn", "bn")
         conn:onerror(function(_, _, why) return why end)
+        -- THE TIMEOUT GOES ON THE SOCKET. `conn:read("*l", 3)` does NOT read
+        -- a line with a three-second deadline: cqueues' `read` takes a LIST OF
+        -- FORMATS, so that reads a line AND THEN THREE MORE BYTES, with no
+        -- deadline anywhere. Against a server that hangs -- the exact failure
+        -- this test's title forbids -- it blocked until the enclosing
+        -- `cq:loop(30)` timed out, `loop` returned truthy (timeout and drain
+        -- are indistinguishable in its return), `outcome` stayed nil, and the
+        -- `if outcome ~= nil` below skipped every assertion in the test.
+        -- `spec/h2_framing_spec.lua` documents this same trap; the fix had
+        -- never reached this file.
+        conn:settimeout(3)
         conn:write "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
         conn:flush()
         -- Either an HTTP/1.1 refusal or a closed connection is correct. What
-        -- is not correct is nothing at all.
-        local line = conn:read("*l", 3)
+        -- is not correct is nothing at all -- and "nothing at all" must come
+        -- back as a VALUE the assertions can see, never as a nil that turns
+        -- them off.
+        local line, why = conn:read "*l"
+        local closed = conn:eof "r"
         conn:close()
-        return line
+        if line then return line end
+        if closed then return "closed" end
+        return "silence: " .. tostring(why)
       end)
 
-    -- nil means the server closed on us, which is a clean refusal too.
-    if outcome ~= nil then
+    -- UNCONDITIONAL. The body always returns a string now, so there is no
+    -- shape of this test in which zero assertions run.
+    assert.is_string(outcome)
+    assert.is_falsy(outcome:match "^silence:",
+      "the server neither answered nor closed -- it hung: " .. outcome)
+    if outcome ~= "closed" then      -- a close is a clean refusal too
       assert.is_truthy(outcome:match "^HTTP/1%.1",
         "answered something that was not an HTTP/1.1 refusal: " .. outcome)
       assert.is_falsy(outcome:match " 2%d%d ",

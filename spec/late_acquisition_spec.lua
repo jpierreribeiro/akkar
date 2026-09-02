@@ -85,7 +85,10 @@ local function run(open_for, budget)
   -- the loop run once more, so this measures the defect rather than the
   -- moment. Without it a release that was merely SCHEDULED reads as a leak.
   collectgarbage(); collectgarbage()
-  cq:loop(1)
+  -- ASSERTED like the loop above it. `cq:loop` returns `false, err` rather
+  -- than raising, so a settle that died took its error with it and the
+  -- release it was waiting for read as a leak.
+  assert(cq:loop(1))
 
   return opened, released, status
 end
@@ -150,7 +153,7 @@ describe("a capability that finishes opening after the deadline", function()
     end)
     assert(cq:loop(10))
     collectgarbage(); collectgarbage()
-    cq:loop(1)
+    assert(cq:loop(1))
 
     assert.is_true(opened >= 1, "nothing was opened")
     assert.equal(opened, released,

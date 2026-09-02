@@ -116,10 +116,22 @@ describe("the rate limiter's identity", function()
     -- PING, not merely connect: `cqueues.socket.connect` builds the socket
     -- lazily, so the factory succeeds with nothing listening.
     local ok, conn = pcall(redis.connect { pool_size = 0 })
-    if not ok then return end
-    local alive = pcall(function() return conn:ping() end)
+    if not ok then
+      -- `pending`, NOT a bare `return`. A silent return reported this test
+      -- green on every machine without Redis while asserting nothing at all,
+      -- and what it asserts is that a spoofed `x-forwarded-for` cannot mint a
+      -- fresh rate-limit bucket. A skip has to be visible to be a skip.
+      pending("Redis is not reachable on 127.0.0.1:6379; skipping: " ..
+              tostring(conn))
+      return
+    end
+    local alive, why = pcall(function() return conn:ping() end)
     conn:close()
-    if not alive then return end
+    if not alive then
+      pending("Redis did not answer PING on 127.0.0.1:6379; skipping: " ..
+              tostring(why))
+      return
+    end
 
     local cqueues = require "cqueues"
     local cq = cqueues.new()

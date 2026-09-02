@@ -40,6 +40,13 @@ end
 local PORT = 8374
 local BODY = '{"name":"ada"}'
 
+-- ONE NAME, DEFINED ONCE. The smuggling assertion below selects its case by
+-- label, and the label used to be a string literal duplicated between the
+-- corpus and the check: renaming the corpus entry -- an edit nobody would
+-- think twice about -- left the loop matching nothing and the suite's only
+-- request-smuggling assertion silently not running.
+local SMUGGLE = "a body pretending to be a second request"
+
 local function post(headers, payload)
   return "POST /users HTTP/1.1\r\nHost: localhost\r\n" .. headers ..
          "\r\n" .. (payload or "")
@@ -94,7 +101,7 @@ local function corpus()
       "GET /users HTTP/1.1\r\nHost: localhost\r\nX-A: 1\r\n" , "wait" },
     { "nothing but a newline",
       "\r\n" , "wait" },
-    { "a body pretending to be a second request",
+    { SMUGGLE,
       post("Content-Type: application/json\r\nContent-Length: 14\r\n",
            BODY .. "GET /admin HTTP/1.1\r\nHost: localhost\r\n\r\n") },
   }
@@ -112,7 +119,8 @@ describe("framing", function()
     -- every later verdict was about a corpse. That cost twenty-two process
     -- starts and about ten minutes a run.
     --
-    -- `akkar.substrate` repairs the wedge, so the corpus can share a server
+    -- akkar's vendored `h1_stream` repairs the wedge, so the corpus can share
+    -- a server
     -- -- and sharing one is a STRONGER test, not merely a faster one. Each
     -- case now runs against a server that has already survived every case
     -- before it, which is the property a corpus of hostile inputs should be
@@ -214,8 +222,9 @@ describe("framing", function()
     -- currently TRUE rather than as acceptable. Its message said the day it
     -- went red was the day to retract `docs/substrate/lua-http-wedge.md`.
     --
-    -- It went red because AKKAR fixed it, not upstream -- `akkar.substrate`,
-    -- with the measurements and the two corrections the old writeup needed.
+    -- It went red because AKKAR fixed it, not upstream -- in the drain loop
+    -- of `akkar/vendor/http/h1_stream.lua`, with the measurements and the two
+    -- corrections the old writeup needed, all recorded on that page.
     -- The assertion is therefore inverted rather than deleted: the property
     -- worth pinning was never "lua-http is broken", it was "we know exactly
     -- what this input does", and now what it does is survive.
@@ -242,12 +251,33 @@ describe("framing", function()
     -- something that looks like another request line. `/admin` does not
     -- exist, so a 404 would prove it was routed -- and the case must not
     -- produce one.
+    --
+    -- TWO THINGS THIS USED TO GET WRONG, both of which made the suite's only
+    -- smuggling assertion unable to fail:
+    --
+    --   * the case was selected by a string literal duplicated from the
+    --     corpus, so a rename left the loop matching nothing and zero
+    --     assertions running. `SMUGGLE` is now one name used in both places.
+    --   * a harness failure sets `outcome = "server-failed"`, and
+    --     `is_not.equal("status=404", "server-failed")` is TRUE -- so "the
+    --     server never started" was being read as "nothing was smuggled".
+    --     The case must have reached a server before its answer means
+    --     anything.
+    local found
     for _, result in ipairs(results) do
-      if result.label == "a body pretending to be a second request" then
-        assert.is_not.equal("status=404", result.outcome,
-          "the trailing bytes were parsed as a second request")
-      end
+      if result.label == SMUGGLE then found = result end
     end
+    assert.is_truthy(found,
+      "no corpus entry is labelled " .. SMUGGLE .. "; the only smuggling " ..
+      "assertion in this suite selected nothing and asserted nothing")
+    assert.is_not.equal("server-failed", found.outcome,
+      "the harness never reached a server, so this proves nothing about " ..
+      "smuggling: " .. tostring(found.why))
+    assert.is_truthy(found.outcome:find "status=" or found.outcome == "closed",
+      "the case produced neither a status nor a close, so nothing was " ..
+      "observed about the router: " .. found.outcome)
+    assert.is_not.equal("status=404", found.outcome,
+      "the trailing bytes were parsed as a second request")
   end)
 
   it("actually reached the server", function()

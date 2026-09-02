@@ -176,7 +176,7 @@ local function simulate(seed, steps)
   -- to happen. One more second of loop, which returns immediately when there
   -- is nothing left, is the difference between "everything came back" and
   -- "everything that had already come back, came back".
-  cq:loop(1)
+  assert(cq:loop(1))
   pool:reap()
 
   restore()
