@@ -427,7 +427,7 @@ four was right.**
 |---|---|---|
 | 1 | Throughput flat from 1.0x onward | **Wrong.** It rises to a peak at 2x (+6% over 1x) and then falls, down 11% from that peak by 4x. There is an optimum, not a plateau |
 | 2 | p99 grows roughly linearly past capacity | **Wrong.** It is nearly flat through 2x and then breaks: 6.22 ms → 37.70 ms → 82.38 ms. A knee between 2x and 3x, not a line |
-| 3 | Pool wait becomes the majority of p99 above 2x | **Not measured.** The benchmark app does not mount `/metrics`, so the counters added to `Pool:get` for exactly this were never read. Owed |
+| 3 | Pool wait becomes the majority of p99 above 2x | **Still not measured, but no longer for that reason.** The note here said the app does not mount `/metrics`; it does now, and `Registry:pool` publishes `akkar_pool_waits_total`, `akkar_pool_wait_seconds_total` and `akkar_pool_wait_seconds_max` by reading `Pool:stats()` at scrape time (2026-09-01). The instrument exists; the sweep has not been re-run. Owed, and now only owed a run |
 | 4 | Errors stay at zero | **Right.** Zero at every point |
 
 ### The sizing rule, which is what the run was for
