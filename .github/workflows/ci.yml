@@ -493,6 +493,18 @@ jobs:
       - name: Doctor
         run: $LUA_BIN bin/akkar doctor --no-probe
 
+      # ------------------------------------------------- the contract gate
+      # `examples/typed-client/client.ts` is GENERATED from the route schemas
+      # in `app.lua` beside it, and a generated file is only as current as the
+      # last time somebody generated it. The green light of `tsc` on a client
+      # means "matches the last generated contract", not "matches the server".
+      # This step is what closes that gap: it regenerates in memory and fails
+      # if the committed file differs, so a schema change that nobody
+      # regenerated is a red build rather than a client that type-checks
+      # against a contract the server no longer honours.
+      - name: The typed client is current with the routes
+        run: $LUA_BIN bin/akkar gen examples/typed-client/app.lua -o examples/typed-client/client.ts --check
+
   # ------------------------------------------------------------- lua 5.5
   # THE ROCKSPECS SAY `lua >= 5.4, < 5.6`. Until this job existed, nothing
   # tested the second half of that range.
