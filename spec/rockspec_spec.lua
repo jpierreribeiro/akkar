@@ -206,29 +206,59 @@ describe("the release rockspec", function()
     return env
   end
 
-  it("declares exactly the same modules as the development one", function()
-    -- A module in one and not the other means `luarocks install akkar` ships
-    -- a package missing a file while the development install is fine. The
-    -- person who finds that is a stranger, and they find it as a require
-    -- error.
-    local dev = load_one "akkar-dev-1.rockspec"
+  it("declares exactly the files its own tag contains", function()
+    -- THIS CHECK USED TO COMPARE AGAINST THE DEVELOPMENT ROCKSPEC, AND THAT
+    -- WAS BACKWARDS.
+    --
+    -- Its reasoning was that a module in one and not the other means
+    -- `luarocks install akkar` ships a package missing a file. True of two
+    -- rockspecs over one tree -- and this one is not over this tree. It pins
+    -- `source.tag`, so `luarocks` fetches THAT tarball, and the only files it
+    -- can install are the ones the tag contains. Declaring a module the tag
+    -- does not have does not complete the package; it breaks the build, on a
+    -- file that cannot be there.
+    --
+    -- So keeping it in step with the moving tree made it worse on every
+    -- commit, and it was kept in step deliberately: two separate pieces of
+    -- work added a module to it purely to satisfy the old assertion, each
+    -- flagging that it looked wrong. When the tree had drifted far enough the
+    -- count told the story -- 72 modules declared, 42 files in the tag.
+    --
+    -- What is actually true is checked instead: a released rockspec describes
+    -- its own tag. When they disagree, the release is stale and the answer is
+    -- to cut a new one from the tree being tagged, never to edit this file.
     local rel = load_one "akkar-0.1.0-1.rockspec"
+    local tag = rel.source.tag
 
-    local missing, extra = {}, {}
-    for name in pairs(dev.build.modules) do
-      if not rel.build.modules[name] then missing[#missing + 1] = name end
+    -- The tag has to be present to compare against, and a shallow clone has
+    -- no tags. Pending rather than green, naming the reason: a check that
+    -- cannot run must not look like a check that passed.
+    local pipe = assert(io.popen(
+      ("git ls-tree -r --name-only %q 2>/dev/null"):format(tag)))
+    local listing = pipe:read "a"
+    pipe:close()
+    if not listing:match "%S" then
+      pending("tag " .. tag .. " is not in this clone (a shallow checkout has "
+              .. "no tags); run `git fetch --tags` to check the release "
+              .. "rockspec against it")
+      return
     end
-    for name in pairs(rel.build.modules) do
-      if not dev.build.modules[name] then extra[#extra + 1] = name end
-    end
-    table.sort(missing) table.sort(extra)
 
-    assert.equal(0, #missing,
-      "in the development rockspec and not the release: " ..
-      table.concat(missing, ", "))
-    assert.equal(0, #extra,
-      "in the release rockspec and not the development one: " ..
-      table.concat(extra, ", "))
+    local in_tag = {}
+    for path in listing:gmatch "[^\n]+" do in_tag[path] = true end
+
+    local absent = {}
+    for _, path in pairs(rel.build.modules) do
+      if not in_tag[path] then absent[#absent + 1] = path end
+    end
+    table.sort(absent)
+
+    assert.equal(0, #absent,
+      ("the release rockspec declares %d file(s) that %s does not contain, so "
+       .. "`luarocks install akkar` would fetch that tag and fail to find "
+       .. "them. Cut a new version from the tree you are tagging rather than "
+       .. "editing this rockspec: %s"):format(#absent, tag,
+                                              table.concat(absent, ", ")))
   end)
 
   it("pins a tag, because a release must not track a branch", function()
