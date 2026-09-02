@@ -568,9 +568,50 @@ end
 ---
 --- Copied rather than written through, for the same reason `expand_schema`
 --- copies: one `item` rule is written once and shared by several routes.
-local function expand_rule(rule)
-  local expanded = expand(rule)
+--- WHAT A TABLE HAS TO BE to count as a rule: `kind` naming one of the seven
+--- types. `expand` hands a table back untouched, so an array written as a bare
+--- nested table -- `users = { { id = "string" } }` -- and an object written
+--- one level down without `v.object` -- `user = { name = "string" } }` -- both
+--- came through as a rule with NO `kind`. `check_one` matches a nil kind
+--- against nothing and returns the value unchanged: the route registered, the
+--- value was never validated, a 200 went out unchecked, and `akkar.openapi`
+--- wrote the field down as `type: string`, its fallthrough for a kind it did
+--- not know, so a generated client typed an array as a string. A contract that
+--- validates nothing and documents the wrong thing must not become a running
+--- server; it is refused here, where the route is declared, naming the
+--- spelling that would have worked.
+---
+--- The shorthand for an object is the field map at the SLOT -- `body = { to =
+--- "string" }` -- and only there. Below it a table is a rule, and a rule says
+--- its kind.
+local function not_a_rule(rule)
+  if rule[1] ~= nil then
+    return "a table with a positional entry is not a rule; an array is " ..
+           "v.array { items = ... }"
+  end
+  if next(rule) == nil then
+    return "an empty table is not a rule; any table is \"table\", an object is " ..
+           "v.object { fields = { ... } }"
+  end
+  return "a bare table of fields is not a rule; a nested object is " ..
+         "v.object { fields = { ... } }"
+end
+
+--- `where` is the dotted path to the rule from its slot -- `body.order.lines`
+--- -- and every error below carries it, the same path a 422 would report for
+--- the value. Threaded down rather than re-prefixed on the way up, so a nested
+--- failure reads `response.order.lines: ...` and not `response: order: lines: ...`.
+local function expand_rule(rule, where)
+  local ok, expanded = pcall(expand, rule)
+  if not ok then error(("%s: %s"):format(where, tostring(expanded)), 0) end
   local kind = expanded.kind
+  if type(kind) ~= "string" then
+    error(("%s: %s"):format(where, not_a_rule(expanded)), 0)
+  end
+  if not SHORTHAND[kind] then
+    error(("%s: unknown schema type: '%s'; use string, integer, number, " ..
+           "boolean, table, object, array"):format(where, kind), 0)
+  end
   if kind ~= "object" and kind ~= "array" then return expanded end
 
   local out = {}
@@ -581,21 +622,22 @@ local function expand_rule(rule)
     -- filters every field of the value away, so it would silently empty a
     -- nested body or -- through the response filter -- a nested reply.
     if type(expanded.fields) ~= "table" then
-      error("an object rule needs `fields`; write v.object { fields = { ... } }" ..
-            " rather than \"object\"", 0)
+      error(("%s: an object rule needs `fields`; write v.object { fields = " ..
+             "{ ... } } rather than \"object\""):format(where), 0)
     end
     local fields = {}
     for name, inner in pairs(expanded.fields) do
-      local ok, done = pcall(expand_rule, inner)
-      if not ok then error(("%s: %s"):format(tostring(name), tostring(done)), 0) end
-      fields[name] = done
+      fields[name] = expand_rule(inner, where .. "." .. tostring(name))
     end
     out.fields = fields
   else
     -- An array with no `items` means the widest element rule. That is already
     -- exactly what `akkar.openapi` documents for one, and defaulting here
     -- rather than refusing keeps the document and the enforcement agreeing.
-    out.items = expand_rule(expanded.items or "table")
+    -- Named `items` in the path for the same reason a field is named: the
+    -- element rule of `body.lines` failing as `body.lines: ...` reads as the
+    -- array itself being wrong.
+    out.items = expand_rule(expanded.items or "table", where .. ".items")
   end
   return out
 end
@@ -624,20 +666,12 @@ local function expand_schema(schema, what)
   -- fields = ... }` says the body IS that object, and `v.array { items = ... }`
   -- says it is a list. Both come back expanded and keep their `kind`, which is
   -- what tells `validate` apart from a field map at request time.
-  if is_root_rule(schema) then
-    local ok, expanded = pcall(expand_rule, schema)
-    if not ok then error(("%s: %s"):format(what, tostring(expanded)), 0) end
-    return expanded
-  end
+  if is_root_rule(schema) then return expand_rule(schema, what) end
   local out = {}
   for field, rule in pairs(schema) do
-    local ok, expanded = pcall(expand_rule, rule)
-    if not ok then
-      -- Name the field. `unknown schema type: 'strng'` with no field is a
-      -- message that sends the reader looking through every rule they wrote.
-      error(("%s.%s: %s"):format(what, tostring(field), tostring(expanded)), 0)
-    end
-    out[field] = expanded
+    -- Named by field. `unknown schema type: 'strng'` with no field is a
+    -- message that sends the reader looking through every rule they wrote.
+    out[field] = expand_rule(rule, what .. "." .. tostring(field))
   end
   return out
 end

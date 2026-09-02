@@ -179,10 +179,17 @@ assert(schema.required[1] == "name")
 assert(schema.required[2] == "role")         -- `age` is optional
 ```
 
-One thing this mapping still does not do. A rule this module does not recognise
-becomes an empty schema `{}` rather than an error, where a route declaring it
-raises `unknown schema type` at the line that declares it — so in practice a bad
-rule fails the boot long before this module sees it.
+A rule this module cannot expand is an error, never a fallback. It used to
+become an empty schema `{}` for an unknown shorthand and `type: string` for a
+table with no `kind`, so an array written as a bare nested table — `response =
+{ users = { { id = "string" } } }` — was documented as a string, and a client
+generated from the document typed it as one against a server that sends a
+list. A route refuses that table where it is declared now, naming the route,
+the path and the spelling that works, so a declared route never carries one.
+A route table assembled by hand and passed to `document` raises here instead —
+`akkar.openapi: GET /x: response.users is a table with no schema kind and
+cannot be documented` — because a quiet default is exactly the lie the
+generated client was built on.
 
 `match` is copied to `pattern` unchanged, and akkar's `match` is a Lua pattern
 while OpenAPI's `pattern` is an ECMA-262 regular expression, so `match =
