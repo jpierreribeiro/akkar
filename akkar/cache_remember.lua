@@ -31,6 +31,16 @@ local condition = require "cqueues.condition"
 
 local M = {}
 
+--- Process-wide health of the write-back half, watched the way an operator
+--- watches one process. The same shape as `akkar.auth.session_write_failures`
+--- next door, and for the same reason: a fill that could not be cached is not
+--- an error the request should see, but it IS something the operator needs a
+--- number for during an incident. `last_write_error` keeps the store's own
+--- message -- `-READONLY ...` off a promoted replica -- so the reason is named
+--- rather than merely counted.
+M.write_failures = 0
+M.last_write_error = nil
+
 local Remember = {}
 Remember.__index = Remember
 
@@ -77,7 +87,27 @@ function Remember:remember(key, ttl, produce)
   if not ok then error(value, 0) end
 
   if value ~= nil then
-    self.cache:set(key, value, ttl)
+    -- THE WRITE-BACK IS THE HALF THAT IS ALLOWED TO FAIL.
+    --
+    -- `produce` already ran and its value is in hand -- the expensive database
+    -- round-trip this whole module exists to coalesce has already been paid
+    -- for. If the cache then refuses the write, returning the value we hold is
+    -- strictly better than turning a served answer into a 500. The measured
+    -- case is a replica promoted read-only mid-incident: it answers every SET
+    -- with `-READONLY` while still serving `get` perfectly, so the cache keeps
+    -- hitting and only fills fail -- and yet an unguarded `set` here took down
+    -- every route that fills a key, on the first miss after the failover.
+    --
+    -- The READ is deliberately NOT symmetric and is NOT guarded: a failed
+    -- `get` has no value to fall back on, and inventing a miss would run
+    -- `produce` for every request through the outage with no coalescing left
+    -- to show for it. That path still raises, above, which `remember` lets
+    -- propagate -- the asymmetry is the point.
+    local wrote, why = pcall(self.cache.set, self.cache, key, value, ttl)
+    if not wrote then
+      M.write_failures = M.write_failures + 1
+      M.last_write_error = why
+    end
   end
   return value
 end
