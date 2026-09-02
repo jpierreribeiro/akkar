@@ -120,10 +120,13 @@ and the encoder have only ever seen small shapes.
 
 ## 7. Dependency movement
 
-`akkar/substrate.lua` repairs two lua-http defects by patching its methods at
-runtime. Nothing checks what happens when lua-http changes those methods —
-the patch is guarded against an unrecognised shape, which is honest, but no
-test pins the guard firing.
+akkar repairs two lua-http defects. They were runtime monkey-patches in
+`akkar/substrate.lua`, and this section used to ask what happens when lua-http
+changes the methods being patched. **That unknown is closed by construction:**
+the repairs now live in the source of `akkar/vendor/http/h1_stream.lua`
+(`docs/substrate/lua-http-wedge.md`), so they cannot silently stop applying —
+an upstream that changed shape would produce a merge conflict when the vendored
+copy is refreshed, not a patch that quietly no-ops.
 
 More generally: cqueues is pinned to a commit of master, pgmoon and luaossl
 are not, and nothing exercises a version bump.

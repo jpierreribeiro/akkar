@@ -59,7 +59,8 @@ cqueues 20200726.54-0 is now installed in /usr/local
 ```
 
 Every green run had tested release 20200726, not the commit `CQUEUES_COMMIT`
-pins. `akkar/substrate.lua` patches cqueues' internals, so that mattered. The
+pins. akkar runs its own vendored lua-http streams directly on cqueues'
+internals, so that mattered. The
 pinned build now goes in last, and `require("cqueues").COMMIT` is asserted —
 the field only exists when built with `-DCQUEUES_COMMIT`, which the release
 rock is not.
