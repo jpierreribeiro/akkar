@@ -34,9 +34,16 @@ assert(type(idempotency.CLAIM_SCRIPT) == "string")
 
 Builds the summary of a request that decides whether a reused key names the same
 request. It is
-`req.method .. " " .. req.path .. " " .. #body .. ":" .. sha256_hex(body)`,
-where `body` is the canonical encoding of `req.body`, or `""` when `req.body`
-is nil. The whole body is hashed, so no part of it is outside the comparison.
+`req.method .. " " .. req.path .. " " .. #material .. ":" .. sha256_hex(material)`,
+where `material` is `#query .. ":" .. query .. #body .. ":" .. body`, and
+`query` and `body` are the canonical encodings of `req.query` and `req.body`, or
+`""` for one that is nil. The whole body is hashed, so no part of it is outside
+the comparison -- and so is the query string, because `req.path` does not carry
+it: `POST /transfers?to=alice` and `POST /transfers?to=bob` with the same body
+and the same key are two requests, and the second is answered `422`, not with
+alice's stored response. The two parts are length-prefixed so a boundary cannot
+slide between them, and a query is a set, so `?a=1&b=2` and `?b=2&a=1` are one
+request.
 
 Not a cryptographic hash. It separates an honest client's retry from an honest
 client's mistake, and it is not a defence against somebody who already chooses
@@ -53,13 +60,22 @@ local print_ = idempotency.fingerprint_of {
   method = "POST", path = "/charges", body = { amount = 100 },
 }
 assert(print_ ==
-  "POST /charges 14:" ..
-  "4d4bbe59c6aad22442cde199a6a8a5f034405fcd78fb5a81c24ef249de1c45f1")
+  "POST /charges 19:" ..
+  "202d200fdbb28db28018dfbe6093c14ba7e5ec289ad46facc6314fc3dfe35170")
 
--- No body at all still fingerprints -- the digest of the empty string.
+-- No body at all still fingerprints -- the material is then `0:0:`.
 assert(idempotency.fingerprint_of { method = "POST", path = "/charges" } ==
-  "POST /charges 0:" ..
-  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+  "POST /charges 4:" ..
+  "390feabc786e369e55b904251d643b52b52b691c60eb74a498ef7c6df993bf12")
+
+-- The query string is part of the request's identity.
+local alice = idempotency.fingerprint_of {
+  method = "POST", path = "/charges", query = { to = "alice" }, body = { amount = 100 },
+}
+local bob = idempotency.fingerprint_of {
+  method = "POST", path = "/charges", query = { to = "bob" }, body = { amount = 100 },
+}
+assert(alice ~= bob and alice ~= print_)
 ```
 
 Two limits used to follow from the shape, and both are gone; they are recorded
