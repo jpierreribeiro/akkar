@@ -19,6 +19,7 @@ libraries implement it" stops being a slogan: the pool it uses is the same
 ]]
 
 local socket    = require "cqueues.socket"
+local errno     = require "cqueues.errno"
 local Pool      = require "akkar.pool"
 local execution = require "akkar.execution"
 
@@ -26,6 +27,34 @@ local Redis = {}
 Redis.__index = Redis
 
 local CRLF = "\r\n"
+
+-- A SOCKET FAILURE SAID `110` AND NOTHING ELSE.
+--
+-- `sock:onerror` hands back cqueues' raw errno, and `command` concatenates it
+-- into the message every layer above then reports. So the one line an operator
+-- reads during a Redis incident -- `akkar.limit`'s degradation warning, whose
+-- whole purpose is to say the limits are not being enforced right now -- read
+--
+--   detail="redis: 110"
+--
+-- Measured, under `docker pause` on the Redis container. 110 is ETIMEDOUT, and
+-- knowing that is the difference between "Redis is alive and not answering"
+-- and "Redis is gone" (111, ECONNREFUSED) -- two incidents with two different
+-- responses. `akkar/db.lua` has a comment naming this same number by hand
+-- because pgmoon's message leaks it raw; here the adapter is ours, so it is
+-- named at the boundary rather than in a comment somebody has to find.
+--
+-- The number is kept as well as the name: it is what a search of the codebase
+-- or of `errno(3)` will match on.
+local function name_error(why)
+  if type(why) ~= "number" then return why end
+  local name = errno[why]
+  local text = errno.strerror(why)
+  if not name then return (text or "errno") .. " (" .. why .. ")" end
+  return name .. " (" .. (text or why) .. ")"
+end
+
+Redis._name_error = name_error   -- exposed for tests; not part of the contract
 
 -- ================================================================== protocol
 -- A command is an array of bulk strings.  Encoding it as such -- rather than
@@ -274,7 +303,7 @@ function M.connect(config)
     -- Without this a command would block the loop while waiting, which is the
     -- whole thing this adapter exists to avoid.
     sock:setmode("bn", "bn")
-    sock:onerror(function(_, _, why) return why end)
+    sock:onerror(function(_, _, why) return name_error(why) end)
 
     -- A READ HAD NO BOUND AT ALL. `read_reply` waited exactly as long as the
     -- server took, and the only thing above it was the request deadline --
