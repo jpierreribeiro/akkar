@@ -71,6 +71,15 @@ usage:
     --cc NAME       the compiler           (default: $CC, or cc)
     --c-only        write the C and stop, without compiling
 
+  akkar gen app.lua [-o client.ts] [--check] [--title T] [--version V]
+
+    Generates a typed TypeScript client from the route schemas, through the
+    same OpenAPI document `akkar.openapi` serves. A wrong field in a call is
+    then a tsc error, not a 422. Writes to stdout without -o.
+
+    --check      exit 1 if the file at -o differs from what would be generated;
+                 for CI, so a schema change nobody regenerated fails the build
+
   akkar version
   akkar help
 ]]
@@ -432,6 +441,66 @@ local function test(args)
   os.exit(how == "exit" and code or 1)
 end
 
+-- ===================================================================== gen
+--
+-- The generated client is only as current as the last run of this command,
+-- which is the honest cost of generating types rather than inferring them.
+-- `--check` is what makes that cost visible: it regenerates in memory and
+-- compares against the committed file, so a route schema that changed without
+-- anybody regenerating is a red CI step rather than a client that type-checks
+-- green against a contract the server no longer honours.
+local function gen(args)
+  local path, output, checking = nil, nil, false
+  local info = {}
+
+  local i = 1
+  local function value(flag)
+    i = i + 1
+    if not args[i] then fail(flag .. " needs a value") end
+    return args[i]
+  end
+
+  while i <= #args do
+    local a = args[i]
+    if     a == "-o"        then output = value(a)
+    elseif a == "--check"   then checking = true
+    elseif a == "--title"   then info.title = value(a)
+    elseif a == "--version" then info.version = value(a)
+    elseif a:sub(1, 1) == "-" then fail("unknown option " .. a)
+    else path = a end
+    i = i + 1
+  end
+
+  if not path then fail("gen needs an app file: akkar gen app.lua -o client.ts") end
+  if checking and not output then fail("--check needs -o, the file to compare against") end
+
+  local app = load_app(path)
+  local generated = require("akkar.gen").typescript(app, info)
+
+  if checking then
+    local file = io.open(output, "r")
+    local current = file and file:read "a"
+    if file then file:close() end
+    if current ~= generated then
+      io.stderr:write(("akkar gen: %s is out of date -- the route schemas changed.\n"
+                    .. "  Regenerate and commit:  akkar gen %s -o %s\n"):format(output, path, output))
+      os.exit(1)
+    end
+    io.write(("akkar gen: %s is up to date\n"):format(output))
+    return
+  end
+
+  if output then
+    local file, err = io.open(output, "w")
+    if not file then fail("could not write " .. output .. ": " .. tostring(err)) end
+    file:write(generated)
+    file:close()
+    io.write(("akkar gen: %s\n"):format(output))
+  else
+    io.write(generated)
+  end
+end
+
 local command = arg[1]
 local rest = { table.unpack(arg, 2) }
 
@@ -449,6 +518,8 @@ elseif command == "build" then
   build(rest)
 elseif command == "archive" then
   archive(rest)
+elseif command == "gen" then
+  gen(rest)
 elseif command == "version" then
   print("akkar dev-1 on " .. _VERSION)
 elseif command == nil or command == "help" or command == "--help" or command == "-h" then

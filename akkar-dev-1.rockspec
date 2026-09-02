@@ -160,6 +160,7 @@ build = {
     ["akkar.email"] = "akkar/email.lua",
     ["akkar.etag"] = "akkar/etag.lua",
     ["akkar.execution"] = "akkar/execution.lua",
+    ["akkar.gen"] = "akkar/gen.lua",
     ["akkar.websocket"] = "akkar/websocket.lua",
     ["akkar.vendor.http.bit"] = "akkar/vendor/http/bit.lua",
     ["akkar.vendor.http.client"] = "akkar/vendor/http/client.lua",
