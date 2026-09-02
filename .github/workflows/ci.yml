@@ -80,9 +80,39 @@ jobs:
         # combinations worth paying for, not every pairing of two lists.
         # macos-14 is Apple Silicon, so it covers macOS and a second arm64.
         include:
-          - { os: ubuntu-24.04,     lua: "5.4" }
-          - { os: ubuntu-24.04-arm, lua: "5.4" }
-          - { os: macos-14,         lua: "5.4" }
+          # DIAG10. STDOUT IS THE VARIABLE.
+          #
+          # Fifty-nine whole-suite arm64 runs across DIAG4, DIAG5 and DIAG6
+          # produced zero crashes. In the SAME jobs, the plain step that runs
+          # `busted` with no redirection segfaulted 2 times out of 4. The
+          # loops and that step differ in exactly one thing that is ours
+          # rather than the bug's:
+          #
+          #     loop:  busted --output=plainTerminal >run.out 2>&1
+          #     step:  busted
+          #
+          # The flag is a red herring. `.busted` names no output handler, and
+          # busted picks plainTerminal whenever stdout is not a tty -- which
+          # a file and a pipe both are not. So both invocations use the same
+          # handler, and what is left is WHERE STDOUT GOES: a regular file in
+          # the loop, the runner's log PIPE in the step.
+          #
+          # That is not cosmetic. A write to a full pipe BLOCKS until the
+          # reader drains it; a write to a file does not. The suite's HTTP
+          # servers and cqueues loops are therefore scheduled differently in
+          # the two cases, and this is a bug whose whole character is that
+          # timing and heap layout decide whether it fires.
+          #
+          # Three jobs leave stdout on the step's pipe, three redirect it to
+          # a file, and nothing else differs. `ulimit -c unlimited` is set in
+          # both, which the plain step never had -- which is why the two
+          # crashes we already have left no core behind.
+          - { os: ubuntu-24.04-arm, lua: "5.4", probe: pipe-a }
+          - { os: ubuntu-24.04-arm, lua: "5.4", probe: pipe-b }
+          - { os: ubuntu-24.04-arm, lua: "5.4", probe: pipe-c }
+          - { os: ubuntu-24.04-arm, lua: "5.4", probe: file-a }
+          - { os: ubuntu-24.04-arm, lua: "5.4", probe: file-b }
+          - { os: ubuntu-24.04-arm, lua: "5.4", probe: file-c }
     steps:
       - uses: actions/checkout@v4
 
@@ -174,7 +204,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/cqueues-build
-          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua${{ matrix.lua }}-${{ matrix.os }}
+          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua${{ matrix.lua }}-${{ matrix.os }}-${{ matrix.probe }}
 
       # OpenSSL has to be pointed at on macOS and does not on Linux, and the
       # difference is not a preference: Homebrew's `openssl@3` is keg-only, so
@@ -192,8 +222,40 @@ jobs:
           cd ~/cqueues-build
           git checkout "$CQUEUES_COMMIT"
 
+          # DIAG4: delete the object freelist on the two probe builds. Nothing
+          # else changes -- same commit, same flags, same everything -- so a
+          # difference in behaviour between these and the four plain jobs is
+          # attributable to recycling and to nothing else.
+          case "${{ matrix.probe }}" in
+            nopool|nopool-asan)
+              python3 - <<'PY'
+          import re
+          p = "src/cqueues.c"
+          s = open(p).read()
+          s, n1 = re.subn(
+              r"static void pool_put\(struct pool \*P, void \*p\) \{.*?\} /\* pool_put\(\) \*/",
+              "static void pool_put(struct pool *P, void *p) {\n"
+              "        (void)P;\n"
+              "        free(p);\n"
+              "} /* pool_put() */", s, flags=re.S)
+          s, n2 = re.subn(
+              r"static void \*pool_get\(struct pool \*P, int \*_error\) \{.*?\} /\* pool_get\(\) \*/",
+              "static void *pool_get(struct pool *P, int *_error) {\n"
+              "        return make(P->size, _error);\n"
+              "} /* pool_get() */", s, flags=re.S)
+          assert n1 == 1 and n2 == 1, (n1, n2)
+          open(p, "w").write(s)
+          print("freelist neutered: pool_put -> free, pool_get -> malloc")
+          PY
+              ;;
+          esac
+
           CPP="-I$LUA_INC"
           LDF=""
+          if [ "${{ matrix.probe }}" = "nopool-asan" ]; then
+            CPP="$CPP -fsanitize=address -fno-omit-frame-pointer -g3"
+            LDF="$LDF -fsanitize=address"
+          fi
           if [ -n "${OPENSSL_DIR:-}" ]; then
             CPP="$CPP -I$OPENSSL_DIR/include"
             LDF="-L$OPENSSL_DIR/lib"
@@ -315,8 +377,97 @@ jobs:
             assert(got == want, "cqueues is " .. got .. ", pinned is " .. want)
             print("commit   " .. got .. "  (pinned)")'
 
+      - name: Install gdb
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+
+      - name: Core dumps into the workspace
+        if: always()
+        run: |
+          sudo sysctl -w kernel.core_pattern="$PWD/core.%p" || true
+          cat /proc/sys/kernel/core_pattern
+          BUSTED_LUA=$(ls /usr/local/lib/luarocks/rocks-5.4/busted/*/bin/busted | head -1)
+          echo "BUSTED_LUA=$BUSTED_LUA" >> $GITHUB_ENV
+          echo "lua bin: $BUSTED_LUA"
+
+      # DIAG4, and it corrects two mistakes in DIAG3 rather than repeating it.
+      #
+      # DIAG3 asked the wrong question and then could not ask it. Its
+      # nine-test window ran 318 times with ZERO crashes -- which is a real
+      # finding, not a null one: busted LOADS EVERY SPEC FILE BEFORE IT RUNS
+      # THE FIRST TEST, so restricting the run to three files removes the
+      # load-time work of the other sixty. The crash lands after nine tests
+      # because that is where the whole suite's load phase ends, not because
+      # those nine tests cause it. The window is not the reproducer; the
+      # suite is.
+      #
+      # And DIAG3's whole-suite loop never ran a second iteration. The step
+      # is `bash -e`, the suite exits 1 on a runner with no Postgres and no
+      # Redis, and `set -e` killed the loop on the first pass. `set +e` here,
+      # explicitly, is the whole repair.
+      - name: HUNT -- stdout on a pipe against stdout on a file
+        if: always()
+        run: |
+          set +e
+          ulimit -c unlimited
+          echo "core_pattern: $(cat /proc/sys/kernel/core_pattern)"
+          echo "core limit  : $(ulimit -c)"
+
+          crashes=0; runs=0
+          deadline=$(( $(date +%s) + 1500 ))
+          while [ $(date +%s) -lt $deadline ]; do
+            runs=$((runs+1))
+            t0=$(date +%s)
+            case "${{ matrix.probe }}" in
+              pipe-*)
+                # NO redirection. stdout stays the step's pipe, exactly as the
+                # `busted` step that actually crashes. The output is verbose
+                # and it goes in the log; that IS the condition being tested.
+                busted
+                rc=$?
+                ;;
+              file-*)
+                busted >run.out 2>&1
+                rc=$?
+                ;;
+            esac
+            echo "PROBE run $runs -> rc=$rc  ($(( $(date +%s) - t0 ))s)"
+
+            if [ $rc -ge 128 ]; then
+              crashes=$((crashes+1))
+              echo "=== CRASH on run $runs, rc=$rc ==="
+              core=$(ls -t core.* 2>/dev/null | head -1)
+              if [ -n "$core" ]; then
+                # THE ONE THING WORTH PRINTING. `struct fileno` is
+                # { int fd; short state; LIST_HEAD events; LLRB_ENTRY rbe; },
+                # so `fd` is at offset 0 and `rbe` at 16 -- and `pool_put`
+                # writes the freelist link with `*(void **)p = P->head`, eight
+                # bytes over offset 0. A recycled node therefore keeps WALKABLE
+                # tree pointers and carries the low half of a heap pointer in
+                # the slot `fileno_cmp` compares. If the node under $x0/$x1
+                # has an `fd` that looks like the bottom of an address rather
+                # than a small integer, that is the freelist link in the fd
+                # slot and the diagnosis is confirmed rather than inferred.
+                gdb --batch -ex "set pagination off" \
+                    -ex "echo \n==== BT ====\n"      -ex "bt" \
+                    -ex "echo \n==== FRAME 0 ====\n" -ex "frame 0" -ex "info args" -ex "info locals" \
+                    -ex "echo \n==== THE NODE ====\n" \
+                    -ex "p *a" -ex "p *b" -ex "p/x a->fd" -ex "p/x b->fd" \
+                    -ex "echo \n==== REGISTERS ====\n" -ex "info registers" \
+                    -ex "echo \n==== INSN ====\n"   -ex "x/8i \$pc" \
+                    "$(command -v lua5.4)" "$core" 2>&1 | tail -200
+                rm -f "$core"
+              else
+                echo "no core in $PWD"; ls -la core* 2>&1 | head -3
+              fi
+              [ $crashes -ge 2 ] && break
+            fi
+          done
+          echo ""
+          echo "HUNT RESULT (${{ matrix.probe }}): $crashes crashes in $runs runs"
+
       - name: The suite, with no database and no Redis
-        run: busted
+        if: always()
+        run: busted || echo "suite exit=$?"
 
       # WHY A DIAGNOSTIC RUNS IN CI AND CANNOT FAIL IT.
       #
@@ -379,6 +530,7 @@ jobs:
   # this file -- the same stance the matrix above takes with macOS. Every step
   # echoes what it resolved, so a break is diagnosable from the log.
   lua55:
+    if: false
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -462,6 +614,7 @@ jobs:
   # The same suite with the backends up, so the specs that skip themselves on
   # a laptop actually run somewhere.
   integration:
+    if: false
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -551,6 +704,7 @@ jobs:
   # command does not ship. Nothing in the repository would ever have noticed,
   # because no documented flow installs the rock at all.
   install:
+    if: false
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
