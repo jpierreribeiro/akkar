@@ -1,0 +1,160 @@
+=== CRASH on run 1, rc=139 ===
++++++++++#42 0x0000ab5713681124 [PAC] in ?? ()
+#43 0x0000ab571367c56c [PAC] in ?? ()
+#44 0x0000ab57136a765c [PAC] in ?? ()
+#45 0x0000ab5713680d24 [PAC] in lua_pcallk ()
+#46 0x0000ab5713682354 [PAC] in ?? ()
+#47 0x0000ab5713684408 [PAC] in ?? ()
+#48 0x0000ab5713680454 [PAC] in ?? ()
+#49 0x0000ab571368110c [PAC] in ?? ()
+#50 0x0000ab571367c56c [PAC] in ?? ()
+#51 0x0000ab57136a765c [PAC] in ?? ()
+#52 0x0000ab5713680d24 [PAC] in lua_pcallk ()
+#53 0x0000ab5713677304 [PAC] in ?? ()
+#54 0x0000ffda1fc984c4 [PAC] in __libc_start_call_main (main=main@entry=0xab5713677280, argc=argc@entry=4, argv=argv@entry=0xfffff0980288) at ../sysdeps/nptl/libc_start_call_main.h:58
+#55 0x0000ffda1fc98598 in __libc_start_main_impl (main=0xab5713677280, argc=4, argv=0xfffff0980288, init=<optimized out>, fini=<optimized out>, rtld_fini=<optimized out>, stack_end=<optimized out>) at ../csu/libc-start.c:360
+#56 0x0000ab57136773b0 in ?? ()
+
+==== BT FULL ====
+#0  fileno_cmp (b=0xffda00014807, a=<optimized out>) at /home/runner/cqueues-build/src/cqueues.c:1195
+No locals.
+#1  table_LLRB_FIND (head=0xab5729b34c88, key=<synthetic pointer>) at /home/runner/cqueues-build/src/cqueues.c:1195
+        comp = <optimized out>
+        elm = 0xffda00014807
+        elm = <optimized out>
+        comp = <optimized out>
+#2  fileno_find (fd=-1, fd@entry=83975, Q=Q@entry=0xab5729b34a68) at /home/runner/cqueues-build/src/cqueues.c:1536
+        key = <optimized out>
+        key = <optimized out>
+#3  cqueue_cancelfd (Q=Q@entry=0xab5729b34a68, fd=fd@entry=-1) at /home/runner/cqueues-build/src/cqueues.c:2428
+        fileno = <optimized out>
+        error = 0
+        _error = <optimized out>
+#4  0x0000ffda1fb161ac in cstack_cancelfd (CS=<optimized out>, fd=-1) at /home/runner/cqueues-build/src/cqueues.c:2780
+        Q = 0xab5729b34a68
+#5  cqs_cancelfd (L=<optimized out>, fd=-1) at /home/runner/cqueues-build/src/cqueues.c:2817
+No locals.
+#6  0x0000ffda1fb16604 in lso_closefd (fd=0xab572a0948d8, arg=<optimized out>) at /home/runner/cqueues-build/src/socket.c:702
+        S = <optimized out>
+#7  0x0000ffda1fb29064 in so_closesocket (fd=fd@entry=0xab572a0948d8, opts=opts@entry=0xab572a094880) at /home/runner/cqueues-build/src/lib/socket.c:875
+No locals.
+#8  0x0000ffda1fb29938 in so_socket_ (so=0xab572a094880) at /home/runner/cqueues-build/src/lib/socket.c:1449
+        error = 65535
+        error = <optimized out>
+#9  so_exec (so=0xab572a094880) at /home/runner/cqueues-build/src/lib/socket.c:1745
+        state = <optimized out>
+        error_ = <optimized out>
+        error = 0
+        exec = <optimized out>
+        error = <optimized out>
+#10 0x0000ffda1fb2a9c4 in so_connect (so=<optimized out>) at /home/runner/cqueues-build/src/lib/socket.c:2107
+No locals.
+#11 0x0000ffda1fb1c468 in lso_connect2 (L=0xab57296772a8) at /home/runner/cqueues-build/src/socket.c:983
+        host = <optimized out>
+        port = <optimized out>
+        path = <optimized out>
+        opts = {sa_bind = 0x0, sun_mode = 0, sun_mask = 0, sun_unlink = false, sin_reuseaddr = true, sin_reuseport = false, sin_broadcast = false, sin_nodelay = false, sin_nopush = false, sin_oobinline = false, sin_v6only = SO_V6ONLY_DEFAULT, fd_nonblock = true, fd_cloexec = true, fd_nosigpipe = true, fd_events = SO_SYSPOLL, fd_close = {arg = 0xab572a08c0c8, cb = 0xffda1fb165e4 <lso_closefd>}, tls_verify = false, tls_sendname = 0x1 <error: Cannot access memory at address 0x1>, st_time = true}
+        S = 0xab572a08c0c8
+        plen = 88
+        family = <optimized out>
+        type = 1
+        error = 0
+#12 0x0000ab5713680454 in ?? ()
+No symbol table info available.
+#13 0x0000ab571368de8c [PAC] in ?? ()
+No symbol table info available.
+#14 0x0000ab5713681124 [PAC] in ?? ()
+No symbol table info available.
+#15 0x0000ab571367c56c [PAC] in ?? ()
+No symbol table info available.
+#16 0x0000ab57136a765c [PAC] in ?? ()
+No symbol table info available.
+#17 0x0000ab5713680d24 [PAC] in lua_pcallk ()
+No symbol table info available.
+#18 0x0000ab571369aba4 [PAC] in ?? ()
+No symbol table info available.
+#19 0x0000ab5713680454 [PAC] in ?? ()
+No symbol table info available.
+#20 0x0000ab571368de8c [PAC] in ?? ()
+No symbol table info available.
+#21 0x0000ab5713681124 [PAC] in ?? ()
+No symbol table info available.
+#22 0x0000ab571367c56c [PAC] in ?? ()
+No symbol table info available.
+#23 0x0000ab57136a765c [PAC] in ?? ()
+No symbol table info available.
+#24 0x0000ab5713680d24 [PAC] in lua_pcallk ()
+No symbol table info available.
+#25 0x0000ab571369aba4 [PAC] in ?? ()
+No symbol table info available.
+#26 0x0000ab5713680454 [PAC] in ?? ()
+No symbol table info available.
+#27 0x0000ab571368de8c [PAC] in ?? ()
+No symbol table info available.
+#28 0x0000ab5713681124 [PAC] in ?? ()
+No symbol table info available.
+#29 0x0000ab571367c56c [PAC] in ?? ()
+No symbol table info available.
+#30 0x0000ab57136a765c [PAC] in ?? ()
+No symbol table info available.
+#31 0x0000ab5713680d24 [PAC] in lua_pcallk ()
+No symbol table info available.
+#32 0x0000ab571369ad0c [PAC] in ?? ()
+No symbol table info available.
+#33 0x0000ab5713680454 [PAC] in ?? ()
+No symbol table info available.
+#34 0x0000ab571368de8c [PAC] in ?? ()
+No symbol table info available.
+#35 0x0000ab5713681124 [PAC] in ?? ()
+No symbol table info available.
+#36 0x0000ab571367c56c [PAC] in ?? ()
+No symbol table info available.
+#37 0x0000ab57136a765c [PAC] in ?? ()
+No symbol table info available.
+#38 0x0000ab5713680d24 [PAC] in lua_pcallk ()
+No symbol table info available.
+#39 0x0000ab571369ad0c [PAC] in ?? ()
+No symbol table info available.
+#40 0x0000ab5713680454 [PAC] in ?? ()
+No symbol table info available.
+#41 0x0000ab571368de8c [PAC] in ?? ()
+No symbol table info available.
+#42 0x0000ab5713681124 [PAC] in ?? ()
+No symbol table info available.
+#43 0x0000ab571367c56c [PAC] in ?? ()
+No symbol table info available.
+#44 0x0000ab57136a765c [PAC] in ?? ()
+No symbol table info available.
+#45 0x0000ab5713680d24 [PAC] in lua_pcallk ()
+No symbol table info available.
+#46 0x0000ab5713682354 [PAC] in ?? ()
+No symbol table info available.
+#47 0x0000ab5713684408 [PAC] in ?? ()
+No symbol table info available.
+#48 0x0000ab5713680454 [PAC] in ?? ()
+No symbol table info available.
+#49 0x0000ab571368110c [PAC] in ?? ()
+No symbol table info available.
+#50 0x0000ab571367c56c [PAC] in ?? ()
+No symbol table info available.
+#51 0x0000ab57136a765c [PAC] in ?? ()
+No symbol table info available.
+#52 0x0000ab5713680d24 [PAC] in lua_pcallk ()
+No symbol table info available.
+#53 0x0000ab5713677304 [PAC] in ?? ()
+No symbol table info available.
+#54 0x0000ffda1fc984c4 [PAC] in __libc_start_call_main (main=main@entry=0xab5713677280, argc=argc@entry=4, argv=argv@entry=0xfffff0980288) at ../sysdeps/nptl/libc_start_call_main.h:58
+        self = <optimized out>
+        result = <optimized out>
+        unwind_buf = {cancel_jmp_buf = {{jmp_buf = {281474718237320, 4, 188390476408744, 188390476051072, 281474718237360, 281312304352088, 0, 281312304353280, 188390476408744, 0, 281474718237200, 2167948202374648052, 281470681743369, 2167948044881712480, 0, 0, 0, 0, 0, 0, 0, 0}, mask_was_saved = 0}}, priv = {pad = {0x0, 0x0, 0xffda1fc98540 <__libc_start_main_impl+64>, 0xfffff0980288}, data = {prev = 0x0, cleanup = 0x0, canceltype = 533300544}}}
+        not_first_call = <optimized out>
+#55 0x0000ffda1fc98598 in __libc_start_main_impl (main=0xab5713677280, argc=4, argv=0xfffff0980288, init=<optimized out>, fini=<optimized out>, rtld_fini=<optimized out>, stack_end=<optimized out>) at ../csu/libc-start.c:360
+No locals.
+#56 0x0000ab57136773b0 in ?? ()
+No symbol table info available.
+
+==== FRAME 0 ====
+#0  fileno_cmp (b=0xffda00014807, a=<optimized out>) at /home/runner/cqueues-build/src/cqueues.c:1195
+1195	LLRB_GENERATE_STATIC(table, fileno, rbe, fileno_cmp)
+b = 0xffda00014807
+a = <optimized out>

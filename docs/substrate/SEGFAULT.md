@@ -1,5 +1,173 @@
 # The suite segfaults, intermittently, inside cqueues
 
+## SOLVED, 2 September 2026 — the backtrace, the trigger, and the mechanism
+
+A symbolized core dump from CI ends the guessing. It was got by running the
+suite EXACTLY as CI runs it (bare `busted`, see "the flag that hid it" below),
+looping on arm64, dumping core, and reading it with debuginfod disabled so gdb
+did not hang. Three runners, three crashes on the first run, one full
+backtrace:
+
+```
+#0  fileno_cmp (b=0xffda00014807, a=<optimized out>)            cqueues.c:1195
+#1  table_LLRB_FIND (head=0xab5729b34c88, key=...)              cqueues.c:1195
+#2  fileno_find (fd=-1, Q=0xab5729b34a68)                       cqueues.c:1536
+#3  cqueue_cancelfd (Q=0xab5729b34a68, fd=-1)                   cqueues.c:2428
+#4  cstack_cancelfd (CS=..., fd=-1)                             cqueues.c:2780
+#5  cqs_cancelfd (L=..., fd=-1)                                 cqueues.c:2817
+#6  lso_closefd (fd=0xab572a0948d8, arg=...)                    socket.c:702
+#7  so_closesocket (fd=..., opts=...)                           lib/socket.c:875
+#8  so_socket_ (so=...)   error = 65535                         lib/socket.c:1449
+#9  so_exec (so=...)                                            lib/socket.c:1745
+#10 so_connect (so=...)                                         lib/socket.c:2107
+#11 lso_connect2 (L=...)                                        socket.c:983
+```
+
+The faulting instruction is `ldr w1, [x20]` with `x20 = 0xffda00014807` — a
+tree node whose child pointer points into a shared-library mapping, i.e. a
+wild pointer. `table` is the fileno tree, as this page always said. What was
+missing is the **trigger** and the **amplifier**, and they are both in the
+frames above.
+
+**The trigger is a socket connect that FAILS.** Frame 11→8 is
+`socket.connect` running its handshake; `so_socket_` carries `error = 65535`.
+A failed connect closes its own socket, and cqueues' close handler for a
+Lua socket is `lso_closefd` (frame 6):
+
+```c
+static int lso_closefd(int *fd, void *arg) {
+        struct luasocket *S = arg;
+        if (S->mainthread) {
+                cqs_cancelfd(S->mainthread, *fd);   /* <- frame 5 */
+                cqs_closefd(fd);
+        }
+        return 0;
+}
+```
+
+The no-services CI runner refuses every Postgres and Redis connection, so the
+suite performs this failing-connect-then-close **thousands of times per run**.
+That is why the crash lives on the no-services arm and not in `integration`,
+which has both services and never fails a connect this way.
+
+**The amplifier is that cqueues cancels an fd across EVERY live controller.**
+`cqs_cancelfd` → `cstack_cancelfd` walks the whole process's controller list
+and does one `fileno_find` — one red-black-tree walk — per controller:
+
+```c
+static void cstack_cancelfd(struct cstack *CS, int fd) {
+        struct cqueue *Q;
+        LIST_FOREACH(Q, &CS->cqueues, le)
+                cqueue_cancelfd(Q, fd);            /* fileno_find on each */
+}
+```
+
+So **every socket close in the process walks the fileno tree of every
+controller alive at that moment.** If any one of those trees is corrupt, the
+next failing connect anywhere crashes on it. The crash is in Q =
+0xab5729b34a68 — not necessarily the controller the socket belonged to, just
+one that happened to be on the list.
+
+**Why a tree gets corrupt, and why ASan never saw it** — unchanged from below
+and now explained by the above. cqueues frees fileno nodes to its own object
+pool (`pool_put`), not to the allocator, so a node freed while another
+controller's tree still links it is reused as a different fileno and the stale
+link becomes a wild pointer — invisible to AddressSanitizer, which only sees
+`malloc`/`free`. The freelist is the reason ASan came back clean, confirmed
+this session by rebuilding cqueues with the freelist removed (`pool_put`→
+`free`, `pool_get`→`malloc`) and running the whole suite under ASan on arm64:
+still zero reports, because catching it needs the crash to fire and the crash
+is layout-dependent (below).
+
+### This is a cqueues design limit, amplified by how akkar uses it
+
+The dangerous line is cqueues': a socket close cancels its fd, by NUMBER,
+across every controller in the Lua state. In ordinary cqueues use there is one
+controller and this is free. akkar is the unusual caller: it keeps **many
+controllers alive at once** — one per in-flight request (`akkar/execution.lua`),
+one per health probe (`akkar/health.lua:132`, which explicitly ABANDONS the
+controller with its coroutine still inside when a check times out), and more.
+Every one of those stays on the cstack until GC, and every one is walked on
+every socket close. The more concurrent controllers, and the more failing
+connects, the larger the window for one tree to be mid-corruption when the
+next close walks it.
+
+**This corrects the 2 September update below.** That update concluded "the
+crash outlived the pool, so it is not controller reuse." Right about the
+POOL — recycling is not it. Wrong about controllers: it is controller
+**multiplicity**, not controller recycling. The `962ceaa` retirement removed
+the pool but not the per-request controller, and left the per-probe ones
+untouched. So the leading suspect was never eliminated, only renamed.
+
+### What akkar should do
+
+1. **The real fix is B1 / F2**: carry the per-request deadline as a number
+   enforced at the adapter boundary, with no per-request `cqueues.new()`. No
+   per-request controller means the cstack holds one long-lived controller
+   instead of dozens, and `cstack_cancelfd` walks one tree. This backtrace is
+   direct evidence FOR that plan, not merely a second reason for it.
+2. **`akkar/health.lua` should stop abandoning controllers.** A timed-out
+   probe drops its controller with a coroutine suspended inside; that
+   controller cannot be `:close()`d (cqueues refuses to close a running
+   controller) and lingers on the cstack until GC, contributing a tree to
+   every socket close in between. It needs a design that does not strand a
+   controller — the same shape as F2.
+3. **Report it upstream.** `wahern/cqueues` master is alive (commits to
+   2026-03-18) and the pinned commit IS its tip — there is no released fix
+   waiting, confirmed this session by `git log c366149..origin/master` being
+   empty. The upstream-worthy report is: `cqs_cancelfd` fans a single fd
+   cancellation across all controllers by fd number, so any one corrupt or
+   stale fileno tree turns every subsequent socket close into a crash, and fd
+   numbers are reused across concurrent controllers.
+
+Until 1 and 2 land, CI carries a **bounded, honest mitigation** (this commit):
+the no-services suite step retries ONCE and ONLY on a death by signal
+(exit ≥ 128), announces both the retry and a double-crash, and leaves an
+ordinary test failure red on the first try. Residual red rate ≈ 1 in 9.
+
+### The flag that hid it — why four prior sessions could not reproduce it
+
+Every probe before this one looped `busted --output=plainTerminal`; the CI
+step that crashes runs bare `busted`. On a redirected stdout the flag is a
+**semantic no-op** — `busted/runner.lua:17` already selects `plainTerminal`
+when stdout is not a tty, and both paths then `require` the same handler. It
+changes only the contents of `arg` and the allocations the CLI parser makes.
+
+Yet on one commit, one runner image, one freshly built cqueues:
+
+| invocation | arm64 runs | crashes |
+|---|---:|---:|
+| `busted --output=plainTerminal` | 48 | **0** |
+| `busted` (bare, as CI runs it) | 6 | **6** |
+
+Six-for-six against zero-for-forty-eight, Fisher exact p ≈ 1.7e-6. A change
+with no logical effect moves the crash from certain to absent — the signature
+of memory corruption whose firing is decided by heap layout. It also explains
+the "intermittent" character: the bug is nearly deterministic per tree, and
+every commit reshuffles the layout, so it looks like it comes and goes. The
+observed CI rate is ~7% of arm64 runs (two SIGSEGVs in ~30), all clustered,
+because most commits happen to land on a surviving layout.
+
+x86 has still never crashed: 28 no-services runs this session plus every
+`integration` job. Same epoll backend as arm64, so the platform sensitivity is
+itself layout — arm64's allocator and 64 KB pages land the wild pointer on an
+unmapped page more often.
+
+### Do NOT re-run, already established this session
+
+- The pin is upstream master's tip; no upstream fix exists to pull.
+- The nine-test window is not the reproducer — restricting to three spec files
+  skips the load phase of the other sixty; 318 windowed runs found nothing.
+- Rebuilding cqueues without its freelist and running under ASan: still clean,
+  for the reason above.
+
+---
+
+## (Original investigation follows, including the 2 September update this
+## section corrects. Kept verbatim: its reproducers, its pricing of the pool,
+## and its dead ends are all still valid as recorded.)
+
+
 Found on 17 August 2026 while running the suite for an unrelated change. Not
 caused by that change — the timestamps rule it out, and they are the first
 thing recorded here because "did I break this" is the only question that

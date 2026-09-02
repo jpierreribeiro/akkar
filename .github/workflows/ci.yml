@@ -315,8 +315,36 @@ jobs:
             assert(got == want, "cqueues is " .. got .. ", pinned is " .. want)
             print("commit   " .. got .. "  (pinned)")'
 
+      # The suite is retried ONCE, and only on a crash, because of a cqueues
+      # use-after-free that `docs/substrate/SEGFAULT.md` diagnoses in full: a
+      # socket connect that FAILS -- which the no-services runner does on every
+      # Postgres and Redis attempt -- closes its fd through cqueues, and
+      # cqueues' close walks the file-descriptor tree of EVERY live controller
+      # in the process (`cqs_cancelfd` -> `cstack_cancelfd`, one LLRB_FIND per
+      # controller). One controller with a corrupted tree crashes that walk.
+      # akkar keeps many controllers alive at once -- one per in-flight request,
+      # one per health probe, some abandoned mid-coroutine -- which is the
+      # unusual shape that exposes it. The real fix is B1/F2 (a per-request
+      # deadline carried as a number, no per-request controller); until then:
+      #
+      # This is NOT "re-run until green". It retries ONLY exit >= 128 -- death
+      # by signal -- so an ordinary test failure is still red on the first
+      # attempt. It retries ONCE: two crashes in a row is not the intermittent
+      # bug and stays red. It announces both, so a real regression cannot hide
+      # in here. Residual red rate at the observed per-run crash probability
+      # (~1 in 3 with this invocation) is about 1 in 9.
       - name: The suite, with no database and no Redis
-        run: busted
+        run: |
+          set +e
+          busted; rc=$?
+          if [ $rc -ge 128 ]; then
+            echo "::warning title=cqueues fd-table crash::the suite died on signal $((rc - 128)) inside cqueues (table_LLRB_FIND, a pollset fd tree). This is the known use-after-free in docs/substrate/SEGFAULT.md, not a test failure. Retrying once; a second crash fails the job."
+            busted; rc=$?
+            if [ $rc -ge 128 ]; then
+              echo "::error title=cqueues fd-table crash::crashed twice in a row -- that is not the intermittent bug, do not paper over this one."
+            fi
+          fi
+          exit $rc
 
       # WHY A DIAGNOSTIC RUNS IN CI AND CANNOT FAIL IT.
       #
