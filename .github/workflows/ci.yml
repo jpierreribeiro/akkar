@@ -328,14 +328,46 @@ jobs:
               --args $LUA_BIN armprobe.lua 2>&1 | tail -80
           echo "gdb step done"
 
+      - name: Locate the real busted entry point
+        if: always()
+        run: |
+          # /usr/local/bin/busted is a luarocks SHELL wrapper, so feeding it to
+          # `lua` fails at line 3 with "unexpected symbol near '-'". The Lua
+          # script itself lives under the rock tree; find it and remember it.
+          BUSTED_LUA=$(ls /usr/local/lib/luarocks/rocks-5.4/busted/*/bin/busted 2>/dev/null | head -1)
+          echo "wrapper : $(command -v busted)"
+          echo "lua bin : $BUSTED_LUA"
+          head -5 "$BUSTED_LUA"
+          echo "BUSTED_LUA=$BUSTED_LUA" >> $GITHUB_ENV
+
+      - name: Baseline -- the suite, no gdb, just the exit code
+        if: always()
+        run: |
+          busted --output=plainTerminal; echo "BASELINE suite exit=$?"
+
+      - name: The WHOLE suite under gdb (backtrace)
+        if: always()
+        run: |
+          ulimit -c unlimited
+          gdb --batch \
+              -ex "set confirm off" \
+              -ex "set pagination off" \
+              -ex run \
+              -ex "echo \n==== BT ====\n" -ex bt \
+              -ex "echo \n==== INFO THREADS ====\n" -ex "info threads" \
+              -ex "echo \n==== REGISTERS ====\n" -ex "info registers" \
+              -ex "echo \n==== BT FULL ====\n" -ex "bt full" \
+              --args $LUA_BIN "$BUSTED_LUA" --output=plainTerminal 2>&1 | tail -200
+          echo "gdb whole-suite step done"
+
       - name: The three spec files under gdb (backtrace)
         if: always()
         run: |
           ulimit -c unlimited
-          BUSTED=$(command -v busted)
-          echo "busted at $BUSTED"
-          gdb --batch -ex run -ex bt -ex "bt full" \
-              --args $LUA_BIN "$BUSTED" --output=plainTerminal \
+          gdb --batch -ex "set confirm off" -ex "set pagination off" -ex run \
+              -ex "echo \n==== BT ====\n" -ex bt \
+              -ex "echo \n==== BT FULL ====\n" -ex "bt full" \
+              --args $LUA_BIN "$BUSTED_LUA" --output=plainTerminal \
               spec/000_strict_first_spec.lua \
               spec/abandoned_defence_spec.lua \
               spec/abandoned_spec.lua 2>&1 | tail -120
