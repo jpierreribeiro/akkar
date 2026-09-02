@@ -2,8 +2,17 @@
 The jobs/store split.
 
 The property that justifies the split is that the SAME semantics run against
-different storage.  So the semantic tests run twice -- once over memory, once
-over Redis -- and the Redis half skips when none is reachable.
+different storage.  So the semantic tests run THREE times -- over memory, over
+Redis and over Postgres -- and each server-backed half skips, by name, when
+its server is unreachable.
+
+Three passes rather than two because a store that is only ever driven by its
+own spec file is a store held to its own idea of the contract. The Postgres
+store is the newest and the one with the most room to disagree: it folds a
+list, a sorted set and a processing list into one table, so "depth" and
+"in flight" and "scheduled" are three different `where` clauses rather than
+three different data structures, and nothing but running the same assertions
+over it says those clauses mean what the other two stores mean.
 ]]
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
@@ -327,6 +336,22 @@ if redis_reachable() then
 else
   describe("queue semantics over redis", function()
     pending "Redis is not reachable; skipping"
+  end)
+end
+
+-- The third pass. `spec/support/jobs_postgres.lua` owns the connection, the
+-- schema and the wipe, so what is added here is the same two lines the Redis
+-- half needs and nothing else -- which is the point of the contract being a
+-- function of `make`.
+local pg_support = require "spec.support.jobs_postgres"
+
+if pg_support.reachable "pgmoon" then
+  behaves_like_a_queue("postgres", function()
+    return pg_support.queue "spec-postgres"
+  end)
+else
+  describe("queue semantics over postgres", function()
+    pending "Postgres is not reachable on 127.0.0.1:55432; skipping"
   end)
 end
 
