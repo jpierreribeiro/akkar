@@ -197,3 +197,137 @@ describe("numbers that came back from JSON", function()
     assert.is_truthy(line_for { s = "7.0" }:find("s=7.0", 1, true))
   end)
 end)
+
+-- =========================================================== log and trace
+--
+-- A LOG LINE AND A SPAN SHARED NO KEY. `req.log` carried `request_id`, the
+-- span carried `trace_id`, and an operator holding one could not find the
+-- other except by timestamp. The OpenTelemetry log data model names the fix:
+-- `TraceId` and `SpanId` are fields ON the log record, "set for logs that are
+-- part of request processing and have an assigned trace ID". The other
+-- direction is the request id as an attribute on the server span.
+--
+-- The rule that costs the most care is the negative one: a request with no
+-- trace must not gain the keys, empty or otherwise. `spec/allocation_spec.lua`
+-- prices that path to the byte.
+describe("log and trace share a key", function()
+  local trace = require "akkar.trace"
+
+  local INBOUND = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+  local TRACE   = "4bf92f3577b34da6a3ce929d0e0e4736"
+  local PARENT  = "00f067aa0ba902b7"
+
+  local function logging_app(exporter)
+    local app = akkar.new()
+    if exporter then app:use(exporter:middleware()) end
+    app:get("/x/:id", function(req)
+      req.log:info("handler ran")
+      return { ok = true }
+    end)
+    return app
+  end
+
+  it("puts the inbound trace id on every line the handler logs", function()
+    -- No exporter at all: the trace exists because the caller sent one, and
+    -- the span this line is emitted within is the caller's, which is what
+    -- OpenTelemetry calls the current span when nothing local started one.
+    local logger, lines = capturing { format = "json" }
+    logging_app():test { log = logger }
+      :get("/x/7", { headers = { traceparent = INBOUND } })
+
+    local entry = cjson.decode(lines[#lines])
+    assert.equal(TRACE, entry.trace_id)
+    assert.equal(PARENT, entry.span_id)
+  end)
+
+  it("writes NO trace key on a request that carried no trace", function()
+    -- Absent, not empty. A collector indexing `trace_id` must not see a
+    -- million empty strings, and a person grepping must not either.
+    local logger, lines = capturing { format = "json" }
+    logging_app():test { log = logger }:get "/x/7"
+
+    local line = lines[#lines]
+    local entry = cjson.decode(line)
+    assert.is_nil(entry.trace_id)
+    assert.is_nil(entry.span_id)
+    assert.is_nil(line:find("trace_id", 1, true), line)
+    assert.is_nil(line:find("span_id", 1, true), line)
+    assert.is_string(entry.request_id)
+  end)
+
+  it("binds the server span's own id once the exporter has started one",
+    function()
+      local exporter = trace.new {}
+      local logger, lines = capturing { format = "json" }
+      logging_app(exporter):test { log = logger }
+        :get("/x/7", { headers = { traceparent = INBOUND } })
+
+      local span = exporter.queue[1]
+      local entry = cjson.decode(lines[#lines])
+      assert.equal(TRACE, entry.trace_id)
+      assert.equal(span.span_id, entry.span_id)
+      assert.are_not.equal(PARENT, entry.span_id)
+    end)
+
+  it("joins a fresh trace too, when the caller sent none", function()
+    local exporter = trace.new {}
+    local logger, lines = capturing { format = "json" }
+    logging_app(exporter):test { log = logger }:get "/x/7"
+
+    local span = exporter.queue[1]
+    local entry = cjson.decode(lines[#lines])
+    assert.equal(span.trace_id, entry.trace_id)
+    assert.equal(span.span_id, entry.span_id)
+  end)
+
+  it("puts the request id on the server span, so the join runs both ways",
+    function()
+      -- `akkar.request_id`, under akkar's own namespace: the semantic
+      -- conventions define no request-id attribute, and the header-capture
+      -- one records what the CLIENT sent, which `req.id` deliberately is not.
+      local exporter = trace.new {}
+      local logger, lines = capturing { format = "json" }
+      local res = logging_app(exporter):test { log = logger }
+        :get("/x/7", { headers = { traceparent = INBOUND } })
+
+      local span = exporter.queue[1]
+      local entry = cjson.decode(lines[#lines])
+      assert.equal(res.headers["x-request-id"], span.attributes["akkar.request_id"])
+      assert.equal(entry.request_id, span.attributes["akkar.request_id"])
+
+      -- And it reaches the wire as an attribute, not as a private field.
+      local encoded = trace.otlp({ span }, {}).resourceSpans[1].scopeSpans[1].spans[1]
+      local found
+      for _, attribute in ipairs(encoded.attributes) do
+        if attribute.key == "akkar.request_id" then found = attribute.value.stringValue end
+      end
+      assert.equal(res.headers["x-request-id"], found)
+    end)
+
+  it("rebinds a logger that was acquired before the span existed", function()
+    -- A middleware registered ahead of the exporter reads `req.log`, which
+    -- caches it on the request without a span to bind to. Lines it writes
+    -- BEFORE the span exists cannot carry it; lines after it must.
+    local exporter = trace.new {}
+    local logger, lines = capturing { format = "json" }
+    local app = akkar.new()
+    app:use(function(req, next)
+      req.log:info("before the span")
+      return next(req)
+    end)
+    app:use(exporter:middleware())
+    app:get("/x/:id", function(req)
+      req.log:info("inside the span")
+      return { ok = true }
+    end)
+    app:test { log = logger }:get("/x/7", { headers = { traceparent = INBOUND } })
+
+    local before = cjson.decode(lines[#lines - 1])
+    local inside = cjson.decode(lines[#lines])
+    assert.equal("before the span", before.message)
+    assert.equal(TRACE, before.trace_id)          -- from the inbound header
+    assert.equal(PARENT, before.span_id)
+    assert.equal("inside the span", inside.message)
+    assert.equal(exporter.queue[1].span_id, inside.span_id)
+  end)
+end)

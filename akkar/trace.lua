@@ -593,9 +593,36 @@ function Exporter:middleware(options)
       attributes     = {
         ["http.request.method"] = req.method,
         ["url.path"]            = req.path,
+        -- THE JOIN KEY, the other way round. `req.log` carries the trace and
+        -- span ids once a span exists; this carries the request id onto the
+        -- span, so a span found in a backend leads to the log lines and the
+        -- `x-request-id` a client was handed, and a log line leads back.
+        --
+        -- Under akkar's own namespace, and not under `http.`, because the
+        -- semantic conventions define no request-id attribute -- the only
+        -- header-shaped one, `http.request.header.<key>`, records what the
+        -- CLIENT sent, and `req.id` is deliberately not that (`spec/
+        -- log_spec.lua` says why). The naming guidance is explicit: an
+        -- application-specific attribute is prefixed by the application's
+        -- name, and "it is not recommended to use existing OpenTelemetry
+        -- semantic convention namespace as a prefix for a new company- or
+        -- application-specific attribute name".
+        ["akkar.request_id"]    = req.id,
       },
     }
     req.span = span
+
+    -- A LOGGER ACQUIRED BEFORE THIS MIDDLEWARE RAN has no span to bind to,
+    -- and it is cached on the request, so every later line would miss the
+    -- ids. Rebinding costs one small table on a traced request that already
+    -- logged, and nothing at all otherwise -- `rawget`, so an unread `log`
+    -- is not acquired here just to be rebound.
+    local logger = rawget(req, "log")
+    if logger then
+      rawset(req, "log", logger:with {
+        trace_id = span.trace_id, span_id = span.span_id,
+      })
+    end
 
     -- pcall, so a handler that RAISES still produces a span. A trace missing
     -- exactly the requests that failed is a trace of the requests nobody

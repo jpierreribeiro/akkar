@@ -233,7 +233,7 @@ O span é exposto ao handler como `req.span`. Nada é escrito na resposta: o val
 | `name` | function | `req.method .. " " .. req.route` | nomeia o span, chamada depois que o handler roda, para que `req.route` já exista |
 | `sampler` | function | nenhum | chamada com a requisição; uma resposta falsa significa nenhum span |
 
-O nome do span usa o padrão da rota, não o caminho, então `/tasks/7` e `/tasks/8` são uma única operação. Atributos definidos: `http.request.method`, `url.path`, `http.response.status_code`. O status é `ERROR` para um erro gerado ou um 5xx, e permanece `UNSET` para um 4xx, que é a própria regra do OpenTelemetry para um span de servidor.
+O nome do span usa o padrão da rota, não o caminho, então `/tasks/7` e `/tasks/8` são uma única operação. Atributos definidos: `http.request.method`, `url.path`, `http.response.status_code` e `akkar.request_id`, que é o `req.id` -- o mesmo valor que `req.log` escreve como `request_id` e que a resposta carrega como `x-request-id`. Fica sob o namespace do próprio akkar porque as convenções semânticas não definem atributo de request id, e o único atributo delas em forma de header registra o que o cliente mandou, que o `req.id` não é. O status é `ERROR` para um erro gerado ou um 5xx, e permanece `UNSET` para um 4xx, que é a própria regra do OpenTelemetry para um span de servidor.
 
 **Retorna** uma função middleware.
 
@@ -382,6 +382,33 @@ O início vem de `akkar.time.now()`, que é `os.time` e tem **resolução de um 
 - **Métricas ou logs via OTLP.** Somente spans. Métricas são [akkar.metrics](metrics.md), um scrape do Prometheus.
 - **Protobuf.** O payload é JSON OTLP/HTTP, gerado aqui.
 - **Amostragem por cabeça (head sampling) por proporção.** `sampler` é uma função que você escreve. Não existe `ratio = 0.1`.
+
+## Correlação com logs
+
+Um span e uma linha de log da mesma requisição compartilham duas chaves, uma em cada direção. `req.log` carrega `trace_id` e `span_id` assim que o middleware iniciou um span (e os ids do trace de entrada mesmo quando não iniciou); o span de servidor carrega `akkar.request_id`. Qualquer um leva ao outro, e uma linha de log de uma requisição sem trace não carrega chave nenhuma, em vez de uma vazia. Veja [akkar.log](log.md#loggerwithfields).
+
+```lua
+local akkar = require "akkar"
+local trace = require "akkar.trace"
+local log   = require "akkar.log"
+local json  = require "akkar.json"
+
+local lines = {}
+local logger = log.new { format = "json", sink = function(line) lines[#lines + 1] = line end }
+local exporter = trace.new {}
+
+local app = akkar.new()
+app:use(exporter:middleware())
+app:get("/tasks/:id", function(req) req.log:info("looked up") return { id = req.params.id } end)
+
+local res = app:test({ log = logger }):get "/tasks/7"
+local span = exporter.queue[1]
+local line = json.decode(lines[1])
+
+print(line.trace_id == span.trace_id)                              --> true
+print(line.span_id == span.span_id)                                --> true
+print(span.attributes["akkar.request_id"] == res.headers["x-request-id"])   --> true
+```
 
 ## Veja também
 

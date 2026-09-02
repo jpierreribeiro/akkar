@@ -42,6 +42,7 @@ local trace = require "akkar.trace"
   - [span:set(key, value)](#spansetkey-value)
   - [span:traceparent()](#spantraceparent)
 - [Timestamps](#timestamps)
+- [Correlation with logs](#correlation-with-logs)
 - [Not here](#not-here)
 
 ## trace.attributes_of(map)
@@ -264,7 +265,11 @@ response: the handler's value comes back exactly as it was returned.
 
 The span name uses the route pattern, not the path, so `/tasks/7` and
 `/tasks/8` are one operation. Attributes set: `http.request.method`,
-`url.path`, `http.response.status_code`. Status is `ERROR` for a raised error
+`url.path`, `http.response.status_code`, and `akkar.request_id`, which is
+`req.id` -- the same value `req.log` writes as `request_id` and the response
+carries as `x-request-id`. It sits under akkar's own namespace because the
+semantic conventions define no request-id attribute, and their one
+header-shaped attribute records what the client sent, which `req.id` is not. Status is `ERROR` for a raised error
 or a 5xx, and left `UNSET` for a 4xx, which is OpenTelemetry's own rule for a
 server span.
 
@@ -426,6 +431,38 @@ accurate to microseconds.
 `endTimeUnixNano` is computed as `start_time + duration` in floating point
 before being split into nanoseconds, so its last digits drift by tens of
 nanoseconds. `startTimeUnixNano` does not: it goes through the integer path.
+
+## Correlation with logs
+
+A span and a log line from the same request share two keys, one in each
+direction. `req.log` carries `trace_id` and `span_id` once the middleware has
+started a span (and the inbound trace's ids even when it has not); the server
+span carries `akkar.request_id`. Either one leads to the other, and a log
+line from a request with no trace carries neither key rather than an empty
+one. See [akkar.log](log.md#loggerwithfields).
+
+```lua
+local akkar = require "akkar"
+local trace = require "akkar.trace"
+local log   = require "akkar.log"
+local json  = require "akkar.json"
+
+local lines = {}
+local logger = log.new { format = "json", sink = function(line) lines[#lines + 1] = line end }
+local exporter = trace.new {}
+
+local app = akkar.new()
+app:use(exporter:middleware())
+app:get("/tasks/:id", function(req) req.log:info("looked up") return { id = req.params.id } end)
+
+local res = app:test({ log = logger }):get "/tasks/7"
+local span = exporter.queue[1]
+local line = json.decode(lines[1])
+
+print(line.trace_id == span.trace_id)                              --> true
+print(line.span_id == span.span_id)                                --> true
+print(span.attributes["akkar.request_id"] == res.headers["x-request-id"])   --> true
+```
 
 ## Not here
 
