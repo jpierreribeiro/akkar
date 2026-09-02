@@ -95,13 +95,29 @@ end
 ---
 --- The number is kept beside the name deliberately: it is what a search of
 --- this codebase, of a log aggregator, or of `errno(3)` will match on.
+--- THE NUMBER IS ALWAYS THERE, and that is not decoration.
+---
+--- An earlier shape rendered `ETIMEDOUT (Connection timed out)` and dropped the
+--- number, on the theory that the prose said the same thing. It does not: the
+--- number is what a grep of this codebase, of an aggregator, or of `errno(3)`
+--- matches on, and the prose is the one part that varies by platform. CI proved
+--- it -- where `strerror` answers its useless "Unknown error: 10", that shape
+--- became `ETIMEDOUT (Unknown error: 10)`, carrying a WRONG number and losing
+--- the right one. So the number is its own field, and the platform's prose is
+--- appended only when it is worth reading.
 function M.describe(why)
   if type(why) ~= "number" then return why end
   local name = M.name_of[why]
   local ok, text = pcall(errno.strerror, why)
   text = (ok and type(text) == "string") and text or nil
-  if not name then return (text or "errno") .. " (" .. why .. ")" end
-  return name .. " (" .. (text or why) .. ")"
+  -- A `strerror` that just spells the number back at us adds nothing, and on
+  -- the CI machine it spells a DIFFERENT number. Drop it rather than print it.
+  if text and text:lower():find("unknown error", 1, true) then text = nil end
+
+  if name and text then return ("%s %d (%s)"):format(name, why, text) end
+  if name             then return ("%s %d"):format(name, why) end
+  if text             then return ("%s (%d)"):format(text, why) end
+  return ("errno %d"):format(why)
 end
 
 return M
