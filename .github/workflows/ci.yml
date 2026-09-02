@@ -249,7 +249,7 @@ jobs:
             $ROCKS --lua-version ${{ matrix.lua }} install "$rock"
           done
           $ROCKS --lua-version ${{ matrix.lua }} install tl || \
-            echo "tl unavailable; spec/teal_spec.lua will report pending"
+            echo "tl unavailable; the tl half of spec/teal_spec.lua and of spec/gen_teal_spec.lua will report pending"
 
       # ...and the pinned build goes in last, over whatever luarocks left.
       #
@@ -502,8 +502,15 @@ jobs:
       # if the committed file differs, so a schema change that nobody
       # regenerated is a red build rather than a client that type-checks
       # against a contract the server no longer honours.
+      #
+      # Three projections of the same routes, so three checks: the TypeScript
+      # client, the Teal client (`client.tl`), and the LuaLS meta file
+      # (`client.d.lua`). One `--lang` that drifts is one red step naming it.
       - name: The typed client is current with the routes
-        run: $LUA_BIN bin/akkar gen examples/typed-client/app.lua -o examples/typed-client/client.ts --check
+        run: |
+          $LUA_BIN bin/akkar gen examples/typed-client/app.lua --lang ts    -o examples/typed-client/client.ts    --check
+          $LUA_BIN bin/akkar gen examples/typed-client/app.lua --lang teal  -o examples/typed-client/client.tl    --check
+          $LUA_BIN bin/akkar gen examples/typed-client/app.lua --lang luals -o examples/typed-client/client.d.lua --check
 
   # ------------------------------------------------------------- lua 5.5
   # THE ROCKSPECS SAY `lua >= 5.4, < 5.6`. Until this job existed, nothing
@@ -595,7 +602,7 @@ jobs:
       - name: Teal, best effort
         run: |
           luarocks --tree="$HOME/lua55" install tl \
-            || echo "tl unavailable; spec/teal_spec.lua will report pending"
+            || echo "tl unavailable; the tl half of spec/teal_spec.lua and of spec/gen_teal_spec.lua will report pending"
 
       # AND THIS IS THE JOB WHERE COMPILING IT MATTERS MOST.
       #
@@ -864,8 +871,10 @@ jobs:
           #
           # WHERE 560 COMES FROM: a full local run on 2026-09-02, with both
           # backends up and the driver built, passed 597 with nothing pending.
-          # The integration runner has no `tl`, so `spec/teal_spec.lua` costs
-          # a handful more. 560 is that number with room, chosen so the floor
+          # The integration runner has no `tl` and no `lua-language-server`, so
+          # the checker halves of `spec/teal_spec.lua`, `spec/gen_teal_spec.lua`
+          # and `spec/gen_luals_spec.lua` all go pending and cost a handful
+          # more. 560 is that number with room, chosen so the floor
           # fires on a spec file that stopped being collected and not on
           # ordinary churn. It is a measurement and not a guess, and the first
           # real run of this job is the thing that confirms it -- if it comes

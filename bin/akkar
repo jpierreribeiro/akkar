@@ -71,12 +71,19 @@ usage:
     --cc NAME       the compiler           (default: $CC, or cc)
     --c-only        write the C and stop, without compiling
 
-  akkar gen app.lua [-o client.ts] [--check] [--title T] [--version V]
+  akkar gen app.lua [--lang ts|teal|luals] [-o FILE] [--check] [--title T] [--version V]
 
-    Generates a typed TypeScript client from the route schemas, through the
-    same OpenAPI document `akkar.openapi` serves. A wrong field in a call is
-    then a tsc error, not a 422. Writes to stdout without -o.
+    Generates a typed client from the route schemas, through the same OpenAPI
+    document `akkar.openapi` serves. A wrong field in a call is then a type
+    error, not a 422. Writes to stdout without -o.
 
+    --lang ts    a TypeScript client (.ts), checked by tsc      (the default)
+    --lang teal  a Teal client (.tl): one record per declared shape and a
+                 typed function per route, checked by `tl check`, compiled
+                 to plain Lua by `tl gen`
+    --lang luals a LuaLS `---@meta` file (.d.lua): annotations for the same
+                 client, so a plain-Lua caller is checked in the editor
+    --module M   the module name the Lua projections declare (default: client)
     --check      exit 1 if the file at -o differs from what would be generated;
                  for CI, so a schema change nobody regenerated fails the build
 
@@ -449,8 +456,15 @@ end
 -- compares against the committed file, so a route schema that changed without
 -- anybody regenerating is a red CI step rather than a client that type-checks
 -- green against a contract the server no longer honours.
+--
+-- One command, three projections: `--lang` picks which of `akkar.gen`'s
+-- emitters runs, and everything else -- the app load, the write, the drift
+-- check -- is shared, so `--check` guards a Teal or LuaLS client exactly as
+-- it guards the TypeScript one.
+local GENERATORS = { ts = "typescript", teal = "teal", luals = "luals" }
+
 local function gen(args)
-  local path, output, checking = nil, nil, false
+  local path, output, checking, lang = nil, nil, false, "ts"
   local info = {}
 
   local i = 1
@@ -464,6 +478,8 @@ local function gen(args)
     local a = args[i]
     if     a == "-o"        then output = value(a)
     elseif a == "--check"   then checking = true
+    elseif a == "--lang"    then lang = value(a)
+    elseif a == "--module"  then info.module = value(a)
     elseif a == "--title"   then info.title = value(a)
     elseif a == "--version" then info.version = value(a)
     elseif a:sub(1, 1) == "-" then fail("unknown option " .. a)
@@ -473,9 +489,12 @@ local function gen(args)
 
   if not path then fail("gen needs an app file: akkar gen app.lua -o client.ts") end
   if checking and not output then fail("--check needs -o, the file to compare against") end
+  if not GENERATORS[lang] then
+    fail("--lang must be one of ts, teal, luals; got " .. tostring(lang))
+  end
 
   local app = load_app(path)
-  local generated = require("akkar.gen").typescript(app, info)
+  local generated = require("akkar.gen")[GENERATORS[lang]](app, info)
 
   if checking then
     local file = io.open(output, "r")
@@ -483,7 +502,8 @@ local function gen(args)
     if file then file:close() end
     if current ~= generated then
       io.stderr:write(("akkar gen: %s is out of date -- the route schemas changed.\n"
-                    .. "  Regenerate and commit:  akkar gen %s -o %s\n"):format(output, path, output))
+                    .. "  Regenerate and commit:  akkar gen %s --lang %s -o %s\n")
+                      :format(output, path, lang, output))
       os.exit(1)
     end
     io.write(("akkar gen: %s is up to date\n"):format(output))
