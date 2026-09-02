@@ -304,6 +304,7 @@ Trinta e seis módulos e oito comandos, cada linha apontando para sua página de
 | [`akkar.metrics`](docs/pt-BR/reference/metrics.md) | Prometheus, com o caminho da requisição instrumentado |
 | [`akkar.trace`](docs/pt-BR/reference/trace.md) | trace context W3C, propagado e exportado |
 | [`akkar.log`](docs/pt-BR/reference/log.md) | JSON ou texto, com redaction |
+| [`akkar.otlp`](docs/pt-BR/reference/otlp.md) | os três sinais para um único collector OpenTelemetry |
 | [`akkar.config`](docs/pt-BR/reference/config.md) | ambiente, tipado e validado no boot |
 | [`akkar.doctor`](docs/pt-BR/reference/doctor.md) | a combinação de bibliotecas, verificada |
 

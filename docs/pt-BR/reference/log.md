@@ -15,6 +15,9 @@ local log = require "akkar.log"
 - [log.LEVELS](#loglevels)
 - [log.Logger](#loglogger)
 - [log.new(options)](#lognewoptions)
+- [log.otlp(entries, resource)](#logotlpentries-resource)
+- [log.record(entry)](#logrecordentry)
+- [log.SEVERITY](#logseverity)
 - [Logger](#logger)
   - [logger:debug(message, fields)](#loggerdebugmessage-fields)
   - [logger:error(message, fields)](#loggererrormessage-fields)
@@ -48,10 +51,11 @@ Constrói um logger. Todos os campos são opcionais.
 | `level` | string | `"info"` | um entre `debug`, `info`, `warn`, `error`. Linhas abaixo dele não são escritas nem formatadas. |
 | `format` | string | `"text"` | `"json"` escreve um objeto JSON por linha. Qualquer outro valor escreve texto. |
 | `sink` | function | escreve em stderr | chamada com uma string por linha, quebra de linha incluída. |
+| `exporter` | table | nenhum | qualquer coisa com um método `record(entry)`, que recebe toda entrada depois que o sink a escreveu; na prática o exportador de logs de [akkar.otlp](otlp.md), e `pipeline:logger` o define por você. Carregado para todo logger que `:with` deriva. |
 
 **Retorna** um logger.
 
-**Levanta** `akkar.log: unknown level '<name>'; use debug, info, warn or error` quando `level` não é um dos quatro. `format` não é validado: um valor que não seja `"json"` produz saída em texto.
+**Levanta** `akkar.log: unknown level '<name>'; use debug, info, warn or error` quando `level` não é um dos quatro, e `akkar.log: exporter needs a record(entry) method; ...` quando `exporter` não tem um. `format` não é validado: um valor que não seja `"json"` produz saída em texto.
 
 ```lua
 local log = require "akkar.log"
@@ -65,6 +69,36 @@ logger:debug("not printed, below the level")
 ```
 INFO  server started port=3000
 ```
+
+## log.otlp(entries, resource)
+
+Constrói o `ExportLogsServiceRequest` em JSON OTLP/HTTP para uma lista de entradas, cada uma como `log.record` a constrói. `resource` é uma table de atributos de recurso. Este é o `encode` que [akkar.otlp](otlp.md) dá ao seu exportador de logs.
+
+**Retorna** uma table.
+
+## log.record(entry)
+
+Uma entrada -- a table que `logger:log` constrói, com `level`, `message`, `time` e todo campo -- como um `LogRecord` do OTLP. `severityNumber` e `severityText` vêm de `log.SEVERITY`, `body` é a mensagem, `time` vira `timeUnixNano`, e todo outro campo é um atributo. Um `trace_id` de 32 caracteres hexadecimais e um `span_id` de 16 são elevados ao registro como `traceId` e `spanId`; um valor de outro formato permanece atributo.
+
+**Retorna** uma table.
+
+```lua
+local log = require "akkar.log"
+
+local record = log.record {
+  level = "warn", message = "slow query", time = 1755000000,
+  ms = 250, trace_id = "4bf92f3577b34da6a3ce929d0e0e4736",
+}
+print(record.severityNumber, record.severityText)   --> 13 WARN
+print(record.body.stringValue)                      --> slow query
+print(record.timeUnixNano)                          --> 1755000000000000000
+print(record.attributes[1].key, record.attributes[1].value.intValue)   --> ms 250
+print(record.traceId)                               --> 4bf92f3577b34da6a3ce929d0e0e4736
+```
+
+## log.SEVERITY
+
+O número de severidade do OpenTelemetry para cada nível, do modelo de dados de logs: `debug = 5`, `info = 9`, `warn = 13`, `error = 17`. Cada nível nomeado possui uma faixa de quatro e o akkar tem uma gradação por nível, então cada um mapeia para o primeiro da sua faixa.
 
 ## Logger
 
@@ -138,9 +172,11 @@ ERROR query failed request_id=1a2b3c table_name=tasks
 - **Um logger global.** Não existe um `log.info` no nível do módulo. Um logger é um valor, e o que o akkar entrega a um handler é `req.log`.
 - **Redação.** Um campo é escrito como é dado. Um valor envolvido por `akkar.config.secret` é seguro (ele não guarda nada), mas uma string simples guardando uma senha é escrita por completo.
 - **Amostragem ou limitação de taxa de linhas.** Toda linha acima do nível é escrita.
+- **Exportação daqui.** `exporter` é um acréscimo a uma fila que outra coisa drena; [akkar.otlp](otlp.md) é essa outra coisa.
 
 ## Veja também
 
 - [akkar](akkar.md) para `app:run { log = ... }`, que substitui o logger pelo qual o akkar escreve suas próprias linhas, e para `req.log`
 - [akkar.config](config.md) para `config:redacted()`, o valor a ser logado quando se quer a palavra `[redacted]` na linha
+- [akkar.otlp](otlp.md) para linhas exportadas a um collector OpenTelemetry
 - o código-fonte do módulo, `akkar/log.lua`, para entender por que um float de valor inteiro é impresso sem sua parte fracionária

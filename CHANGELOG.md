@@ -72,6 +72,24 @@ one commit with a spec that failed before it and passes after.
   that its name is allowed.
 - `name` and `namespace` on both rate limiters; `Registry:counter` on metrics;
   `for_update`, `skip_locked` and typed casts on `akkar.sql`.
+- **`akkar.otlp`, one telemetry pipeline: metrics and logs over OTLP beside the
+  spans `akkar.trace` already exported.** One `otlp = { endpoint, headers }`
+  reaches one collector with all three signals, each opt-out-able with
+  `traces = false`, `metrics = false` or `logs = false`. It is not a second
+  exporter: `akkar.trace`'s exporter grew an `encode` and a `name`, so the
+  bounded drop-don't-block queue, the flush, the counters and the flush-on-stop
+  are the same code for all three, with one queue and one bound per signal so
+  the noisiest cannot starve the others. Counters push as cumulative monotonic
+  `Sum`s — a dropped push loses nothing, because the next one carries the same
+  total — gauges as `Gauge`, and the latency as a `Histogram` with the
+  registry's own bounds, converted from Prometheus's cumulative buckets to
+  OTLP's per-bucket counts. `registry:snapshot()` is `render()` in a second
+  shape: the same read at the same instant, pools included, off the request
+  path. `log.new { exporter = ... }` appends each entry to the queue AFTER
+  stderr is written, never instead of it, and lifts `trace_id`/`span_id` onto
+  the record when they are the shape W3C Trace Context gives them.
+- The Prometheus text renderer is untouched and stays the default; OTLP is
+  additive, and no signal is on without being asked for.
 
 ### Fixed
 

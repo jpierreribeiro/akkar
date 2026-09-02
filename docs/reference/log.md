@@ -18,6 +18,9 @@ local log = require "akkar.log"
 - [log.LEVELS](#loglevels)
 - [log.Logger](#loglogger)
 - [log.new(options)](#lognewoptions)
+- [log.otlp(entries, resource)](#logotlpentries-resource)
+- [log.record(entry)](#logrecordentry)
+- [log.SEVERITY](#logseverity)
 - [Logger](#logger)
   - [logger:debug(message, fields)](#loggerdebugmessage-fields)
   - [logger:error(message, fields)](#loggererrormessage-fields)
@@ -54,11 +57,13 @@ Builds a logger. All fields are optional.
 | `level` | string | `"info"` | one of `debug`, `info`, `warn`, `error`. Lines below it are not written and not formatted. |
 | `format` | string | `"text"` | `"json"` writes one JSON object per line. Any other value writes text. |
 | `sink` | function | writes to stderr | called with one string per line, newline included. |
+| `exporter` | table | none | anything with a `record(entry)` method, given every entry after the sink has written it; in practice the logs exporter from [akkar.otlp](otlp.md), and `pipeline:logger` sets it for you. Carried into every logger `:with` derives. |
 
 **Returns** a logger.
 
 **Raises** `akkar.log: unknown level '<name>'; use debug, info, warn or error`
-when `level` is not one of the four. `format` is not validated: a value that is
+when `level` is not one of the four, and `akkar.log: exporter needs a
+record(entry) method; ...` when `exporter` has none. `format` is not validated: a value that is
 not `"json"` produces text output.
 
 ```lua
@@ -73,6 +78,46 @@ logger:debug("not printed, below the level")
 ```
 INFO  server started port=3000
 ```
+
+## log.otlp(entries, resource)
+
+Builds the OTLP/HTTP JSON `ExportLogsServiceRequest` for a list of entries,
+each as `log.record` builds it. `resource` is a table of resource attributes.
+This is the `encode` [akkar.otlp](otlp.md) gives its logs exporter.
+
+**Returns** a table.
+
+## log.record(entry)
+
+One entry -- the table `logger:log` builds, with `level`, `message`, `time`
+and every field -- as an OTLP `LogRecord`. `severityNumber` and
+`severityText` come from `log.SEVERITY`, `body` is the message, `time`
+becomes `timeUnixNano`, and every other field is an attribute. A `trace_id`
+of 32 hex characters and a `span_id` of 16 are lifted onto the record as
+`traceId` and `spanId`; a value of another shape stays an attribute.
+
+**Returns** a table.
+
+```lua
+local log = require "akkar.log"
+
+local record = log.record {
+  level = "warn", message = "slow query", time = 1755000000,
+  ms = 250, trace_id = "4bf92f3577b34da6a3ce929d0e0e4736",
+}
+print(record.severityNumber, record.severityText)   --> 13 WARN
+print(record.body.stringValue)                      --> slow query
+print(record.timeUnixNano)                          --> 1755000000000000000
+print(record.attributes[1].key, record.attributes[1].value.intValue)   --> ms 250
+print(record.traceId)                               --> 4bf92f3577b34da6a3ce929d0e0e4736
+```
+
+## log.SEVERITY
+
+The OpenTelemetry severity number for each level, from the logs data model:
+`debug = 5`, `info = 9`, `warn = 13`, `error = 17`. Each named level owns a
+range of four and akkar has one gradation per level, so each maps to the
+first of its range.
 
 ## Logger
 
@@ -161,6 +206,8 @@ ERROR query failed request_id=1a2b3c table_name=tasks
   a password is written in full.
 - **Sampling or rate limiting of lines.** Every line above the level is
   written.
+- **Export from here.** `exporter` is an append to a queue somebody else
+  drains; [akkar.otlp](otlp.md) is that somebody.
 
 ## See also
 
@@ -168,5 +215,6 @@ ERROR query failed request_id=1a2b3c table_name=tasks
   akkar writes its own lines through, and for `req.log`
 - [akkar.config](config.md) for `config:redacted()`, the value to log when the
   word `[redacted]` is wanted in the line
+- [akkar.otlp](otlp.md) for lines exported to an OpenTelemetry collector
 - the module source, `akkar/log.lua`, for why an integer-valued float prints
   without its fractional part

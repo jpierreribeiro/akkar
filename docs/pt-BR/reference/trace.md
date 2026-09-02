@@ -93,6 +93,8 @@ Constrói um exportador. Tudo é opcional, mas um exportador sem capability `htt
 | `interval` | number | `5` | segundos que tornam uma exportação devida por tempo |
 | `timeout` | number | `2` | segundos que uma exportação pode levar |
 | `sampler` | function | nenhum | chamada com a requisição; uma resposta falsa significa nenhum span |
+| `encode` | function | `trace.otlp` | transforma um lote e o recurso no corpo da requisição. [akkar.otlp](otlp.md) passa `metrics.otlp` e `log.otlp` aqui, e é assim que um único exportador carrega três sinais. |
+| `name` | string | `"akkar.trace"` | como os motivos que este exportador retorna o chamam |
 
 **Retorna** um exportador.
 
@@ -379,7 +381,7 @@ O início vem de `akkar.time.now()`, que é `os.time` e tem **resolução de um 
 - **Spans de cliente em torno de HTTP de saída.** `akkar.http` envia um `traceparent`, e `span:traceparent()` o fornece, mas nada envolve uma chamada de saída em um span automaticamente para você.
 - **Spans de banco de dados ou cache.** Só existe o span de servidor, de `exporter:middleware()`.
 - **Nova tentativa de uma exportação com falha.** De propósito. O lote é descartado e contabilizado.
-- **Métricas ou logs via OTLP.** Somente spans. Métricas são [akkar.metrics](metrics.md), um scrape do Prometheus.
+- **Métricas ou logs via OTLP.** Este exportador carrega spans. O mesmo exportador com outro `encode` carrega os outros dois, e [akkar.otlp](otlp.md) constrói os três a partir de uma única opção.
 - **Protobuf.** O payload é JSON OTLP/HTTP, gerado aqui.
 - **Amostragem por cabeça (head sampling) por proporção.** `sampler` é uma função que você escreve. Não existe `ratio = 0.1`.
 
@@ -387,4 +389,5 @@ O início vem de `akkar.time.now()`, que é `os.time` e tem **resolução de um 
 
 - [akkar](akkar.md) para `req.trace`, o `traceparent` de entrada validado, e para `app:use`
 - [akkar.metrics](metrics.md) para a visão agregada das mesmas requisições
+- [akkar.otlp](otlp.md) para métricas e logs no mesmo collector, por meio deste exportador
 - o código-fonte do módulo, `akkar/trace.lua`, para entender por que uma requisição nunca fica bloqueada esperando uma exportação

@@ -357,6 +357,7 @@ a global by another name.
 | [`akkar.metrics`](docs/reference/metrics.md) | Prometheus, with the request path instrumented |
 | [`akkar.trace`](docs/reference/trace.md) | W3C trace context, propagated and exported |
 | [`akkar.log`](docs/reference/log.md) | JSON or text, with redaction |
+| [`akkar.otlp`](docs/reference/otlp.md) | all three signals to one OpenTelemetry collector |
 | [`akkar.config`](docs/reference/config.md) | environment, typed and validated at boot |
 | [`akkar.doctor`](docs/reference/doctor.md) | the library combination, checked |
 
