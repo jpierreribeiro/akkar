@@ -728,6 +728,18 @@ e `"object"` levanta erro: uma regra de objeto sem `fields` filtra todo campo
 do valor, então isso esvaziaria silenciosamente um corpo em vez de recusar
 um. Escreva `v.object { fields = { ... } }`.
 
+Abaixo de um slot, uma tabela é uma regra, e uma regra diz o seu tipo. A grafia
+curta de mapa de campos — `body = { to = "string" }` — é a grafia do próprio
+slot e de nada abaixo dele: um array escrito como tabela aninhada nua, `users =
+{ { id = "string" } }`, ou um objeto um nível abaixo escrito como `user = { name
+= "string" }` sem `v.object`, é uma tabela sem `kind`. Uma regra assim não
+validava nada, e `akkar.openapi` só conseguia documentá-la errado, então uma
+rota que declara uma levanta erro onde é declarada, nomeando a rota, o caminho
+e a grafia que funciona: `GET /x: response.users: a table with a positional
+entry is not a rule; an array is v.array { items = ... }`. Uma tabela vazia e um
+`{ kind = ... }` escrito à mão cujo tipo não é um dos sete são recusados do
+mesmo jeito.
+
 ```lua no-run
 { title = "string", page = akkar.v.integer { min = 1, default = 1 } }
 ```

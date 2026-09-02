@@ -711,6 +711,17 @@ accepted, and `"object"` raises: an object rule with no `fields` filters every
 field of the value away, so it would silently empty a body rather than refuse
 one. Write `v.object { fields = { ... } }`.
 
+Below a slot, a table is a rule, and a rule names its kind. The field-map
+shorthand — `body = { to = "string" }` — is the slot's own spelling and nothing
+below it: an array written as a bare nested table, `users = { { id = "string" }
+}`, or an object one level down written as `user = { name = "string" }` without
+`v.object`, is a table with no `kind`. Such a rule validated nothing, and
+`akkar.openapi` could only document it wrongly, so a route that declares one
+raises where it is declared, naming the route, the path and the spelling that
+works: `GET /x: response.users: a table with a positional entry is not a rule;
+an array is v.array { items = ... }`. An empty table and a hand-written `{ kind
+= ... }` whose kind is not one of the seven are refused the same way.
+
 ```lua no-run
 { title = "string", page = akkar.v.integer { min = 1, default = 1 } }
 ```
