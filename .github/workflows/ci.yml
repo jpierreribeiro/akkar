@@ -103,10 +103,10 @@ jobs:
           # the two cases, and this is a bug whose whole character is that
           # timing and heap layout decide whether it fires.
           #
-          # Three jobs leave stdout on the step's pipe, three redirect it to
-          # a file, and nothing else differs. `ulimit -c unlimited` is set in
-          # both, which the plain step never had -- which is why the two
-          # crashes we already have left no core behind.
+          # Three jobs leave stdout alone, three redirect it to a file,
+          # nothing else differs, and both set `ulimit -c unlimited` -- which
+          # the plain step never did, and is why the two crashes already in
+          # hand left no core behind.
           - { os: ubuntu-24.04-arm, lua: "5.4", probe: pipe-a }
           - { os: ubuntu-24.04-arm, lua: "5.4", probe: pipe-b }
           - { os: ubuntu-24.04-arm, lua: "5.4", probe: pipe-c }
@@ -437,24 +437,41 @@ jobs:
               echo "=== CRASH on run $runs, rc=$rc ==="
               core=$(ls -t core.* 2>/dev/null | head -1)
               if [ -n "$core" ]; then
-                # THE ONE THING WORTH PRINTING. `struct fileno` is
-                # { int fd; short state; LIST_HEAD events; LLRB_ENTRY rbe; },
-                # so `fd` is at offset 0 and `rbe` at 16 -- and `pool_put`
-                # writes the freelist link with `*(void **)p = P->head`, eight
-                # bytes over offset 0. A recycled node therefore keeps WALKABLE
-                # tree pointers and carries the low half of a heap pointer in
-                # the slot `fileno_cmp` compares. If the node under $x0/$x1
-                # has an `fd` that looks like the bottom of an address rather
-                # than a small integer, that is the freelist link in the fd
-                # slot and the diagnosis is confirmed rather than inferred.
+                # FRAME 1 IS THE WHOLE GAME.
+                #
+                # `cqueues.c:1192` is `return a->fd - b->fd;`, the body of
+                # `fileno_cmp`, which is `static inline`; addr2line names the
+                # generated find as the function and the comparator as the
+                # line. In `LLRB_FIND` the call is `(cmp)(key, elm)` -- so `a`
+                # is `&key`, a stack local in `fileno_find`, ALWAYS VALID, and
+                # the faulting load is `b->fd`, a pointer taken from the tree.
+                #
+                # `fileno_find` has exactly two callers, and they are two
+                # different bugs with two different fixes:
+                #
+                #   cqueue_cancelfd  -- reached from `cstack_cancelfd`, which
+                #     walks LIST_FOREACH over EVERY controller on the stack.
+                #     A stale entry there means Q itself is freed and the tree
+                #     ROOT is wild. The fix is in controller teardown.
+                #
+                #   fileno_get       -- Q is live and a LINK inside the tree
+                #     is corrupt. The fix is wherever a node is written.
+                #
+                # So: backtrace first, root second, node third.
                 gdb --batch -ex "set pagination off" \
-                    -ex "echo \n==== BT ====\n"      -ex "bt" \
-                    -ex "echo \n==== FRAME 0 ====\n" -ex "frame 0" -ex "info args" -ex "info locals" \
-                    -ex "echo \n==== THE NODE ====\n" \
-                    -ex "p *a" -ex "p *b" -ex "p/x a->fd" -ex "p/x b->fd" \
+                    -ex "echo \n==== BT ====\n"        -ex "bt 12" \
+                    -ex "echo \n==== FRAME 0 ====\n"   -ex "frame 0" -ex "info args" -ex "info locals" \
+                    -ex "echo \n==== FRAME 1 -- cancelfd or get? ====\n" \
+                    -ex "frame 1" -ex "info args" -ex "info locals" \
+                    -ex "echo \n==== FRAME 2 ====\n"   -ex "frame 2" -ex "info args" -ex "info locals" \
+                    -ex "echo \n==== THE ROOT AND THE NODE ====\n" \
+                    -ex "frame 0" \
+                    -ex "p Q" -ex "p Q->fileno.table.rbh_root" \
+                    -ex "p *Q->fileno.table.rbh_root" \
+                    -ex "p elm" -ex "p *elm" -ex "p key" \
                     -ex "echo \n==== REGISTERS ====\n" -ex "info registers" \
                     -ex "echo \n==== INSN ====\n"   -ex "x/8i \$pc" \
-                    "$(command -v lua5.4)" "$core" 2>&1 | tail -200
+                    "$(command -v lua5.4)" "$core" 2>&1 | tail -220
                 rm -f "$core"
               else
                 echo "no core in $PWD"; ls -la core* 2>&1 | head -3
