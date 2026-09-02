@@ -132,6 +132,7 @@ local time         = require "akkar.time"
 -- For the execution's remaining budget. `akkar.execution` requires only
 -- cqueues and akkar.time, so this adds no cycle.
 local execution    = require "akkar.execution"
+local describe     = require("akkar.errno").describe
 
 local M = {}
 
@@ -275,7 +276,15 @@ function Client:pool_for(key, host, port, tls)
     }, timeout)
     -- `Pool:get` expects `open` to raise, and treats the raise as a slot that
     -- must be given back -- so returning nil here would wedge the pool.
-    if not conn then error(tostring(err or "could not connect"), 0) end
+    --
+    -- NAMED, NOT NUMBERED. `http_client.connect` hands back cqueues' raw errno
+    -- on a socket failure, and `tostring` on that produced a reason of `32` --
+    -- the whole message, in the log line and in the 502 the caller sees.
+    -- `spec/dns_failure_spec.lua` caught it: a lookup that fails somewhere with
+    -- no resolver reports a number nobody can act on. `akkar.errno.describe`
+    -- passes an already-worded message through untouched, so this only ever
+    -- adds a name where there was none.
+    if not conn then error(tostring(describe(err) or "could not connect"), 0) end
     return setmetatable({ conn = conn, key = key }, Connection)
   end, self.pool_size, function(resource)
     return self.reuse and not resource.broken and resource:alive()
