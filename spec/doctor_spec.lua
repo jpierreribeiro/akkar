@@ -158,7 +158,15 @@ describe("the descriptor ceiling", function()
   it("reports the number the runtime would actually use", function()
     -- A doctor that derives its own ceiling would agree with itself and
     -- nobody else. This is `app:run`'s arithmetic, called.
+    --
+    -- Skipped where there is no `/proc/self/limits`, which is macOS. The
+    -- finding for that case is asserted separately; what cannot be asserted
+    -- here is agreement with a number the runtime does not derive either.
     local soft = akkar.descriptor_limits()
+    if not soft then
+      pending "no /proc/self/limits here, so there is no ceiling to agree with"
+      return
+    end
     local _, title = doctor.descriptor_finding(soft, nil)
     assert.is_truthy(title:find(tostring(akkar.descriptor_ceiling(soft)), 1, true),
                      title)
