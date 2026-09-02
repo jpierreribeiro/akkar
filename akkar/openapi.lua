@@ -33,19 +33,43 @@ local KIND_TO_JSON = {
 }
 
 -- The same set `akkar.validate` accepts, and it has to stay the same set: a
--- kind the validator expands and this module does not comes out of `expand`
--- as nil and is documented as `{}`, which is the document describing nothing
--- where the server enforces something.
+-- kind the validator expands and this module does not would be the document
+-- describing nothing where the server enforces something.
 local SHORTHAND = { string = true, integer = true, number = true,
                     boolean = true, table = true, object = true, array = true }
 
 -- Same expansion `akkar.validate` performs, kept in one shape so the document
 -- can never describe something different from what is enforced.
-local function expand(rule)
-  if type(rule) == "table" then return rule end
+--
+-- RAISES for a rule it cannot expand, and never writes one down as something
+-- else. This used to return nil for an unknown shorthand and hand back any
+-- table untouched, and `to_schema` turned a table with no `kind` into
+-- `type: string`: `response = { users = { { id = "string" } } }` -- an array
+-- written as a bare nested table -- was documented as a string, and the
+-- client generated from the document typed it as one against a server that
+-- sends a list. Routes refuse that table at registration now, so for a
+-- declared route this branch is unreachable; it stays an error rather than a
+-- fallback because a rule reaching the document without passing through
+-- `app:get` is exactly the case in which a quiet default lies.
+--
+-- `where` names the route and the path to the rule, so the message reads
+-- `GET /x: response.users` rather than pointing at this file.
+local function expand(rule, where)
+  if type(rule) == "table" then
+    if type(rule.kind) == "string" and SHORTHAND[rule.kind] then return rule end
+    error(("akkar.openapi: %s is a table with no schema kind and cannot be "
+        .. "documented; a rule is a shorthand, v.object { fields = ... } or "
+        .. "v.array { items = ... }, and app:get refuses anything else at "
+        .. "registration"):format(where), 0)
+  end
+  if type(rule) ~= "string" then
+    error(("akkar.openapi: %s is a %s, not a schema rule"):format(where, type(rule)), 0)
+  end
   local optional = rule:sub(-1) == "?"
   local kind = optional and rule:sub(1, -2) or rule
-  if not SHORTHAND[kind] then return nil end
+  if not SHORTHAND[kind] then
+    error(("akkar.openapi: %s: unknown schema type '%s'"):format(where, rule), 0)
+  end
   return { kind = kind, optional = optional }
 end
 
@@ -56,11 +80,10 @@ end
 -- enforce and the client cannot send.
 local object_schema
 
-local function to_schema(rule)
-  local expanded = expand(rule)
-  if not expanded then return { } end
+local function to_schema(rule, where)
+  local expanded = expand(rule, where)
   local schema = {}
-  for key, value in pairs(KIND_TO_JSON[expanded.kind] or { type = "string" }) do
+  for key, value in pairs(KIND_TO_JSON[expanded.kind]) do
     schema[key] = value
   end
   -- The constraints validation enforces are the constraints the document
@@ -100,21 +123,21 @@ local function to_schema(rule)
     -- The whole schema is replaced rather than extended: an object's shape is
     -- its `properties` and `required`, and the scalar keywords collected
     -- above do not apply to one.
-    schema = object_schema(expanded.fields or {})
+    schema = object_schema(expanded.fields or {}, where)
   elseif expanded.kind == "array" then
-    schema.items = to_schema(expanded.items or "table")
+    schema.items = to_schema(expanded.items or "table", where .. ".items")
     if expanded.min then schema.minItems = expanded.min end
     if expanded.max then schema.maxItems = expanded.max end
   end
   return schema
 end
 
-object_schema = function(fields)
+object_schema = function(fields, where)
   local properties, required = {}, {}
   for name, rule in pairs(fields) do
-    properties[name] = to_schema(rule)
-    local expanded = expand(rule)
-    if expanded and not expanded.optional then required[#required + 1] = name end
+    local at = where .. "." .. tostring(name)
+    properties[name] = to_schema(rule, at)
+    if not expand(rule, at).optional then required[#required + 1] = name end
   end
   table.sort(required)
   local schema = { type = "object", properties = properties }
@@ -128,22 +151,23 @@ end
 -- The validator tells them apart by `kind` holding a string and so does this,
 -- because a body documented as an object where the route enforces a list is
 -- the exact mismatch this module exists to make impossible.
-local function schema_of(declaration)
+local function schema_of(declaration, where)
   if type(declaration) == "table" and type(declaration.kind) == "string" then
-    return to_schema(declaration)
+    return to_schema(declaration, where)
   end
-  return object_schema(declaration)
+  return object_schema(declaration, where)
 end
 
-local function parameters(where, fields)
+local function parameters(location, fields, where)
   local list = {}
   for name, rule in pairs(fields) do
-    local expanded = expand(rule)
+    local at = where .. "." .. tostring(name)
+    local expanded = expand(rule, at)
     list[#list + 1] = {
       name = name,
-      ["in"] = where,
-      required = where == "path" or not (expanded and expanded.optional),
-      schema = to_schema(rule),
+      ["in"] = location,
+      required = location == "path" or not expanded.optional,
+      schema = to_schema(rule, at),
     }
   end
   table.sort(list, function(a, b) return a.name < b.name end)
@@ -197,6 +221,27 @@ local function collect(app, prefix, out, chain)
   return out
 end
 
+--- The body of a 422, exactly as `akkar/init.lua` builds it: `fields` is a
+--- flat map from the dotted path of the failing value (`body.amount`,
+--- `params.id`, `query.limit`) to the reason. Exported so a generator and a
+--- test can name the same table this document embeds.
+M.VALIDATION_FAILED = {
+  type = "object",
+  required = { "error", "fields" },
+  properties = {
+    error  = { type = "string", enum = { "validation failed" } },
+    fields = { type = "object", additionalProperties = { type = "string" } },
+  },
+}
+
+--- The body of a 500. Deliberately nothing but the constant: the real error
+--- goes to the log with the request id, never to the wire.
+M.INTERNAL_ERROR = {
+  type = "object",
+  required = { "error" },
+  properties = { error = { type = "string", enum = { "internal server error" } } },
+}
+
 --- Builds the OpenAPI document for an app.
 -- @param app   an akkar application
 -- @param info  optional { title = ..., version = ..., description = ... }
@@ -223,9 +268,12 @@ function M.document(app, info)
     operation.description = metadata.description
     operation.security    = metadata.security
 
+    -- The prefix every schema error under this route carries.
+    local at = route.method .. " " .. entry.path .. ": "
+
     local params = {}
     if opts.params then
-      for _, p in ipairs(parameters("path", opts.params)) do params[#params + 1] = p end
+      for _, p in ipairs(parameters("path", opts.params, at .. "params")) do params[#params + 1] = p end
     else
       -- A route with `:id` but no schema still has a path parameter, and
       -- OpenAPI requires every template variable to be declared.
@@ -235,7 +283,7 @@ function M.document(app, info)
       end
     end
     if opts.query then
-      for _, p in ipairs(parameters("query", opts.query)) do params[#params + 1] = p end
+      for _, p in ipairs(parameters("query", opts.query, at .. "query")) do params[#params + 1] = p end
     end
     -- Headers are parameters too, in OpenAPI's vocabulary. They are NOT
     -- validated -- akkar has no header schema -- so this is documentation
@@ -262,7 +310,7 @@ function M.document(app, info)
     if opts.body then
       operation.requestBody = {
         required = true,
-        content = { ["application/json"] = { schema = schema_of(opts.body) } },
+        content = { ["application/json"] = { schema = schema_of(opts.body, at .. "body") } },
       }
     end
 
@@ -282,24 +330,38 @@ function M.document(app, info)
           -- 204 means there is no body, so a content schema for one would be
           -- a contradiction in the document itself.
           content = code == 204 and nil
-                    or { ["application/json"] = { schema = schema_of(declaration) } },
+                    or { ["application/json"] = { schema = schema_of(declaration,
+                              at .. "responses[" .. tostring(status) .. "]") } },
         }
       end
     elseif opts.response then
       operation.responses["200"] = {
         description = "OK",
-        content = { ["application/json"] = { schema = schema_of(opts.response) } },
+        content = { ["application/json"] = { schema = schema_of(opts.response, at .. "response") } },
       }
     else
       operation.responses["200"] = { description = "OK" }
     end
 
     -- Statuses akkar produces on its own are documented without anyone
-    -- declaring them, because akkar is the one that produces them.
+    -- declaring them, because akkar is the one that produces them -- AND WITH
+    -- THEIR SHAPE, because akkar is the one that fixes it. These used to be a
+    -- description and nothing else, which left the error half of the contract
+    -- untyped: a generated client knew what a 200 looked like and had to guess
+    -- at a 422. The shapes are the literal tables `akkar/init.lua` returns --
+    -- `{ error = "validation failed", fields = { ["body.amount"] = "required" } }`
+    -- and `{ error = "internal server error" }` -- so a client can narrow on
+    -- `error` and read `fields` by the same dotted path the validator wrote.
     if opts.params or opts.query or opts.body then
-      operation.responses["422"] = { description = "validation failed" }
+      operation.responses["422"] = {
+        description = "validation failed",
+        content = { ["application/json"] = { schema = M.VALIDATION_FAILED } },
+      }
     end
-    operation.responses["500"] = { description = "internal server error" }
+    operation.responses["500"] = {
+      description = "internal server error",
+      content = { ["application/json"] = { schema = M.INTERNAL_ERROR } },
+    }
 
     paths[template][route.method:lower()] = operation
   end

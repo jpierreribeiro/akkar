@@ -396,6 +396,38 @@ local function shadowed_routes(app, report, prefix)
   end
 end
 
+-- A route that validates its INPUT and says nothing about its OUTPUT is half a
+-- contract. `akkar gen` still emits a client for it, but the return type is
+-- honestly `unknown`, and `akkar.openapi` documents "a response exists" with
+-- no shape -- so every consumer of the contract gets the checking on the way
+-- in and none on the way out. Nothing at runtime can notice that; a response
+-- schema is optional by design. So the doctor says it, per route, as a warn:
+-- the fix is one `response = { ... }` table beside the `body` that is already
+-- there.
+local function untyped_responses(app, report, prefix)
+  prefix = prefix or ""
+  for _, route in ipairs(app.routes or {}) do
+    local opts = route.opts or {}
+    local typed_input = opts.body or opts.params or opts.query
+    if typed_input and not opts.response and not opts.responses then
+      report:warn("routes",
+        ("%s %s%s validates its input and declares no response"):format(
+          route.method, prefix, route.path),
+        "the generated client returns `unknown` for it and the OpenAPI document "
+        .. "carries no response shape, so a caller is checked on the way in and "
+        .. "not on the way out",
+        "add `response = { ... }` (or `responses = { [201] = ... }`) beside the "
+        .. "input schema")
+    end
+  end
+  for _, mount in ipairs(app.mounts or {}) do
+    untyped_responses(mount.app, report, prefix .. mount.prefix)
+  end
+  for _, host in ipairs(app.hosts or {}) do
+    untyped_responses(host.app, report, host.pattern .. prefix)
+  end
+end
+
 local function count_routes(app)
   local n = #(app.routes or {})
   for _, mount in ipairs(app.mounts or {}) do n = n + count_routes(mount.app) end
@@ -429,6 +461,7 @@ function M.check_app(app, config, report)
   end
 
   shadowed_routes(app, report)
+  untyped_responses(app, report)
 
   -- EVERY SETTING WHOSE VALUE THE RUNTIME CANNOT USE, checked here rather
   -- than discovered at `app:run`.

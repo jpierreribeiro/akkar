@@ -218,6 +218,31 @@ describe("the app check", function()
     assert.is_truthy(finding.detail:match "/users/:id")
   end)
 
+  it("warns about a route that validates its input and declares no response", function()
+    -- Half a contract: `akkar gen` returns `unknown` for it and the OpenAPI
+    -- document carries no response shape. Nothing at runtime can notice.
+    local app = akkar.new()
+    app:post("/transfers", { body = { to = "string" } }, function() end)
+
+    local report = doctor.check_app(app, {})
+    local finding = find(report, "declares no response")
+    assert.is_truthy(finding, "the untyped response was not reported")
+    assert.equal("warn", finding.level)
+    assert.is_truthy(finding.title:match "POST /transfers")
+    assert.is_truthy(finding.fix:match "response = ")
+  end)
+
+  it("is satisfied by either `response` or `responses`, and says nothing about "
+     .. "a route with no schema at all", function()
+    local app = akkar.new()
+    app:post("/a", { body = { x = "string" }, response = { ok = "boolean" } }, function() end)
+    app:post("/b", { body = { x = "string" }, responses = { [201] = { ok = "boolean" } } }, function() end)
+    app:get("/c", function() end)   -- no contract either way; not this lint's business
+
+    local report = doctor.check_app(app, {})
+    assert.is_nil(find(report, "declares no response"))
+  end)
+
   it("does not cry wolf over routes that are genuinely distinct", function()
     local app = akkar.new()
     app:get("/users/:id", function() end)

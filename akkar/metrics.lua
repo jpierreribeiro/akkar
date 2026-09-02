@@ -508,6 +508,243 @@ function Registry:memory()
   return lua_bytes, rss_bytes
 end
 
+-- ====================================================================== OTLP
+--
+-- THE SAME NUMBERS, READ AT THE SAME MOMENT, IN A SECOND SHAPE.
+--
+-- `render` is a scrape: something asks, and the registry answers with what it
+-- holds right then. An OTLP push is the same read on a timer -- `akkar/otlp.lua`
+-- calls `snapshot` from its loop, and what `snapshot` returns is the registry
+-- as it stands at that instant, pools included. The pool note above `Registry:
+-- pool` applies unchanged: the pool is read here, at push time, exactly as it
+-- is read inside `render`; nothing samples it in between and nothing is pushed
+-- from its checkout path.
+--
+-- WHY THE SNAPSHOT IS ENCODED WHEN IT IS TAKEN. The push queue in
+-- `akkar/otlp.lua` may hold a snapshot for a while -- an export in flight
+-- yields, and the next snapshot lands behind it. If encoding waited for the
+-- flush, the counters would have moved by then and the snapshot would carry a
+-- timestamp from one moment and values from another. Encoding at the read
+-- pins both to the same instant, and a snapshot is small: one table per
+-- series.
+--
+-- The data model (opentelemetry.io/docs/specs/otel/metrics/data-model/), and
+-- how each family here maps onto it:
+--
+--   a counter    -> Sum, cumulative, monotonic. "Cumulative temporality means
+--                   that successive data points repeat the starting
+--                   timestamp": `startTimeUnixNano` is when the registry was
+--                   built, and every push carries the total since then. That
+--                   is why a DROPPED push loses nothing -- the next one
+--                   carries the same total plus what came after.
+--   a gauge      -> Gauge. "A sampled value" and the time it was sampled.
+--   the latency  -> Histogram with explicit bounds. The bounds are the
+--                   registry's own buckets; the counts are PER BUCKET, not
+--                   cumulative, and there is one more count than there are
+--                   bounds, for what fell past the last one. Prometheus text
+--                   is cumulative (`le`), so this is the one place the two
+--                   shapes differ and the conversion is the subtraction below.
+--
+-- Every int64 and uint64 is a STRING, as `akkar/trace.lua` explains where it
+-- defines `nanoseconds` and `any_value`: OTLP's JSON mapping quotes them
+-- because a JSON number is a double.
+
+-- Aggregation temporality, from the proto. Named, for the reason `trace.KIND`
+-- is: `aggregationTemporality = 2` in a payload is unreadable.
+local CUMULATIVE = 2
+
+-- The built-in families. The pool families are in `POOL_METRICS` above with
+-- their help text and take it with them; these carry theirs here.
+local BUILTIN = {
+  requests = { name = "akkar_requests_total",
+               description = "Requests handled, by method, route and status." },
+  duration = { name = "akkar_request_duration_seconds", unit = "s",
+               description = "Request duration." },
+  uptime   = { name = "akkar_uptime_seconds", unit = "s",
+               description = "Seconds since the registry was built." },
+}
+
+-- A Lua integer is `asInt` (quoted), a float is `asDouble`. The same rule
+-- `any_value` applies to an attribute, on a data point.
+local function point_value(point, value)
+  if math.type(value) == "integer" then point.asInt = tostring(value)
+  else point.asDouble = value end
+  return point
+end
+
+-- A list of label pairs, as the registry keeps them, to an attribute map.
+local function attributes_from_pairs(pairs_list)
+  if not pairs_list or #pairs_list == 0 then return nil end
+  local map = {}
+  for _, pair in ipairs(pairs_list) do map[pair[1]] = pair[2] end
+  return map
+end
+
+--- The registry as a list of OTLP `Metric` objects, read now.
+---
+--- `now` is the wall-clock second for `timeUnixNano`; it defaults to
+--- `akkar.time.now()` and is a parameter so a spec can pin it. Memory is
+--- reported the way `serve` reports it on a scrape -- the two gauges are set
+--- on the registry first, so a scrape after a push and a push after a scrape
+--- show the same series.
+---
+--- **Returns** a table `{ time = now, metrics = { ... } }`, which is what the
+--- push queue holds and what `metrics.otlp` wraps.
+function Registry:snapshot(now)
+  local trace = require "akkar.trace"
+  now = now or time.now()
+  local started = trace.nanoseconds(self.started)
+  local stamp   = trace.nanoseconds(now)
+
+  local lua_bytes, rss_bytes = self:memory()
+  self:gauge("akkar_lua_heap_bytes", math.floor(lua_bytes))
+  self:gauge("akkar_process_resident_bytes", rss_bytes)
+
+  local metrics = {}
+  local function sum(name, description, unit, points)
+    metrics[#metrics + 1] = {
+      name = name, description = description, unit = unit,
+      sum = { dataPoints = points, aggregationTemporality = CUMULATIVE,
+              isMonotonic = true },
+    }
+  end
+  local function gauge(name, description, unit, points)
+    metrics[#metrics + 1] = {
+      name = name, description = description, unit = unit,
+      gauge = { dataPoints = points },
+    }
+  end
+  local function point(attributes, value, cumulative)
+    return point_value({
+      attributes         = trace.attributes_of(attributes),
+      startTimeUnixNano  = cumulative and started or nil,
+      timeUnixNano       = stamp,
+    }, value)
+  end
+
+  -- akkar_requests_total, sorted as `render` sorts it.
+  local names = {}
+  for k in pairs(self.requests) do names[#names + 1] = k end
+  table.sort(names)
+  local points = {}
+  for i, k in ipairs(names) do
+    local method, route, status = k:match "([^\1]*)\1([^\1]*)\1([^\1]*)"
+    points[i] = point({ method = method, route = route, status = status },
+                      self.requests[k], true)
+  end
+  sum(BUILTIN.requests.name, BUILTIN.requests.description, nil, points)
+
+  -- Application counters, grouped by name: one Metric per name, one data
+  -- point per label combination, which is what `# TYPE` groups in the text.
+  local counter_keys = {}
+  for k in pairs(self.counters) do counter_keys[#counter_keys + 1] = k end
+  table.sort(counter_keys)
+  local by_name, order = {}, {}
+  for _, k in ipairs(counter_keys) do
+    local counter = self.counters[k]
+    if not by_name[counter.name] then
+      by_name[counter.name] = {}
+      order[#order + 1] = counter.name
+    end
+    local list = by_name[counter.name]
+    list[#list + 1] = point(attributes_from_pairs(counter.labels),
+                            counter.value, true)
+  end
+  for _, name in ipairs(order) do sum(name, nil, nil, by_name[name]) end
+
+  -- Pools, read here. `_pool_series` folds and sorts them exactly as it does
+  -- for a scrape; this only decides which family each field belongs to.
+  local pools = self:_pool_series()
+  if #pools > 0 then
+    for _, metric in ipairs(POOL_METRICS) do
+      local pts = {}
+      for i, acc in ipairs(pools) do
+        pts[i] = point({ pool = acc.label }, acc[metric.field],
+                       metric.kind == "counter")
+      end
+      if metric.kind == "counter" then
+        sum(metric.name, metric.help, nil, pts)
+      else
+        gauge(metric.name, metric.help, nil, pts)
+      end
+    end
+  end
+
+  -- The latency histogram. The registry's counts are cumulative per bucket,
+  -- the way Prometheus wants them; OTLP wants each bucket's own count and a
+  -- final one for everything past the last bound, so each is the difference
+  -- from its predecessor and the last is the total less the last cumulative.
+  local hist_keys = {}
+  for k in pairs(self.duration) do hist_keys[#hist_keys + 1] = k end
+  table.sort(hist_keys)
+  local hist_points = {}
+  for i, k in ipairs(hist_keys) do
+    local method, route = k:match "([^\1]*)\1([^\1]*)"
+    local hist = self.duration[k]
+    local counts, previous = {}, 0
+    for j = 1, #self.buckets do
+      counts[j] = tostring(hist.counts[j] - previous)
+      previous = hist.counts[j]
+    end
+    counts[#self.buckets + 1] = tostring(hist.total - previous)
+    hist_points[i] = {
+      attributes        = trace.attributes_of { method = method, route = route },
+      startTimeUnixNano = started,
+      timeUnixNano      = stamp,
+      count             = tostring(hist.total),
+      sum               = hist.sum + 0.0,
+      bucketCounts      = counts,
+      explicitBounds    = self.buckets,
+    }
+  end
+  metrics[#metrics + 1] = {
+    name = BUILTIN.duration.name, description = BUILTIN.duration.description,
+    unit = BUILTIN.duration.unit,
+    histogram = { dataPoints = hist_points,
+                  aggregationTemporality = CUMULATIVE },
+  }
+
+  -- Gauges, grouped by name as the counters are.
+  local gauge_keys = {}
+  for k in pairs(self.gauges) do gauge_keys[#gauge_keys + 1] = k end
+  table.sort(gauge_keys)
+  local gauges_by_name, gauge_order = {}, {}
+  for _, k in ipairs(gauge_keys) do
+    local g = self.gauges[k]
+    if not gauges_by_name[g.name] then
+      gauges_by_name[g.name] = {}
+      gauge_order[#gauge_order + 1] = g.name
+    end
+    local list = gauges_by_name[g.name]
+    list[#list + 1] = point(attributes_from_pairs(g.labels), g.value, false)
+  end
+  for _, name in ipairs(gauge_order) do
+    gauge(name, nil, nil, gauges_by_name[name])
+  end
+
+  gauge(BUILTIN.uptime.name, BUILTIN.uptime.description, BUILTIN.uptime.unit,
+        { point(nil, now - self.started, false) })
+
+  return { time = now, metrics = metrics }
+end
+
+--- Builds the OTLP/HTTP JSON `ExportMetricsServiceRequest` for a batch of
+--- snapshots. One `ResourceMetrics` per snapshot, each carrying its own
+--- timestamp: a queue that held two pushes while the collector was slow
+--- sends both, and cumulative temporality means the collector keeps the
+--- later one and loses nothing either way.
+function M.otlp(snapshots, resource)
+  local trace = require "akkar.trace"
+  local out = {}
+  for i, snapshot in ipairs(snapshots) do
+    out[i] = {
+      resource     = { attributes = trace.attributes_of(resource) },
+      scopeMetrics = { { scope = { name = "akkar" }, metrics = snapshot.metrics } },
+    }
+  end
+  return { resourceMetrics = out }
+end
+
 -- ================================================================ integration
 
 --- Middleware that records every request.

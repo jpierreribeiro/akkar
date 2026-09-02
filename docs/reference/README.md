@@ -22,6 +22,8 @@ table you already have.
 | know who the caller is | [akkar.session](session.md), [akkar.auth](auth.md) |
 | stop one caller taking the whole server | [akkar.limit](limit.md) |
 | see what the server is doing | [akkar.log](log.md), [akkar.metrics](metrics.md), [akkar.trace](trace.md) |
+| send all three to one OpenTelemetry collector | [akkar.otlp](otlp.md) |
+| find out why it answered 500 | [akkar.errors](errors.md) |
 | ship it | [akkar.build](build.md), [akkar.config](config.md), [akkar.health](health.md) |
 
 ## Every module
@@ -82,9 +84,11 @@ table you already have.
 |---|---|
 | [akkar.config](config.md) | settings from the environment, checked at boot |
 | [akkar.doctor](doctor.md) | what is wrong with this installation |
+| [akkar.errors](errors.md) | the failure behind a 500, sent somewhere it is kept |
 | [akkar.health](health.md) | liveness and readiness |
 | [akkar.log](log.md) | structured logging |
 | [akkar.metrics](metrics.md) | counters and histograms, in Prometheus text |
+| [akkar.otlp](otlp.md) | traces, metrics and logs to one collector, over OTLP |
 | [akkar.trace](trace.md) | W3C trace context, in and out |
 
 ### Utilities and tooling

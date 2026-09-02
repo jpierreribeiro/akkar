@@ -249,7 +249,7 @@ jobs:
             $ROCKS --lua-version ${{ matrix.lua }} install "$rock"
           done
           $ROCKS --lua-version ${{ matrix.lua }} install tl || \
-            echo "tl unavailable; spec/teal_spec.lua will report pending"
+            echo "tl unavailable; the tl half of spec/teal_spec.lua and of spec/gen_teal_spec.lua will report pending"
 
       # ...and the pinned build goes in last, over whatever luarocks left.
       #
@@ -419,6 +419,46 @@ jobs:
                    ("built for LUA_VERSION_NUM %d, running %s (%d)")
                      :format(m.LUA_VERSION_NUM, _VERSION, want))'
 
+      # ------------------------------------- the type checkers the specs need
+      # `spec/gen_spec.lua`, `spec/gen_teal_spec.lua` and `spec/gen_luals_spec.lua`
+      # each have two halves: assertions about the SHAPE of what `akkar gen`
+      # emits, which always run, and assertions about what a real type checker
+      # says about it, which need that checker. Without these steps the second
+      # half reports `pending` on every runner, and the claim this whole feature
+      # rests on -- that a wrong call is caught before the request is sent --
+      # would be proven on nobody's machine but the author's.
+      #
+      # BEST EFFORT, in the shape the 5.5 job already uses for `tl`: a release
+      # that will not install says so and the run continues, because a checker
+      # that was unavailable must never be reported as a checker that passed.
+      # The specs distinguish the two -- they go `pending` with the reason named,
+      # not green.
+      #
+      # Both are PINNED. A checker that moves under us turns an unrelated red
+      # into a mystery, and "the generated client stopped type-checking" is
+      # exactly the kind of red that must mean what it says.
+      - name: TypeScript, best effort
+        run: |
+          npm install -g typescript@5.6.3 \
+            && echo "AKKAR_TSC=$(command -v tsc)" >> "$GITHUB_ENV" \
+            || echo "tsc unavailable; the tsc half of spec/gen_spec.lua will report pending"
+
+      - name: lua-language-server, best effort
+        if: runner.os == 'Linux'
+        run: |
+          LUALS=3.19.1
+          case "${{ runner.arch }}" in
+            ARM64) ASSET="linux-arm64" ;;
+            *)     ASSET="linux-x64"   ;;
+          esac
+          URL="https://github.com/LuaLS/lua-language-server/releases/download/$LUALS/lua-language-server-$LUALS-$ASSET.tar.gz"
+          if curl -fsSL -o /tmp/luals.tar.gz "$URL"; then
+            mkdir -p "$HOME/luals" && tar -xzf /tmp/luals.tar.gz -C "$HOME/luals"
+            echo "AKKAR_LUALS=$HOME/luals/bin/lua-language-server" >> "$GITHUB_ENV"
+          else
+            echo "lua-language-server unavailable; the LuaLS half of spec/gen_luals_spec.lua will report pending"
+          fi
+
       - name: The suite, with no database and no Redis
         run: |
           set -o pipefail
@@ -492,6 +532,47 @@ jobs:
 
       - name: Doctor
         run: $LUA_BIN bin/akkar doctor --no-probe
+
+      # ------------------------------------------------- the contract gate
+      # `examples/typed-client/client.ts` is GENERATED from the route schemas
+      # in `app.lua` beside it, and a generated file is only as current as the
+      # last time somebody generated it. The green light of `tsc` on a client
+      # means "matches the last generated contract", not "matches the server".
+      # This step is what closes that gap: it regenerates in memory and fails
+      # if the committed file differs, so a schema change that nobody
+      # regenerated is a red build rather than a client that type-checks
+      # against a contract the server no longer honours.
+      #
+      # Three projections of the same routes, so three checks: the TypeScript
+      # client, the Teal client (`client.tl`), and the LuaLS meta file
+      # (`client.d.lua`). One `--lang` that drifts is one red step naming it.
+      - name: The typed client is current with the routes
+        run: |
+          $LUA_BIN bin/akkar gen examples/typed-client/app.lua --lang ts    -o examples/typed-client/client.ts    --check
+          $LUA_BIN bin/akkar gen examples/typed-client/app.lua --lang teal  -o examples/typed-client/client.tl    --check
+          $LUA_BIN bin/akkar gen examples/typed-client/app.lua --lang luals -o examples/typed-client/client.d.lua --check
+
+      # AND THE ARTIFACT ITSELF TYPE-CHECKS, which the gate above does NOT say.
+      #
+      # `--check` compares the committed file against what the generator would
+      # emit right now: it proves they AGREE. It cannot notice that they agree
+      # on something invalid. A generator bug that emitted Teal no compiler
+      # accepts -- but emitted it deterministically -- would regenerate to a
+      # byte-identical file and sail through every gate above, and the first
+      # person to find out would be whoever imported the client.
+      #
+      # `tl check` is the half that reads it as Teal. Best effort, like the 5.5
+      # job's own `tl` step: if the rock will not install the step says so and
+      # moves on, because a checker that is unavailable must not be reported as
+      # a checker that passed.
+      - name: The generated Teal client is valid Teal
+        run: |
+          if luarocks install --local tl 2>/dev/null; then
+            eval "$(luarocks path --bin)"
+            tl check examples/typed-client/client.tl
+          else
+            echo "tl unavailable; the generated client was not type-checked in this job"
+          fi
 
   # ------------------------------------------------------------- lua 5.5
   # THE ROCKSPECS SAY `lua >= 5.4, < 5.6`. Until this job existed, nothing
@@ -583,7 +664,7 @@ jobs:
       - name: Teal, best effort
         run: |
           luarocks --tree="$HOME/lua55" install tl \
-            || echo "tl unavailable; spec/teal_spec.lua will report pending"
+            || echo "tl unavailable; the tl half of spec/teal_spec.lua and of spec/gen_teal_spec.lua will report pending"
 
       # AND THIS IS THE JOB WHERE COMPILING IT MATTERS MOST.
       #
@@ -852,8 +933,10 @@ jobs:
           #
           # WHERE 560 COMES FROM: a full local run on 2026-09-02, with both
           # backends up and the driver built, passed 597 with nothing pending.
-          # The integration runner has no `tl`, so `spec/teal_spec.lua` costs
-          # a handful more. 560 is that number with room, chosen so the floor
+          # The integration runner has no `tl` and no `lua-language-server`, so
+          # the checker halves of `spec/teal_spec.lua`, `spec/gen_teal_spec.lua`
+          # and `spec/gen_luals_spec.lua` all go pending and cost a handful
+          # more. 560 is that number with room, chosen so the floor
           # fires on a spec file that stopped being collected and not on
           # ordinary churn. It is a measurement and not a guess, and the first
           # real run of this job is the thing that confirms it -- if it comes

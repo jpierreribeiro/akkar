@@ -91,6 +91,18 @@ arbitrarily against each other by start time. Reading the clock through the
 capability is worth more than the sub-second stamp -- it is what lets
 `spec/trace_spec.lua` prove the time bound without waiting for one.
 
+## THE QUEUE AND THE LOOP ARE SHARED, AND THE ARGUMENT IS WHY
+
+Everything above -- never on the request's clock, drop rather than grow, drop
+rather than retry, two bounds and not one -- is an argument about getting data
+out of a process, not an argument about spans. `akkar.errors` needs the same
+one for captured failures.
+
+So it lives once, in `M.Batch` below, and this file's exporter is that plus
+two things that really are about tracing: how a span is started, and how a
+batch of them is encoded. A second copy of a queue swap whose correctness only
+shows under concurrency is how the second copy ends up subtly wrong.
+
 ## The wire format is OTLP/HTTP JSON
 
 Because it is what a collector already accepts -- the OpenTelemetry Collector,
@@ -219,6 +231,10 @@ local function attributes_of(map)
   return out
 end
 
+-- OTLP documents and need the same scalar wrapper the span encoder uses. It
+-- was exported for exactly that and the extraction dropped it, which surfaced
+-- as `attempt to call a nil value` inside the log encoder.
+M.any_value = any_value
 M.attributes_of = attributes_of
 
 --- Builds the OTLP/HTTP JSON payload for a batch of spans.
@@ -309,10 +325,295 @@ end
 
 M.Span = Span
 
+-- ================================================== the batching machinery
+--
+-- THE QUEUE, THE BOUND AND THE LOOP, factored out of the exporter because
+-- there is now more than one thing in this runtime that has to leave the
+-- process without standing on the request's clock. `akkar.errors` sends
+-- captured failures; this file sends spans.
+--
+-- The argument is identical in both cases -- a request is never blocked on an
+-- export, a full queue drops rather than grows, a failed batch is dropped
+-- rather than retried -- and it is exactly the kind of argument that goes
+-- subtly wrong the second time somebody writes it out. The queue swap before
+-- the network call is four lines and one of them is load-bearing under
+-- concurrency only. So there is one of it.
+--
+-- What a user of this supplies is `encode`, which turns a batch into whatever
+-- its destination reads: OTLP/HTTP JSON here, a generic JSON envelope there.
+local Batch = {}
+Batch.__index = Batch
+
+--- Installs the queue-and-flush fields on `target`, and returns it.
+---
+--- Deliberately not a constructor. Both users of this have their own
+--- metatable and their own fields; what they share is state, not identity, so
+--- this fills in the shared half and the caller sets the metatable over it.
+---
+--- `origin` is the module's own name, and it is here rather than hardcoded so
+--- that "has no http capability" names the thing that is misconfigured. An
+--- operator reading `akkar.trace has no http capability` in a service that
+--- also reports errors should not have to guess which of the two it is.
+function M.batch(target, options)
+  target.origin    = options.origin or "akkar.trace"
+  target.http      = options.http
+  target.sink      = options.sink
+  target.endpoint  = options.endpoint
+  target.headers   = options.headers
+  target.max_batch = options.max_batch or DEFAULTS.max_batch
+  target.max_queue = options.max_queue or DEFAULTS.max_queue
+  target.interval  = options.interval or DEFAULTS.interval
+  target.timeout   = options.timeout or DEFAULTS.timeout
+
+  -- `encode` AS A CONSTRUCTOR OPTION, and it is not merely a convenience.
+  --
+  -- The two callers reached for opposite spellings: a batch that knows its own
+  -- format overrides the `Batch:encode` METHOD (`akkar.errors` does, and so
+  -- does the span exporter below), while `akkar.otlp` builds three exporters
+  -- that differ ONLY in their encoder and passes each one as a FIELD. A field
+  -- installed straight onto the table is then reached as `self:encode(batch)`
+  -- and receives the exporter where it expects the batch -- which failed deep
+  -- inside the encoder, on a nil timestamp, rather than at the point of
+  -- confusion.
+  --
+  -- So a supplied function is wrapped into the method shape once, here, and is
+  -- handed exactly what the standalone encoders take: the batch and the
+  -- resource. Callers may still override the method directly; this only gives
+  -- the field spelling a defined meaning instead of a misleading crash.
+  if options.encode then
+    local encode = options.encode
+    target.encode = function(self, batch) return encode(batch, self.resource) end
+  end
+
+  target.queue      = {}
+  target.last_flush = time.monotime()
+  target.counts     = { recorded = 0, dropped = 0, exported = 0,
+                        failed = 0, batches = 0 }
+  return target
+end
+
+--- Turns a batch into the document its destination reads.
+---
+--- The identity is the default because a list of plain tables is already a
+--- JSON array, which is a legitimate thing to POST. Both shipped users
+--- override it.
+function Batch:encode(batch) return batch end
+
+--- Queues a finished item. Returns true when it was kept, false when dropped.
+---
+--- THE WHOLE FUNCTION IS AN APPEND, and that is the point. It performs no
+--- encoding, opens no socket and makes no decision that can take time, because
+--- it runs on the request's coroutine and everything it does is time the user
+--- waits for.
+---
+--- When the queue is full the NEWEST item is refused rather than the oldest
+--- being evicted. Both are O(1) and neither is obviously right, so the reason
+--- is the cheaper one: evicting would mean the request path pays for the
+--- backend's outage, and the refusal costs a comparison. The counter is what
+--- makes the choice visible either way.
+function Batch:record(item)
+  self.counts.recorded = self.counts.recorded + 1
+  if #self.queue >= self.max_queue then
+    self.counts.dropped = self.counts.dropped + 1
+    return false
+  end
+  self.queue[#self.queue + 1] = item
+  return true
+end
+
+--- Is an export due, by either bound?
+function Batch:due()
+  if #self.queue == 0 then return false end
+  if #self.queue >= self.max_batch then return true end
+  return (time.monotime() - self.last_flush) >= self.interval
+end
+
+--- Exports if either bound has been reached. This is what the loop calls.
+function Batch:tick()
+  if not self:due() then return false end
+  self:flush()
+  return true
+end
+
+--- Resolves the HTTP capability once and keeps it.
+---
+--- A factory is called once rather than per flush. `akkar/init.lua` calls a
+--- capability factory once per REQUEST and releases it at the end, because a
+--- request is the lifetime of the work; an exporter is a process-lifetime
+--- thing, so acquiring a connection per batch would open and close one every
+--- few seconds forever.
+function Batch:client()
+  if self.resolved ~= nil then return self.resolved end
+  local given = self.http
+  if given == nil then return nil end
+  if type(given) == "function" then
+    local ok, client = pcall(given)
+    self.resolved = ok and client or false
+  else
+    self.resolved = given
+  end
+  return self.resolved or nil
+end
+
+--- Hands one encoded batch to whatever is configured to take it.
+--- Returns true, or nil and a reason.
+---
+--- TWO SINKS AND ONE CONTRACT. A function receives exactly the document the
+--- HTTP sink would have POSTed, which is what makes the test double worth
+--- anything: a spec asserting on what the function got is asserting on the
+--- bytes that would have gone out, not on an internal shape that happens to
+--- resemble them.
+---
+--- pcall on both, because the transport may RAISE rather than return a reason
+--- -- a DNS failure inside lua-http does -- and so may somebody's sink. Either
+--- would otherwise kill the coroutine the loop runs in and stop exporting for
+--- the life of the process, with nothing in the log to say the loop had ended.
+function Batch:deliver(payload, batch)
+  if self.sink then
+    local ok, res, why = pcall(self.sink, payload, batch)
+    if not ok then return nil, tostring(res) end
+    -- A sink that returns nothing has accepted the batch. `nil, "reason"` and
+    -- a bare `false` are the two ways to say it did not, and both are counted
+    -- as a failed batch rather than raised.
+    if res == false or (res == nil and why ~= nil) then
+      return nil, tostring(why or "the sink refused the batch")
+    end
+    return true
+  end
+
+  local client = self:client()
+  local ok, res, why = pcall(client.post, client, self.endpoint, {
+    body    = payload,
+    headers = self.headers,
+    timeout = self.timeout,
+  })
+  if not ok then return nil, tostring(res) end
+  if not res then return nil, tostring(why or "export failed") end
+  if res.status and res.status >= 400 then
+    return nil, ("status %d"):format(res.status)
+  end
+  return true
+end
+
+--- Exports what is queued, now. Returns true, or nil and a reason.
+---
+--- **Not to be called from a handler or from middleware.** Everything in this
+--- function can wait on a network, which is the one thing a request must not
+--- do for a span or for a captured error. It exists to be called from `run`,
+--- and from a test.
+function Batch:flush()
+  -- THE QUEUE IS SWAPPED BEFORE THE NETWORK CALL, not after.
+  --
+  -- akkar is cooperative, so the POST below yields and other requests run
+  -- while it is in flight. Those requests record spans. Clearing the queue
+  -- afterwards would throw away everything recorded during the export --
+  -- silently, and only under load, which is when the data matters.
+  local batch = self.queue
+  self.queue = {}
+  self.last_flush = time.monotime()
+  if #batch == 0 then return true end
+
+  if not self.sink and not self:client() then
+    -- Counted as dropped, not raised. An exporter with no destination is a
+    -- misconfiguration, and a misconfiguration in the observability system
+    -- must not take down the service it is observing.
+    self.counts.dropped = self.counts.dropped + #batch
+    return nil, self.origin .. " has no http capability"
+  end
+
+  self.counts.batches = self.counts.batches + 1
+
+  local ok, why = self:deliver(self:encode(batch), batch)
+  if not ok then
+    -- DROPPED, NOT RETRIED. See the header: retrying moves the growth from
+    -- this queue into a retry buffer and buys nothing, because the request
+    -- these records describe was already answered.
+    self.counts.failed  = self.counts.failed + 1
+    self.counts.dropped = self.counts.dropped + #batch
+    return nil, why
+  end
+
+  self.counts.exported = self.counts.exported + #batch
+  return true
+end
+
+--- The counters. Put `dropped` and `failed` on a dashboard.
+function Batch:stats()
+  return {
+    queued   = #self.queue,
+    recorded = self.counts.recorded,
+    dropped  = self.counts.dropped,
+    exported = self.counts.exported,
+    failed   = self.counts.failed,
+    batches  = self.counts.batches,
+  }
+end
+
+--- Runs the flush loop on a cqueues controller. Call it once, at startup.
+---
+--- This is the only place `flush` is meant to be called from, and it is three
+--- lines so that the interesting behaviour lives in `tick`, which a spec can
+--- drive without a scheduler or a clock that moves on its own.
+---
+--- The loop sleeps for a FRACTION of the interval rather than for the whole of
+--- it, because the size bound needs checking more often than the time bound: a
+--- burst that fills `max_batch` in the first second of a five-second interval
+--- should not wait out the other four.
+--- Ticks anything with a `tick` and a `stopped` on `controller`, every `nap`
+--- seconds, until it stops.
+---
+--- GENERIC ON PURPOSE, and the reason is a collision worth recording. Two
+--- pieces of work factored this same loop out of `Exporter` at the same time
+--- and arrived at byte-equivalent code: one as a free function over a subject,
+--- one as a method on the batch. They were the same idea, so this is the one
+--- implementation and `Batch:run` is a caller of it -- `akkar.otlp` drives
+--- three exporters from a single coroutine and needs the free form, while a
+--- lone batch reads better as `batch:run()`.
+---
+--- `pcall` around the tick so that one bad export cannot end the loop; `flush`
+--- already swallows transport failures and this covers the rest.
+function M.loop(subject, controller, nap)
+  local cqueues = require "cqueues"
+  controller = controller or cqueues.running()
+  if not controller then
+    error((subject.origin or subject.name or "akkar.trace")
+          .. ": run() needs a cqueues controller; call it from inside the loop "
+          .. "akkar runs on, or pass one", 3)
+  end
+
+  subject.stopped = false
+  controller:wrap(function()
+    while not subject.stopped do
+      time.sleep(nap)
+      pcall(function() subject:tick() end)
+    end
+  end)
+  return subject
+end
+
+function Batch:run(controller)
+  return M.loop(self, controller, math.min(self.interval / 4, 1))
+end
+
+--- Stops the loop, after one last export.
+function Batch:stop()
+  self.stopped = true
+  return self:flush()
+end
+
+M.Batch = Batch
+
 -- ============================================================== the exporter
 
-local Exporter = {}
+-- INHERITS THE QUEUE AND THE LOOP from `Batch` above and adds the two things
+-- that are actually about tracing: how a span is started, and how a batch of
+-- them is encoded. Everything else an exporter does -- `record`, `due`,
+-- `tick`, `flush`, `stats`, `run`, `stop` -- is the shared machinery.
+local Exporter = setmetatable({}, { __index = Batch })
 Exporter.__index = Exporter
+
+--- OTLP/HTTP JSON, which is what a collector already accepts.
+function Exporter:encode(batch) return M.otlp(batch, self.resource) end
 
 --- Builds an exporter.
 ---
@@ -336,22 +637,27 @@ function M.new(options)
   local resource = { ["service.name"] = options.service or DEFAULTS.service }
   for key, value in pairs(options.resource or {}) do resource[key] = value end
 
-  return setmetatable({
+  -- The tracing half is `resource` and `sampler`; `M.batch` fills in the
+  -- queue, the bounds and the destination, which are the same fields
+  -- `akkar.errors` asks it for.
+  local exporter = M.batch({ resource = resource, sampler = options.sampler }, {
+    -- `origin` and `encode` are forwarded, and both matter to `akkar.otlp`:
+    -- it builds three exporters through this constructor that differ only in
+    -- what they encode and what they call themselves. Dropping `encode` here
+    -- left all three encoding as SPANS, which surfaced as a nil timestamp deep
+    -- inside the span encoder rather than as the missing option it was.
+    origin    = options.origin or options.name or "akkar.trace",
+    encode    = options.encode,
     http      = options.http,
+    sink      = options.sink,
     endpoint  = options.endpoint or DEFAULTS.endpoint,
     headers   = options.headers,
-    resource  = resource,
-    max_batch = options.max_batch or DEFAULTS.max_batch,
-    max_queue = options.max_queue or DEFAULTS.max_queue,
-    interval  = options.interval or DEFAULTS.interval,
-    timeout   = options.timeout or DEFAULTS.timeout,
-    sampler   = options.sampler,
-
-    queue      = {},
-    last_flush = time.monotime(),
-    counts     = { recorded = 0, dropped = 0, exported = 0,
-                   failed = 0, batches = 0 },
-  }, Exporter)
+    max_batch = options.max_batch,
+    max_queue = options.max_queue,
+    interval  = options.interval,
+    timeout   = options.timeout,
+  })
+  return setmetatable(exporter, Exporter)
 end
 
 --- Starts a span. Returns nil when this trace is not being sampled.
@@ -377,164 +683,6 @@ function Exporter:start_span(options)
     attributes     = options.attributes or {},
     status         = M.STATUS.UNSET,
   }, Span)
-end
-
---- Queues a finished span. Returns true when it was kept, false when dropped.
----
---- THE WHOLE FUNCTION IS AN APPEND, and that is the point. It performs no
---- encoding, opens no socket and makes no decision that can take time, because
---- it runs on the request's coroutine and everything it does is time the user
---- waits for.
----
---- When the queue is full the NEWEST span is refused rather than the oldest
---- being evicted. Both are O(1) and neither is obviously right, so the reason
---- is the cheaper one: evicting would mean the request path pays for the
---- backend's outage, and the refusal costs a comparison. The counter is what
---- makes the choice visible either way.
-function Exporter:record(span)
-  self.counts.recorded = self.counts.recorded + 1
-  if #self.queue >= self.max_queue then
-    self.counts.dropped = self.counts.dropped + 1
-    return false
-  end
-  self.queue[#self.queue + 1] = span
-  return true
-end
-
---- Is an export due, by either bound?
-function Exporter:due()
-  if #self.queue == 0 then return false end
-  if #self.queue >= self.max_batch then return true end
-  return (time.monotime() - self.last_flush) >= self.interval
-end
-
---- Exports if either bound has been reached. This is what the loop calls.
-function Exporter:tick()
-  if not self:due() then return false end
-  self:flush()
-  return true
-end
-
---- Resolves the HTTP capability once and keeps it.
----
---- A factory is called once rather than per flush. `akkar/init.lua` calls a
---- capability factory once per REQUEST and releases it at the end, because a
---- request is the lifetime of the work; an exporter is a process-lifetime
---- thing, so acquiring a connection per batch would open and close one every
---- few seconds forever.
-function Exporter:client()
-  if self.resolved ~= nil then return self.resolved end
-  local given = self.http
-  if given == nil then return nil end
-  if type(given) == "function" then
-    local ok, client = pcall(given)
-    self.resolved = ok and client or false
-  else
-    self.resolved = given
-  end
-  return self.resolved or nil
-end
-
---- Exports what is queued, now. Returns true, or nil and a reason.
----
---- **Not to be called from a handler or from middleware.** Everything in this
---- function can wait on a network, which is the one thing a request must not
---- do for a span. It exists to be called from `run`, and from a test.
-function Exporter:flush()
-  -- THE QUEUE IS SWAPPED BEFORE THE NETWORK CALL, not after.
-  --
-  -- akkar is cooperative, so the POST below yields and other requests run
-  -- while it is in flight. Those requests record spans. Clearing the queue
-  -- afterwards would throw away every span recorded during the export --
-  -- silently, and only under load, which is when the traces matter.
-  local batch = self.queue
-  self.queue = {}
-  self.last_flush = time.monotime()
-  if #batch == 0 then return true end
-
-  local client = self:client()
-  if not client then
-    -- Counted as dropped, not raised. An exporter with no HTTP capability is a
-    -- misconfiguration, and a misconfiguration in the tracing system must not
-    -- take down the service it is tracing.
-    self.counts.dropped = self.counts.dropped + #batch
-    return nil, "akkar.trace has no http capability"
-  end
-
-  self.counts.batches = self.counts.batches + 1
-
-  local ok, res, why = pcall(client.post, client, self.endpoint, {
-    body    = M.otlp(batch, self.resource),
-    headers = self.headers,
-    timeout = self.timeout,
-  })
-
-  -- pcall, because the transport may RAISE rather than return a reason -- a
-  -- DNS failure inside lua-http does, and an exporter that propagates it would
-  -- kill whatever coroutine the loop is running in and stop exporting for the
-  -- life of the process, with nothing in the log to say the loop had ended.
-  if not ok or not res or (res.status and res.status >= 400) then
-    -- DROPPED, NOT RETRIED. See the header: retrying moves the growth from
-    -- this queue into a retry buffer and buys nothing, because the request
-    -- these spans describe was already answered.
-    self.counts.failed  = self.counts.failed + 1
-    self.counts.dropped = self.counts.dropped + #batch
-    local reason = (not ok and tostring(res))
-                   or (res and res.status and ("status " .. res.status))
-                   or tostring(why or "export failed")
-    return nil, reason
-  end
-
-  self.counts.exported = self.counts.exported + #batch
-  return true
-end
-
---- The counters. Put `dropped` and `failed` on a dashboard.
-function Exporter:stats()
-  return {
-    queued   = #self.queue,
-    recorded = self.counts.recorded,
-    dropped  = self.counts.dropped,
-    exported = self.counts.exported,
-    failed   = self.counts.failed,
-    batches  = self.counts.batches,
-  }
-end
-
---- Runs the flush loop on a cqueues controller. Call it once, at startup.
----
---- This is the only place `flush` is meant to be called from, and it is three
---- lines so that the interesting behaviour lives in `tick`, which a spec can
---- drive without a scheduler or a clock that moves on its own.
----
---- The loop sleeps for a FRACTION of the interval rather than for the whole of
---- it, because the size bound needs checking more often than the time bound: a
---- burst that fills `max_batch` in the first second of a five-second interval
---- should not wait out the other four.
-function Exporter:run(controller)
-  local cqueues = require "cqueues"
-  controller = controller or cqueues.running()
-  if not controller then
-    error("akkar.trace: run() needs a cqueues controller; call it from " ..
-          "inside the loop akkar runs on, or pass one", 2)
-  end
-
-  self.stopped = false
-  controller:wrap(function()
-    while not self.stopped do
-      time.sleep(math.min(self.interval / 4, 1))
-      -- pcall so that one bad tick cannot end the loop. `flush` already
-      -- swallows transport failures; this covers the rest.
-      pcall(function() self:tick() end)
-    end
-  end)
-  return self
-end
-
---- Stops the loop, after one last export.
-function Exporter:stop()
-  self.stopped = true
-  return self:flush()
 end
 
 --- Server-span middleware.
@@ -593,9 +741,36 @@ function Exporter:middleware(options)
       attributes     = {
         ["http.request.method"] = req.method,
         ["url.path"]            = req.path,
+        -- THE JOIN KEY, the other way round. `req.log` carries the trace and
+        -- span ids once a span exists; this carries the request id onto the
+        -- span, so a span found in a backend leads to the log lines and the
+        -- `x-request-id` a client was handed, and a log line leads back.
+        --
+        -- Under akkar's own namespace, and not under `http.`, because the
+        -- semantic conventions define no request-id attribute -- the only
+        -- header-shaped one, `http.request.header.<key>`, records what the
+        -- CLIENT sent, and `req.id` is deliberately not that (`spec/
+        -- log_spec.lua` says why). The naming guidance is explicit: an
+        -- application-specific attribute is prefixed by the application's
+        -- name, and "it is not recommended to use existing OpenTelemetry
+        -- semantic convention namespace as a prefix for a new company- or
+        -- application-specific attribute name".
+        ["akkar.request_id"]    = req.id,
       },
     }
     req.span = span
+
+    -- A LOGGER ACQUIRED BEFORE THIS MIDDLEWARE RAN has no span to bind to,
+    -- and it is cached on the request, so every later line would miss the
+    -- ids. Rebinding costs one small table on a traced request that already
+    -- logged, and nothing at all otherwise -- `rawget`, so an unread `log`
+    -- is not acquired here just to be rebound.
+    local logger = rawget(req, "log")
+    if logger then
+      rawset(req, "log", logger:with {
+        trace_id = span.trace_id, span_id = span.span_id,
+      })
+    end
 
     -- pcall, so a handler that RAISES still produces a span. A trace missing
     -- exactly the requests that failed is a trace of the requests nobody
