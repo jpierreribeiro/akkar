@@ -169,7 +169,12 @@ end
 function Db:query(sql, ...)
   local bounded = bound_by_execution(self)
   self.in_flight = true
-  local ok, res, err = pcall(self.pg.query, self.pg, statement(sql, ...))
+  -- `completed` is the fourth value the driver returns behind a failure, and
+  -- it is read for one reason: see the transport check below. Taken as extra
+  -- locals rather than through `table.pack`, because this is the hot path and
+  -- `spec/allocation_spec.lua` counts what it allocates.
+  local ok, res, err, _rows, completed =
+    pcall(self.pg.query, self.pg, statement(sql, ...))
   self.in_flight = false
 
   -- A raised error leaves the protocol at an unknown offset, so the
@@ -211,6 +216,42 @@ function Db:query(sql, ...)
   -- written for the first door this defect came through.
   if not res then
     if bounded and execution.remaining() and execution.remaining() <= 0 then
+      self.broken = true
+    elseif completed == nil then
+      -- THE OTHER TRANSPORT FAILURE, AND THE ONE THAT HAD NO DEADLINE BEHIND
+      -- IT: the backend went away.
+      --
+      -- A `pg_terminate_backend`, a failover, a restart, a proxy reaping the
+      -- socket -- pgmoon reports every one of them as a RETURN, with the
+      -- message `receive_message: failed to get type: nil`, which is the same
+      -- shape a SQL error arrives in. The budget above cannot see it, because
+      -- no deadline was involved; nothing else set `broken`; so `reusable`
+      -- judged the corpse fit and `put` filed it straight back into `idle`.
+      --
+      -- Measured before this branch existed, pool of 1, backend killed while
+      -- idle: 5 of 5 following requests failed, then 8 of 8, then 12 of 12 --
+      -- with `live=3 idle=3 retired=0` the whole time, a pool reporting
+      -- perfect health while every request 500s. A full `docker restart` was
+      -- identical: Postgres accepted connections again after 2 s and the
+      -- process never recovered. `spec/pg_restart_spec.lua` holds it.
+      --
+      -- THE DISCRIMINATOR IS THE PROTOCOL, NOT THE WORDING, for the same
+      -- reason stated above about `statement_timeout`. pgmoon reads messages
+      -- until `ReadyForQuery` and only then returns
+      -- `nil, error, result, num_queries` -- so a QUERY error always carries
+      -- a `num_queries` behind it, and a failure raised out of
+      -- `receive_message` carries nothing. Its absence means the exchange
+      -- never completed, which means the connection is at an unknown offset,
+      -- which is the definition of finished. Verified on the wire: a SQL
+      -- error returned 7 values with `num_queries = 0`, a killed backend
+      -- returned 3.
+      --
+      -- The two client-side refusals with the same shape -- `invalid null
+      -- byte in query`, and a serializer that failed before anything was sent
+      -- -- are misread here as transport failures, and the cost is one
+      -- reconnect on a programming error. That is the same trade `reusable`
+      -- already takes: "a reconnect on every timed-out query, which is the
+      -- right price".
       self.broken = true
     end
     error("db: " .. tostring(err), 0)
@@ -470,7 +511,14 @@ local function pq_open(config)
       -- catch on the pgmoon path, where an unread result set left the
       -- connection refusing everything for the rest of its life.
       if self.conn.spoiled then self.spoiled = true end
-      return nil, err and err.message or "query failed"
+      -- THE FOURTH VALUE IS pgmoon's `num_queries`, AND IT IS ZERO HERE ON
+      -- PURPOSE. `Db:query` reads its absence as "the protocol exchange never
+      -- completed, so the connection is finished" -- which is the right
+      -- question and the wrong signal for this driver, because libpq answers
+      -- it directly through `spoiled` a line above. Returning a number keeps
+      -- that check inert here instead of making every SQL error cost a
+      -- reconnect on the C driver.
+      return nil, err and err.message or "query failed", nil, 0
     end,
     disconnect = function(self) self.conn:close() end,
   }

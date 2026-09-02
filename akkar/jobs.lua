@@ -733,8 +733,55 @@ function Queue:consume(handlers, options)
   local idle = options.idle or 0.05
   local store_waits = (options.timeout or 1) > 0
 
+  -- How long an unreachable store costs before the next attempt. Not `idle`:
+  -- `idle` paces an EMPTY queue, which is a healthy state, and a store that is
+  -- refusing wants a wait long enough that a failover finishes inside a few of
+  -- them rather than a tight loop of failing round trips against a server that
+  -- is already unwell.
+  local store_backoff = options.store_backoff or 1
+  local blind = false
+
   while not should_stop() do
-    local job, decode_error = self:pop(options.timeout or 1)
+    -- THE ONE STORE CALL IN THIS LOOP THAT WAS STILL BARE.
+    --
+    -- `_maybe_reap` is wrapped and says why -- "the store is a network and a
+    -- blip in a chore must not unwind the worker loop that called it" -- and
+    -- `settle` is wrapped and says the same. `pop` is the first store call of
+    -- every turn and it was not, so the reasoning covered the chores and
+    -- missed the trunk.
+    --
+    -- Measured against a real Redis promoted to a replica of a dead master
+    -- (`redis-cli REPLICAOF localhost 1`), which is what a failover looks like
+    -- from a client that reconnected to the wrong node:
+    --
+    --   worker on a promoted replica: survived=false turns=1
+    --   err=redis: READONLY You can't write against a read only replica.
+    --
+    -- One turn. The consume loop unwound on the first `BRPOP` after the
+    -- promotion and did not come back when the promotion ended -- nothing in
+    -- akkar restarts it, so the queue keeps filling and no worker in the
+    -- fleet is reading it. A rate limiter failing open is a control that
+    -- stopped enforcing; a worker fleet that exits on a failover is work that
+    -- silently stops happening, and it outlives the incident that caused it.
+    --
+    -- So: report it, wait, and go round again. There is no fail-open choice
+    -- to make here -- a job that cannot be read cannot be run either way, and
+    -- the only question is whether the worker is still there when the store
+    -- comes back.
+    local reachable, job, decode_error = pcall(self.pop, self, options.timeout or 1)
+    if not reachable then
+      if log and not blind then
+        blind = true
+        log:error("jobs: the store is unreachable; this worker is not " ..
+                  "consuming and will keep retrying", {
+          queue = self.key, retry_in_s = store_backoff, detail = tostring(job),
+        })
+      end
+      job, decode_error = nil, nil
+      if not should_stop() then time.sleep(store_backoff) end
+      goto continue
+    end
+    blind = false
 
     if not job and not decode_error and not store_waits and not should_stop() then
       time.sleep(idle)
@@ -789,6 +836,7 @@ function Queue:consume(handlers, options)
         end
       end
     end
+    ::continue::
   end
 
   return {
