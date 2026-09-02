@@ -1,5 +1,7 @@
 # akkar
 
+> **English** | [Português (Brasil)](README.pt-BR.md)
+
 **A backend runtime for Lua that boots in 29 milliseconds, speaks HTTP/2 with
 no nginx in front of it, and will not let you write the bugs that page you at
 three in the morning.**
@@ -226,8 +228,17 @@ where your latency is, and if it ever becomes where your latency is, the
 profiler in `bench/` will say so with a number.
 
 Several things that would make it faster were measured and refused, with the
-arithmetic written down: LuaJIT at 1.62x against a bar of 2x, a tokeniser in C
-at 1.09x, generated validators at 1.04x. `docs/why/` has each one.
+arithmetic written down. LuaJIT at 1.62x against a bar of 2x
+(`docs/substrate/LUAJIT.md`). A tokeniser in C, refused because all request
+parsing is **152 bytes, 1.3% of a request** — months of work and a new
+security-relevant boundary to replace that (`docs/PERFORMANCE-PLAN.md`).
+Generated validators, refused because they **save zero bytes**
+(`bench/study/HTTP-OPTIMISATION.md`).
+
+The last two are refused on ALLOCATION, not on a throughput ratio, and this
+paragraph used to quote them as 1.09x and 1.04x and point at `docs/why/`.
+Neither number exists anywhere in this repository and that directory discusses
+neither thing. Corrected 2026-09-02.
 
 ---
 
