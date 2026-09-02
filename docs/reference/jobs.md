@@ -12,8 +12,11 @@ work is done.
 local jobs = require "akkar.jobs"
 ```
 
-Two stores ship with akkar. [`akkar.jobs.memory`](#akkarjobsmemory) keeps jobs
-in a Lua table, [`akkar.jobs.redis`](#akkarjobsredis) keeps them in Redis.
+Three stores ship with akkar. [`akkar.jobs.memory`](#akkarjobsmemory) keeps
+jobs in a Lua table, [`akkar.jobs.redis`](#akkarjobsredis) keeps them in Redis,
+and `akkar.jobs.postgres` keeps them in one Postgres table -- claiming with
+`select ... for update skip locked`, so a job pushed inside the transaction
+that produced it exists if and only if that write does.
 
 ## Index
 
@@ -72,7 +75,11 @@ a feature that quietly does nothing.
 | `store:peek(key, limit)` | `queue:dead_letters` |
 | `store:trim(key, keep)` | the dead-letter list staying under `max_dead` |
 
-Both shipped stores implement all of them.
+All three shipped stores implement all of them, and the same contract specs
+run over each: `spec/jobs_spec.lua`, `spec/jobs_delivery_spec.lua` and
+`spec/jobs_expired_order_spec.lua` take one pass per store rather than one set
+of assertions per store, because matching assertions in three files drift
+apart and a shared pass cannot.
 
 **The last four come as a set.** `jobs.new` turns at-least-once delivery on
 only when all four are present, because a store that leases a job without
@@ -88,7 +95,7 @@ in the middle costs a redelivery rather than the job. Its `now` is a test seam
 -- left out, the store answers with its own clock, which for Redis is the
 server's `TIME` and is the one clock every worker in a fleet shares.
 
-Oldest first is part of the contract and both stores now obey it. The Redis
+Oldest first is part of the contract and all three stores now obey it. The Redis
 one did not: `RPOPLPUSH` pushes to the head of the processing list, so the
 `LRANGE` window came back newest-first and a mass reap -- a deploy, an OOM
 kill, a fleet restart, which is the only time more than one lease expires at
