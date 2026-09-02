@@ -34,6 +34,8 @@ function M.new(options)
     series   = {},        -- [name] = how many label combinations it holds
     pools    = {},         -- list of { label, pool }, read at render time
     pool_labels = {},      -- [label] = true, for the same bound counters have
+    breakers = {},         -- list of { label, breaker }, read the same way
+    breaker_labels = {},
     started  = time.now(),
   }, Registry)
 end
@@ -187,6 +189,53 @@ local POOL_METRICS = {
 -- of the two rather than the sum of them.
 local POOL_MAX = { waited_max = true }
 
+-- A breaker is read the same way and for the same reasons: `Breaker:allow`
+-- is on the outbound hot path, and a breaker that could only be measured by
+-- a process holding a registry would be a breaker `akkar.http` could not
+-- create per origin. `state` is a code -- 0 closed, 1 half-open, 2 open -- so
+-- an alert is `akkar_breaker_state > 0`; two breakers under one label report
+-- the WORSE state rather than a sum that means nothing.
+local BREAKER_METRICS = {
+  { name = "akkar_breaker_state", kind = "gauge", field = "state",
+    help = "0 closed, 1 half-open (probing), 2 open (refusing)." },
+  { name = "akkar_breaker_trips_total", kind = "counter", field = "trips",
+    help = "Times the breaker opened." },
+  { name = "akkar_breaker_refused_total", kind = "counter", field = "refused",
+    help = "Calls refused without running because the breaker was open." },
+  { name = "akkar_breaker_calls_total", kind = "counter", field = "calls",
+    help = "Calls that ran under the breaker." },
+  { name = "akkar_breaker_failures_total", kind = "counter", field = "failures",
+    help = "Calls that ran and were counted as failures." },
+}
+local BREAKER_MAX = { state = true }
+
+-- The label bound, shared by every kind of thing read at render: past
+-- `MAX_SERIES` distinct names the rest fold into `<other>`.
+local function bounded_label(labels, name)
+  if labels[name] then return name end
+  local held = 0
+  for _ in pairs(labels) do held = held + 1 end
+  local label = held >= MAX_SERIES and "<other>" or name
+  labels[label] = true
+  return label
+end
+
+local function register(self, what, list, labels, name, thing)
+  if type(name) ~= "string" or name == "" then
+    error("akkar.metrics: " .. what .. " name must be a non-empty string, got "
+          .. tostring(name), 3)
+  end
+  if type(thing) ~= "table" or type(thing.stats) ~= "function" then
+    error("akkar.metrics: " .. name .. " is not a " .. what
+          .. ": no stats() to read", 3)
+  end
+  -- Raised rather than folded, unlike a label value: registering happens
+  -- once at boot, so a bad argument here is a startup failure the author
+  -- sees immediately, not a 500 in the middle of a request.
+  list[#list + 1] = { label = bounded_label(labels, name), thing = thing }
+  return thing
+end
+
 --- Registers a pool to be READ at every scrape, under `pool="<name>"`.
 ---
 --- The registry keeps a reference and calls `pool:stats()` from `render()`.
@@ -198,50 +247,40 @@ local POOL_MAX = { waited_max = true }
 ---
 --- Returns the pool, so the call chains off a `db.connect{...}.pool`.
 function Registry:pool(name, pool)
-  if type(name) ~= "string" or name == "" then
-    error("akkar.metrics: pool name must be a non-empty string, got "
-          .. tostring(name), 2)
-  end
-  if type(pool) ~= "table" or type(pool.stats) ~= "function" then
-    error("akkar.metrics: " .. name .. " is not a pool: no stats() to read", 2)
-  end
-
-  -- Raised rather than folded, unlike a label value: registering a pool
-  -- happens once at boot, so a bad argument here is a startup failure the
-  -- author sees immediately, not a 500 in the middle of a request.
-  local label = name
-  if not self.pool_labels[label] then
-    local held = 0
-    for _ in pairs(self.pool_labels) do held = held + 1 end
-    if held >= MAX_SERIES then label = "<other>" end
-    self.pool_labels[label] = true
-  end
-
-  self.pools[#self.pools + 1] = { label = label, pool = pool }
-  return pool
+  return register(self, "pool", self.pools, self.pool_labels, name, pool)
 end
 
--- Reads every registered pool once and folds them into one accumulator per
+--- Registers a breaker to be READ at every scrape, under `breaker="<name>"`.
+---
+--- Same contract as `pool`: a reference is held, `breaker:stats()` is read
+--- inside `render()`, and the breaker's own path is never touched. Returns
+--- the breaker, so it chains off `breaker.new{...}`.
+function Registry:breaker(name, breaker)
+  return register(self, "breaker", self.breakers, self.breaker_labels,
+                  name, breaker)
+end
+
+-- Reads every registered thing once and folds them into one accumulator per
 -- label, sorted so two scrapes of unchanged state produce identical text.
 --
--- A pool whose `stats()` raises is skipped rather than allowed to fail the
+-- One whose `stats()` raises is skipped rather than allowed to fail the
 -- scrape, for the reason `serve` already pcalls a gauge source: an
 -- instrument must not be able to take down the thing that reads it.
-function Registry:_pool_series()
+local function read_series(list, metrics, keep_max)
   local order, by_label = {}, {}
-  for _, entry in ipairs(self.pools) do
-    local ok, stats = pcall(entry.pool.stats, entry.pool)
+  for _, entry in ipairs(list) do
+    local ok, stats = pcall(entry.thing.stats, entry.thing)
     if ok and type(stats) == "table" then
       local acc = by_label[entry.label]
       if not acc then
         acc = { label = entry.label }
-        for _, metric in ipairs(POOL_METRICS) do acc[metric.field] = 0 end
+        for _, metric in ipairs(metrics) do acc[metric.field] = 0 end
         by_label[entry.label] = acc
         order[#order + 1] = entry.label
       end
-      for _, metric in ipairs(POOL_METRICS) do
+      for _, metric in ipairs(metrics) do
         local value = tonumber(stats[metric.field]) or 0
-        if POOL_MAX[metric.field] then
+        if keep_max[metric.field] then
           if value > acc[metric.field] then acc[metric.field] = value end
         else
           acc[metric.field] = acc[metric.field] + value
@@ -253,6 +292,14 @@ function Registry:_pool_series()
   local out = {}
   for index, label in ipairs(order) do out[index] = by_label[label] end
   return out
+end
+
+function Registry:_pool_series()
+  return read_series(self.pools, POOL_METRICS, POOL_MAX)
+end
+
+function Registry:_breaker_series()
+  return read_series(self.breakers, BREAKER_METRICS, BREAKER_MAX)
 end
 
 -- A DECIMAL POINT, WHATEVER THE PROCESS'S LOCALE SAYS.
@@ -405,18 +452,20 @@ function Registry:render()
   -- Read here, at scrape time. Grouped by metric name rather than by pool
   -- because the exposition format requires every sample of one family to be
   -- contiguous, and a scrape that interleaves two families is rejected.
-  local pools = self:_pool_series()
-  if #pools > 0 then
+  local function emit(series, metrics, label_name)
+    if #series == 0 then return end
     line ""
-    for _, metric in ipairs(POOL_METRICS) do
+    for _, metric in ipairs(metrics) do
       line("# HELP " .. metric.name .. " " .. metric.help)
       line("# TYPE " .. metric.name .. " " .. metric.kind)
-      for _, acc in ipairs(pools) do
-        line(metric.name .. labels_of { { "pool", acc.label } } ..
+      for _, acc in ipairs(series) do
+        line(metric.name .. labels_of { { label_name, acc.label } } ..
              " " .. number(acc[metric.field]))
       end
     end
   end
+  emit(self:_pool_series(), POOL_METRICS, "pool")
+  emit(self:_breaker_series(), BREAKER_METRICS, "breaker")
 
   line ""
   line "# HELP akkar_request_duration_seconds Request duration."

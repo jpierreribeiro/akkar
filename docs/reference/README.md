@@ -21,6 +21,7 @@ table you already have.
 | put work off the request path | [akkar.jobs](jobs.md), [akkar.work](work.md) |
 | know who the caller is | [akkar.session](session.md), [akkar.auth](auth.md) |
 | stop one caller taking the whole server | [akkar.limit](limit.md) |
+| stop dialling a dependency that is down | [akkar.breaker](breaker.md) |
 | see what the server is doing | [akkar.log](log.md), [akkar.metrics](metrics.md), [akkar.trace](trace.md) |
 | ship it | [akkar.build](build.md), [akkar.config](config.md), [akkar.health](health.md) |
 
@@ -57,6 +58,7 @@ table you already have.
 
 | module | what it is |
 |---|---|
+| [akkar.breaker](breaker.md) | a circuit breaker, so a dead dependency stops being dialled |
 | [akkar.compress](compress.md) | response compression |
 | [akkar.etag](etag.md) | conditional requests, and the write that would vanish |
 | [akkar.http](http.md) | the outbound client, as a capability |
