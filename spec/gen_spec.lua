@@ -70,6 +70,18 @@ describe("akkar gen, the generated TypeScript", function()
     assert.is_truthy(ts:find("#params.id >= 1", 1, true))
   end)
 
+  it("types the error half: a per-route union of the declared error bodies", function()
+    -- The 422 akkar produces is in the document with its shape now, so the
+    -- client can narrow on `error` and read `fields` by the dotted path the
+    -- validator wrote -- akkar's version of a defined, typed error.
+    assert.is_truthy(ts:find("export class AkkarError<TBody = unknown> extends Error", 1, true))
+    assert.is_truthy(ts:find("export type PostTransfersError = {", 1, true))
+    assert.is_truthy(ts:find('error: "validation failed";', 1, true))
+    assert.is_truthy(ts:find("fields: Record<string, string>;", 1, true))
+    assert.is_truthy(ts:find('error: "internal server error";', 1, true))
+    assert.is_truthy(ts:find("throw new AkkarError<PostTransfersError>(", 1, true))
+  end)
+
   it("substitutes path parameters and serialises query parameters", function()
     assert.is_truthy(ts:find('path.replace("{id}", encodeURIComponent(String(args.params.id)))', 1, true))
     assert.is_truthy(ts:find("new URLSearchParams()", 1, true))
@@ -134,6 +146,51 @@ export async function bad() {
   await getUsersId({ params: { idd: "u1" } });
 }
 ]])
+    write("errors.ts", [[
+import { postTransfers, AkkarError, PostTransfersError } from "./client";
+export async function handled(): Promise<string | undefined> {
+  try {
+    await postTransfers({ body: { to: "acct_9", amount: 5 } });
+  } catch (e) {
+    if (e instanceof AkkarError) {
+      const body = e.body as PostTransfersError;
+      if (body.error === "validation failed") {
+        // Narrowed: `fields` exists on this member and is a string map.
+        return body.fields["body.amount"];
+      }
+      const status: number = e.status;
+      return String(status);
+    }
+    throw e;
+  }
+}
+]])
+    write("errors_bad.ts", [[
+import { postTransfers, AkkarError, PostTransfersError } from "./client";
+export async function mishandled() {
+  try {
+    await postTransfers({ body: { to: "acct_9", amount: 5 } });
+  } catch (e) {
+    if (e instanceof AkkarError) {
+      const body = e.body as PostTransfersError;
+      if (body.error === "internal server error") {
+        return body.fields;   // no `fields` on a 500: must not type-check
+      }
+    }
+  }
+}
+]])
+  end)
+
+  it("lets a caller narrow a thrown error to the 422 and read its fields", function()
+    local ok, out = check "errors.ts"
+    assert.is_true(ok, "typed error narrowing was rejected:\n" .. out)
+  end)
+
+  it("refuses to read `fields` off the 500 member, because a 500 has none", function()
+    local ok, out = check "errors_bad.ts"
+    assert.is_false(ok, "tsc let a 500 be read as if it carried fields")
+    assert.is_truthy(out:find("TS2339", 1, true), out)
   end)
 
   teardown(function() os.execute(("rm -rf %q"):format(dir)) end)

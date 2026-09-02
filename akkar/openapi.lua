@@ -197,6 +197,27 @@ local function collect(app, prefix, out, chain)
   return out
 end
 
+--- The body of a 422, exactly as `akkar/init.lua` builds it: `fields` is a
+--- flat map from the dotted path of the failing value (`body.amount`,
+--- `params.id`, `query.limit`) to the reason. Exported so a generator and a
+--- test can name the same table this document embeds.
+M.VALIDATION_FAILED = {
+  type = "object",
+  required = { "error", "fields" },
+  properties = {
+    error  = { type = "string", enum = { "validation failed" } },
+    fields = { type = "object", additionalProperties = { type = "string" } },
+  },
+}
+
+--- The body of a 500. Deliberately nothing but the constant: the real error
+--- goes to the log with the request id, never to the wire.
+M.INTERNAL_ERROR = {
+  type = "object",
+  required = { "error" },
+  properties = { error = { type = "string", enum = { "internal server error" } } },
+}
+
 --- Builds the OpenAPI document for an app.
 -- @param app   an akkar application
 -- @param info  optional { title = ..., version = ..., description = ... }
@@ -295,11 +316,24 @@ function M.document(app, info)
     end
 
     -- Statuses akkar produces on its own are documented without anyone
-    -- declaring them, because akkar is the one that produces them.
+    -- declaring them, because akkar is the one that produces them -- AND WITH
+    -- THEIR SHAPE, because akkar is the one that fixes it. These used to be a
+    -- description and nothing else, which left the error half of the contract
+    -- untyped: a generated client knew what a 200 looked like and had to guess
+    -- at a 422. The shapes are the literal tables `akkar/init.lua` returns --
+    -- `{ error = "validation failed", fields = { ["body.amount"] = "required" } }`
+    -- and `{ error = "internal server error" }` -- so a client can narrow on
+    -- `error` and read `fields` by the same dotted path the validator wrote.
     if opts.params or opts.query or opts.body then
-      operation.responses["422"] = { description = "validation failed" }
+      operation.responses["422"] = {
+        description = "validation failed",
+        content = { ["application/json"] = { schema = M.VALIDATION_FAILED } },
+      }
     end
-    operation.responses["500"] = { description = "internal server error" }
+    operation.responses["500"] = {
+      description = "internal server error",
+      content = { ["application/json"] = { schema = M.INTERNAL_ERROR } },
+    }
 
     paths[template][route.method:lower()] = operation
   end

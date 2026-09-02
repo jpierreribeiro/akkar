@@ -71,7 +71,16 @@ local function object_to_ts(schema, indent)
   for name in pairs(schema.properties or {}) do names[#names + 1] = name end
   table.sort(names)
 
-  if #names == 0 then return "Record<string, unknown>" end
+  if #names == 0 then
+    -- No fixed properties: a map. Its value type is whatever
+    -- `additionalProperties` says (the 422 `fields` map is `string`), or
+    -- unknown when the schema left that open too.
+    local extra = schema.additionalProperties
+    if type(extra) == "table" then
+      return "Record<string, " .. ts_type(extra, indent) .. ">"
+    end
+    return "Record<string, unknown>"
+  end
 
   local lines = { "{" }
   for _, name in ipairs(names) do
@@ -238,6 +247,20 @@ function M.typescript(app, info)
   w("  headers?: Record<string, string>;")
   w("}")
   w("")
+  -- THE ERROR HALF OF THE CONTRACT. A non-2xx answer is thrown as one class
+  -- carrying the status and the parsed body, and the body is typed PER ROUTE as
+  -- the union of every error response the document declares for it -- the 422
+  -- and 500 akkar itself produces, plus any `responses[4xx]` the route added.
+  -- So `catch (e) { if (e instanceof AkkarError && e.body.error === \"validation
+  -- failed\") e.body.fields[\"body.amount\"] }` narrows without a cast, which is
+  -- what makes an error a typed value rather than a string to grep.
+  w("export class AkkarError<TBody = unknown> extends Error {")
+  w("  constructor(public readonly status: number, public readonly body: TBody, operation: string) {")
+  w("    super(operation + \" failed: HTTP \" + status);")
+  w("    this.name = \"AkkarError\";")
+  w("  }")
+  w("}")
+  w("")
 
   -- Stable emission order: path template, then method. `doc.paths` and each
   -- method map come out of `pairs` unordered.
@@ -258,6 +281,24 @@ function M.typescript(app, info)
       local path_schema, query_schema = param_schemas(op.parameters)
       local body_schema = op.requestBody and json_schema(op.requestBody.content)
       local resp_schema = success_schema(op.responses)
+
+      -- Every non-2xx response that carries a body, in status order, becomes
+      -- one member of this route's error union.
+      local error_members = {}
+      do
+        local codes = {}
+        for code in pairs(op.responses) do
+          local n = tonumber(code)
+          if n and n >= 400 and json_schema(op.responses[code].content) then
+            codes[#codes + 1] = code
+          end
+        end
+        table.sort(codes)
+        for _, code in ipairs(codes) do
+          error_members[#error_members + 1] =
+            ts_type(json_schema(op.responses[code].content), "")
+        end
+      end
 
       -- The constraints the types cannot carry, gathered across every input.
       local uncheckable = {}
@@ -290,6 +331,11 @@ function M.typescript(app, info)
       else
         -- No declared response schema: the return type is honestly unknown.
         w(("export type %sResponse = unknown;"):format(Name))
+      end
+      if #error_members > 0 then
+        w(("export type %sError = %s;"):format(Name, table.concat(error_members, " | ")))
+      else
+        w(("export type %sError = unknown;"):format(Name))
       end
 
       -- The typed function. The argument object carries only the parts this
@@ -349,7 +395,8 @@ function M.typescript(app, info)
       if body_schema then w("    body: JSON.stringify(args.body),") end
       w("  });")
       w("  if (!res.ok) {")
-      w(("    throw new Error(%q + res.status);"):format(op.operationId .. " failed: HTTP "))
+      w(("    throw new AkkarError<%sError>(res.status, (await res.json().catch(() => undefined)) as %sError, %q);")
+        :format(Name, Name, op.operationId))
       w("  }")
       if resp_schema then
         w(("  return (await res.json()) as %sResponse;"):format(Name))
