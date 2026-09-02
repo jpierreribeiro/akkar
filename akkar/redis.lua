@@ -46,10 +46,44 @@ local CRLF = "\r\n"
 --
 -- The number is kept as well as the name: it is what a search of the codebase
 -- or of `errno(3)` will match on.
+-- THE REVERSE LOOKUP IS NOT PORTABLE, and CI is where that showed.
+--
+-- `errno[110]` answers `"ETIMEDOUT"` on this laptop's cqueues and answers
+-- nothing on the one CI builds, where the fallback then rendered
+-- `strerror(110)` as the machine's unhelpful `"Unknown error: 11"` -- a worse
+-- line than the bare number this function exists to replace.
+--
+-- What IS portable is the other direction: cqueues exports the constants by
+-- name, so `errno.ETIMEDOUT` is 110 wherever the header said so. Inverting
+-- those once at load builds the table the module needs out of the half of the
+-- interface that is guaranteed, and `strerror` is then only ever decoration.
+-- ASKED FOR BY NAME, NOT ITERATED. `pairs(errno)` is empty on a cqueues that
+-- serves its constants through `__index`, so building the table by walking it
+-- reproduces the very bug this replaces. The names are listed instead: these
+-- are the errnos a socket adapter can actually surface, and one that is not
+-- here still reports its number.
+local NAME_OF = {}
+for _, name in ipairs {
+  "EACCES", "EADDRINUSE", "EADDRNOTAVAIL", "EAFNOSUPPORT", "EAGAIN", "EALREADY",
+  "EBADF", "ECONNABORTED", "ECONNREFUSED", "ECONNRESET", "EDESTADDRREQ",
+  "EHOSTDOWN", "EHOSTUNREACH", "EINPROGRESS", "EINTR", "EINVAL", "EIO",
+  "EISCONN", "EMFILE", "EMSGSIZE", "ENETDOWN", "ENETRESET", "ENETUNREACH",
+  "ENFILE", "ENOBUFS", "ENOMEM", "ENOTCONN", "ENOTSOCK", "EPERM", "EPIPE",
+  "EPROTO", "EPROTONOSUPPORT", "ETIMEDOUT",
+} do
+  local ok, value = pcall(function() return errno[name] end)
+  if ok and type(value) == "number" and NAME_OF[value] == nil then
+    NAME_OF[value] = name
+  end
+end
+
 local function name_error(why)
   if type(why) ~= "number" then return why end
-  local name = errno[why]
-  local text = errno.strerror(why)
+  local name = NAME_OF[why]
+  local ok, text = pcall(errno.strerror, why)
+  text = ok and text or nil
+  -- A message the platform could not name is still better with the number in
+  -- it than without, and the number is what an operator searches for.
   if not name then return (text or "errno") .. " (" .. why .. ")" end
   return name .. " (" .. (text or why) .. ")"
 end
