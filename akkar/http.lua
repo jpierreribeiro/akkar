@@ -15,7 +15,8 @@ argued: `spec/db_spec.lua` runs one contract against two Postgres drivers, so
 swapping a transport costs one file. That matters more here than it did for
 the database, because the transport underneath this one is lua-http -- the
 library this project found a denial of service in, whose last commit is
-September 2024, and which `akkar/substrate.lua` already carries a repair for.
+September 2024, and which `akkar/vendor/http/h1_stream.lua` already carries a
+repair for.
 
 So the value is in the ADAPTER: a deadline, a response ceiling, a retry policy
 that knows what is safe to repeat, trace propagation, and metrics. The

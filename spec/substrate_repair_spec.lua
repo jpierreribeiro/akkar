@@ -24,9 +24,14 @@ different symptoms and one repair:
     `http/server.lua` invokes `shutdown` with no pcall, the error leaves the
     coroutine and ends `server:loop()`. The process exits and the port closes.
 
-The last test starts a server with `repair_substrate = false` and requires it
-to die, so that the three passing above are attributed to the repair rather
-than to something else that happens to be true today.
+The last test starts a server whose `akkar.vendor.http.h1_stream` has been
+swapped for the upstream rock's, and requires it to die, so that the three
+passing above are attributed to the repair rather than to something else that
+happens to be true today. That control used to be a `repair_substrate = false`
+config flag turning off a runtime monkey-patch; the repair now lives in the
+source of `akkar/vendor/http/h1_stream.lua`, the flag and the module it gated
+are gone, and swapping the real library in is the stronger control anyway.
+See `docs/substrate/lua-http-wedge.md`.
 ]]
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
@@ -105,7 +110,8 @@ describe("substrate repair", function()
       -- monkey-patch. The repairs now live in the source of
       -- `akkar/vendor/http/h1_stream.lua`, so there is no flag to turn off --
       -- and this test failed exactly as its own error message said it would,
-      -- which is the spec noticing its premise had moved.
+      -- which is the spec noticing its premise had moved. The flag and
+      -- `akkar/substrate.lua` have since been deleted outright.
       --
       -- The replacement is a stronger control than the flag ever was: it
       -- swaps OUR h1_stream for the upstream rock's, still installed, and
@@ -146,7 +152,8 @@ end
       assert.is_falsy(after:find("status=", 1, true),
         "the unrepaired server answered, so this spec is no longer testing " ..
         "anything -- check whether lua-http has fixed it upstream, and if it " ..
-        "has, retire akkar.substrate rather than editing this line")
+        "has, drop the repair from akkar/vendor/http/h1_stream.lua rather " ..
+        "than editing this line")
     end)
   end)
 end)
