@@ -693,6 +693,32 @@ jobs:
                    ", not 505: this is the 5.4 build, and it would dump core")
             print("built for 505, as it must be")'
 
+      # The checkers the generator specs need, in the two jobs that also run
+      # the suite. Pinned and best effort, exactly as in `unit`: without them
+      # these runners fall back to whatever `tsc` they happen to ship, and a
+      # compiler from a different era refuses flags rather than the code -- one
+      # did, and reported `TS5108` as though the generated client were wrong.
+      - name: TypeScript, best effort
+        run: |
+          npm install -g typescript@5.6.3 \
+            && echo "AKKAR_TSC=$(command -v tsc)" >> "$GITHUB_ENV" \
+            || echo "tsc unavailable; the tsc half of spec/gen_spec.lua will report pending"
+
+      - name: lua-language-server, best effort
+        run: |
+          LUALS=3.19.1
+          case "${{ runner.arch }}" in
+            ARM64) ASSET="linux-arm64" ;;
+            *)     ASSET="linux-x64"   ;;
+          esac
+          URL="https://github.com/LuaLS/lua-language-server/releases/download/$LUALS/lua-language-server-$LUALS-$ASSET.tar.gz"
+          if curl -fsSL -o /tmp/luals.tar.gz "$URL"; then
+            mkdir -p "$HOME/luals" && tar -xzf /tmp/luals.tar.gz -C "$HOME/luals"
+            echo "AKKAR_LUALS=$HOME/luals/bin/lua-language-server" >> "$GITHUB_ENV"
+          else
+            echo "lua-language-server unavailable; the LuaLS half will report pending"
+          fi
+
       - name: The suite, under Lua 5.5
         run: |
           set -o pipefail
@@ -861,6 +887,32 @@ jobs:
       # line per test -- `ok N - name`, `not ok N - name`, and a pending as
       # `ok N - # SKIP name` -- which is greppable without a parser and does
       # not care that the specs also print application logs to stdout.
+      # The checkers the generator specs need, in the two jobs that also run
+      # the suite. Pinned and best effort, exactly as in `unit`: without them
+      # these runners fall back to whatever `tsc` they happen to ship, and a
+      # compiler from a different era refuses flags rather than the code -- one
+      # did, and reported `TS5108` as though the generated client were wrong.
+      - name: TypeScript, best effort
+        run: |
+          npm install -g typescript@5.6.3 \
+            && echo "AKKAR_TSC=$(command -v tsc)" >> "$GITHUB_ENV" \
+            || echo "tsc unavailable; the tsc half of spec/gen_spec.lua will report pending"
+
+      - name: lua-language-server, best effort
+        run: |
+          LUALS=3.19.1
+          case "${{ runner.arch }}" in
+            ARM64) ASSET="linux-arm64" ;;
+            *)     ASSET="linux-x64"   ;;
+          esac
+          URL="https://github.com/LuaLS/lua-language-server/releases/download/$LUALS/lua-language-server-$LUALS-$ASSET.tar.gz"
+          if curl -fsSL -o /tmp/luals.tar.gz "$URL"; then
+            mkdir -p "$HOME/luals" && tar -xzf /tmp/luals.tar.gz -C "$HOME/luals"
+            echo "AKKAR_LUALS=$HOME/luals/bin/lua-language-server" >> "$GITHUB_ENV"
+          else
+            echo "lua-language-server unavailable; the LuaLS half will report pending"
+          fi
+
       - name: The suite, with the backends up
         run: |
           set -o pipefail
