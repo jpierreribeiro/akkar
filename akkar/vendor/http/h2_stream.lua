@@ -19,6 +19,27 @@ end
 
 local MAX_HEADER_BUFFER_SIZE = 400*1024 -- 400 KB is max size in h2o
 
+-- AND A FRAME COUNT, because the byte cap above cannot see an empty frame.
+--
+-- A CONTINUATION frame with a zero-length payload adds nothing to the byte
+-- total, so `len > MAX_HEADER_BUFFER_SIZE` can never fire on a stream of them
+-- -- while each one still appends to the buffer table. `h2_connection` forbids
+-- every other frame type while a header block is open, so an attacker is
+-- confined to exactly the frame that works, and there is no deadline on an
+-- incomplete block.
+--
+-- Measured with the accumulation isolated: two million empty frames accepted,
+-- byte total still zero, 32 MB of Lua heap, nothing refused. On the wire that
+-- is 9 bytes per frame -- 18 MB of traffic for 32 MB of memory that is never
+-- freed, on one unauthenticated connection.
+--
+-- The existing spec for this class sends 32 frames of 16 KB and passes,
+-- because that crosses the byte cap. It tests the variant the cap catches.
+--
+-- 20,000 is far above any real header block -- HPACK's own worst case here is
+-- bounded by the 400 KB above -- and far below the millions an attack needs.
+local MAX_HEADER_BUFFER_ITEMS = 20000
+
 local known_settings = {}
 for i, s in pairs({
 	[0x1] = "HEADER_TABLE_SIZE";
@@ -1138,6 +1159,9 @@ frame_handlers[frame_types.CONTINUATION] = function(stream, flags, payload, dead
 	local len = stream.connection.recv_headers_buffer_length + #payload
 	if len > MAX_HEADER_BUFFER_SIZE then
 		return nil, h2_errors.PROTOCOL_ERROR:new_traceback("headers too large"), ce.E2BIG
+	end
+	if stream.connection.recv_headers_buffer_items >= MAX_HEADER_BUFFER_ITEMS then
+		return nil, h2_errors.PROTOCOL_ERROR:new_traceback("too many header frames"), ce.E2BIG
 	end
 	table.insert(stream.connection.recv_headers_buffer, payload)
 	stream.connection.recv_headers_buffer_items = stream.connection.recv_headers_buffer_items + 1

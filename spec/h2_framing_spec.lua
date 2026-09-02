@@ -306,6 +306,64 @@ describe("hostile HTTP/2 frames", function()
       "the server did not survive a CONTINUATION flood past its header cap")
   end)
 
+  it("bounds a flood of EMPTY CONTINUATION frames, which the byte cap cannot see",
+     function()
+    -- The case above sends 32 frames of 16 KB and passes, because 512 KB
+    -- crosses the 400 KB byte cap. It tests the variant the cap catches.
+    --
+    -- A CONTINUATION frame with a ZERO-LENGTH payload adds nothing to that
+    -- total, so `len > MAX_HEADER_BUFFER_SIZE` can never fire on a stream of
+    -- them -- while each one still appends to the buffer table.
+    -- `h2_connection` forbids every other frame type while a header block is
+    -- open, so the attacker is confined to exactly the frame that works, and
+    -- nothing puts a deadline on an incomplete block.
+    --
+    -- Measured with the accumulation isolated from the socket: two million
+    -- empty frames accepted, byte total still zero, 32 MB of Lua heap, nothing
+    -- refused. On the wire that is nine bytes per frame.
+    --
+    -- The bound is now a frame COUNT beside the byte cap.
+    --
+    -- This asserts the REFUSAL, not survival. Survival is what the case above
+    -- asserts, and it is the wrong instrument here: measured, a server with no
+    -- frame cap at all survives forty thousand empty frames comfortably, so a
+    -- survival assertion passes with the bound removed and proves nothing. The
+    -- attack needs millions of frames to exhaust memory and a test must not.
+    --
+    -- So this drives `handle_continuation_frame` directly, past the cap, and
+    -- requires it to answer with an error rather than keep appending.
+    local h2_stream = require "akkar.vendor.http.h2_stream"
+    local handler = h2_stream.frame_handlers[0x9]
+    assert.is_function(handler, "no CONTINUATION handler to drive")
+
+    -- The minimum a CONTINUATION handler reads: an open header block on a
+    -- connection, and the counters it accumulates into.
+    local connection = {
+      recv_headers_buffer = {},
+      recv_headers_buffer_items = 1,
+      recv_headers_buffer_length = 0,
+      recv_headers_end_stream = false,
+      need_continuation = true,
+    }
+    local stream = { connection = connection, id = 1 }
+    connection.recv_headers_buffer[1] = ""
+
+    local accepted, err = 0, nil
+    for _ = 1, 200000 do
+      local ok, why = handler(stream, 0x0, "")   -- zero-length payload
+      if ok == nil then err = why break end
+      accepted = accepted + 1
+    end
+
+    assert.is_truthy(err,
+      ("%d empty CONTINUATION frames were accepted with no refusal; the byte "
+       .. "cap cannot see them and nothing else counts"):format(accepted))
+    assert.equal(0, connection.recv_headers_buffer_length,
+      "the byte total moved, so this was not the empty-frame path")
+    assert.is_true(accepted < 200000,
+      "every frame was accepted")
+  end)
+
   it("does not accept a frame larger than it advertises", function()
     -- SETTINGS_MAX_FRAME_SIZE defaults to 16,384 and akkar sends no override.
     -- A peer that ignores it must be refused rather than allocated for: this
