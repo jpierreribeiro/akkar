@@ -80,13 +80,22 @@ being able to say which leases have expired holds that job for ever -- which
 is a worse failure than never leasing it. A store with three of the four gets
 at-most-once delivery and says so; see [`jobs.new`](#jobsnewstore-name-options).
 
-`store:expired` returns the encoded jobs whose lease has run out, and stamps
-each one it returns so a second reaper arriving mid-pass takes nothing. It does
-not remove them: they stay in flight until `queue:reap` has written the next
-copy and acknowledged the old one, so a reaper that dies in the middle costs a
-redelivery rather than the job. Its `now` is a test seam -- left out, the store
-answers with its own clock, which for Redis is the server's `TIME` and is the
-one clock every worker in a fleet shares.
+`store:expired` returns the encoded jobs whose lease has run out, **oldest
+first**, and stamps each one it returns so a second reaper arriving mid-pass
+takes nothing. It does not remove them: they stay in flight until `queue:reap`
+has written the next copy and acknowledged the old one, so a reaper that dies
+in the middle costs a redelivery rather than the job. Its `now` is a test seam
+-- left out, the store answers with its own clock, which for Redis is the
+server's `TIME` and is the one clock every worker in a fleet shares.
+
+Oldest first is part of the contract and both stores now obey it. The Redis
+one did not: `RPOPLPUSH` pushes to the head of the processing list, so the
+`LRANGE` window came back newest-first and a mass reap -- a deploy, an OOM
+kill, a fleet restart, which is the only time more than one lease expires at
+once -- redelivered LIFO there and FIFO in memory. LIFO starves the entry at
+the bottom of the list, and that entry is the one that has been redelivered
+most often, so it is the one closest to `max_redeliveries`. Every spec that
+existed reaped a single job, where the order cannot be seen.
 
 ## jobs.delay_for(attempt, backoff)
 
