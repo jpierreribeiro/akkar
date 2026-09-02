@@ -44,13 +44,49 @@ local NAMES = {
   "ESHUTDOWN", "ESPIPE", "ETIMEDOUT",
 }
 
---- number -> "ETIMEDOUT", for the errnos above. Built once at load.
+--- The Linux numbers, as a floor.
+---
+--- CI proved the third trap after the first two were fixed: on the cqueues that
+--- job builds, `errno.ETIMEDOUT` does not resolve EITHER -- neither direction of
+--- the table is populated -- so asking by name produced the same
+--- `Unknown error: 11 (110)` as asking by number. A module that answers nothing
+--- cannot be the only source.
+---
+--- These are the values from `asm-generic/errno.h`, which is where the numbers
+--- an akkar adapter sees on Linux come from, and they are ABI: 110 has been
+--- ETIMEDOUT for as long as the platform has existed and cannot change without
+--- breaking every compiled program on it. macOS numbers its higher errnos
+--- differently (60 is its ETIMEDOUT), which is exactly why the module is asked
+--- FIRST and this table is only the fallback -- on a cqueues that answers, the
+--- platform's own numbering wins; on one that does not, Linux is the right guess
+--- for a runtime that deploys on Linux.
+local LINUX = {
+  [1] = "EPERM", [2] = "ENOENT", [4] = "EINTR", [5] = "EIO", [9] = "EBADF",
+  [11] = "EAGAIN", [12] = "ENOMEM", [13] = "EACCES", [14] = "EFAULT",
+  [22] = "EINVAL", [23] = "ENFILE", [24] = "EMFILE", [32] = "EPIPE",
+  [34] = "ERANGE", [40] = "ELOOP", [36] = "ENAMETOOLONG", [71] = "EPROTO",
+  [88] = "ENOTSOCK", [89] = "EDESTADDRREQ", [90] = "EMSGSIZE",
+  [91] = "EPROTOTYPE", [92] = "ENOPROTOOPT", [93] = "EPROTONOSUPPORT",
+  [95] = "EOPNOTSUPP", [97] = "EAFNOSUPPORT", [98] = "EADDRINUSE",
+  [99] = "EADDRNOTAVAIL", [100] = "ENETDOWN", [101] = "ENETUNREACH",
+  [102] = "ENETRESET", [103] = "ECONNABORTED", [104] = "ECONNRESET",
+  [105] = "ENOBUFS", [106] = "EISCONN", [107] = "ENOTCONN",
+  [108] = "ESHUTDOWN", [110] = "ETIMEDOUT", [111] = "ECONNREFUSED",
+  [112] = "EHOSTDOWN", [113] = "EHOSTUNREACH", [114] = "EALREADY",
+  [115] = "EINPROGRESS", [125] = "ECANCELED",
+}
+
+--- number -> "ETIMEDOUT". Built once at load: the module's own constants where
+--- it has them, the Linux floor where it has not.
 M.name_of = {}
 for _, name in ipairs(NAMES) do
   local ok, value = pcall(function() return errno[name] end)
   if ok and type(value) == "number" and M.name_of[value] == nil then
     M.name_of[value] = name
   end
+end
+for value, name in pairs(LINUX) do
+  if M.name_of[value] == nil then M.name_of[value] = name end
 end
 
 --- `110` -> `"ETIMEDOUT (Connection timed out)"`. Anything that is not a
