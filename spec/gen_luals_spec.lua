@@ -159,13 +159,52 @@ describe("akkar gen --lang luals, checked by lua-language-server", function()
     f:close()
   end
 
+  -- THE CHECKER HAS TO BE TOLD WHICH LUA IT IS CHECKING.
+  --
+  -- Without a `.luarc.json` LuaLS assumes nothing about the runtime: no
+  -- standard library, so `print` and `require` come back as
+  -- `undefined-global`, and every case in this file fails on diagnostics that
+  -- have nothing to do with the generated file. That is not a hypothetical --
+  -- it is what happened the first time these proofs ran against a
+  -- lua-language-server installed from a release rather than one that
+  -- happened to sit beside a configured project.
+  --
+  -- `runtime.version` is the one akkar targets. `diagnostics.globals` is
+  -- deliberately EMPTY: nothing here should need a global the standard library
+  -- does not define, and listing one would hide exactly the undeclared read
+  -- the last case in this file exists to catch.
+  write(".luarc.json", [[
+{
+  "runtime": { "version": "Lua 5.4", "path": ["?.lua", "?/init.lua"] },
+  "diagnostics": { "globals": [] },
+  "workspace": { "checkThirdParty": false }
+}
+]])
+
   --- Runs the checker over the whole directory and returns the diagnostics
   --- per file name: `{ ["bad.lua"] = { {code=..., message=...}, ... } }`.
   --- A file with no problems is absent, so callers ask for `or {}`.
   local function check()
     os.execute(("rm -rf %q"):format(dir .. "/log"))
-    local cmd = ("%s --check %q --checklevel=Hint --check_format=json --logpath %q >/dev/null 2>&1")
-      :format(luals, dir, dir .. "/log")
+    -- `--metapath`, AND IT IS NOT A TIDINESS FLAG.
+    --
+    -- LuaLS GENERATES the standard library's definitions on first run, into its
+    -- own installation directory by default. Install it where the running user
+    -- cannot write -- `/opt`, the ordinary place for a release tarball -- and
+    -- that generation fails with `create_directories: permission denied`,
+    -- `initBuiltIn` raises, and the checker then reports `print` and `require`
+    -- as `undefined-global`. Every case in this file fails on diagnostics that
+    -- have nothing to do with the generated client.
+    --
+    -- It took an installed-from-release LuaLS to see it: the first machine to
+    -- run these proofs had one sitting in a writable directory, so they passed
+    -- there and only there. Pointing the meta at the same temporary directory
+    -- the fixtures live in makes the proof independent of how the checker was
+    -- installed, which is what a CI runner needs too.
+    local meta = dir .. "/.meta"
+    local cmd = ("%s --check %q --metapath %q --checklevel=Hint "
+              .. "--check_format=json --logpath %q >/dev/null 2>&1")
+      :format(luals, dir, meta, dir .. "/log")
     os.execute(cmd)
     local f = io.open(dir .. "/log/check.json")
     if not f then return {} end
@@ -175,7 +214,14 @@ describe("akkar gen --lang luals, checked by lua-language-server", function()
     local by_name = {}
     if type(by_uri) == "table" then
       for uri, list in pairs(by_uri) do
-        by_name[uri:match "[^/]+$"] = list
+        -- The generated stdlib definitions live under `.meta` inside the same
+        -- directory, and LuaLS checks them too -- they arrive as `bit.lua`,
+        -- `table.lua` and friends. They are the CHECKER'S OWN files, not
+        -- anything this spec wrote, so they are skipped by path rather than by
+        -- name: a fixture is free to be called `table.lua` one day.
+        if not uri:find("/.meta/", 1, true) then
+          by_name[uri:match "[^/]+$"] = list
+        end
       end
     end
     return by_name
