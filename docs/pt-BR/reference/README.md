@@ -21,6 +21,7 @@ um valor, ou um campo para adicionar a uma tabela que você já tem.
 | declarar rotas, retornar respostas, rodar o servidor | [akkar](akkar.md) |
 | conversar com o Postgres | [akkar.db](db.md), [akkar.sql](sql.md), [akkar.migrate](migrate.md) |
 | tirar trabalho do caminho da requisição | [akkar.jobs](jobs.md), [akkar.work](work.md) |
+| executar algo em etapas que sobreviva a uma queda entre elas | [akkar.workflow](workflow.md) |
 | saber quem é o chamador | [akkar.session](session.md), [akkar.auth](auth.md) |
 | impedir que um chamador tome o servidor inteiro | [akkar.limit](limit.md) |
 | ver o que o servidor está fazendo | [akkar.log](log.md), [akkar.metrics](metrics.md), [akkar.trace](trace.md) |
@@ -56,6 +57,7 @@ um valor, ou um campo para adicionar a uma tabela que você já tem.
 | [akkar.redis](redis.md) | o cliente Redis que os outros módulos usam |
 | [akkar.storage](storage.md) | arquivos, em algum lugar que não seja este disco |
 | [akkar.work](work.md) | trabalho que precisa acontecer depois que a resposta é enviada |
+| [akkar.workflow](workflow.md) | uma função cujas etapas concluídas não rodam duas vezes |
 
 ### HTTP
 
