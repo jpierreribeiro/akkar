@@ -356,6 +356,7 @@ a global by another name.
 | [`akkar.health`](docs/reference/health.md) | liveness and readiness, separately |
 | [`akkar.metrics`](docs/reference/metrics.md) | Prometheus, with the request path instrumented |
 | [`akkar.trace`](docs/reference/trace.md) | W3C trace context, propagated and exported |
+| [`akkar.errors`](docs/reference/errors.md) | the failure behind a 500, off the request path |
 | [`akkar.log`](docs/reference/log.md) | JSON or text, with redaction |
 | [`akkar.config`](docs/reference/config.md) | environment, typed and validated at boot |
 | [`akkar.doctor`](docs/reference/doctor.md) | the library combination, checked |

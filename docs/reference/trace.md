@@ -15,6 +15,7 @@ local trace = require "akkar.trace"
 ## Contents
 
 - [trace.attributes_of(map)](#traceattributes_ofmap)
+- [trace.Batch](#tracebatch)
 - [trace.DEFAULTS](#tracedefaults)
 - [trace.Exporter](#traceexporter)
 - [trace.KIND](#tracekind)
@@ -55,6 +56,28 @@ A string becomes `stringValue`, a boolean `boolValue`, a Lua integer
 int64), a float `doubleValue`. Anything else is stringified.
 
 **Returns** a list, or `nil` for a `nil` or empty map.
+
+## trace.Batch
+
+The queue, the two bounds and the background loop, on their own metatable.
+`record`, `due`, `tick`, `client`, `deliver`, `flush`, `stats`, `run` and
+`stop` are defined here; an `Exporter` inherits all of them and adds
+`start_span`, `middleware` and `encode`.
+
+It is separate because there is more than one thing in this runtime that has
+to leave the process without standing on the request's clock: `akkar.errors`
+is the other, and every argument on this page — never inline, drop rather than
+grow, drop rather than retry, two bounds and not one — is its argument too.
+Writing a queue swap whose correctness only shows under concurrency a second
+time is how the second copy goes subtly wrong.
+
+`trace.batch(target, options)` installs those fields on a table; the caller
+sets its own metatable over it. `options.origin` is the module's own name, so
+`"akkar.trace has no http capability"` names the thing that is misconfigured.
+
+A consequence worth knowing: `sink = function(document, spans)` works on an
+exporter too, and receives exactly the OTLP document that would have been
+POSTed.
 
 ## trace.DEFAULTS
 

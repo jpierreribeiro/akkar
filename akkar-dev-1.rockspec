@@ -159,6 +159,7 @@ build = {
     ["akkar.idempotency"] = "akkar/idempotency.lua",
     ["akkar.email"] = "akkar/email.lua",
     ["akkar.etag"] = "akkar/etag.lua",
+    ["akkar.errors"] = "akkar/errors.lua",
     ["akkar.execution"] = "akkar/execution.lua",
     ["akkar.websocket"] = "akkar/websocket.lua",
     ["akkar.vendor.http.bit"] = "akkar/vendor/http/bit.lua",

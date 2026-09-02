@@ -24,6 +24,7 @@ um valor, ou um campo para adicionar a uma tabela que você já tem.
 | saber quem é o chamador | [akkar.session](session.md), [akkar.auth](auth.md) |
 | impedir que um chamador tome o servidor inteiro | [akkar.limit](limit.md) |
 | ver o que o servidor está fazendo | [akkar.log](log.md), [akkar.metrics](metrics.md), [akkar.trace](trace.md) |
+| descobrir por que ele respondeu 500 | [akkar.errors](errors.md) |
 | colocar em produção | [akkar.build](build.md), [akkar.config](config.md), [akkar.health](health.md) |
 
 ## Todos os módulos
@@ -84,6 +85,7 @@ um valor, ou um campo para adicionar a uma tabela que você já tem.
 |---|---|
 | [akkar.config](config.md) | configurações a partir do ambiente, checadas na inicialização |
 | [akkar.doctor](doctor.md) | o que está errado com esta instalação |
+| [akkar.errors](errors.md) | a falha por trás de um 500, enviada para onde fique guardada |
 | [akkar.health](health.md) | vivacidade e prontidão (liveness e readiness) |
 | [akkar.log](log.md) | logging estruturado |
 | [akkar.metrics](metrics.md) | contadores e histogramas, em formato de texto do Prometheus |

@@ -1259,12 +1259,23 @@ end
 --- Registers what to do when akkar is about to answer 500.
 ---
 ---     app:on_error(function(err, req)
----       sentry:capture(err, { request_id = req.id, route = req.path })
 ---       return akkar.response(500, { instance = req.id })
 ---     end)
 ---
 --- `err` is whatever was raised, untouched. `req` is the request, and it may
 --- be absent for a failure that happened before one existed.
+---
+--- THE EXAMPLE HERE USED TO BE `sentry:capture(err, ...)` AND THERE WAS NO
+--- SENTRY. The hook was real and the thing on the other end of it was left as
+--- an exercise, so the cause of a 500 reached exactly one place: `internal:
+--- error("handler raised", ...)` on stderr. `akkar.errors` is the other end,
+--- and it hands back a function of this shape:
+---
+---     app:on_error(reporter:handler())
+---
+--- It captures and returns nil, which is read as "the hook declined" -- so
+--- the response stays the bare 500 argued for below, and the detail goes to
+--- whatever ingests JSON instead of to the client.
 function App:on_error(fn)
   if type(fn) ~= "function" then
     error("app:on_error needs a function(err, req); got " .. type(fn), 2)

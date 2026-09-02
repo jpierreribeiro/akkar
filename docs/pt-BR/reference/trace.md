@@ -13,6 +13,7 @@ local trace = require "akkar.trace"
 ## Sumário
 
 - [trace.attributes_of(map)](#traceattributes_ofmap)
+- [trace.Batch](#tracebatch)
 - [trace.DEFAULTS](#tracedefaults)
 - [trace.Exporter](#traceexporter)
 - [trace.KIND](#tracekind)
@@ -49,6 +50,16 @@ Transforma uma tabela de chave para valor na lista de atributos do OTLP, ordenad
 Uma string vira `stringValue`, um booleano vira `boolValue`, um inteiro Lua vira `intValue` (como **string**, que é o que o mapeamento JSON do OTLP exige para um int64), um float vira `doubleValue`. Qualquer outra coisa é convertida para string.
 
 **Retorna** uma lista, ou `nil` para um mapa `nil` ou vazio.
+
+## trace.Batch
+
+A fila, os dois limites e o loop em segundo plano, em uma metatabela própria. `record`, `due`, `tick`, `client`, `deliver`, `flush`, `stats`, `run` e `stop` são definidos aqui; um `Exporter` herda todos eles e acrescenta `start_span`, `middleware` e `encode`.
+
+Está separado porque há mais de uma coisa neste runtime que precisa sair do processo sem ficar em cima do relógio da requisição: o `akkar.errors` é a outra, e todo argumento desta página — nunca inline, descartar em vez de crescer, descartar em vez de repetir, dois limites e não um — é argumento dela também. Escrever uma segunda vez uma troca de fila cuja correção só aparece sob concorrência é como a segunda cópia sai sutilmente errada.
+
+`trace.batch(target, options)` instala esses campos em uma tabela; quem chama põe a própria metatabela por cima. `options.origin` é o nome do módulo, para que `"akkar.trace has no http capability"` nomeie o que está mal configurado.
+
+Uma consequência que vale saber: `sink = function(document, spans)` também funciona em um exporter, e recebe exatamente o documento OTLP que teria ido no POST.
 
 ## trace.DEFAULTS
 
