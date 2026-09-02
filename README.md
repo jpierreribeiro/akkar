@@ -196,6 +196,13 @@ upstream lua-http: a frame header that arrives three bytes short makes
 with it. Process alive, socket open, nothing ever accepted again, including
 HTTP/1.1. Three bytes, no credentials.
 
+It was the second such defect, not the first: one malformed
+`Content-Length` header stops an upstream lua-http server accepting for ever,
+and a negative one exits the process outright.
+[`docs/substrate/lua-http-wedge.md`](docs/substrate/lua-http-wedge.md) has the
+reproduction, the measurements, and the repair — which lives in akkar's
+vendored copy of `h1_stream`.
+
 Two things came out of that, and the second matters more.
 
 The parser now checks the length it was handed, which upstream already does
@@ -234,6 +241,10 @@ parsing is **152 bytes, 1.3% of a request** — months of work and a new
 security-relevant boundary to replace that (`docs/PERFORMANCE-PLAN.md`).
 Generated validators, refused because they **save zero bytes**
 (`bench/study/HTTP-OPTIMISATION.md`).
+
+`docs/why/slower-than-openresty.md` is the single account: where the time goes,
+which of the three published gap figures is current, every refusal with the bar
+it was measured against, and what is still open.
 
 The last two are refused on ALLOCATION, not on a throughput ratio, and this
 paragraph used to quote them as 1.09x and 1.04x and point at `docs/why/`.
@@ -364,7 +375,6 @@ a global by another name.
 | [`akkar.build`](docs/RUNTIME.md) | the single-executable host |
 | [`akkar.watch`](docs/reference/cli.md#akkar-watch----command) | file watching for development |
 | [`akkar.strict`](docs/reference/strict.md) | an accidental global becomes an error |
-| [`akkar.substrate`](docs/substrate/lua-http-wedge.md) | the lua-http defects akkar repairs at runtime |
 | [`akkar.time`](docs/reference/time.md) | the clock the framework reads |
 | [`akkar.vm`](docs/reference/vm.md) | a sandbox for untrusted Lua; read its limits first |
 

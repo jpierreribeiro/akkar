@@ -238,10 +238,19 @@ and no driver was ever going to touch it.
 
 ### Two things this does not say
 
-- **It is not a new default.** pgmoon remains the default driver.
+- **It is not a new default.** pgmoon remains the default driver. ~~
   `bench/driver/RESULTS.md` §5.4 has the reason, and it is a measured one: the
   C driver is faster and measurably *less consistent*, with two anomalous
-  windows in thirty against pgmoon's zero, unexplained.
+  windows in thirty against pgmoon's zero, unexplained.~~ **That reason has been
+  retracted.** `bench/driver/RESULTS.md` §5.4 now carries a correction and
+  `bench/driver/ANOMALY.md` has the four experiments: `akkar.pq` is **not** less
+  consistent — 1.8% spread with zero anomalous windows at the same
+  configuration — and the raggedness belongs to the harness, where
+  `SO_REUSEPORT` splitting six connections over two processes hits **pgmoon
+  harder** (37.3% against 30.5%). The default stays pgmoon for a different
+  reason: `akkar.pq_native` is a separate rock, so a default of `pq` would fail
+  at the first query for anyone who installed only `akkar`.
+  `docs/why/slower-than-openresty.md` section 5 carries both.
 - **The `akkar` and `akkar-lean` rows reproduce section 2 rather than replace
   it.** Run a day apart on the same box: Gin 7,194 → 7,206 and FastAPI 880 →
   881 on `/rows/200`, akkar 1,450 → 1,425. That agreement is worth as much as
