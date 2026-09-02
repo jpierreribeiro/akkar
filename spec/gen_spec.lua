@@ -118,7 +118,21 @@ describe("akkar gen, checked by tsc", function()
 
   --- Runs tsc over one file; returns ok, and the diagnostics text.
   local function check(name)
-    local cmd = ("%s --strict --noEmit --target es2020 --moduleResolution node "
+    -- NO `--moduleResolution`, and its absence is the point.
+    --
+    -- This passed `--moduleResolution node` and CI refused it: modern
+    -- TypeScript removed that mode outright, so every case here failed with
+    -- `TS5108: Option 'moduleResolution=node10' has been removed` -- a
+    -- diagnostic about the invocation, reported as though the generated client
+    -- were wrong.
+    --
+    -- The flag was never needed. These fixtures import one sibling by relative
+    -- path, which every resolution mode has always handled. Naming a mode only
+    -- pinned the proof to one era of the compiler, and the whole reason to run
+    -- a real checker is that it is the one the reader will actually have --
+    -- including the newer one a CI runner ships by default, which is exactly
+    -- what caught this.
+    local cmd = ("%s --strict --noEmit --target es2020 "
               .. "--lib es2020,dom %q 2>&1"):format(tsc, dir .. "/" .. name)
     local pipe = assert(io.popen(cmd))
     local out = pipe:read "a"
