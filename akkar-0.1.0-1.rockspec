@@ -130,6 +130,7 @@ build = {
     ["akkar.etag"] = "akkar/etag.lua",
     ["akkar.strict"] = "akkar/strict.lua",
     ["akkar.work"] = "akkar/work.lua",
+    ["akkar.workflow"] = "akkar/workflow.lua",
     ["akkar.openapi"] = "akkar/openapi.lua",
   },
 

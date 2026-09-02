@@ -19,6 +19,7 @@ table you already have.
 | declare routes, return responses, run the server | [akkar](akkar.md) |
 | talk to Postgres | [akkar.db](db.md), [akkar.sql](sql.md), [akkar.migrate](migrate.md) |
 | put work off the request path | [akkar.jobs](jobs.md), [akkar.work](work.md) |
+| run something in stages that survives a crash between them | [akkar.workflow](workflow.md) |
 | know who the caller is | [akkar.session](session.md), [akkar.auth](auth.md) |
 | stop one caller taking the whole server | [akkar.limit](limit.md) |
 | stop dialling a dependency that is down | [akkar.breaker](breaker.md) |
@@ -55,6 +56,7 @@ table you already have.
 | [akkar.redis](redis.md) | the Redis client the other modules use |
 | [akkar.storage](storage.md) | files, somewhere other than this disk |
 | [akkar.work](work.md) | work that must happen after the response is sent |
+| [akkar.workflow](workflow.md) | a function whose finished steps do not run twice |
 
 ### HTTP
 

@@ -191,6 +191,7 @@ build = {
     ["akkar.vendor.http.zlib"] = "akkar/vendor/http/zlib.lua",
     ["akkar.strict"] = "akkar/strict.lua",
     ["akkar.work"] = "akkar/work.lua",
+    ["akkar.workflow"] = "akkar/workflow.lua",
     ["akkar.openapi"] = "akkar/openapi.lua",
   },
 
