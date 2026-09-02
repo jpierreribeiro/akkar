@@ -32,6 +32,15 @@ Three decisions are settled:
 
 ### What "public" does and does not promise, yet
 
+> **Superseded, 2 September 2026, and the reasoning is kept below rather than
+> rewritten.** The paragraph that follows was overtaken by its own arguments: the
+> version number is now `0.1.0` (`CHANGELOG.md`, "Why 0.1.0 and not 1.0.0"), a
+> CHANGELOG exists, and there is now a written compatibility policy —
+> `docs/COMPATIBILITY.md`. What did *not* change is the substance of the "yet":
+> `0.x` still makes **no stable-API promise until 1.0**, for the two reasons this
+> paragraph gives. `dev-1` was the placeholder; `0.x` is the honest version of
+> the same honesty, and `RELEASE.md` is what publishing it takes.
+
 Public audience, and **no version number, no CHANGELOG and no compatibility
 promise until 1.0.** The rockspec stays at `dev-1`.
 
