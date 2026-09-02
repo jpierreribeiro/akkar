@@ -443,7 +443,17 @@ end
 local function namespace_for(options, req)
   local namespace = options.namespace
   if namespace == nil then return "" end
-  local value = type(namespace) == "function" and namespace(req) or namespace
+  -- NOT `type(namespace) == "function" and namespace(req) or namespace`.
+  -- That idiom collapses on exactly the value this function exists to catch:
+  -- a resolver returning nil makes `(true and nil)` nil, and `nil or namespace`
+  -- then yields THE FUNCTION ITSELF. `tostring` of a function is
+  -- "function: 0x55..." -- never empty -- so the raise below could not fire,
+  -- and every tenant whose resolver had stopped working shared one bucket
+  -- keyed by a pointer address. Measured: two requests with the header absent,
+  -- the second answered 429 out of the first one's budget, and the key read
+  -- `akkar:rate:...24:function: 0x62da296d6530...`.
+  local value
+  if type(namespace) == "function" then value = namespace(req) else value = namespace end
   value = tostring(value or "")
   if value == "" then
     error("limit: namespace returned an empty value", 0)

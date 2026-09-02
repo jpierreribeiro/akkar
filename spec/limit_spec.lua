@@ -80,6 +80,58 @@ end
 -- ========================================================= the logic half
 -- Everything below runs in process, against `akkar.cache.memory`.
 
+describe("a namespace resolver that stops working", function()
+  -- THE GUARD THAT COULD NOT FIRE.
+  --
+  -- `namespace_for` raises when a resolver returns nothing, and the comment
+  -- above it says why: a namespace that silently resolves to empty is the
+  -- multi-tenant collision coming back at exactly the moment the resolver
+  -- stopped working. It was written as
+  --
+  --   type(namespace) == "function" and namespace(req) or namespace
+  --
+  -- which collapses on precisely that value: `(true and nil)` is nil, and
+  -- `nil or namespace` is THE FUNCTION, whose `tostring` is
+  -- "function: 0x55..." and therefore never empty. So the raise could not fire
+  -- for the one case it exists for, and the bucket key carried a pointer
+  -- address where the tenant should have been.
+  --
+  -- Measured before the fix: two requests with the header absent, the second
+  -- answered 429 out of the first one's budget, and the key read
+  -- `akkar:rate:5:1/1/1` `24:function: 0x62da296d6530` `6:user:7`.
+  local function app_with(namespace)
+    local cache = memory.new()
+    local app = akkar.new()
+    app:use(akkar.limit.rate { per_second = 1, burst = 1, cache = cache,
+                               namespace = namespace,
+                               key = function() return "user:7" end })
+    app:get("/x", function() return { ok = true } end)
+    return app:test { cache = function() return cache end }, cache
+  end
+
+  it("refuses rather than putting every tenant in one bucket", function()
+    local client, cache = app_with(function(req) return req.headers["x-tenant"] end)
+
+    assert.equal(500, client:get("/x", { headers = {} }).status,
+      "a resolver that returned nothing was accepted, so the key carries a "
+      .. "function address and every tenant shares the bucket")
+
+    for key in pairs(cache.store or {}) do
+      assert.is_nil(key:find("function:", 1, true),
+        "the bucket key carries a function address: " .. key)
+    end
+  end)
+
+  it("still separates tenants when the resolver answers", function()
+    -- The other half, and the one that makes the first meaningful: a fix that
+    -- simply refused every namespace would pass the case above.
+    local client = app_with(function(req) return req.headers["x-tenant"] end)
+    assert.equal(200, client:get("/x", { headers = { ["x-tenant"] = "acme" } }).status)
+    assert.equal(200, client:get("/x", { headers = { ["x-tenant"] = "other" } }).status,
+      "a second tenant spent the first tenant's budget on a shared caller key")
+  end)
+end)
+
 describe("the token bucket", function()
   it("allows the burst, then throttles to the refill rate", function()
     local cache = stored()
