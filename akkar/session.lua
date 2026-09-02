@@ -170,11 +170,22 @@ function Session:all() return self.data end
 --- you log in knows your session id after you log in, and is then logged in as
 --- you. Rotating at the moment privileges change is the fix, and it is cheap.
 --- Call it on login; `akkar.auth` does.
+--- EVERY rotated id is remembered, not only the most recent.
+---
+--- A single field held one predecessor, so a second rotation overwrote the
+--- first -- and the first is the id that arrived in the cookie, the one an
+--- attacker plants in a fixation attack. Two rotations in one request (log in,
+--- then rotate again on a privilege change, both reasons listed above) then
+--- left the planted id alive in the store: rotation that forgets the wrong id
+--- is not rotation. A list is destroyed in full on commit and on destroy, so
+--- the promise "the old id stops working" holds for however many rotations a
+--- request performs.
 function Session:regenerate()
   local old = self.id
   self.id = crypto.token(32)
   self.dirty = true
-  self.rotated_from = old
+  self.rotated = self.rotated or {}
+  self.rotated[#self.rotated + 1] = old
   return self
 end
 
@@ -186,7 +197,7 @@ end
 --- avoid and this design exists to avoid.
 function Session:destroy()
   self.store:destroy(self.id)
-  if self.rotated_from then self.store:destroy(self.rotated_from) end
+  for _, old in ipairs(self.rotated or {}) do self.store:destroy(old) end
   self.data = {}
   self.destroyed = true
   self.dirty = true
@@ -210,7 +221,7 @@ function Session:commit()
     })
   end
 
-  if self.rotated_from then self.store:destroy(self.rotated_from) end
+  for _, old in ipairs(self.rotated or {}) do self.store:destroy(old) end
   self.store:save(self.id, self.data)
 
   return M.cookie_header(self.name, sign(self.secret, self.id), {
