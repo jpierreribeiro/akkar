@@ -222,7 +222,25 @@ static int pq_send_query(lua_State *L) {
   }
 
   /* The converted strings are pushed onto the stack and stay there until
-   * PQsendQueryParams has copied them, so nothing here outlives its buffer. */
+   * PQsendQueryParams has copied them, so nothing here outlives its buffer.
+   *
+   * WHICH IS WHY THE STACK HAS TO BE GROWN FIRST. The C API guarantees only
+   * LUA_MINSTACK (20) free slots on entry, and the check above admits n up to
+   * 65535. Past the guarantee, lua_rawgeti and lua_pushstring write beyond the
+   * frame: api_check compiles out under NDEBUG, so it is silent heap
+   * corruption rather than an error. Measured with this exact push pattern and
+   * no other change: n=28 clean, n=40 and n=200 hang, n=1000 dumps core. The
+   * threshold moves with the Lua stack depth at the call site, so in a server
+   * the same query can corrupt quietly on one path and crash on another --
+   * worse than a crash, because it is silent.
+   *
+   * Reachable from ordinary code: `Query:where_in(column, values)` in
+   * akkar/sql.lua emits one placeholder per element with no bound on the
+   * array, so a handler doing `where_in("id", body.ids)` over a client-supplied
+   * list is enough. */
+  if (!lua_checkstack(L, n + 4))
+    return luaL_error(L, "akkar.pq: %d parameters do not fit on the Lua stack", n);
+
   int base = lua_gettop(L);
   for (int i = 0; i < n; i++) {
     lua_rawgeti(L, 3, i + 1);

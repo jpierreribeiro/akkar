@@ -103,6 +103,44 @@ describe("akkar.pq", function()
 
       conn:close()
     end)
+
+    it("binds many parameters without corrupting the Lua stack", function()
+      -- `pq_send_query` pushes one Lua stack slot per parameter and leaves it
+      -- there until libpq has copied the values. The C API guarantees only
+      -- LUA_MINSTACK -- twenty -- free slots on entry, and the parameter check
+      -- admits up to 65535. Without `lua_checkstack` the pushes write past the
+      -- frame, and `api_check` compiles out under NDEBUG, so it is silent heap
+      -- corruption rather than an error.
+      --
+      -- Measured with that push pattern isolated and nothing else changed:
+      -- twenty-eight parameters clean, forty and two hundred hang, a thousand
+      -- dumps core. The threshold moves with the Lua stack depth at the call
+      -- site, so the same query can corrupt quietly on one path and crash on
+      -- another -- which is worse than crashing, because it is silent.
+      --
+      -- Every case in this file before this one binds at most ONE parameter,
+      -- which is why 65535 was reachable and untested. The route that reaches
+      -- it needs no exotic SQL: `Query:where_in(column, values)` emits one
+      -- placeholder per element with no bound on the array, so a handler doing
+      -- `where_in("id", body.ids)` over a client-supplied list is enough.
+      local conn = assert(pq.connect(PG))
+
+      for _, n in ipairs { 28, 200, 1000 } do
+        local params, marks = {}, {}
+        for i = 1, n do
+          params[i] = i
+          marks[i] = "$" .. i
+        end
+        local rows = assert(conn:query(
+          "select " .. table.concat(marks, " + ") .. " as total", params),
+          n .. " parameters did not come back")
+        assert.equal(n * (n + 1) / 2, tonumber(rows[1].total),
+          "the sum came back wrong at " .. n .. " parameters, which means the "
+          .. "values were not the values that were bound")
+      end
+
+      conn:close()
+    end)
   end)
 
   it("keeps Lua's integer and float distinction", function()
