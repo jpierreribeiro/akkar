@@ -1012,29 +1012,39 @@ describe("SO_REUSEPORT", function()
     local servers = {}
     local cq = cqueues.new()
     local bound = 0
+    local refused = {}
 
     for _ = 1, 3 do
       local app = akkar.new()
       app:get("/", function() return { ok = true } end)
+      -- APPENDED, because the stopper below iterates this list. While it was
+      -- empty nothing was ever stopped, `run` never returned, `bound` stayed
+      -- at zero -- and the only assertion in the test was `is_true(true)`.
+      servers[#servers + 1] = app
       cq:wrap(function()
-        local ok = pcall(function()
+        local ok, why = pcall(function()
           app:run { port = 8399, reuseport = true, check_capabilities = false }
         end)
-        if ok then bound = bound + 1 end
+        -- `run` returns when `stop` has drained it. Reaching here at all is
+        -- the proof that this server owned the port; EADDRINUSE raises out of
+        -- the bind instead, and `why` names which one lost.
+        if ok then bound = bound + 1 else refused[#refused + 1] = tostring(why) end
       end)
     end
 
     -- Give them a moment to bind, then stop them.
     cq:wrap(function()
-      cqueues.sleep(0.4)
+      cqueues.sleep(0.5)
       for _, app in ipairs(servers) do pcall(function() app:stop(1) end) end
-      error("done", 0)
     end)
-    pcall(function() cq:loop(5) end)
+    assert(cq:loop(15))
 
-    -- The assertion that matters is that nothing raised EADDRINUSE, which
-    -- pcall above would have swallowed into ok = false.
-    assert.is_true(true)
+    -- THE ASSERTION THIS TEST EXISTS FOR. All three, not "no error was seen":
+    -- with reuseport a no-op, two of the three die with EADDRINUSE and the
+    -- scaling story -- one process per core, all on one port -- is gone.
+    assert.equal(3, bound,
+      ("only %d of 3 servers held port 8399 with reuseport: %s")
+        :format(bound, table.concat(refused, " | ")))
   end)
 
   it("is off unless asked for, because sharing a port is a deployment choice", function()

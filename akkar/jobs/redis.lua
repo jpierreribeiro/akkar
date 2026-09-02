@@ -276,7 +276,18 @@ local cutoff = asked - visibility
 -- last element and a job abandoned twice must not overtake one abandoned once.
 local held = redis.call('LRANGE', processing, -limit, -1)
 local out = {}
-for i = 1, #held do
+-- BACKWARDS, and the comment above is why. `LRANGE` hands back the slice in
+-- LIST order -- head first -- so `held[1]` is the NEWEST lease in it and
+-- `held[#held]` the oldest. Walking it forwards built the answer
+-- newest-first, so after a mass reap Redis redelivered LIFO while
+-- `akkar/jobs/memory.lua` redelivered FIFO, and every existing spec reaped
+-- exactly one job, where the order cannot be seen. Oldest-first is the
+-- correct one: it is what the memory store documents, what `promote` and
+-- `peek` already do, and the only order under which a job abandoned twice
+-- does not overtake one abandoned once -- LIFO starves the oldest entry,
+-- which is the one closest to `max_redeliveries` and to whatever deadline
+-- put it in the queue.
+for i = #held, 1, -1 do
   local entry = held[i]
   local score = redis.call('ZSCORE', claimed, entry)
   if not score then

@@ -187,9 +187,23 @@ print(cache:set("ref_cache_cold", "1"))   --> OK
 The object `memory.new` returns. It satisfies the `cache` capability contract
 that `app:run{}` and `app:test{}` check, which is `get`, `set` and `del`.
 
-Expiry is lazy. An entry is dropped when it is next read, not by a timer, so an
-expired key still occupies memory until something touches it or `cache:sweep()`
-runs.
+Expiry is active, the way it is on a real server. An entry is dropped when its
+TTL passes whether or not anything reads it: every round trip pays for a slice
+of the same sampled cycle Redis runs on its own time, so a store whose keys
+have all gone stale drains over the next handful of commands and an idle one
+costs nothing. Nothing here owns a background task; the work rides on the
+commands you were sending anyway. `cache:sweep()` still reclaims everything at
+once for a caller who wants it now.
+
+It used to be lazy -- dropped on the next read and by nothing else -- and that
+was a leak with a respectable name. `akkar.limit` keys a bucket on (limiter,
+tenant, caller), so a process that had served N callers held N dead hashes for
+ever, and `cache:size()` reported 5,000 keys that had expired an hour earlier.
+
+There is no `maxmemory` here. Redis's default `maxmemory-policy` is
+`noeviction`, which refuses the write rather than throwing live keys away, and
+that refusal is a fault you can program: `cache:fail("SET", "OOM command not
+allowed when used memory > 'maxmemory'")`.
 
 ```lua
 local akkar  = require "akkar"
@@ -304,7 +318,28 @@ become `KEYS`, the rest become `ARGV` as strings. Inside the script,
 through `cache:command`.
 
 Replies are converted the way a real server converts them: a number is
-truncated to an integer, `false` becomes `nil`.
+truncated toward zero, `false` becomes `nil`.
+
+**The script runs in a Lua 5.1 sandbox, because that is what Redis embeds.**
+The environment is an allowlist read off a running server rather than this
+process's `_G`: `table.unpack`, `table.move`, `string.pack`, `math.tointeger`,
+`math.type` and `math.maxinteger` are absent because Redis does not have them,
+`unpack`, `math.pow`, `math.log10`, `table.getn` and `table.maxn` are present
+because it does, `_VERSION` reads `Lua 5.1`, and reading or writing an
+undefined global raises the way it does on the server. Source Lua 5.1 cannot
+parse -- `//`, `&`, `|`, `~` as an operator, `<<`, `>>`, `::labels::` -- is
+refused before the chunk is compiled.
+
+Numbers cross the boundary the way they do on a real server: `tostring` inside
+a script formats through a double, so `tostring(10/2)` is `"5"` and not
+`"5.0"`, and a number handed to `redis.call` is converted to the shortest
+decimal that reads back as the same double, so `redis.call('SET', k, 10/2)`
+writes `"5"`.
+
+One gap is left open and is worth knowing about: `..` on a number cannot be
+intercepted, because Lua consults no metamethod when concatenating one. So
+`'k:' .. 10/2` is `"k:5.0"` here and `"k:5"` on the server. Build a key with
+`tostring` and this adapter is honest about it.
 
 **Returns** the converted reply.
 
@@ -430,7 +465,18 @@ Adds one, treating an absent key as zero. Any expiry already on the key is
 kept, which is what makes it usable for a rate limit and not only for a
 counter.
 
+The value has to be what Redis calls an integer, which is stricter than
+`tonumber`: base ten only, no surrounding space, no leading `+`, no leading
+zero (`"01"` and `"-0"` are both refused), no decimal point or exponent, and
+inside signed 64-bit range. `HINCRBY` applies the same rule.
+
 **Returns** the new value, as a number.
+
+**Raises** `ERR value is not an integer or out of range` when the stored value
+is not one, and `ERR increment or decrement would overflow` at the top of the
+range -- the replies a real server sends. It used to accept anything
+`tonumber` did, so `"abc"` counted up to `1`, silently destroying the value,
+and `"1.5"` counted up to `2.5`.
 
 ```lua
 local memory = require "akkar.cache.memory"
@@ -508,9 +554,10 @@ print(cache:set("ref_cache_greeting", "hello", 30))   --> OK
 
 ### cache:size()
 
-**Returns** how many entries the table holds, counting entries that have
-expired but have not been read since. `cache:sweep()` first if you want the
-live count.
+**Returns** how many LIVE entries the store holds -- the same question
+`DBSIZE` answers on a real server. Anything expired that the count walks over
+is dropped on the way. It used to count the table, expired keys included,
+which is how an hour-old TTL could still be reported as 5,000 keys.
 
 ### cache:sweep()
 

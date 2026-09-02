@@ -45,6 +45,22 @@ one commit with a spec that failed before it and passes after.
 - **A job queue states its delivery guarantee.** `delivery` is a field; asking
   for `at_least_once` over a store that cannot lease is refused rather than
   silently becoming at-most-once.
+- **`repair_substrate` is gone, and `akkar.substrate` with it.** If you have
+  `repair_substrate` in your `app:run{}` config, DELETE THE LINE — `App:run`
+  now rejects unknown settings, so leaving it there is an error at boot.
+  Nothing else changes: **you keep the repair either way, including if you had
+  set it to `false`.** That is the whole reason this landed. The setting once
+  gated a runtime monkey-patch of `http.h1_stream`; the repair moved into the
+  source of akkar's vendored `h1_stream` some time ago, akkar stopped loading
+  the upstream module, and the flag was left guarding a call that returned a
+  constant. So `repair_substrate = false` had not opted anybody out of anything
+  for a while — it read as a switch and was documented as one, which is worse
+  than no switch at all. There is no replacement setting and there will not be
+  one: a server that one header can stop is not a configuration.
+  `akkar.substrate` (the module, its reference page, `M.apply`, `M.applied`,
+  `M.rescued`) is deleted; its account of the defect — the reproduction, the
+  measurements, the two repairs that do not work, and why the guard is written
+  the way it is — is now in `docs/substrate/lua-http-wedge.md`.
 
 ### Added
 
@@ -92,6 +108,35 @@ one commit with a spec that failed before it and passes after.
   ran.
 - **Idempotency answering 500 with no `retry-after`** when its store could not
   answer, instead of 503.
+- **HTTP/2 accepted a header list HTTP/1.1 would have refused.** `h1_stream`
+  has capped header lines at 100 since it was vendored; the h2 half had no
+  counterpart anywhere and advertised `SETTINGS_MAX_HEADER_LIST_SIZE` as
+  infinity, leaving one bound: 400 KB of *compressed* block. HPACK is a
+  compressor -- an indexed header field is one byte and appends a whole
+  name/value pair -- so a single HEADERS frame that seeds a 4,000-byte value and
+  then references it reached ~400,000 fields inside that cap, unauthenticated.
+  Measured: 20,008 bytes decoded to 16,001 fields carrying 64 MB. h2 now enforces
+  the same `max_header_lines = 100`, inside `hpack:decode_headers` rather than
+  on its result, because by the time it returns the fields are already
+  allocated. A request carrying more than 100 header fields over h2 is now
+  refused, exactly as it already was over h1.
+- **Duplicate header values were joined quadratically.** `req.headers` built
+  repeats of one name with `existing .. ", " .. value`, rebuilding the whole
+  accumulation each time -- in a count the peer chooses, on a path `req.ip` and
+  therefore the default rate-limit key both take. Measured with 4,000-byte
+  values: 1,000 repeats 1.8 s, 2,000 repeats 9.2 s, 16,000 repeats 364 s, none
+  of it yielding. Collected and joined once now: the same 1,000 repeats cost
+  0.043 s, and doubling the count doubles the cost instead of quintupling it.
+- **HTTP/2 Rapid Reset, CVE-2023-44487, was open.** A peer could open a stream
+  and cancel it at line speed for ever: `RST_STREAM` freed the stream slot
+  before the next frame was read, so `MAX_CONCURRENT_STREAMS` was never
+  approached by construction, while every cycle still cost a full HPACK decode.
+  One million resets were accepted in 5.3 s with the active-stream count back at
+  zero after each. `RST_STREAM` frames are now rate-accounted per connection --
+  a token bucket, burst 100 (nginx's floor) or the advertised concurrency
+  ceiling if higher, refilled at 33/s (nghttp2's rate) -- and a peer past it
+  gets `ENHANCE_YOUR_CALM` (the code Go's `net/http2` uses for the same attack)
+  as a connection error.
 
 ## 0.1.0 — 2026-08-16
 

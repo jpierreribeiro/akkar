@@ -161,7 +161,55 @@ local function wrap_socket(self, socket, timeout)
 	return conn
 end
 
+--- ACCEPT ERRORS THAT LEAVE THE CONNECTION ON THE QUEUE, which is the whole
+--- difference between one dropped connection and a dead process.
+---
+--- `accept()` fails in two unrelated ways and upstream only separated one of
+--- them. `ECONNABORTED`, `EPROTO` and `EPERM` are about ONE pending
+--- connection: the kernel takes it off the queue and hands back the error, so
+--- the next call makes progress and the loop self-limits at one iteration per
+--- bad connection. `EMFILE`, `ENFILE`, `ENOBUFS` and `ENOMEM` are about the
+--- PROCESS or the MACHINE: nothing is dequeued, the listening socket stays
+--- readable, and calling `accept()` again reproduces the error immediately and
+--- for ever.
+---
+--- Upstream throttles `EMFILE` and sends the other three to `onerror` in the
+--- `else` branch -- which returns, and the `while` runs `accept()` again. That
+--- is an unyielding busy loop, and unyielding is the word that matters:
+--- measured here at 349,000 accept() calls a second under `ENFILE`, and a
+--- sibling coroutine in the same controller got **one turn in a full second**
+--- against the ~100 it should get. Every in-flight request, every registered
+--- task and the signal handler that makes SIGTERM work are all in that same
+--- controller. The process holds the port, burns a core, and serves nothing.
+---
+--- akkar's `onerror` logs this branch, so it is also a log flood: 61,216 lines
+--- a second, 3.8 MB/s, measured through `akkar.log` -- which fills a small
+--- disk in under an hour and turns a transient kernel condition into the
+--- ENOSPC failure two sections of `docs/UNKNOWNS.md` down.
+---
+--- akkar's own `descriptor_ceiling` keeps a Linux process off `EMFILE` by
+--- capping `max_concurrent` at 66% of the soft limit, and that was measured to
+--- work -- 0.0% CPU where an uncapped server sat at 92.6%. It cannot help
+--- here. `ENFILE` is system-wide and `ENOMEM`/`ENOBUFS` are the kernel's, so
+--- no per-process ceiling can prevent them, and off Linux no ceiling is
+--- derived at all.
+local RETRY_LATER = {
+	[ce.EMFILE]  = true, -- this process is at its descriptor limit
+	[ce.ENFILE]  = true, -- the machine is at its descriptor limit
+	[ce.ENOBUFS] = true, -- the kernel has no buffer for the new socket
+	[ce.ENOMEM]  = true, -- ... and no memory for it either
+}
+
+-- How many identical failures in a row before an errno NOT in the table above
+-- is treated as one anyway. A per-connection error self-limits, so under an
+-- RST flood this counter is reset by every successful accept in between and
+-- throughput is untouched. An errno nobody anticipated that does NOT dequeue
+-- reaches this count in microseconds and then throttles like the rest: the
+-- point is that no accept error, known or not, can starve the loop.
+local repeat_before_throttle = 20
+
 local function server_loop(self)
+	local last_errno, repeats = nil, 0
 	while self.socket do
 		if self.paused then
 			cqueues.poll(self.pause_cond)
@@ -170,20 +218,59 @@ local function server_loop(self)
 		else
 			local socket, accept_errno = self.socket:accept({nodelay = true;}, 0)
 			if socket == nil then
+				if accept_errno == last_errno then
+					repeats = repeats + 1
+				else
+					last_errno, repeats = accept_errno, 1
+				end
+
 				if accept_errno == ce.ETIMEDOUT then
 					-- Yield this thread until a client arrives
 					cqueues.poll(self.socket, self.pause_cond)
-				elseif accept_errno == ce.EMFILE then
-					-- Wait for another request to finish
-					if cqueues.poll(self.connection_done, hang_timeout) == hang_timeout then
-						-- If we're stuck waiting, run a garbage collection sweep
-						-- This can prevent a hang
-						collectgarbage()
-					end
 				else
-					self:onerror()(self, self, "accept", ce.strerror(accept_errno), accept_errno)
+					local stuck = RETRY_LATER[accept_errno]
+						or repeats > repeat_before_throttle
+
+					-- Reported whatever we then do about it. Throttling an
+					-- error must not also hide it, and `ENFILE` with no line
+					-- in the log is a server that has stopped accepting for a
+					-- reason nobody can name. Reported ONCE per run of
+					-- identical failures rather than per iteration, because
+					-- the second line says nothing the first did not and the
+					-- sixty-thousandth costs a disk.
+					if not stuck or repeats == 1 then
+						self:onerror()(self, self, "accept",
+							ce.strerror(accept_errno), accept_errno)
+					end
+
+					if stuck then
+						-- Wait for another request to finish
+						if cqueues.poll(self.connection_done, hang_timeout) == hang_timeout then
+							-- If we're stuck waiting, run a garbage collection
+							-- sweep. This can prevent a hang: a descriptor held
+							-- by an unreachable object is only released by a
+							-- collection, so this is how a leak-induced EMFILE
+							-- recovers on its own.
+							--
+							-- AT MOST ONCE A SECOND, not on every 30 ms
+							-- timeout. A full sweep 33 times a second costs in
+							-- proportion to the heap and nothing else: measured
+							-- at 4.6% of a core on an empty heap, 28.0% at
+							-- 40,000 live tables and 92.6% at 1.2 million. An
+							-- application heap is the large end of that range,
+							-- so the recovery mechanism was itself pinning the
+							-- core it was trying to save. Once a second frees
+							-- exactly the same descriptors.
+							local now = monotime()
+							if now - (self.last_accept_gc or 0) >= 1 then
+								self.last_accept_gc = now
+								collectgarbage()
+							end
+						end
+					end
 				end
 			else
+				last_errno, repeats = nil, 0
 				self:add_socket(socket)
 			end
 		end

@@ -255,13 +255,52 @@ function Registry:_pool_series()
   return out
 end
 
+-- A DECIMAL POINT, WHATEVER THE PROCESS'S LOCALE SAYS.
+--
+-- Lua renders a float through C's `printf`, which writes the decimal point
+-- LC_NUMERIC asks for. Under a locale with a comma -- pt_BR, de_DE, fr_FR, and
+-- most of the world -- `string.format("%.6f", 0.013427)` is `0,013427`, and
+-- the exposition line built from it is
+--
+--     akkar_request_duration_seconds_sum{...} 0,013427
+--
+-- which is not a sample. Prometheus does not drop that metric; it rejects the
+-- text, so the whole SCRAPE fails and every series in the process goes stale
+-- at once. The blast radius is the reason this is worth three lines: the cost
+-- of the bug is not a wrong number, it is no numbers.
+--
+-- HOW REACHABLE IS IT. Lua never calls `setlocale`, so a process starts at
+-- "C" and stays there -- akkar's whole dependency stack was checked and none
+-- of it moves the locale. That guard is real, and it is also held by ABSENCE:
+-- `os.setlocale` is in the standard library, any C extension an application
+-- loads may call `setlocale(3)` in its initialiser, and akkar does not own the
+-- application. The machine this was written on has `LC_NUMERIC=pt_BR.UTF-8`
+-- exported already; one `os.setlocale("", "numeric")` anywhere in a process is
+-- the whole distance from here to a dead scrape. Fixed rather than documented,
+-- because the guard belongs to somebody else and the fix is cheap.
+--
+-- WHY NOT A LIST OF LOCALES. There is no need to know which character the
+-- locale chose. A finite number rendered by `%f` or `%g` is digits, an
+-- optional sign, an optional `e+dd`, and at most one separator -- so anything
+-- in it that is not one of those IS the separator, whatever byte it is. The
+-- digit test keeps `inf`, `-inf` and `nan` out, which carry letters and no
+-- separator. Under "C" this substitutes `.` for `.` and the output is
+-- byte-identical, which is what `spec/numeric_locale_spec.lua` pins.
+--
+-- `akkar/log.lua` carries the same three lines for the same reason; they are
+-- duplicated rather than shared because neither module is the other's home.
+local function decimal(rendered)
+  if not rendered:find "%d" then return rendered end
+  return (rendered:gsub("[^-+0-9eE]", "."))
+end
+
 -- An integer renders bare and a float renders with six decimals, which is the
 -- resolution the histogram's `_sum` already uses. Without this a count that
 -- arrived as a float would scrape as `3.0`, and a sub-millisecond wait would
 -- scrape in Lua's scientific notation.
 local function number(value)
   if math.type(value) == "integer" then return tostring(value) end
-  return string.format("%.6f", value)
+  return decimal(string.format("%.6f", value))
 end
 
 function Registry:observe(method, route, status, seconds)
@@ -359,7 +398,7 @@ function Registry:render()
       end
       local rendered = counter.labels and #counter.labels > 0
                        and labels_of(counter.labels) or ""
-      line(counter.name .. rendered .. " " .. counter.value)
+      line(counter.name .. rendered .. " " .. decimal(tostring(counter.value)))
     end
   end
 
@@ -390,7 +429,8 @@ function Registry:render()
     local hist = self.duration[k]
     for i, edge in ipairs(self.buckets) do
       line("akkar_request_duration_seconds_bucket" ..
-           labels_of { { "method", method }, { "route", route }, { "le", tostring(edge) } } ..
+           labels_of { { "method", method }, { "route", route },
+                      { "le", decimal(tostring(edge)) } } ..
            " " .. hist.counts[i])
     end
     line("akkar_request_duration_seconds_bucket" ..
@@ -398,7 +438,7 @@ function Registry:render()
          " " .. hist.total)
     line("akkar_request_duration_seconds_sum" ..
          labels_of { { "method", method }, { "route", route } } ..
-         " " .. string.format("%.6f", hist.sum))
+         " " .. decimal(string.format("%.6f", hist.sum)))
     line("akkar_request_duration_seconds_count" ..
          labels_of { { "method", method }, { "route", route } } ..
          " " .. hist.total)
@@ -416,13 +456,14 @@ function Registry:render()
         line("# TYPE " .. g.name .. " gauge")
         declared[g.name] = true
       end
-      line(g.name .. (g.labels and labels_of(g.labels) or "") .. " " .. g.value)
+      line(g.name .. (g.labels and labels_of(g.labels) or "") ..
+           " " .. decimal(tostring(g.value)))
     end
   end
 
   line ""
   line "# TYPE akkar_uptime_seconds gauge"
-  line("akkar_uptime_seconds " .. (time.now() - self.started))
+  line("akkar_uptime_seconds " .. decimal(tostring(time.now() - self.started)))
 
   return table.concat(out, "\n") .. "\n"
 end

@@ -903,7 +903,6 @@ Binds a socket and serves. This call does not return until the server stops.
 | `strict` | boolean | `false` | turn on `akkar.strict`, making a global an error |
 | `max_concurrent` | number | derived | in flight ceiling, default about a third of the descriptor limit |
 | `trusted_proxies` | list of strings | none | CIDRs whose `x-forwarded-for` is believed |
-| `repair_substrate` | boolean | `true` | patch the known lua-http defects before binding |
 | `db`, `cache`, `log`, `clock`, `http` | table or function | none | capabilities. A function is called once per request that reads it |
 
 A capability given as a function is called per request, and if what it returns

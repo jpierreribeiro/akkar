@@ -1,6 +1,6 @@
 # Why akkar is like this
 
-Six arguments. Each one takes a decision that shows up in the API, says what it
+Seven arguments. Each one takes a decision that shows up in the API, says what it
 makes impossible, says what it costs, and points at the measurement or the
 retraction behind it.
 
@@ -17,6 +17,7 @@ when a page makes you ask "why on earth is it like that".
 | [one-process-per-core.md](one-process-per-core.md) | Why processes and `SO_REUSEPORT` rather than threads? |
 | [what-the-runtime-is-for.md](what-the-runtime-is-for.md) | What does `akkar build` buy, and why is speed not on the list? |
 | [what-akkar-does-not-do.md](what-akkar-does-not-do.md) | What is deliberately excluded, and what should you use instead? |
+| [slower-than-openresty.md](slower-than-openresty.md) | Why is akkar slower than OpenResty, where does the time go, and what can be done? |
 
 ## How to read a number on these pages
 

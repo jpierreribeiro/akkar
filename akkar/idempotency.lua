@@ -367,7 +367,14 @@ function M.new(options)
     local cache = options.cache or req.cache
     local scoped = ""
     if namespace then
-      scoped = type(namespace) == "function" and namespace(req) or namespace
+      -- NOT `... and namespace(req) or namespace`: a resolver returning nil
+      -- makes that expression yield the FUNCTION, whose `tostring` is never
+      -- empty, so the raise below could not fire for the one case it is
+      -- written for. Here the consequence is a shared idempotency keyspace
+      -- over a client-chosen header -- the cross-tenant replay this option
+      -- exists to prevent, returning at the moment the resolver breaks.
+      if type(namespace) == "function" then scoped = namespace(req)
+      else scoped = namespace end
       scoped = tostring(scoped or "")
       if scoped == "" then
         error("idempotency: namespace returned an empty value", 0)

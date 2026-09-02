@@ -256,22 +256,47 @@ describe("paths that must never escape", function()
   it("never resolves anything outside the root, over a fuzz of segments", function()
     -- A property rather than a case list: whatever comes out, if it came out
     -- at all, starts with the root followed by a separator.
+    --
+    -- BUT "IF IT CAME OUT AT ALL" IS NOT A FREE PASS. Both assertions live
+    -- under `if absolute then`, so a `resolve` that returned nil for
+    -- everything -- a refusal of every path, or a `return` accidentally
+    -- dropped -- ran three thousand iterations, made zero assertions and
+    -- reported green. `resolved` below is what makes the loop have to have
+    -- resolved something, and it is asserted OUTSIDE the loop so the property
+    -- itself stays "whatever comes out is inside the root".
     local pieces = { "..", ".", "%2e", "%2e%2e", "a", "", "....", "%2f", "%5c",
                      "..%2f", "x.txt", "%00", "nested" }
-    local rng = math.randomseed and math.random or math.random
+    -- `local rng = math.randomseed and math.random or math.random` stood here,
+    -- which picks `math.random` either way -- a condition with one outcome.
+    local rng = math.random
     math.randomseed(20260816)
+    local resolved, refused = 0, 0
     for _ = 1, 3000 do
       local parts = {}
       for _ = 1, rng(1, 6) do parts[#parts + 1] = pieces[rng(1, #pieces)] end
       local attempt = "/" .. table.concat(parts, "/")
       local absolute = static.resolve(ROOT, attempt)
       if absolute then
+        resolved = resolved + 1
         assert.is_true(absolute == ROOT or absolute:sub(1, #ROOT + 1) == ROOT .. "/",
           ("%q resolved to %q, which is outside %q"):format(attempt, absolute, ROOT))
         assert.is_nil(absolute:find("/../", 1, true),
           ("%q resolved to %q, which still contains a parent"):format(attempt, absolute))
+      else
+        refused = refused + 1
       end
     end
+
+    -- THE ASSERTION THAT MAKES THE THREE THOUSAND ITERATIONS MEAN SOMETHING.
+    -- Half the corpus (`%5c`, `%00`, and enough `..` to climb out) is meant
+    -- to be refused, so this is a floor and not an equality -- but a fuzz
+    -- that resolved nothing tested nothing.
+    assert.is_true(resolved > 200,
+      ("only %d of 3000 attempts resolved at all (%d refused); the loop's " ..
+       "assertions are inside `if absolute then`, so this run proved nothing")
+        :format(resolved, refused))
+    assert.is_true(refused > 0,
+      "every attempt resolved, including the ones that climb out of the root")
   end)
 end)
 
@@ -499,7 +524,12 @@ describe("the metadata source CI actually runs", function()
   end)
 
   it("agrees with lfs about size and kind, where lfs exists to ask", function()
-    if not static.stat_lfs then return end
+    if not static.stat_lfs then
+      -- `pending`, not a bare `return`: without lfs installed this reported
+      -- green having compared nothing, and the comparison is the whole test.
+      pending "lfs is not installed, so there is no second implementation to agree with"
+      return
+    end
     for _, name in ipairs { "/hello.txt", "/app.css", "/nested", "/big.bin" } do
       local a, b = static.stat_io(ROOT .. name), static.stat_lfs(ROOT .. name)
       assert.equal(b.kind, a.kind, name .. ": kind disagrees")

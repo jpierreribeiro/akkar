@@ -526,6 +526,27 @@ describe("keys by kid, for an issuer that rotates", function()
                                                  ["2026-08"] = NEW } }))
   end)
 
+  it("refuses a retired key even when the kid names the current one", function()
+    -- THE TEST THE TITLE ABOVE DOES NOT BACK, AND THE CASE ROTATION EXISTS
+    -- FOR. "picks the key the header names" is satisfied by a verifier that
+    -- ignores `kid` entirely and tries every configured key until one
+    -- verifies: the happy-path token above is signed with NEW, so a
+    -- try-them-all verifier finds NEW and passes.
+    --
+    -- What such a verifier also accepts is this: a token signed with the
+    -- RETIRED key, carrying the CURRENT kid. The kid says "2026-08", so the
+    -- only key that may be tried is NEW, and the signature is OLD's -- so the
+    -- answer must be a refusal. A verifier that falls back to OLD after NEW
+    -- fails has un-retired the retired key, and rotation bought nothing.
+    local token = forge({ alg = "HS256", kid = "2026-08" }, claims(),
+                        hmac_with(OLD))
+    local out, why = jwt.verify(token, { alg = "HS256",
+                                         keys = { ["2026-07"] = OLD,
+                                                  ["2026-08"] = NEW } })
+    assert.is_nil(out, "a token signed with the retired key was accepted")
+    assert.is_truthy(why)
+  end)
+
   it("refuses an unknown kid instead of falling back to a default", function()
     -- A verifier that tries a default when the kid is unknown accepts tokens
     -- signed with a retired key, which is the thing rotation was for.

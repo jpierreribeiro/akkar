@@ -53,7 +53,7 @@ describe("a database connection that asked for TLS", function()
       })
       outcome = { ok = ok, err = tostring(err) }
     end)
-    loop:loop(5)
+    assert(loop:loop(5))
     listener:close()
 
     assert.is_false(outcome.ok, "the adapter accepted a stripped connection")
@@ -76,7 +76,7 @@ describe("a database connection that asked for TLS", function()
       })
       outcome = { ok = ok, err = tostring(err) }
     end)
-    loop:loop(5)
+    assert(loop:loop(5))
     listener:close()
 
     assert.is_false(outcome.ok, "the fake server cannot complete a startup")

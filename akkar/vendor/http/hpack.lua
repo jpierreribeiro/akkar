@@ -4,6 +4,7 @@
 local schar = string.char
 local spack = string.pack or require "compat53.string".pack -- luacheck: ignore 143
 local sunpack = string.unpack or require "compat53.string".unpack -- luacheck: ignore 143
+local ce = require "cqueues.errno"
 local band = require "akkar.vendor.http.bit".band
 local bor = require "akkar.vendor.http.bit".bor
 local new_headers = require "akkar.vendor.http.headers".new
@@ -817,10 +818,46 @@ local function decode_header_helper(self, payload, prefix_len, pos)
 	end
 	return name, value, pos
 end
-function methods:decode_headers(payload, header_list, pos)
+--- Decodes a header block, refusing one that decodes to too many FIELDS.
+---
+--- `max_entries` is the h1 `max_header_lines` bound, on the h2 side of the
+--- house. It has to live HERE, inside the loop, and not at the call site:
+--- by the time `decode_headers` returns, every field the attacker asked for
+--- has already been allocated and appended, which is the entire cost. A
+--- check on the result would observe the damage rather than prevent it.
+---
+--- Why a field COUNT and not the byte cap that already exists. The only h2
+--- bound in the tree is `MAX_HEADER_BUFFER_SIZE` in `h2_stream`, 400 KB of
+--- *compressed* block. HPACK's indexed header field (Section 6.1) is ONE
+--- BYTE -- `0x80 | index` -- and it appends a whole name/value pair from the
+--- dynamic table. So one literal that seeds a 4,000-byte value, followed by
+--- one-byte references to it, buys 4,000 bytes of header per byte sent, and
+--- there is no size the byte cap can be set to that sees it.
+---
+--- Measured on this box against the unbounded decoder: a 20,008-byte block
+--- decoded to 16,001 fields carrying 64 MB of value. Under the 400 KB cap
+--- the same shape reaches ~400,000 fields.
+local MAX_HEADER_LIST_ENTRIES = 100 -- `h1_stream`'s `max_header_lines`
+function methods:decode_headers(payload, header_list, pos, max_entries)
 	header_list = header_list or new_headers()
 	pos = pos or 1
+	max_entries = max_entries or MAX_HEADER_LIST_ENTRIES
 	while pos <= #payload do
+		-- Checked before decoding the next field rather than after appending
+		-- it, so a block of exactly `max_entries` fields is accepted and the
+		-- refusal costs one comparison, not one allocation.
+		--
+		-- A CONNECTION error, not a stream error, and not a choice: abandoning
+		-- a block half-decoded leaves the dynamic table out of step with the
+		-- peer's, and RFC 7540 section 6.8 is explicit that a connection whose
+		-- header compression state has desynchronised cannot carry another
+		-- stream. `PROTOCOL_ERROR` rather than `COMPRESSION_ERROR` because the
+		-- encoding was valid, and to match the "headers too large" refusal
+		-- next door in `h2_stream`.
+		if header_list:len() >= max_entries then
+			return nil, h2_errors.PROTOCOL_ERROR:new_traceback(
+				string.format("header list of more than %d fields", max_entries)), ce.E2BIG
+		end
 		local first_byte = payload:byte(pos, pos)
 		if band(first_byte, 0x80) ~= 0 then -- Section 6.1
 			-- indexed header

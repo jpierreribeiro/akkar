@@ -222,7 +222,27 @@ static int pq_send_query(lua_State *L) {
   }
 
   /* The converted strings are pushed onto the stack and stay there until
-   * PQsendQueryParams has copied them, so nothing here outlives its buffer. */
+   * PQsendQueryParams has copied them, so nothing here outlives its buffer.
+   *
+   * WHICH IS WHY THE STACK HAS TO BE GROWN FIRST. The C API guarantees only
+   * LUA_MINSTACK (20) free slots on entry, and the check above admits n up to
+   * 65535. Past the guarantee, lua_rawgeti and lua_pushstring write beyond the
+   * frame: api_check compiles out under NDEBUG, so it is silent heap
+   * corruption rather than an error. Measured with this exact push pattern and
+   * no other change: n=28 clean, n=40 and n=200 hang, n=1000 dumps core. The
+   * threshold moves with the Lua stack depth at the call site, so in a server
+   * the same query can corrupt quietly on one path and crash on another --
+   * worse than a crash, because it is silent.
+   *
+   * Reachable from ordinary code: `Query:where_in(column, values)` in
+   * akkar/sql.lua emits one placeholder per element with no bound on the
+   * array, so a handler doing `where_in("id", body.ids)` over a client-supplied
+   * list is enough. */
+  if (!lua_checkstack(L, n + 4)) {
+    free(types); free((void *)values); free(lengths); free(formats);
+    return luaL_error(L, "akkar.pq: %d parameters do not fit on the Lua stack", n);
+  }
+
   int base = lua_gettop(L);
   for (int i = 0; i < n; i++) {
     lua_rawgeti(L, 3, i + 1);
@@ -247,8 +267,37 @@ static int pq_send_query(lua_State *L) {
       values[i] = lua_tostring(L, -1);
       lua_remove(L, -2);
     } else if (t == LUA_TSTRING) {
+      /* A LUA STRING CAN HOLD A NUL AND A TEXT-FORMAT PARAMETER CANNOT.
+       *
+       * `formats[i]` is 0, so libpq takes each value as a C string and
+       * measures it with strlen; `lengths` is ignored entirely for text
+       * format. A Lua string is counted, not terminated, so "ab\0cd" was
+       * being sent as "ab" -- five bytes in, two bytes bound, no error
+       * anywhere. Measured against this driver before this check:
+       * `select length($1::text)` with a five-byte value answered 2.
+       *
+       * Truncating IS WORSE THAN FAILING, because the query still runs and
+       * still matches rows -- just different ones. `where email = $1` over an
+       * attacker-supplied string finds the account whose address is the
+       * prefix. pgmoon does not have this hole: the same value comes back
+       * from Postgres as `invalid byte sequence for encoding "UTF8": 0x00`,
+       * an error, which is the behaviour this driver claims to match.
+       *
+       * Postgres text cannot store a NUL under any encoding, so nothing is
+       * lost by refusing: there is no correct value to send. */
+      size_t slen = 0;
+      const char *sv = lua_tolstring(L, -1, &slen);
+      if (memchr(sv, '\0', slen) != NULL) {
+        lua_settop(L, base);
+        free(types); free((void *)values); free(lengths); free(formats);
+        return luaL_error(L, "akkar.pq: parameter %d contains a NUL byte at "
+                             "offset %d of %d, which no Postgres text type can "
+                             "hold", i + 1,
+                          (int)((const char *)memchr(sv, '\0', slen) - sv),
+                          (int)slen);
+      }
       types[i] = OID_TEXT;
-      values[i] = lua_tostring(L, -1);
+      values[i] = sv;
     } else {
       lua_settop(L, base);
       free(types); free((void *)values); free(lengths); free(formats);

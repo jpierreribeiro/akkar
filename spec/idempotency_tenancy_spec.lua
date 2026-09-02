@@ -18,9 +18,21 @@ local redis       = require "akkar.redis"
 local cqueues     = require "cqueues"
 
 local function reachable()
+  -- PING, not merely connect. `cqueues.socket.connect` builds the socket
+  -- lazily and touches the network on first use, so `pcall` around the factory
+  -- returns TRUE with nothing listening. This guard was that shape, and it
+  -- only looked correct because a developer's machine always has Redis
+  -- running -- `spec/jobs_redis_spec.lua` records the same discovery, and CI's
+  -- no-services job found this one the same way, on its first run against
+  -- this file.
+  --
+  -- A Postgres guard of the identical shape is fine, which is why they sit
+  -- side by side in this suite looking equivalent: pgmoon connects eagerly.
   local ok, conn = pcall(redis.connect { pool_size = 0 })
-  if ok then conn:close() end
-  return ok
+  if not ok then return false end
+  local alive = pcall(function() return conn:ping() end)
+  conn:close()
+  return alive
 end
 
 if not reachable() then

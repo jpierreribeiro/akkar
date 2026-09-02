@@ -53,6 +53,16 @@ local crypto = require "akkar.crypto"
 
 local M = {}
 
+--- How many session writes have failed, process-wide, since this process
+--- started.
+---
+--- The same shape and the same reasoning as `akkar.limit.store_failures`: a
+--- plain field rather than a `metrics` registration, process-wide rather than
+--- per middleware, because "is anything in this process failing to save
+--- sessions" is the question an operator wants answered and the fleet
+--- aggregates it by scraping each process. See the commit in `M.middleware`.
+M.session_write_failures = 0
+
 -- ============================================================== 401 and 403
 
 --- The response for "I do not know who you are".
@@ -249,8 +259,53 @@ function M.middleware(options)
     -- Required lazily rather than at the top of the file: `akkar` does not
     -- require this module, but keeping the edge one-directional at load time
     -- means nobody has to reason about the order later.
+    -- THE COMMIT RUNS AFTER THE HANDLER, SO ITS FAILURE COSTS THE HANDLER.
+    --
+    -- `commit` writes the session to `req.cache`, and this call was
+    -- unguarded. Measured against a real Redis, twice:
+    --
+    --   REPLICAOF localhost 1     POST /charge -> 500 in 0.00s
+    --   docker pause              POST /charge -> 500 in 5.01s
+    --
+    -- and in both the handler had ALREADY RUN and counted its charge. The
+    -- store failed on the way out, the raise left this middleware, and
+    -- `handle` turned a finished 200 into a bare 500 with the work done and
+    -- nothing said about it. The client's only correct move on a 500 is to
+    -- retry, so a promoted replica converts every non-idempotent POST in the
+    -- fleet into a duplicate -- which is a larger failure than the one being
+    -- reported, and caused by a store that was never on the critical path for
+    -- answering the request.
+    --
+    -- This is the argument `akkar.limit` makes in its own header, applied
+    -- where it had not been: the store's opinion is advice, and a session that
+    -- cannot be persisted is a session that does not persist, not a request
+    -- that did not happen. So the response the handler produced is returned,
+    -- WITHOUT the `Set-Cookie` -- issuing a cookie for state that was never
+    -- written would hand the browser an id the store has never heard of, and
+    -- the next request would be handed a fresh empty session under a signed
+    -- cookie that looks valid.
+    --
+    -- And it is not silent. Failing open on a session write means the user's
+    -- login did not take, so it is logged at ERROR -- one level above the
+    -- limiter's warn, because the limiter degrades a control and this degrades
+    -- the user's own state -- and counted in `M.session_write_failures` for an
+    -- operator to alert on, the same plain field `akkar.limit.store_failures`
+    -- is and for the same reason.
     if req.session then
-      local set_cookie = req.session:commit()
+      local committed, set_cookie = pcall(function() return req.session:commit() end)
+      if not committed then
+        M.session_write_failures = M.session_write_failures + 1
+        pcall(function()
+          req.log:error("session store write failed; the response stands and " ..
+                        "the session was NOT saved", {
+            detail = tostring(set_cookie),
+            effect = "this request is answered without a session cookie; the " ..
+                     "user will appear logged out until the store recovers",
+            session_write_failures = M.session_write_failures,
+          })
+        end)
+        return res
+      end
       if set_cookie then
         local akkar = require "akkar"
         local normalised = res

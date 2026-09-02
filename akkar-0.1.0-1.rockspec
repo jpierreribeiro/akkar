@@ -157,7 +157,6 @@ build = {
     ["akkar.sql"] = "akkar/sql.lua",
     ["akkar.static"] = "akkar/static.lua",
     ["akkar.storage"] = "akkar/storage.lua",
-    ["akkar.substrate"] = "akkar/substrate.lua",
     ["akkar.scope"] = "akkar/scope.lua",
     ["akkar.session"] = "akkar/session.lua",
     ["akkar.time"] = "akkar/time.lua",

@@ -270,7 +270,7 @@ local SETTINGS = {
   body_limit = true, timeout = true, shutdown_grace = true,
   check_capabilities = true, reuseport = true, strict = true,
   max_concurrent = true, trusted_proxies = true, read_timeout = true,
-  repair_substrate = true, socket_buffer = true, gc = true,
+  socket_buffer = true, gc = true,
   cpu_limit = true, h2c = true, websocket_idle_timeout = true,
   websocket_max_message = true, websocket_max_connections = true,
   h2_max_concurrent_streams = true,
@@ -981,7 +981,13 @@ function akkar.new()
   -- that have no reason to end, and a deploy would hang until the grace period
   -- killed it. `sockets_open` is the count, kept separately because counting a
   -- set with `pairs` on every request would be a linear scan on the hot path.
+  --
+  -- `skeletons`, `shapes` and `registered` are the route index. `routes` is
+  -- still the ordered list every reader walks -- doctor, openapi, from_spec --
+  -- and it stays the truth; the three below are lookups derived from it so
+  -- that neither a request nor a registration has to scan it. See `skeleton`.
   return setmetatable({ routes = {}, middleware = {}, exact = {}, mounts = {},
+                        skeletons = {}, shapes = {}, registered = {},
                         sockets = {}, sockets_open = 0 }, App)
 end
 
@@ -1001,6 +1007,102 @@ local function compile(path)
   return pattern .. "$", names
 end
 
+-- ==================================================== the route index
+--
+-- WHAT IT IS FOR. A request that matches nothing used to pay for every route
+-- that exists, twice: `App:match` walked the whole table running a Lua pattern
+-- per parameterised route, and `dispatch` then called `App:methods_for`, which
+-- walked it again to tell a 404 from a 405. Measured on this laptop at 10,000
+-- routes: 19.0 ms of blocking CPU per 404, which is about 50 requests a second
+-- of 404 capacity on a single-threaded loop -- unauthenticated, no body, and
+-- free for whoever asks. `bench/study/router-scale.lua` has the table.
+--
+-- WHAT MAKES A HASH POSSIBLE. `compile` turns `:name` into `([^/]+)`, which
+-- cannot cross a `/`. So a route consumes exactly as many segments as it was
+-- written with, and each of its segments is either a fixed literal or any one
+-- segment. That pair -- the segment count, and which positions are literal --
+-- is the route's SKELETON, and a path can only match a route whose skeleton it
+-- shares. `/users/:id` has skeleton `users/*`, and `/orders/9` cannot reach it
+-- without a comparison.
+--
+-- So: routes are grouped by skeleton, and a lookup builds the skeleton keys a
+-- path could have and reads them out of a table. The number of keys built is
+-- the number of distinct literal/parameter SHAPES registered at that depth --
+-- a property of how the application is written, not of how many routes it has
+-- -- so a 404 costs the same at ten routes and at ten thousand.
+--
+-- WHAT IT IS NOT. It is not a prefix tree. `docs/BACKLOG.md` closed that one
+-- with numbers, and closing it was right: a tree tries children in tree order,
+-- and akkar resolves an ambiguity -- `/users/:id` against `/users/:name` --
+-- by REGISTRATION order, which `akkar doctor` reports on and the reference
+-- documents. The index below changes which routes are compared and changes
+-- nothing about the answer: `route.order` is carried so that the winner is
+-- still the earliest-registered route that matches, exactly as when the list
+-- was walked front to back.
+local SEP, ANY = "\1", "\2"
+
+--- The skeleton of a REGISTERED path: `n`, the key, and which positions are
+--- parameters. `/users/:id` -> 2, `users\1\2`, `{ false, true }`.
+local function skeleton(path)
+  local parts, wild, n = {}, {}, 0
+  for segment in path:gmatch "[^/]+" do
+    n = n + 1
+    if segment:sub(1, 1) == ":" then parts[n], wild[n] = ANY, true
+    else parts[n], wild[n] = segment, false end
+  end
+  return n, table.concat(parts, SEP), wild
+end
+
+--- Every route list whose skeleton this path could match, left in `FOUND`.
+--- Returns how many. Usually one; never more than the number of distinct
+--- shapes the application registered at this depth.
+---
+--- THREE SCRATCH TABLES AND NOT THREE ALLOCATIONS, and the reason is
+--- `spec/allocation_spec.lua`. Written the obvious way -- a fresh `segs`,
+--- `key` and result array per call -- this index cost 952 bytes on every
+--- request to a parameterised route and broke the validated-route ceiling at
+--- 4,502 bytes against 3,650. A router that gets faster by allocating an
+--- index per request has not got faster; it has moved the cost onto the
+--- successful requests to make the 404s look good.
+---
+--- THE ONE RULE THAT MAKES THEM SAFE: nothing may route between filling these
+--- and reading them. `buckets` calls out to nothing, and both callers finish
+--- reading `FOUND` before they touch `self.mounts` -- which is where a nested
+--- `match` or `methods_for` would overwrite it. Moving either mount loop above
+--- its candidate loop breaks that, so do not.
+local SEGS, KEY, FOUND = {}, {}, {}
+
+--- NOT `path:gmatch "[^/]+"`, which is what this said first and what cost 704
+--- of those 952 bytes. A `gmatch` iterator carries a `MatchState`, and a
+--- `MatchState` carries `LUA_MAXCAPTURES` capture slots -- 32 of them, whether
+--- or not the pattern has any -- so splitting a two-segment path on a pattern
+--- allocates more than half a kilobyte to find two substrings. `find` with
+--- `plain` set takes no such state, and the segments it cuts out are short
+--- strings, which Lua interns: the second request for the same path allocates
+--- nothing at all for them.
+local function buckets(self, path)
+  local n, i, len = 0, 1, #path
+  while i <= len do
+    if path:byte(i) == 47 then i = i + 1                   -- `/`, and `//` too
+    else
+      local stop = path:find("/", i, true)
+      n = n + 1
+      if stop then SEGS[n] = path:sub(i, stop - 1); i = stop + 1
+      else SEGS[n] = path:sub(i); i = len + 1 end
+    end
+  end
+  local shapes = self.shapes[n]
+  if not shapes then return 0 end
+  local found = 0
+  for s = 1, #shapes do
+    local wild = shapes[s]
+    for j = 1, n do KEY[j] = wild[j] and ANY or SEGS[j] end
+    local list = self.skeletons[table.concat(KEY, SEP, 1, n)]
+    if list then found = found + 1; FOUND[found] = list end
+  end
+  return found
+end
+
 for _, method in ipairs { "get", "post", "put", "patch", "delete" } do
   App[method] = function(self, path, opts, handler)
     if handler == nil then opts, handler = nil, opts end
@@ -1013,11 +1115,18 @@ for _, method in ipairs { "get", "post", "put", "patch", "delete" } do
     if opts then check_config(opts, ROUTE_OPTIONS, verb .. " " .. path) end
 
     -- Invariant: a duplicate route fails at startup, naming both sites.
-    for _, r in ipairs(self.routes) do
-      if r.method == verb and r.path == path then
-        error(string.format("duplicate route: %s %s\n  already registered at %s\n  duplicated at %s",
-                            verb, path, r.where, where), 2)
-      end
+    --
+    -- Read out of `registered` rather than by rescanning `self.routes`. The
+    -- scan was O(routes) per registration, so booting an application was
+    -- O(routes^2) -- 9.9 s at 10,000 routes on this laptop, against 0.10 s at
+    -- 1,000. Nobody can reach it from outside, which is why it is the cheaper
+    -- half of the same defect; but boot time is the number that decides how
+    -- dense a process-per-tenant deployment can be, and ten seconds spent
+    -- comparing strings to themselves is not a rounding error.
+    local first_at = self.registered[verb .. " " .. path]
+    if first_at then
+      error(string.format("duplicate route: %s %s\n  already registered at %s\n  duplicated at %s",
+                          verb, path, first_at, where), 2)
     end
 
     -- Every schema this route declares is expanded HERE, once, rather than
@@ -1067,9 +1176,28 @@ for _, method in ipairs { "get", "post", "put", "patch", "delete" } do
 
     local pattern, names = compile(path)
     local route = { method = verb, path = path, pattern = pattern, names = names,
-                    handler = handler, opts = opts, where = where }
+                    handler = handler, opts = opts, where = where,
+                    order = #self.routes + 1 }
     self.routes[#self.routes + 1] = route
     if #names == 0 then self.exact[verb .. " " .. path] = route end
+    self.registered[verb .. " " .. path] = where
+
+    -- Indexed here, at the end, so a registration that raised -- a bad schema,
+    -- a duplicate -- leaves nothing behind to be found by a later lookup.
+    local n, key, wild = skeleton(path)
+    local list = self.skeletons[key]
+    if list then list[#list + 1] = route else self.skeletons[key] = { route } end
+    local shapes = self.shapes[n]
+    if not shapes then shapes = { seen = {} }; self.shapes[n] = shapes end
+    -- The shape is the wildcard mask; one entry per distinct mask at this
+    -- depth, because that is how many keys a lookup has to build.
+    local bits = {}
+    for j = 1, n do bits[j] = wild[j] and "1" or "0" end
+    local mask = table.concat(bits)
+    if not shapes.seen[mask] then
+      shapes.seen[mask] = true
+      shapes[#shapes + 1] = wild
+    end
     return self
   end
 end
@@ -1361,12 +1489,25 @@ end
 function App:match(method, path)
   local hit = self.exact[method .. " " .. path]
   if hit then return hit, {} end
-  for _, r in ipairs(self.routes) do
-    if r.method == method and #r.names > 0 then
-      local captured = { path:match(r.pattern) }
-      if captured[1] ~= nil then return r, decode_params(r.names, captured) end
+  -- The earliest-registered route that matches, which is what walking
+  -- `self.routes` front to back returned. `order` is what keeps that true
+  -- across two buckets: within one bucket the routes are already in
+  -- registration order, and the guard also stops a later route in the same
+  -- bucket from being pattern-matched at all once one has won.
+  local found = buckets(self, path)
+  local best, captured
+  for i = 1, found do
+    local list = FOUND[i]
+    for k = 1, #list do
+      local r = list[k]
+      if r.method == method and #r.names > 0
+         and (best == nil or r.order < best.order) then
+        local got = { path:match(r.pattern) }
+        if got[1] ~= nil then best, captured = r, got end
+      end
     end
   end
+  if best then return best, decode_params(best.names, captured) end
   for _, m in ipairs(self.mounts) do
     if path:sub(1, #m.prefix) == m.prefix then
       local rest = path:sub(#m.prefix + 1)
@@ -1403,11 +1544,19 @@ function App:methods_for(path)
   local function add(verb)
     if not seen[verb] then seen[verb] = true list[#list + 1] = verb end
   end
-  for _, r in ipairs(self.routes) do
-    if #r.names == 0 then
-      if r.path == path then add(r.method) end
-    elseif path:match(r.pattern) then
-      add(r.method)
+  -- Same index as `App:match`, for the same reason: this is the SECOND walk a
+  -- 404 paid for, and `dispatch` calls it on every miss to tell a 404 from a
+  -- 405. Order does not matter here -- the list is sorted below.
+  local found = buckets(self, path)
+  for i = 1, found do
+    local list = FOUND[i]
+    for k = 1, #list do
+      local r = list[k]
+      if #r.names == 0 then
+        if r.path == path then add(r.method) end
+      elseif path:match(r.pattern) then
+        add(r.method)
+      end
     end
   end
   for _, m in ipairs(self.mounts) do
@@ -2099,17 +2248,60 @@ local function trace_context(headers)
 end
 akkar.trace_context = trace_context
 
+--- Turns whatever carried the headers into a plain lowercase table.
+---
+--- DUPLICATE VALUES ARE COLLECTED AND JOINED ONCE. The line this replaced was
+--- `out[name] = existing and (existing .. ", " .. clean) or clean`, which
+--- builds a NEW string of the whole accumulation on every repeat of a name --
+--- the textbook quadratic string build, and quadratic in a number an
+--- unauthenticated peer chooses.
+---
+--- Measured on this box, with 4,000-byte values arriving over h2:
+---
+---     1,000 duplicates      2.5 s
+---     4,000 duplicates     32.2 s
+---     8,000 duplicates    111.4 s
+---    16,000 duplicates    364.0 s      from a 20,008-byte header block
+---
+--- None of it yields, so it is the whole process, not one request. `req.headers`
+--- is lazy, but `req.ip` reads it and `akkar/limit.lua` reads `req.ip` in the
+--- default rate-limit key, so the ordinary path arrives here.
+---
+--- The h2 header-count cap in `hpack` is what stops that block being decoded at
+--- all, and is the fix that matters for the attack. This is the other half: a
+--- bound and a quadratic together are a bound on how bad the bound may be
+--- wrong, and 100 duplicates should not cost what 100 duplicates cost here.
+---
+--- The single-value case -- every header appearing once, which is every real
+--- request -- still writes straight into `out` and allocates no table.
 local function normalize_headers(source)
   local out = {}
   if not source then return out end
   if type(source.get) == "function" then          -- a lua-http headers object
+    local repeated                                -- name -> {value, ...}, lazily
     for name, value in source:each() do
       if name:sub(1, 1) ~= ":" then               -- drop :method, :path, ...
         -- Header values are bytes as far as HTTP is concerned, and akkar puts
         -- them in JSON responses. See `safe_text`.
         local clean = safe_text(value)
         local existing = out[name]
-        out[name] = existing and (existing .. ", " .. clean) or clean
+        if existing == nil then
+          out[name] = clean
+        else
+          repeated = repeated or {}
+          local parts = repeated[name]
+          if parts == nil then
+            parts = { existing, clean }
+            repeated[name] = parts
+          else
+            parts[#parts + 1] = clean
+          end
+        end
+      end
+    end
+    if repeated then
+      for name, parts in pairs(repeated) do
+        out[name] = table.concat(parts, ", ")
       end
     end
   else
@@ -2117,6 +2309,11 @@ local function normalize_headers(source)
   end
   return out
 end
+-- Exported for the same reason `safe_text`, `client_ip`, `parse_query` and
+-- `trace_context` are: it is reachable from a request only through a live
+-- server, and its cost is the thing under test. `spec/http2_spec.lua` measures
+-- it directly.
+akkar.normalize_headers = normalize_headers
 
 -- ============================================================== client address
 --
@@ -2245,7 +2442,6 @@ local SETTING_RULES = {
   reuseport          = flag,
   strict             = flag,
   check_capabilities = flag,
-  repair_substrate   = flag,
   -- Cleartext h2, which costs a preface sniff on every connection including
   -- the h1 ones -- so it is a decision, and a decision made with a string is
   -- not one.
@@ -2741,10 +2937,11 @@ local function read_body(stream, request_headers, limit, budget)
   -- unavailability for a header the client typed wrong.
   --
   -- This fixes the ANSWER. The server is saved separately and was not, when
-  -- this comment was first written: `akkar.substrate` repairs the two ways a
-  -- malformed length takes a lua-http server down -- an unbounded spin in
-  -- `shutdown` for a length that is not a number, and an uncaught raise that
-  -- exits the process for one that is negative. See that module and
+  -- this comment was first written: the drain loop in
+  -- `akkar/vendor/http/h1_stream.lua` repairs the two ways a malformed length
+  -- takes a lua-http server down -- an unbounded spin in `shutdown` for a
+  -- length that is not a number, and an uncaught raise that exits the process
+  -- for one that is negative. See that loop and
   -- `docs/substrate/lua-http-wedge.md`.
   if declared and declared < 0 then
     return nil, "malformed"
@@ -3156,22 +3353,6 @@ function App:run(config)
   -- live server is worse than the bug it was looking for.  Development and
   -- the test suite should turn it on; see `akkar.strict`.
   if config.strict then require("akkar.strict").on() end
-
-  -- REPAIR THE SUBSTRATE BEFORE BINDING A PORT.
-  --
-  -- One malformed header stops a lua-http server accepting for ever, and a
-  -- second one kills the process outright. Both are repaired by
-  -- `akkar.substrate`, which explains itself at length and carries the
-  -- measurements. Here rather than at require time: importing akkar should
-  -- not mutate a third-party library as a side effect, and the substrate
-  -- tests need the unpatched behaviour available to compare against.
-  --
-  -- Opt out with `repair_substrate = false` -- for anyone who would rather
-  -- carry the defect than a patched dependency, and so the specs can prove
-  -- what happens without it.
-  if config.repair_substrate ~= false then
-    require("akkar.substrate").apply()
-  end
 
   local port = config.port or 8080
   local host = config.host or "127.0.0.1"

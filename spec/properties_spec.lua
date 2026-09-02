@@ -99,7 +99,11 @@ describe("the pool, under schedules nobody wrote", function()
             local ok, resource = pcall(function() return pool:get() end)
             if ok then held[#held + 1] = resource end
           end)
-          cq:loop(0.05)                          -- may park; that is a schedule too
+          -- ASSERTED, not called: `cq:loop` RETURNS `false, err` when a
+          -- coroutine raises, so a discarded return value swallows every
+          -- assertion made inside a `cq:wrap`. Timeout is truthy, so parking
+          -- is still a schedule.
+          assert(cq:loop(0.05))                  -- may park; that is a schedule too
         end
 
       elseif action <= 7 then                   -- give one back
@@ -162,7 +166,11 @@ describe("the pool, under schedules nobody wrote", function()
               out[#out + 1] = r
             end
           end)
-          cq:loop(0.05)
+          -- THE FIX THAT MAKES THIS TEST ABLE TO FAIL. The only assertion in
+          -- this test lives inside the `cq:wrap` above, and cqueues does not
+          -- re-raise it: `loop` RETURNS `false, err`. Called bare, the
+          -- duplicate-handout this test exists to catch was reported green.
+          assert(cq:loop(0.05))
         elseif #out > 0 then
           local r = table.remove(out, random(#out))
           pool:put(r)

@@ -33,7 +33,6 @@ table you already have.
 | [akkar](akkar.md) | applications, routes, responses, validation, the server |
 | [akkar.scope](scope.md) | rows one tenant may see, enforced at the connection |
 | [akkar.strict](strict.md) | makes a global variable an error |
-| [akkar.substrate](substrate.md) | repairs the known defects in lua-http before they are hit |
 
 ### Data
 

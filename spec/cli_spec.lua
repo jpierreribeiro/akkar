@@ -180,7 +180,10 @@ describe("akkar run", function()
         if ss then ss:get_body_as_string() end
       end
     end)
-    cq:loop(30)
+    -- ASSERTED: bare, a raise inside the polling wrap above became `false,
+    -- err` that nobody read, and the test then reported "the scaffolded app
+    -- never answered" for a client-side error.
+    assert(cq:loop(30))
 
     -- Stop it by port rather than by name: `pkill -f lua5.4` in a suite that
     -- spawns interpreters is a way to kill the suite. `ss` is iproute2, so

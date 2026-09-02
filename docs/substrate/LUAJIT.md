@@ -4,8 +4,15 @@ F3 in `docs/PLAN.md` is a one-week timebox with its decision rule written in
 advance: **if `/ping` does not gain ≥ 2×, LuaJIT is refused with a number.**
 
 This page is the half of that week that does not need the study box: **what it
-would cost**, enumerated rather than estimated. The throughput half is still
-unmeasured and the decision is still open.
+would cost**, enumerated rather than estimated. ~~The throughput half is still
+unmeasured and the decision is still open.~~ **It was measured — see "THE
+ANSWER: 1.62×, REFUSED" below, which is the current state of this page. The
+sentence above and the "still to do" paragraph at the end were written before
+the run and were never updated; they are struck rather than deleted so the
+order of events stays readable.**
+
+`docs/why/slower-than-openresty.md` puts this number beside the other refusals
+and against the two decision rules that disagree about what 1.62× licenses.
 
 The short version: the substrate is ready and akkar is not. Nine of akkar's
 own files do not compile under LuaJIT, and the reason is not the one the plan

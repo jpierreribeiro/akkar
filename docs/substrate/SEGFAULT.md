@@ -130,9 +130,48 @@ Nothing touches the fileno tree, the pollset, or memory management. Upgrading
 would not fix this, and saying otherwise would have sent somebody down a
 packaging path for a memory bug.
 
+## UPDATE, 2 September 2026: the pool was retired and the crash outlived it
+
+The experiment below implicated the controller pool, and the pool is gone --
+`962ceaa` retired it the same day, and `akkar/execution.lua` now keeps
+`AKKAR_CONTROLLER_POOL` only as a no-op read so an environment that still sets
+it does not look like it is doing something. There are no nested controllers.
+
+**The crash is still here.** `unit (ubuntu-24.04-arm, 5.4)` exits 139 on every
+CI run since 1 September, at `table_LLRB_FIND`, the same function this file
+records. So the hypothesis below is refuted by elimination: whatever corrupts
+that tree, it is not controller reuse.
+
+Two facts frame what replaced it. First, the arm64 job was green at `ec74364`
+and has failed since, which looks like a regression and is not one: the only
+change to `akkar/execution.lua` across that range is Lua code adding a second
+field to a log table. It touches no socket, no descriptor and no controller,
+and cannot corrupt a pollset.
+
+Second, the suite grew from **1205 tests to 1501** across the same range, a
+quarter more. This file already says the bug is intermittent, load-dependent,
+and that "re-running until it passes is exactly what must not be done with it."
+A load-dependent memory bug surfaces more often when the load rises. The
+likeliest reading is that we did not introduce it -- we made it likely enough
+to see every time, on the slowest of the three platforms.
+
+That is a worse position than a regression, not a better one. A regression has
+a commit to revert. This has an intermittent use-after-free in a C dependency,
+now firing reliably enough to block CI, with its leading suspect eliminated.
+
+**What is still true from below, and worth not re-running:** the minimal
+reproducer did not reproduce (8,000 rounds), ASan found nothing and is the
+wrong instrument for a race, and the pinned cqueues commit differs by seven
+lines that touch nothing relevant.
+
+**What is newly testable:** the crash is now reproducible on demand on arm64 in
+CI, where before it needed half an hour of local runs to catch four. A
+platform that fails every time is a better laboratory than one that fails
+sometimes.
+
 ## The experiment, and its result
 
-**The controller pool is implicated.**
+**The controller pool is implicated.** (Superseded -- see the update above.)
 
 | arm | crashes | runs |
 |---|---:|---:|

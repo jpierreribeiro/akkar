@@ -19,6 +19,58 @@ end
 
 local MAX_HEADER_BUFFER_SIZE = 400*1024 -- 400 KB is max size in h2o
 
+-- AND A FRAME COUNT, because the byte cap above cannot see an empty frame.
+--
+-- A CONTINUATION frame with a zero-length payload adds nothing to the byte
+-- total, so `len > MAX_HEADER_BUFFER_SIZE` can never fire on a stream of them
+-- -- while each one still appends to the buffer table. `h2_connection` forbids
+-- every other frame type while a header block is open, so an attacker is
+-- confined to exactly the frame that works, and there is no deadline on an
+-- incomplete block.
+--
+-- Measured with the accumulation isolated: two million empty frames accepted,
+-- byte total still zero, 32 MB of Lua heap, nothing refused. On the wire that
+-- is 9 bytes per frame -- 18 MB of traffic for 32 MB of memory that is never
+-- freed, on one unauthenticated connection.
+--
+-- The existing spec for this class sends 32 frames of 16 KB and passes,
+-- because that crosses the byte cap. It tests the variant the cap catches.
+--
+-- 20,000 is far above any real header block -- HPACK's own worst case here is
+-- bounded by the 400 KB above -- and far below the millions an attack needs.
+local MAX_HEADER_BUFFER_ITEMS = 20000
+
+-- RAPID RESET, CVE-2023-44487. A token bucket on RST_STREAM frames received,
+-- per connection, drained one per frame and refilled with time.
+--
+-- The shape is not invented here. Every implementation that shipped a fix in
+-- October 2023 landed on counting resets and killing the connection past a
+-- threshold, and they differ only in how the threshold decays:
+--
+--   * nginx 1.25.3 counts for the LIFETIME of the connection --
+--     `if (h2c->refused_streams++ > ngx_max(h2scf->concurrent_streams, 100))`
+--     then closes with GOAWAY(NO_ERROR). Source of the 100 floor below.
+--   * Go's `net/http2` refuses at `4 * advMaxStreams` queued handlers with
+--     `ConnectionError(ErrCodeEnhanceYourCalm)`, counted as
+--     "too_many_early_resets". Source of the error code below.
+--   * nghttp2 1.57 added `nghttp2_option_set_stream_reset_rate_limit`, a
+--     token bucket -- burst and per-second refill. Source of the shape.
+--
+-- The bucket, rather than nginx's lifetime counter, because a lifetime counter
+-- eventually kills a long-lived connection that has done nothing wrong: a
+-- browser tab open for an hour cancelling one fetch a minute is indistinguish-
+-- able from an attacker to a counter that never decays. What separates them is
+-- RATE, so that is what is measured.
+--
+-- 100 is the floor nginx uses and is raised to the advertised concurrency
+-- ceiling when there is one, so a client permitted N streams at once may
+-- always cancel N. 33/s is nghttp2's refill: sustained, a peer may cancel
+-- roughly two thousand streams a minute for ever without being disconnected,
+-- and an attacker needs orders of magnitude more than that for the attack to
+-- be worth mounting.
+local RST_STREAM_BURST = 100
+local RST_STREAM_RATE = 33 -- credits per second
+
 local known_settings = {}
 for i, s in pairs({
 	[0x1] = "HEADER_TABLE_SIZE";
@@ -54,7 +106,23 @@ end
 
 local frame_handlers = {}
 
-local stream_methods = {}
+local stream_methods = {
+	-- THE BOUND HTTP/1.1 HAS HAD ALL ALONG. `h1_stream` sets
+	-- `max_header_lines = 100` and enforces it in its read loop; h2 had no
+	-- counterpart anywhere -- not here, not in `h2_connection`, not in
+	-- `hpack` -- and `SETTINGS_MAX_HEADER_LIST_SIZE` is advertised as
+	-- `math.huge`. The only h2 bound was `MAX_HEADER_BUFFER_SIZE` above,
+	-- 400 KB of COMPRESSED block, and HPACK is a compressor: an indexed
+	-- header field is one byte and appends a whole name/value pair.
+	--
+	-- Same name and same number as h1 on purpose. A request that h1 refuses
+	-- and h2 accepts is a hole with a version number on it, and the two
+	-- limits should move together when either moves.
+	--
+	-- Enforced inside `hpack:decode_headers`, not on its result: after it
+	-- returns, every field has already been allocated.
+	max_header_lines = 100;
+}
 for k, v in pairs(stream_common.methods) do
 	stream_methods[k] = v
 end
@@ -464,7 +532,10 @@ local function process_end_headers(stream, end_stream, pad_len, pos, promised_st
 		payload = payload:sub(1, -pad_len-1)
 	end
 
-	local headers, newpos, errno = stream.connection.decoding_context:decode_headers(payload, nil, pos)
+	-- The field-count bound travels INTO the decoder, because the decoder is
+	-- where the fields are allocated. See `max_header_lines` above.
+	local headers, newpos, errno = stream.connection.decoding_context:decode_headers(
+		payload, nil, pos, stream.max_header_lines)
 	if not headers then
 		return nil, newpos, errno
 	end
@@ -688,6 +759,47 @@ frame_handlers[frame_types.RST_STREAM] = function(stream, flags, payload, deadli
 	if #payload ~= 4 then
 		return nil, h2_errors.FRAME_SIZE_ERROR:new_traceback("'RST_STREAM' frames must be 4 bytes"), ce.EILSEQ
 	end
+
+	-- RAPID RESET, CVE-2023-44487, counted here because nothing above can.
+	--
+	-- Counting every well-formed RST_STREAM, including the one for an already
+	-- closed stream that falls through to `return true` below: an attacker who
+	-- could recycle a closed stream id for free would have the same connection
+	-- back.
+	--
+	-- Why `max_peer_streams` cannot do this job. `set_state("closed")` at the
+	-- bottom of this handler decrements `n_active_streams`, so the slot is free
+	-- again before the next frame is read and the concurrency ceiling is never
+	-- approached, let alone crossed -- by construction, not by tuning. The cost
+	-- the attacker still pays for is upstream of the slot: a full HPACK decode
+	-- and a stream object per cycle, on a connection that never holds two
+	-- streams at once. akkar's own admission gate sits above this layer, on
+	-- requests that reach the application, and these never do.
+	--
+	-- Measured before this bound existed: one million RST_STREAM frames
+	-- accepted in 5.3 s with `n_active_streams` back at zero every time.
+	local connection = stream.connection
+	local burst = RST_STREAM_BURST
+	local ceiling = connection.max_peer_streams
+	if type(ceiling) == "number" and ceiling > burst and ceiling < math.huge then
+		burst = ceiling -- nginx's floor: max(concurrent_streams, 100)
+	end
+	local now = monotime()
+	local credits = connection.rst_stream_credits
+	if credits == nil then
+		credits = burst
+	else
+		credits = math.min(burst,
+			credits + (now - connection.rst_stream_time) * RST_STREAM_RATE)
+	end
+	connection.rst_stream_time = now
+	if credits < 1 then
+		connection.rst_stream_credits = credits
+		return nil, h2_errors.ENHANCE_YOUR_CALM:new_traceback(
+			"too many 'RST_STREAM' frames"), ce.E2BIG
+	end
+	connection.rst_stream_credits = credits - 1
+
 	if stream.state == "idle" then
 		return nil, h2_errors.PROTOCOL_ERROR:new_traceback("'RST_STREAM' frames MUST NOT be sent for a stream in the 'idle' state"), ce.EILSEQ
 	elseif stream.state == "closed" then
@@ -1138,6 +1250,9 @@ frame_handlers[frame_types.CONTINUATION] = function(stream, flags, payload, dead
 	local len = stream.connection.recv_headers_buffer_length + #payload
 	if len > MAX_HEADER_BUFFER_SIZE then
 		return nil, h2_errors.PROTOCOL_ERROR:new_traceback("headers too large"), ce.E2BIG
+	end
+	if stream.connection.recv_headers_buffer_items >= MAX_HEADER_BUFFER_ITEMS then
+		return nil, h2_errors.PROTOCOL_ERROR:new_traceback("too many header frames"), ce.E2BIG
 	end
 	table.insert(stream.connection.recv_headers_buffer, payload)
 	stream.connection.recv_headers_buffer_items = stream.connection.recv_headers_buffer_items + 1
