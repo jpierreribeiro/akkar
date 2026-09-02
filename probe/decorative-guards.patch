@@ -1,0 +1,56 @@
+diff --git a/spec/idempotency_tenancy_spec.lua b/spec/idempotency_tenancy_spec.lua
+index 842b48b..0bb15ff 100644
+--- a/spec/idempotency_tenancy_spec.lua
++++ b/spec/idempotency_tenancy_spec.lua
+@@ -18,21 +18,9 @@ local redis       = require "akkar.redis"
+ local cqueues     = require "cqueues"
+ 
+ local function reachable()
+-  -- PING, not merely connect. `cqueues.socket.connect` builds the socket
+-  -- lazily and touches the network on first use, so `pcall` around the factory
+-  -- returns TRUE with nothing listening. This guard was that shape, and it
+-  -- only looked correct because a developer's machine always has Redis
+-  -- running -- `spec/jobs_redis_spec.lua` records the same discovery, and CI's
+-  -- no-services job found this one the same way, on its first run against
+-  -- this file.
+-  --
+-  -- A Postgres guard of the identical shape is fine, which is why they sit
+-  -- side by side in this suite looking equivalent: pgmoon connects eagerly.
+   local ok, conn = pcall(redis.connect { pool_size = 0 })
+-  if not ok then return false end
+-  local alive = pcall(function() return conn:ping() end)
+-  conn:close()
+-  return alive
++  if ok then conn:close() end
++  return ok
+ end
+ 
+ if not reachable() then
+diff --git a/spec/limit_keys_spec.lua b/spec/limit_keys_spec.lua
+index 95f40f1..72baf85 100644
+--- a/spec/limit_keys_spec.lua
++++ b/spec/limit_keys_spec.lua
+@@ -17,21 +17,9 @@ local redis   = require "akkar.redis"
+ local cqueues = require "cqueues"
+ 
+ local function reachable()
+-  -- PING, not merely connect. `cqueues.socket.connect` builds the socket
+-  -- lazily and touches the network on first use, so `pcall` around the factory
+-  -- returns TRUE with nothing listening. This guard was that shape, and it
+-  -- only looked correct because a developer's machine always has Redis
+-  -- running -- `spec/jobs_redis_spec.lua` records the same discovery, and CI's
+-  -- no-services job found this one the same way, on its first run against
+-  -- this file.
+-  --
+-  -- A Postgres guard of the identical shape is fine, which is why they sit
+-  -- side by side in this suite looking equivalent: pgmoon connects eagerly.
+   local ok, conn = pcall(redis.connect { pool_size = 0 })
+-  if not ok then return false end
+-  local alive = pcall(function() return conn:ping() end)
+-  conn:close()
+-  return alive
++  if ok then conn:close() end
++  return ok
+ end
+ 
+ if not reachable() then
