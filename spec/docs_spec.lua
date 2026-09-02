@@ -102,8 +102,12 @@ TMP = (TMP and TMP .. "/tmp") or "/tmp"
 -- is a lesson teaching the wrong text, and nothing but running it can tell.
 -- Its database examples create their own `sqlguide_`-prefixed tables and drop
 -- them again, so the track leaves the shared database as it found it.
-local DOC_DIRS = { "docs/guide", "docs/recipes", "docs/reference", "docs/sql",
-                   "docs/why" }
+local ENGLISH_DOC_DIRS = { "guide", "recipes", "reference", "sql", "why" }
+local DOC_DIRS = {}
+for _, dir in ipairs(ENGLISH_DOC_DIRS) do
+  DOC_DIRS[#DOC_DIRS + 1] = "docs/" .. dir
+  DOC_DIRS[#DOC_DIRS + 1] = "docs/pt-BR/" .. dir
+end
 
 --- Every markdown file under the documented directories, sorted so failures
 --- are reported in a stable order rather than in whatever order the
@@ -314,6 +318,28 @@ local function port_is_free()
 end
 
 local files = doc_files()
+
+describe("the Brazilian Portuguese documentation", function()
+  local function names_under(root)
+    local names = {}
+    local pipe = io.popen(("find %s -name '*.md' -type f 2>/dev/null"):format(root))
+    if pipe then
+      for path in pipe:lines() do
+        names[#names + 1] = path:sub(#root + 2)
+      end
+      pipe:close()
+    end
+    table.sort(names)
+    return names
+  end
+
+  for _, dir in ipairs(ENGLISH_DOC_DIRS) do
+    it("mirrors every page under docs/" .. dir, function()
+      assert.same(names_under("docs/" .. dir),
+                  names_under("docs/pt-BR/" .. dir))
+    end)
+  end
+end)
 
 describe("the documentation", function()
   if #files == 0 then
