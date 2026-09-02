@@ -133,6 +133,8 @@ local time         = require "akkar.time"
 -- cqueues and akkar.time, so this adds no cycle.
 local execution    = require "akkar.execution"
 local describe     = require("akkar.errno").describe
+-- Requires only akkar.time, so this adds no cycle either.
+local breaker      = require "akkar.breaker"
 
 local M = {}
 
@@ -449,6 +451,47 @@ function Client:attempt(method, url, options)
   local key = ("%s://%s:%d"):format(scheme, req.host, req.port)
   local limit = options.max_body or self.max_body
 
+  -- THE BREAKER IS CONSULTED BEFORE ANYTHING IS DIALLED, and a refusal
+  -- returns here having spent nothing: no connection, no slot, none of the
+  -- execution's budget. That is the gap the deadline leaves open -- it bounds
+  -- what one call to a dead service costs, and this is what stops the next
+  -- thousand calls from each paying it.
+  local guard = self:breaker_for(key)
+  if guard then
+    local allowed, why = guard:allow()
+    if not allowed then return nil, why end
+  end
+
+  local repeatable = SAFE_TO_RETRY[method] or options.retry_unsafe
+  local res, why = self:exchange(key, req, body, timeout, limit, repeatable)
+
+  if guard then
+    -- A 5xx is the dependency failing and a 4xx is the dependency working,
+    -- which is the same line `request` draws for retries. A transport error
+    -- (nil) is a failure whatever the reason says.
+    if res and res.status < 500 then guard:success() else guard:failure() end
+  end
+  return res, why
+end
+
+--- The breaker for `key`, or nil when this client has none.
+---
+--- One shared instance covers every origin; a configuration table builds one
+--- per origin on first use, keyed exactly as the pools are, so a dead host
+--- trips its own breaker and not its neighbours'.
+function Client:breaker_for(key)
+  if self.breaker then return self.breaker end
+  if not self.breaker_config then return nil end
+  local found = self.breakers[key]
+  if not found then
+    found = breaker.new(self.breaker_config)
+    self.breakers[key] = found
+  end
+  return found
+end
+
+--- The pool loop: a connection, one exchange, and at most one repeat.
+function Client:exchange(key, req, body, timeout, limit, repeatable)
   -- TWICE AT MOST, AND ONLY FOR A REUSED CONNECTION.
   --
   -- The liveness probe cannot be atomic with the write, so a connection can
@@ -457,7 +500,6 @@ function Client:attempt(method, url, options)
   -- but only when repeating the request is safe, because a POST that reached
   -- the server before the socket broke has already had its effect. The same
   -- rule as `SAFE_TO_RETRY`, applied to a different failure.
-  local repeatable = SAFE_TO_RETRY[method] or options.retry_unsafe
   for try = 1, 2 do
     local deadline = time.monotime() + timeout
     local resource, reused = self:acquire(key, req.host, req.port, req.tls,
@@ -496,6 +538,11 @@ function Client:request(method, url, options)
       last = ("status %d"):format(res.status)
     else
       last = why
+      -- Refused by the breaker: nothing was dialled, and dialling again after
+      -- a backoff would only be refused again until the cooldown passes --
+      -- which is measured in seconds, not in this request's budget. So the
+      -- refusal is the answer, at once, and the budget is left for the caller.
+      if why == breaker.OPEN then return nil, why end
     end
     if attempt < allowed then
       time.sleep((options.retry_backoff or self.retry_backoff) * (2 ^ attempt))
@@ -545,8 +592,14 @@ end
 --- saturated or every host is idle, and those want opposite responses.
 function Client:stats()
   local out = { stale_reused = self.stale_reused,
-                retried_stale = self.retried_stale, origins = {} }
+                retried_stale = self.retried_stale, origins = {},
+                breakers = {} }
   for key, pool in pairs(self.pools) do out.origins[key] = pool:stats() end
+  if self.breaker then
+    out.breakers["*"] = self.breaker:stats()
+  else
+    for key, guard in pairs(self.breakers) do out.breakers[key] = guard:stats() end
+  end
   return out
 end
 
@@ -569,6 +622,16 @@ function M.connect(config)
     -- Left nil on purpose: lua-http then negotiates. Pinning 1.1 is available
     -- for a peer that mis-advertises h2.
     http_version  = config.http_version,
+    -- `breaker = breaker.new{...}` is one breaker for the whole client, which
+    -- is right when the client talks to one service. A plain table of
+    -- breaker options is one breaker PER ORIGIN, built on first use, which is
+    -- right when it talks to several and one of them going down must not
+    -- take the others off the air with it.
+    breaker       = breaker.is(config.breaker) and config.breaker or nil,
+    breaker_config = (type(config.breaker) == "table"
+                      and not breaker.is(config.breaker)) and config.breaker
+                     or nil,
+    breakers      = {},
     pools         = {},
     stale_reused  = 0,
     retried_stale = 0,

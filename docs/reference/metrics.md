@@ -19,6 +19,7 @@ local metrics = require "akkar.metrics"
 - [metrics.otlp(snapshots, resource)](#metricsotlpsnapshots-resource)
 - [metrics.Registry](#metricsregistry)
 - [Registry](#registry)
+  - [registry:breaker(name, breaker)](#registrybreakername-breaker)
   - [registry:counter(name, delta, labels)](#registrycountername-delta-labels)
   - [registry:gauge(name, value, labels)](#registrygaugename-value-labels)
   - [registry:memory()](#registrymemory)
@@ -87,6 +88,51 @@ The metatable every registry shares. Exported for a test that wants to
 identify one.
 
 ## Registry
+
+### registry:breaker(name, breaker)
+
+Registers a [breaker](breaker.md) to be READ at every scrape, under the label
+`breaker="<name>"`. The same contract as `registry:pool`: the registry keeps
+a reference and calls `breaker:stats()` from inside `render()`, and the
+breaker's own path is never touched.
+
+| argument | type | meaning |
+|---|---|---|
+| `name` | string | the `breaker` label value, non-empty |
+| `breaker` | breaker | anything with a `stats()` returning the fields below |
+
+**Returns** the breaker, so the call chains off `breaker.new{...}`.
+
+**Raises** on a `name` that is not a non-empty string, and on a `breaker`
+with no `stats()` to read, for the reason `registry:pool` does.
+
+Five series per breaker:
+
+| metric | type | from |
+|---|---|---|
+| `akkar_breaker_state` | gauge | `0` closed, `1` half-open, `2` open |
+| `akkar_breaker_trips_total` | counter | times it opened |
+| `akkar_breaker_refused_total` | counter | calls refused without running |
+| `akkar_breaker_calls_total` | counter | calls that ran under it |
+| `akkar_breaker_failures_total` | counter | calls that ran and failed |
+
+`state` is a number so an alert can be `akkar_breaker_state > 0`. Two
+breakers registered under one name sum their counters and report the WORSE
+state rather than a sum that means nothing; the label is bounded at 64 names
+the way `pool` is.
+
+```lua
+local metrics = require "akkar.metrics"
+local breaker = require "akkar.breaker"
+
+local registry = metrics.new()
+local b = registry:breaker("payments", breaker.new { threshold = 1 })
+b:call(function() return nil, "down" end)
+
+local text = registry:render()
+print((text:match "akkar_breaker_state{[^\n]*"))   --> akkar_breaker_state{breaker="payments"} 2
+assert(text:find('akkar_breaker_trips_total{breaker="payments"} 1', 1, true))
+```
 
 ### registry:counter(name, delta, labels)
 
@@ -299,8 +345,9 @@ Always present:
 
 Counters and gauges are rendered only when at least one has been set, each
 with a `# TYPE` line written once per name. Every pool registered with
-`registry:pool` is READ here, at render time, and contributes the nine
-families listed under that method, grouped by metric name -- the exposition
+`registry:pool`, and every breaker registered with `registry:breaker`, is
+READ here, at render time, and contributes the families listed under that
+method, grouped by metric name -- the exposition
 format requires every sample of one family to be contiguous.
 
 An integer renders bare; anything fractional renders with six decimals, so a

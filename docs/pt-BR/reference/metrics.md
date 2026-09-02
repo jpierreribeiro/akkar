@@ -17,6 +17,7 @@ local metrics = require "akkar.metrics"
 - [metrics.otlp(snapshots, resource)](#metricsotlpsnapshots-resource)
 - [metrics.Registry](#metricsregistry)
 - [Registry](#registry)
+  - [registry:breaker(name, breaker)](#registrybreakername-breaker)
   - [registry:counter(name, delta, labels)](#registrycountername-delta-labels)
   - [registry:gauge(name, value, labels)](#registrygaugename-value-labels)
   - [registry:memory()](#registrymemory)
@@ -80,6 +81,44 @@ print(body.resourceMetrics[1].scopeMetrics[1].scope.name)               --> akka
 A metatable que todo registro compartilha. Exportada para um teste que queira identificar um.
 
 ## Registry
+
+### registry:breaker(name, breaker)
+
+Registra um [breaker](breaker.md) para ser LIDO a cada scrape, sob o rótulo `breaker="<name>"`. O mesmo contrato de `registry:pool`: o registro mantém uma referência e chama `breaker:stats()` de dentro de `render()`, e o caminho do próprio breaker nunca é tocado.
+
+| argumento | tipo | significado |
+|---|---|---|
+| `name` | string | o valor do rótulo `breaker`, não vazio |
+| `breaker` | breaker | qualquer coisa com um `stats()` que retorne os campos abaixo |
+
+**Retorna** o breaker, para que a chamada encadeie a partir de `breaker.new{...}`.
+
+**Levanta** erro quando `name` não é uma string não vazia, e quando `breaker` não tem um `stats()` para ler, pelo motivo que `registry:pool` levanta.
+
+Cinco séries por breaker:
+
+| métrica | tipo | origem |
+|---|---|---|
+| `akkar_breaker_state` | gauge | `0` fechado, `1` half-open, `2` aberto |
+| `akkar_breaker_trips_total` | counter | vezes que ele abriu |
+| `akkar_breaker_refused_total` | counter | chamadas recusadas sem rodar |
+| `akkar_breaker_calls_total` | counter | chamadas que rodaram sob ele |
+| `akkar_breaker_failures_total` | counter | chamadas que rodaram e falharam |
+
+`state` é um número para que um alerta possa ser `akkar_breaker_state > 0`. Dois breakers registrados sob um mesmo nome somam seus contadores e reportam o PIOR estado em vez de uma soma que não significa nada; o rótulo é limitado a 64 nomes do jeito que `pool` é.
+
+```lua
+local metrics = require "akkar.metrics"
+local breaker = require "akkar.breaker"
+
+local registry = metrics.new()
+local b = registry:breaker("payments", breaker.new { threshold = 1 })
+b:call(function() return nil, "down" end)
+
+local text = registry:render()
+print((text:match "akkar_breaker_state{[^\n]*"))   --> akkar_breaker_state{breaker="payments"} 2
+assert(text:find('akkar_breaker_trips_total{breaker="payments"} 1', 1, true))
+```
 
 ### registry:counter(name, delta, labels)
 
@@ -235,7 +274,7 @@ Sempre presente:
 | `akkar_request_duration_seconds_count` | histogram | `method`, `route` |
 | `akkar_uptime_seconds` | gauge | nenhum |
 
-Contadores e gauges são renderizados só quando pelo menos um foi definido, cada um com uma linha `# TYPE` escrita uma vez por nome. Todo pool registrado com `registry:pool` é LIDO aqui, no momento do render, e contribui com as nove famílias listadas naquele método, agrupadas por nome de métrica — o formato de exposição exige que toda amostra de uma família fique contígua.
+Contadores e gauges são renderizados só quando pelo menos um foi definido, cada um com uma linha `# TYPE` escrita uma vez por nome. Todo pool registrado com `registry:pool`, e todo breaker registrado com `registry:breaker`, é LIDO aqui, no momento do render, e contribui com as famílias listadas naquele método, agrupadas por nome de métrica — o formato de exposição exige que toda amostra de uma família fique contígua.
 
 Um inteiro é renderizado puro; qualquer coisa fracionária é renderizada com seis casas decimais, para que uma espera abaixo de um milissegundo não saia no scrape em notação científica do Lua.
 

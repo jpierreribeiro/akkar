@@ -23,6 +23,7 @@ um valor, ou um campo para adicionar a uma tabela que você já tem.
 | tirar trabalho do caminho da requisição | [akkar.jobs](jobs.md), [akkar.work](work.md) |
 | saber quem é o chamador | [akkar.session](session.md), [akkar.auth](auth.md) |
 | impedir que um chamador tome o servidor inteiro | [akkar.limit](limit.md) |
+| parar de discar uma dependência que caiu | [akkar.breaker](breaker.md) |
 | ver o que o servidor está fazendo | [akkar.log](log.md), [akkar.metrics](metrics.md), [akkar.trace](trace.md) |
 | enviar os três para um único collector OpenTelemetry | [akkar.otlp](otlp.md) |
 | descobrir por que ele respondeu 500 | [akkar.errors](errors.md) |
@@ -61,6 +62,7 @@ um valor, ou um campo para adicionar a uma tabela que você já tem.
 
 | módulo | o que é |
 |---|---|
+| [akkar.breaker](breaker.md) | um circuit breaker, para uma dependência morta parar de ser discada |
 | [akkar.compress](compress.md) | compressão de resposta |
 | [akkar.etag](etag.md) | requisições condicionais, e a escrita que desapareceria |
 | [akkar.http](http.md) | o cliente de saída, como uma capacidade |
