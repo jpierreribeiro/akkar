@@ -103,27 +103,29 @@ describe("akkar.pq", function()
 
       conn:close()
     end)
+  end)
 
-    it("binds many parameters without corrupting the Lua stack", function()
-      -- `pq_send_query` pushes one Lua stack slot per parameter and leaves it
-      -- there until libpq has copied the values. The C API guarantees only
-      -- LUA_MINSTACK -- twenty -- free slots on entry, and the parameter check
-      -- admits up to 65535. Without `lua_checkstack` the pushes write past the
-      -- frame, and `api_check` compiles out under NDEBUG, so it is silent heap
-      -- corruption rather than an error.
-      --
-      -- Measured with that push pattern isolated and nothing else changed:
-      -- twenty-eight parameters clean, forty and two hundred hang, a thousand
-      -- dumps core. The threshold moves with the Lua stack depth at the call
-      -- site, so the same query can corrupt quietly on one path and crash on
-      -- another -- which is worse than crashing, because it is silent.
-      --
-      -- Every case in this file before this one binds at most ONE parameter,
-      -- which is why 65535 was reachable and untested. The route that reaches
-      -- it needs no exotic SQL: `Query:where_in(column, values)` emits one
-      -- placeholder per element with no bound on the array, so a handler doing
-      -- `where_in("id", body.ids)` over a client-supplied list is enough.
-      local conn = assert(pq.connect(PG))
+  it("binds many parameters without corrupting the Lua stack", function()
+    -- `pq_send_query` pushes one Lua stack slot per parameter and leaves it
+    -- there until libpq has copied the values. The C API guarantees only
+    -- LUA_MINSTACK -- twenty -- free slots on entry, and the parameter check
+    -- admits up to 65535. Without `lua_checkstack` the pushes write past the
+    -- frame, and `api_check` compiles out under NDEBUG, so it is silent heap
+    -- corruption rather than an error.
+    --
+    -- Measured with that push pattern isolated and nothing else changed:
+    -- twenty-eight parameters clean, forty and two hundred hang, a thousand
+    -- dumps core. The threshold moves with the Lua stack depth at the call
+    -- site, so the same query can corrupt quietly on one path and crash on
+    -- another -- which is worse than crashing, because it is silent.
+    --
+    -- Every case in this file before this one binds at most ONE parameter,
+    -- which is why 65535 was reachable and untested. The route that reaches
+    -- it needs no exotic SQL: `Query:where_in(column, values)` emits one
+    -- placeholder per element with no bound on the array, so a handler doing
+    -- `where_in("id", body.ids)` over a client-supplied list is enough.
+    inside(function()
+      local conn = assert(pq.connect(CONFIG))
 
       for _, n in ipairs { 28, 200, 1000 } do
         local params, marks = {}, {}
@@ -138,6 +140,48 @@ describe("akkar.pq", function()
           "the sum came back wrong at " .. n .. " parameters, which means the "
           .. "values were not the values that were bound")
       end
+
+      conn:close()
+    end)
+  end)
+
+  it("refuses a NUL in a parameter rather than binding a shorter value", function()
+    -- FOUND BY RUNNING THIS FILE FOR THE FIRST TIME.
+    --
+    -- Parameters go over in text format, so libpq measures each value with
+    -- `strlen` and ignores the `lengths` array entirely. A Lua string is
+    -- counted rather than terminated, so `"ab\0cd"` was bound as `"ab"`:
+    -- five bytes handed in, two bytes sent, no error raised anywhere. The
+    -- assertion below FAILED before the fix, answering 2.
+    --
+    -- Silently binding a shorter value is worse than refusing, because the
+    -- query still runs and still matches rows -- different ones.
+    -- `where email = $1` over an attacker-supplied string finds whichever
+    -- account has the prefix as its whole address.
+    --
+    -- pgmoon does not have the hole: Postgres rejects the same value with
+    -- `invalid byte sequence for encoding "UTF8": 0x00`. Since no Postgres
+    -- text type can hold a NUL, there is no correct value to send, and the
+    -- contract this file exists to pin is that both drivers fail here.
+    inside(function()
+      local conn = assert(pq.connect(CONFIG))
+
+      local ok, why = pcall(function()
+        return conn:query("select length($1::text) as n", { "ab\0cd" })
+      end)
+      assert.is_false(ok, "a parameter with a NUL byte was accepted")
+      assert.is_truthy(tostring(why):find("NUL", 1, true),
+        "it failed, but not for the reason it should: " .. tostring(why))
+
+      -- And a string with no NUL is untouched, including one with high bytes,
+      -- so the check is not quietly rejecting anything non-ASCII. `length`
+      -- counts CHARACTERS, so six for nine bytes -- which is also the
+      -- assertion that the value arrived whole rather than cut at the first
+      -- byte above 0x7f.
+      local rows = assert(conn:query(
+        "select length($1::text) as n, $1::text as v", { "caf\u{e9} \u{1F600}" }))
+      assert.equal(6, rows[1].n)
+      assert.equal("caf\u{e9} \u{1F600}", rows[1].v)
 
       conn:close()
     end)

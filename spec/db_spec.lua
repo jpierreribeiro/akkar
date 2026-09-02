@@ -50,9 +50,34 @@ end
 --
 -- It is also the gate for promoting `pq` to the default. A driver earns that
 -- by answering the contract, not by being newer.
+--
+-- AND A CONDITIONAL THAT REPORTS NOTHING IS WORSE THAN ONE THAT REPORTS
+-- PENDING. This used to be a bare `if`: with `pq_native.so` absent the whole
+-- second pass -- twenty-five cases, the entire evidence for the adapter-boundary
+-- claim -- vanished from the run with no scoreboard entry at all. The suite
+-- printed the same green either way, so "the C driver answers the contract"
+-- and "the C driver was never asked" were indistinguishable from the output.
+-- That is exactly how `.github/workflows/ci.yml` went ten months without
+-- compiling `src/akkar_pq.c` and stayed green.
+--
+-- So the absence is now NAMED, and named with its cause: a missing build and
+-- a missing server are different problems with different fixes, and a single
+-- "skipping" would send the reader to the wrong one.
 local DRIVERS = { "pgmoon" }
-if pcall(require, "akkar.pq_native") and reachable "pq" then
+local pq_built = pcall(require, "akkar.pq_native")
+if pq_built and reachable "pq" then
   DRIVERS[#DRIVERS + 1] = "pq"
+elseif not pq_built then
+  describe("driver pq", function()
+    pending("akkar/pq_native.so is not built, so the adapter contract ran " ..
+            "against pgmoon only; build it with `bash src/build.sh`")
+  end)
+else
+  describe("driver pq", function()
+    pending("akkar/pq_native.so is built but `driver = \"pq\"` could not " ..
+            "reach Postgres on 127.0.0.1:55432; the adapter contract ran " ..
+            "against pgmoon only")
+  end)
 end
 
 for _, DRIVER in ipairs(DRIVERS) do

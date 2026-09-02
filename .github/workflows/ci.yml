@@ -92,7 +92,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             lua${{ matrix.lua }} liblua${{ matrix.lua }}-dev luarocks \
-            libssl-dev build-essential m4
+            libssl-dev build-essential m4 libpq-dev
           {
             echo "LUA_BIN=lua${{ matrix.lua }}"
             echo "LUA_INC=/usr/include/lua${{ matrix.lua }}"
@@ -125,7 +125,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew update
-          brew install lua@${{ matrix.lua }} luarocks openssl@3 m4 pkg-config
+          brew install lua@${{ matrix.lua }} luarocks openssl@3 m4 pkg-config libpq
 
           # Resolved, not assumed. Homebrew's prefix differs between Apple
           # Silicon (/opt/homebrew) and Intel (/usr/local).
@@ -315,8 +315,150 @@ jobs:
             assert(got == want, "cqueues is " .. got .. ", pinned is " .. want)
             print("commit   " .. got .. "  (pinned)")'
 
+      # ------------------------------------------------- the C driver
+      # 582 LINES OF C THAT NOTHING COMPILED.
+      #
+      # `src/akkar_pq.c` is hand-written C linked against libpq and shipped as
+      # `luarocks install akkar-pq`. Until this step existed, no job in this
+      # file mentioned `build.sh`, `libpq`, `pg_config` or `akkar-pq`: the file
+      # was not compiled, not linked, not loaded and not syntax-checked, by
+      # anything, ever. `spec/pq_spec.lua` opened with
+      # `pcall(require, "akkar.pq_native")` and reported one tidy pending, so
+      # the suite was the same green whether the driver worked or did not
+      # exist -- and the driver was carrying a silent heap-corruption defect
+      # (`pq_send_query` pushing one Lua stack slot per parameter with no
+      # `lua_checkstack`, against a limit of 65535) that a single compile plus
+      # a single test binding more than one parameter would have caught.
+      #
+      # This job has no Postgres, so what it proves is the half that does not
+      # need one: THE C COMPILES, LINKS AND LOADS, on x86_64 and on arm64.
+      # `integration` is where it then answers queries. Splitting it that way
+      # means an arm64 portability break and a driver logic break arrive as
+      # different reds in different jobs.
+      #
+      # AND IT CHANGES WHAT THE SKIP MEANS. With the module built, both
+      # `spec/pq_spec.lua` and the `pq` pass of `spec/db_spec.lua` stop saying
+      # "not built" and start saying "no Postgres here" -- which is true, is
+      # this job's whole premise, and is a different sentence from the one
+      # that hid the gap.
+      #
+      # NOT `luarocks install akkar-pq`, and not `luarocks install` at all:
+      # `akkar-pq-0.1.0-1.rockspec` has `source.url = git+... tag = "v0.1.0"`,
+      # so it would fetch and compile the TAGGED RELEASE'S copy of
+      # `src/akkar_pq.c` rather than the one in this checkout -- testing the
+      # last release on every pull request -- and its `akkar >= 0.1.0`
+      # dependency can pull a published `akkar` in over the working tree.
+      # `src/build.sh` compiles the file that is actually here, which is the
+      # only file this run is about.
+      #
+      # NO ENVIRONMENT IS PASSED IN, on purpose. `src/build.sh` finds the
+      # header through `pg_config --includedir` and the runtime by globbing
+      # `/usr/lib/*/libpq.so.5`, and that discovery is itself part of what a
+      # clean runner is here to test -- the script is the documented way a
+      # user builds this, and a CI invocation that spoon-feeds it every path
+      # would leave the documented path untested. If it cannot find libpq it
+      # exits non-zero with a message naming the variable to set.
+      - name: Build the C Postgres driver (Linux)
+        if: runner.os == 'Linux'
+        run: bash src/build.sh
+
+      # macOS IS A COMPILE CHECK AND NOT A LOAD, DELIBERATELY.
+      #
+      # Two separate reasons, and only the first is about macOS:
+      #
+      #   1. macOS runners have NO SERVICE CONTAINERS, so there is no Postgres
+      #      to answer a query here even if the module loaded. Getting one
+      #      would mean `brew install postgresql@16` plus `brew services start`
+      #      on every macOS leg -- minutes per run -- to re-run coverage the
+      #      `integration` job already has. The thing macOS can tell us that
+      #      Linux cannot is whether the C is PORTABLE: whether the headers
+      #      resolve, whether the Lua API calls are valid, whether clang
+      #      objects to what gcc accepted. `-c` answers all three.
+      #
+      #   2. `src/build.sh` links with `-shared`, which is correct on ELF and
+      #      is NOT how a loadable Lua module is linked on Darwin -- that wants
+      #      `-bundle -undefined dynamic_lookup`, because the Lua symbols are
+      #      resolved by the host interpreter at load time. Making build.sh
+      #      branch on `uname -s` is a one-line change and it is NOT MADE HERE,
+      #      because nobody in this project has a Mac to run it on and a fix
+      #      whose proof is "it looks right" is the thing this repository keeps
+      #      finding in its own history. Compiling is verified; linking is
+      #      written down as unverified, which is the honest half.
+      #
+      # `libpq` is keg-only, so its include path is taken from its own prefix
+      # rather than assumed to be on the default search path.
+      - name: Compile-check the C Postgres driver (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          PQ_PREFIX=$(brew --prefix libpq)
+          echo "libpq prefix : $PQ_PREFIX"
+          ls "$PQ_PREFIX/include/libpq-fe.h"
+          cc -c -O2 -fPIC -Wall -Wextra \
+            -I"$LUA_INC" -I"$PQ_PREFIX/include" \
+            -o /tmp/akkar_pq.o src/akkar_pq.c
+          echo "compiled clean against $(cc --version | head -1)"
+
+      # The build can fail in a way that leaves a stale or unloadable object
+      # behind, and the specs would go straight back to the tidy pending that
+      # hid all of this. So the module is REQUIRED, not assumed -- and the Lua
+      # it was compiled against is checked, because a 5.4 build loads into a
+      # 5.5 interpreter without complaint and dumps core on the first real
+      # call. `src/akkar_pq.c` exports `LUA_VERSION_NUM` for exactly this.
+      - name: The C driver loads, and was built for this Lua
+        if: runner.os == 'Linux'
+        run: |
+          $LUA_BIN -e '
+            package.cpath = "./?.so;" .. package.cpath
+            local m = assert(require("akkar.pq_native"),
+                             "akkar/pq_native.so did not load")
+            print("driver   " .. m.VERSION)
+            print("built for LUA_VERSION_NUM " .. m.LUA_VERSION_NUM)
+            local maj, min = _VERSION:match("Lua (%d+)%.(%d+)")
+            local want = tonumber(maj) * 100 + tonumber(min)
+            assert(m.LUA_VERSION_NUM == want,
+                   ("built for LUA_VERSION_NUM %d, running %s (%d)")
+                     :format(m.LUA_VERSION_NUM, _VERSION, want))'
+
       - name: The suite, with no database and no Redis
-        run: busted
+        run: |
+          set -o pipefail
+          busted --output=TAP | tee tap.txt
+
+      # ------------------------------------------- the skip-is-green guard
+      # THE BUILD STEP ABOVE CAN SUCCEED AND STILL NOT REACH THE TESTS.
+      #
+      # `src/build.sh` writes `akkar/pq_native.so`, and the specs find it only
+      # because they prepend `./?.so` to `package.cpath` -- a different
+      # working directory, a different OUT, a stale object, and the module is
+      # missing again while every step in this job stays green. The specs
+      # would then report the same tidy pending they reported for the entire
+      # life of this file, which is exactly the signal that hid 582 lines of
+      # uncompiled C.
+      #
+      # So the assertion is made against THE TEST RUN rather than the build:
+      # this job has no Postgres, so the driver specs must skip -- but they
+      # must skip saying "no Postgres here", never "not built". The two
+      # sentences are one grep apart and mean completely different things.
+      #
+      # There is no floor on the total here, and that is deliberate rather
+      # than an oversight: the number of tests a machine with no Postgres and
+      # no Redis runs has never been measured on these runners, and a floor
+      # invented rather than measured is the unverified claim this guard
+      # exists to stop. `integration` carries the floor, because that is the
+      # job whose count is known.
+      - name: The driver was built, and the run proves it
+        # LINUX ONLY, because the macOS leg above compile-checks the C rather
+        # than linking a loadable module -- see the reason there -- so on
+        # macOS "not built" is the true and expected answer, not a defect.
+        if: runner.os == 'Linux'
+        run: |
+          if grep -E '^ok [0-9]+ - # SKIP' tap.txt | grep -Fi 'is not built'; then
+            echo "::error::a spec skipped because akkar/pq_native.so was not" \
+                 "found, even though the build step above reported success."
+            exit 1
+          fi
+          echo "--- pending (expected: no Postgres, no Redis) ---"
+          grep -E '^ok [0-9]+ - # SKIP' tap.txt | head -40 || true
 
       # WHY A DIAGNOSTIC RUNS IN CI AND CANNOT FAIL IT.
       #
@@ -387,7 +529,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            build-essential git curl unzip libssl-dev libreadline-dev
+            build-essential git curl unzip libssl-dev libreadline-dev libpq-dev
 
       # Every layer is compiled from source, so this is minutes without a
       # cache and seconds with one. Keyed on the recipe itself: change the
@@ -434,14 +576,78 @@ jobs:
       # Without this the 5.5 job runs six fewer tests than `unit` and the two
       # scoreboards differ for a reason that has nothing to do with Lua. Making
       # them run the same set means any difference between them IS a finding.
-      # Neither job builds `pq_native.so`, so the C driver skips in both.
+      # Both jobs now build `pq_native.so`, which is the other half of that
+      # parity and used to be the sentence "Neither job builds
+      # `pq_native.so`, so the C driver skips in both" -- an accurate
+      # description of a hole, written down and left open.
       - name: Teal, best effort
         run: |
           luarocks --tree="$HOME/lua55" install tl \
             || echo "tl unavailable; spec/teal_spec.lua will report pending"
 
+      # AND THIS IS THE JOB WHERE COMPILING IT MATTERS MOST.
+      #
+      # `src/akkar_pq.c` reaches for `lua_newuserdata`, `lua_getuservalue` and
+      # `lua_setuservalue` -- three names that Lua 5.4 kept only as
+      # compatibility macros over the `...uv` forms. If 5.5 ever drops them
+      # the file stops compiling, and this is the only job that would find
+      # out. The C itself already knows the stakes: it exports
+      # `LUA_VERSION_NUM` because a module built for 5.4 loads into a 5.5
+      # interpreter WITHOUT COMPLAINT and dumps core on the first real call --
+      # which is how a 5.4 build left in the tree once segfaulted the whole
+      # suite before it printed a line.
+      #
+      # So it is built here against the 5.5 headers and asserted to report
+      # 505, which turns that comment from a story into a check.
+      - name: Build the C Postgres driver against Lua 5.5
+        run: |
+          LUA_CFLAGS="-I$HOME/lua55/include" bash src/build.sh
+          lua5.5 -e '
+            package.cpath = "./?.so;" .. package.cpath
+            local m = assert(require("akkar.pq_native"),
+                             "akkar/pq_native.so did not load under 5.5")
+            print("driver   " .. m.VERSION)
+            assert(m.LUA_VERSION_NUM == 505,
+                   "built for LUA_VERSION_NUM " .. m.LUA_VERSION_NUM ..
+                   ", not 505: this is the 5.4 build, and it would dump core")
+            print("built for 505, as it must be")'
+
       - name: The suite, under Lua 5.5
-        run: busted
+        run: |
+          set -o pipefail
+          busted --output=TAP | tee tap.txt
+
+      # ------------------------------------------- the skip-is-green guard
+      # THE BUILD STEP ABOVE CAN SUCCEED AND STILL NOT REACH THE TESTS.
+      #
+      # `src/build.sh` writes `akkar/pq_native.so`, and the specs find it only
+      # because they prepend `./?.so` to `package.cpath` -- a different
+      # working directory, a different OUT, a stale object, and the module is
+      # missing again while every step in this job stays green. The specs
+      # would then report the same tidy pending they reported for the entire
+      # life of this file, which is exactly the signal that hid 582 lines of
+      # uncompiled C.
+      #
+      # So the assertion is made against THE TEST RUN rather than the build:
+      # this job has no Postgres, so the driver specs must skip -- but they
+      # must skip saying "no Postgres here", never "not built". The two
+      # sentences are one grep apart and mean completely different things.
+      #
+      # There is no floor on the total here, and that is deliberate rather
+      # than an oversight: the number of tests a machine with no Postgres and
+      # no Redis runs has never been measured on these runners, and a floor
+      # invented rather than measured is the unverified claim this guard
+      # exists to stop. `integration` carries the floor, because that is the
+      # job whose count is known.
+      - name: The driver was built, and the run proves it
+        run: |
+          if grep -E '^ok [0-9]+ - # SKIP' tap.txt | grep -Fi 'is not built'; then
+            echo "::error::a spec skipped because akkar/pq_native.so was not" \
+                 "found, even though the build step above reported success."
+            exit 1
+          fi
+          echo "--- pending (expected: no Postgres, no Redis) ---"
+          grep -E '^ok [0-9]+ - # SKIP' tap.txt | head -40 || true
 
       # 5.4 and 5.5 do not have to allocate identically, and if they diverge
       # the ceiling is where it shows. `spec/allocation_spec.lua` is exact
@@ -487,7 +693,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            lua5.4 liblua5.4-dev luarocks libssl-dev build-essential m4 postgresql-client
+            lua5.4 liblua5.4-dev luarocks libssl-dev build-essential m4 \
+            postgresql-client libpq-dev
 
       - name: Cache the cqueues build
         id: cqueues-cache
@@ -530,6 +737,32 @@ jobs:
             assert(got == os.getenv("CQUEUES_COMMIT"),
                    "cqueues is not the pinned build: " .. tostring(got))'
 
+      # ------------------------------------------------- the C driver
+      # THIS IS THE JOB THE DRIVER WAS ALWAYS FOR, and until now it did not
+      # build it either. See the long note in the `unit` job for what that
+      # cost. Here the module is not only compiled but EXERCISED: this is the
+      # only job in the file with a Postgres, so it is the only place
+      # `spec/pq_spec.lua`'s twelve cases and the second, `pq` pass of
+      # `spec/db_spec.lua`'s twenty-five-case adapter contract can run at all.
+      #
+      # Same reasoning as the unit job for using `src/build.sh` rather than
+      # `luarocks install akkar-pq`: the rockspec's `source.url` is
+      # `git+... tag = "v0.1.0"`, so luarocks would compile the tagged
+      # release's C rather than this checkout's, and its `akkar >= 0.1.0`
+      # dependency can install a published `akkar` over the working tree. The
+      # point of a pull request is to test the pull request.
+      - name: Build the C Postgres driver
+        run: |
+          bash src/build.sh
+          lua5.4 -e '
+            package.cpath = "./?.so;" .. package.cpath
+            local m = assert(require("akkar.pq_native"),
+                             "akkar/pq_native.so did not load")
+            print("driver   " .. m.VERSION)
+            local maj, min = _VERSION:match("Lua (%d+)%.(%d+)")
+            assert(m.LUA_VERSION_NUM == tonumber(maj) * 100 + tonumber(min),
+                   "the driver was built for a different Lua than this one")'
+
       - name: Create the fixture the examples and specs expect
         env:
           PGPASSWORD: akkar
@@ -542,8 +775,98 @@ jobs:
           on conflict do nothing;
           SQL
 
+      # `--output=TAP` rather than the default, because the next step has to
+      # READ this run rather than trust its exit code. TAP is one anchored
+      # line per test -- `ok N - name`, `not ok N - name`, and a pending as
+      # `ok N - # SKIP name` -- which is greppable without a parser and does
+      # not care that the specs also print application logs to stdout.
       - name: The suite, with the backends up
-        run: busted
+        run: |
+          set -o pipefail
+          busted --output=TAP | tee tap.txt
+
+      # ---------------------------------------------- the skip-is-green guard
+      # A GREEN TICK IS NOT EVIDENCE THAT ANYTHING RAN.
+      #
+      # Every skip guard in this suite is a `pending` behind a reachability
+      # check, which is right on a laptop and is a hole in CI: a job where
+      # Postgres failed to start, or where a build step silently produced no
+      # module, skips the tests that needed them, reports pending, and exits
+      # zero. The whole pipeline stays green while the thing it exists to
+      # check is not executed. That is not a hypothetical -- `src/akkar_pq.c`
+      # was compiled by nothing for the entire life of this file, and the only
+      # reason CI never said so is that `spec/pq_spec.lua` skipped politely
+      # and `spec/db_spec.lua` did not even do that.
+      #
+      # For a project whose rule is that every fix ships with an executable
+      # proof, the proof going quiet has to be a red. So this job asserts
+      # three things about the run it just did:
+      #
+      #   1. NOTHING SKIPPED FOR AN INFRASTRUCTURE REASON. This job supplies
+      #      Postgres, Redis and a compiled driver, so a pending that names
+      #      any of them is a broken job, not a portable spec.
+      #   2. THE DRIVER TESTS ARE PRESENT BY NAME AND BY COUNT. A guard on
+      #      pendings alone would not notice a spec file that stopped being
+      #      collected, or a `describe` that returned early before registering
+      #      anything -- which is precisely how the `pq` half of
+      #      `spec/db_spec.lua` disappeared with no scoreboard entry.
+      #   3. A FLOOR ON THE TOTAL. Deliberately a floor and not an equality:
+      #      an equality is a chore on every added test and gets raised
+      #      without being read. The floor only ever fires when a run gets
+      #      substantially SMALLER, which is the failure this is for. Raise it
+      #      when the suite has genuinely grown; never lower it to get green.
+      - name: Nothing skipped for a reason this job exists to remove
+        run: |
+          ran=$(grep -cE '^ok [0-9]+ - ' tap.txt || true)
+          skipped=$(grep -cE '^ok [0-9]+ - # SKIP' tap.txt || true)
+          passed=$(( ran - skipped ))
+          echo "passed  : $passed"
+          echo "skipped : $skipped"
+
+          if [ "$skipped" -gt 0 ]; then
+            echo "--- pending ---"
+            grep -E '^ok [0-9]+ - # SKIP' tap.txt || true
+          fi
+
+          fail=0
+
+          # 1. Infrastructure-shaped pendings.
+          if grep -E '^ok [0-9]+ - # SKIP' tap.txt \
+             | grep -Ei 'postgres|redis|pq_native' ; then
+            echo "::error::a test skipped because Postgres, Redis or the C driver" \
+                 "was unavailable -- in the one job that provides all three."
+            fail=1
+          fi
+
+          # 2. The C driver actually answered, rather than being merely built.
+          #    Twelve cases in spec/pq_spec.lua and the twenty-five-case
+          #    adapter contract replayed for `driver = "pq"` in spec/db_spec.lua.
+          pq_unit=$(grep -cE '^ok [0-9]+ - akkar\.pq ' tap.txt || true)
+          pq_contract=$(grep -cE '^ok [0-9]+ - driver pq ' tap.txt || true)
+          echo "akkar.pq cases          : $pq_unit  (floor 12)"
+          echo "adapter contract on pq  : $pq_contract  (floor 25)"
+          [ "$pq_unit"     -ge 12 ] || { echo "::error::spec/pq_spec.lua did not run"; fail=1; }
+          [ "$pq_contract" -ge 25 ] || { echo "::error::the pq pass of spec/db_spec.lua did not run"; fail=1; }
+
+          # 3. The floor on the whole run.
+          #
+          # WHERE 560 COMES FROM: a full local run on 2026-09-02, with both
+          # backends up and the driver built, passed 597 with nothing pending.
+          # The integration runner has no `tl`, so `spec/teal_spec.lua` costs
+          # a handful more. 560 is that number with room, chosen so the floor
+          # fires on a spec file that stopped being collected and not on
+          # ordinary churn. It is a measurement and not a guess, and the first
+          # real run of this job is the thing that confirms it -- if it comes
+          # in materially above 560, raise it to match what CI actually sees.
+          MIN_PASSING=560
+          echo "floor                   : $MIN_PASSING"
+          if [ "$passed" -lt "$MIN_PASSING" ]; then
+            echo "::error::$passed tests passed, below the floor of $MIN_PASSING." \
+                 "Either the suite shrank or a spec file stopped being collected."
+            fail=1
+          fi
+
+          exit "$fail"
 
   # -------------------------------------------------------------- install
   # The job that would have caught `bin/akkar` never being installed: the
