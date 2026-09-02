@@ -610,7 +610,15 @@ function request_methods:go(timeout)
 		self.cookie_store:store_from_request(request_headers, headers, self.host, self.site_for_cookies)
 	end
 
-	if self.follow_redirects and headers:get(":status"):sub(1,1) == "3" then
+	-- BACKPORT of upstream 059ae00 (2024-09-06), which landed after v0.4 and
+	-- has never been released. `304 Not Modified` begins with a 3 and is not a
+	-- redirect: it is the answer to a conditional request, and it carries no
+	-- `location`. Without the second test `handle_redirect` runs, finds no
+	-- `location`, and returns `nil, "missing location header for redirect",
+	-- EINVAL` -- so a correct cache revalidation reaches the caller of
+	-- `akkar.http` as a failed request. Proven by `spec/vendor_backport_spec`.
+	if self.follow_redirects and headers:get(":status"):sub(1,1) == "3"
+		and headers:get(":status") ~= "304" then
 		stream:shutdown()
 		local new_req, err2, errno2 = self:handle_redirect(headers)
 		if not new_req then

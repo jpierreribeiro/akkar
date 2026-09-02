@@ -236,12 +236,23 @@ function stream_methods:shutdown()
 		end
 		-- read any remaining available response and get out of the way
 		--
-		-- AKKAR: two denial-of-service repairs live in this loop. They were
-		-- monkey-patches in `akkar/substrate.lua` until this file was vendored;
-		-- folding them in is most of why it was vendored. Sixty lines of
-		-- instance overrides, `rawset` juggling and defensive shape checks
-		-- became the eight below, and they can no longer silently stop
-		-- applying when this file changes shape.
+		-- AKKAR: two denial-of-service repairs live in this loop. THE EIGHT
+		-- LINES BELOW ARE NOT UPSTREAM'S -- do not "simplify" them back to the
+		-- original two conditions, which is the defect.
+		--
+		-- `docs/substrate/lua-http-wedge.md` is the whole account: the
+		-- reproduction, the measurements taken off a running process, the two
+		-- obvious repairs that do not work, and why the idle limit is eight.
+		-- Its "Where the repair lives, and where it used to live" section
+		-- records the history -- these were monkey-patches in a now-deleted
+		-- `akkar/substrate.lua` until this file was vendored, and folding them
+		-- in is most of why it was vendored. Sixty lines of instance
+		-- overrides, `rawset` juggling and defensive shape checks became the
+		-- eight below, and they can no longer silently stop applying when this
+		-- file changes shape.
+		--
+		-- `spec/substrate_repair_spec.lua` is the proof: it swaps this module
+		-- for the upstream rock's and requires that server to die.
 		--
 		-- ONE: the spin. `step(0)` can return true -- "I did something" --
 		-- while `stats_recv` never advances, and then neither condition of
@@ -942,6 +953,17 @@ function stream_methods:read_next_chunk(timeout)
 			if chunk ~= nil then
 				self.body_read_left = length_n - #chunk
 				end_stream = (self.body_read_left == 0)
+			elseif err == nil then
+				-- BACKPORT of upstream ddab283 (2023-08-22), which landed after
+				-- v0.4 and has never been released.
+				--
+				-- A peer that announces `content-length: 100` and hangs up after
+				-- forty bytes produces `nil, nil` here: not an error, and not the
+				-- end of the body. `shutdown` drains until the body is done, so it
+				-- drains for ever on a connection that is already gone. The
+				-- `chunked` branch thirty lines above already answers EPIPE for
+				-- exactly this shape; this is the `length` branch catching up.
+				return nil, ce.strerror(ce.EPIPE), ce.EPIPE
 			end
 		elseif length_n == 0 then
 			chunk = ""
