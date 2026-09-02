@@ -512,6 +512,28 @@ jobs:
           $LUA_BIN bin/akkar gen examples/typed-client/app.lua --lang teal  -o examples/typed-client/client.tl    --check
           $LUA_BIN bin/akkar gen examples/typed-client/app.lua --lang luals -o examples/typed-client/client.d.lua --check
 
+      # AND THE ARTIFACT ITSELF TYPE-CHECKS, which the gate above does NOT say.
+      #
+      # `--check` compares the committed file against what the generator would
+      # emit right now: it proves they AGREE. It cannot notice that they agree
+      # on something invalid. A generator bug that emitted Teal no compiler
+      # accepts -- but emitted it deterministically -- would regenerate to a
+      # byte-identical file and sail through every gate above, and the first
+      # person to find out would be whoever imported the client.
+      #
+      # `tl check` is the half that reads it as Teal. Best effort, like the 5.5
+      # job's own `tl` step: if the rock will not install the step says so and
+      # moves on, because a checker that is unavailable must not be reported as
+      # a checker that passed.
+      - name: The generated Teal client is valid Teal
+        run: |
+          if luarocks install --local tl 2>/dev/null; then
+            eval "$(luarocks path --bin)"
+            tl check examples/typed-client/client.tl
+          else
+            echo "tl unavailable; the generated client was not type-checked in this job"
+          fi
+
   # ------------------------------------------------------------- lua 5.5
   # THE ROCKSPECS SAY `lua >= 5.4, < 5.6`. Until this job existed, nothing
   # tested the second half of that range.
