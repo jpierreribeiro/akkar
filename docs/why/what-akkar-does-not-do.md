@@ -125,6 +125,14 @@ promise, and there are two things this project cannot promise: the substrate
 depends on a commit of cqueues that upstream has never released, and the API is
 still moving under measurement. Pin a commit and expect it to change.
 
+> **Half of this was overtaken, 2 September 2026.** There *is* now a version
+> number (`0.1.0`), a CHANGELOG, and a compatibility policy at
+> `docs/COMPATIBILITY.md`. What survives unchanged is the part that was ever the
+> point: **no stable-API promise until 1.0**, and for exactly the two reasons
+> above — the unreleased cqueues commit, and an API still moving under
+> measurement. A `0.x` number is a way of publishing that honesty on
+> luarocks.org, not a retraction of it; `RELEASE.md` is what publishing takes.
+
 ## What is still excluded, and what to use instead
 
 ### An ORM, and models
