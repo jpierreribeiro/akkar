@@ -278,4 +278,114 @@ describe("HTTP/2", function()
       assert.equal(value, got:get(name), "header " .. name .. " did not survive")
     end
   end)
+
+  it("refuses a header block that decodes to more fields than h1 allows",
+     function()
+    -- THE AMPLIFIER. `h1_stream` has capped header lines at 100 since it was
+    -- vendored; the h2 half had no counterpart anywhere -- not `h2_stream`,
+    -- not `h2_connection`, not `hpack` -- and advertises
+    -- SETTINGS_MAX_HEADER_LIST_SIZE = math.huge. The only h2 bound was
+    -- `MAX_HEADER_BUFFER_SIZE`, 400 KB of COMPRESSED block, and HPACK is a
+    -- compressor: an indexed header field (RFC 7541 Section 6.1) is the single
+    -- byte `0x80 | index` and appends a whole name/value pair.
+    --
+    -- So: one literal header with a 4,000-byte value, which HPACK puts in the
+    -- dynamic table at index 62, then one-byte references to it. Measured
+    -- against the unbounded decoder, 20,008 bytes on the wire decoded to
+    -- 16,001 fields carrying 64 MB of value, and the 400 KB cap allows roughly
+    -- 400,000 fields.
+    --
+    -- THIS ASSERTS THE REFUSAL, not survival. A survival assertion is the
+    -- wrong instrument for a bound: a server with no cap at all survives a
+    -- block this size comfortably -- the run below takes well under a second
+    -- unbounded -- so it would pass with the cap removed and prove nothing.
+    -- What the cap changes is that the decode is refused, so that is what is
+    -- checked, along with the field count at which it stops.
+    local hpack = require "akkar.vendor.http.hpack"
+
+    local seed = hpack.new(8192)
+    seed:add_header_indexed("x-a", string.rep("v", 4000))
+    local block = seed:render_data() .. string.rep(string.char(0x80 + 62), 16000)
+    assert.is_true(#block < 400 * 1024,
+      "the attack has to fit under the compressed-block cap or it proves nothing")
+
+    local got, err = hpack.new(8192):decode_headers(block)
+    assert.is_nil(got,
+      ("%s fields decoded from %d bytes with no refusal")
+        :format(got and got:len() or "?", #block))
+    assert.is_truthy(tostring(err):find("field", 1, true),
+      "refused, but not for the reason this test is about: " .. tostring(err))
+
+    -- And the number is h1's, reached through the h2 stream so the two cannot
+    -- drift apart in a later edit.
+    local h2_stream = require "akkar.vendor.http.h2_stream"
+    local h1_stream = require "akkar.vendor.http.h1_stream"
+    assert.equal(h1_stream.methods.max_header_lines,
+                 h2_stream.methods.max_header_lines,
+      "h1 and h2 disagree about how many header fields a request may carry")
+
+    -- A block AT the limit still decodes. A bound that refuses ordinary
+    -- traffic is not a fix.
+    local ordinary = hpack.new(8192)
+    for i = 1, h2_stream.methods.max_header_lines do
+      ordinary:add_header_indexed("x-" .. i, "v")
+    end
+    local decoded = hpack.new(8192):decode_headers(ordinary:render_data(), nil, nil,
+                                                   h2_stream.methods.max_header_lines)
+    assert.is_truthy(decoded, "a block at exactly the limit was refused")
+    assert.equal(h2_stream.methods.max_header_lines, decoded:len())
+  end)
+
+  it("joins duplicate header values in linear time", function()
+    -- The other half of the same attack. `normalize_headers` accumulated
+    -- repeats of one name with `existing .. ", " .. clean`, which rebuilds the
+    -- whole accumulation on every repeat: quadratic, in a count the peer picks.
+    -- Measured with the old line, 4,000-byte values: 1,000 repeats 2.5 s,
+    -- 4,000 repeats 32.2 s, 16,000 repeats 364 s. None of it yields.
+    --
+    -- `req.headers` is lazy, but `req.ip` reads it and `akkar/limit.lua` reads
+    -- `req.ip` for the default rate-limit key, so the ordinary path arrives
+    -- here.
+    --
+    -- ASSERTED AS A RATIO, not a wall clock. An absolute budget is a machine
+    -- benchmark and turns into a flake on a loaded box; the SHAPE of the cost
+    -- is what was wrong. Doubling the input doubles linear work and quadruples
+    -- quadratic work, so the ratio separates them by 2x whatever the box is
+    -- doing. The gate is 3x -- comfortably above linear's 2, comfortably below
+    -- quadratic's 4 -- and the measured ratio at these sizes with the old line
+    -- was 5.0x (1.835 s -> 9.170 s), against 1.84x with this one -- and the
+    -- 1,000-duplicate case itself went from 1.835 s to 0.043 s.
+    local akkar = require "akkar"
+    local new_headers = require "akkar.vendor.http.headers".new
+    local monotime = require("cqueues").monotime
+
+    local function build(n)
+      local h = new_headers()
+      h:append(":method", "GET")
+      local value = string.rep("v", 4000)
+      for _ = 1, n do h:append("x-a", value) end
+      return h
+    end
+
+    local function cost(n)
+      local h = build(n)
+      collectgarbage()
+      local t0 = monotime()
+      local out = akkar.normalize_headers(h)
+      local elapsed = monotime() - t0
+      -- The work has to have actually happened, and the answer has to be right.
+      assert.equal(n * 4000 + (n - 1) * 2, #out["x-a"])
+      assert.is_nil(out[":method"])
+      return elapsed
+    end
+
+    cost(500)                                    -- warm the allocator
+    local small = cost(1000)
+    local large = cost(2000)
+
+    assert.is_true(large < small * 3,
+      ("doubling the duplicate count multiplied the cost by %.1fx (%.3f s -> "
+       .. "%.3f s); linear is 2x, the old quadratic line measured 5.0x")
+        :format(large / small, small, large))
+  end)
 end)

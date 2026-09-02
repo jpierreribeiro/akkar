@@ -84,9 +84,9 @@ them in between.
 | `h1_stream.lua` | patched | +144 / −24 | 10 |
 | `h2_connection.lua` | patched | +80 / −2 | 6 |
 | `h2_error.lua` | unmodified | | |
-| `h2_stream.lua` | patched | +23 / −0 | 2 |
+| `h2_stream.lua` | patched | +116 / −2 | 6 |
 | `headers.lua` | patched | +144 / −78 | 8 |
-| `hpack.lua` | unmodified | | |
+| `hpack.lua` | patched | +38 / −1 | 4 |
 | `hsts.lua` | unmodified | | |
 | `proxies.lua` | unmodified | | |
 | `request.lua` | patched | +14 / −19 | 3 |
@@ -134,6 +134,36 @@ one still appends to the buffer. Measured: two million empty frames accepted,
 byte total still zero, 32 MB of Lua heap, nothing refused — 18 MB of traffic
 for 32 MB that is never freed, on one unauthenticated connection. Guard:
 `MAX_HEADER_BUFFER_ITEMS`.
+
+**`hpack.lua` and `h2_stream.lua` — a header LIST is bounded by field count.**
+Uncommitted. `h1_stream.lua` has capped header lines at 100 since it was
+vendored; the h2 half had no counterpart in any of the three files that could
+carry one, and advertises `SETTINGS_MAX_HEADER_LIST_SIZE = math.huge`. The only
+h2 bound was the 400 KB above, and that counts the *compressed* block — HPACK's
+indexed header field (RFC 7541 §6.1) is the single byte `0x80 | index` and
+appends a whole name/value pair from the dynamic table. Measured against the
+unbounded decoder: 20,008 bytes decoded to 16,001 fields carrying 64 MB of
+value, and the same shape reaches ~400,000 fields inside the cap. The bound is
+enforced *inside* `decode_headers`, not on its result, because by the time it
+returns every field has already been allocated; it is a connection error
+because a half-decoded block leaves the dynamic table out of step with the
+peer's (RFC 7540 §6.8). Guards: `max_header_lines` on the h2 stream,
+`max_entries` in `hpack:decode_headers`.
+
+**`h2_stream.lua` — RST_STREAM is rate-accounted. CVE-2023-44487.**
+Uncommitted. Rapid Reset: open a stream, cancel it, repeat at line speed. The
+`RST_STREAM` handler's `set_state("closed")` decrements `n_active_streams`
+before the next frame is read, so the enforced MAX_CONCURRENT_STREAMS above is
+never approached — by construction, not by tuning — while each cycle still
+costs a full HPACK decode and a stream object. Measured before this existed:
+one million resets accepted in 5.3 s with the active count back at zero every
+time. A token bucket per connection now: burst 100 (nginx 1.25.3's
+`ngx_max(concurrent_streams, 100)` floor), or the advertised ceiling when it is
+higher, refilled at 33/s (nghttp2 1.57's `stream_reset_rate_limit`). A bucket
+rather than nginx's lifetime counter because a counter that never decays
+eventually kills a long-lived connection that has done nothing wrong. Past it,
+`ENHANCE_YOUR_CALM` as a connection error — the code Go's `net/http2` answers
+the same attack with. Guards: `RST_STREAM_BURST`, `RST_STREAM_RATE`.
 
 **`websocket.lua` — a message is bounded before it is buffered.**
 `b3f5577`. `sock:fill()` commits the whole payload to the socket buffer, so a

@@ -415,4 +415,77 @@ describe("hostile HTTP/2 frames", function()
     assert.is_true(answered == nil or #answered > 0,
       "the oversized frame was neither refused nor answered")
   end)
+
+  it("bounds a flood of RST_STREAM frames, the CVE-2023-44487 class", function()
+    -- RAPID RESET. Open a stream with HEADERS, cancel it with RST_STREAM,
+    -- repeat at line speed. The server pays a full HPACK decode and a stream
+    -- object per cycle and is never holding more than one stream at a time.
+    --
+    -- WHY THE EXISTING CEILING CANNOT SEE IT. `h2_connection` enforces
+    -- MAX_CONCURRENT_STREAMS against `n_active_streams`, and the RST_STREAM
+    -- handler's `set_state("closed")` decrements that counter before the next
+    -- frame is read. The slot is free again by construction, so the ceiling is
+    -- never approached -- no value of `max_peer_streams` closes this. akkar's
+    -- own admission gate is further up still, on requests that reach the
+    -- application, and a cancelled stream never gets there.
+    --
+    -- Before the bound: one million RST_STREAM frames accepted in 5.3 s with
+    -- `n_active_streams` back at zero after every one.
+    --
+    -- THIS ASSERTS THE REFUSAL, for the reason the empty-CONTINUATION case
+    -- above gives at length: a survival assertion passes with the bound
+    -- removed, because the attack needs far more frames to hurt than a test
+    -- may send. So it drives the frame handler directly and requires an answer
+    -- rather than an acceptance.
+    local h2_stream = require "akkar.vendor.http.h2_stream"
+    local handler = h2_stream.frame_handlers[0x3]
+    assert.is_function(handler, "no RST_STREAM handler to drive")
+
+    -- The minimum the handler reads: a connection to keep the accounting on,
+    -- and a stream it may close. A fresh stream per iteration is what the
+    -- attack does -- a new id every time -- and it is also what makes the
+    -- point: nothing accumulates anywhere for a ceiling to notice.
+    local connection = { n_active_streams = 0 }
+    local function reset(i)
+      local stream = { connection = connection, id = 2 * i - 1, state = "open",
+                       set_state = function(self, new) self.state = new end }
+      return handler(stream, 0x0, "\0\0\0\8")    -- CANCEL
+    end
+
+    local accepted, err = 0, nil
+    for i = 1, 100000 do
+      local ok, why = reset(i)
+      if ok == nil then err = why break end
+      accepted = accepted + 1
+    end
+
+    assert.is_truthy(err,
+      ("%d RST_STREAM frames were accepted with no refusal"):format(accepted))
+    assert.equal(0, connection.n_active_streams,
+      "streams were left open, so this was not the rapid-reset path")
+
+    -- The refusal is ENHANCE_YOUR_CALM, 0xb -- "processing capacity exceeded",
+    -- which is what happened -- and not a PROTOCOL_ERROR, because the peer's
+    -- frames were all well formed. Go's net/http2 answers rapid reset with the
+    -- same code.
+    assert.equal(0xb, err.code,
+      "refused with code 0x" .. string.format("%x", err.code or 0))
+
+    -- The burst is 100, nginx's floor, so an ordinary peer cancelling a
+    -- handful of streams is never touched -- and the bucket REFILLS, which is
+    -- what separates this from a lifetime counter that eventually kills a
+    -- long-lived connection that did nothing wrong.
+    assert.is_true(accepted >= 100,
+      ("only %d resets were allowed before refusal; 100 is the floor")
+        :format(accepted))
+    --
+    -- The refill is checked by moving the bucket's clock rather than by
+    -- sleeping: `cqueues.sleep` needs a controller and this test deliberately
+    -- has none, and half a second of real waiting in a suite buys nothing that
+    -- rewinding the timestamp does not. One second back is 33 credits.
+    connection.rst_stream_time = connection.rst_stream_time - 1
+    local ok = reset(999999)
+    assert.is_true(ok == true,
+      "the bucket never refilled, so this is a lifetime counter, not a rate")
+  end)
 end)
