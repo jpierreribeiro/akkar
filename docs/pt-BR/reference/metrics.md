@@ -14,6 +14,7 @@ local metrics = require "akkar.metrics"
 
 - [metrics.DEFAULT_BUCKETS](#metricsdefault_buckets)
 - [metrics.new(options)](#metricsnewoptions)
+- [metrics.otlp(snapshots, resource)](#metricsotlpsnapshots-resource)
 - [metrics.Registry](#metricsregistry)
 - [Registry](#registry)
   - [registry:counter(name, delta, labels)](#registrycountername-delta-labels)
@@ -24,6 +25,7 @@ local metrics = require "akkar.metrics"
   - [registry:pool(name, pool)](#registrypoolname-pool)
   - [registry:render()](#registryrender)
   - [registry:serve(app, path, sources)](#registryserveapp-path-sources)
+  - [registry:snapshot(now)](#registrysnapshotnow)
 - [O que é exportado](#o-que-é-exportado)
 - [O que não está aqui](#o-que-não-está-aqui)
 
@@ -55,6 +57,22 @@ registry:observe("GET", "/users/:id", 200, 0.012)
 registry:observe("GET", "/users/:id", 404, 0.003)
 
 io.write(registry:render())
+```
+
+## metrics.otlp(snapshots, resource)
+
+Constrói o `ExportMetricsServiceRequest` em JSON OTLP/HTTP para uma lista de snapshots de `registry:snapshot`, um `ResourceMetrics` por snapshot. `resource` é uma table de atributos de recurso. Este é o `encode` que [akkar.otlp](otlp.md) dá ao seu exportador de métricas.
+
+**Retorna** uma table.
+
+```lua
+local metrics = require "akkar.metrics"
+
+local registry = metrics.new()
+local body = metrics.otlp({ registry:snapshot(1755000000) },
+                          { ["service.name"] = "tasks" })
+print(body.resourceMetrics[1].resource.attributes[1].value.stringValue)  --> tasks
+print(body.resourceMetrics[1].scopeMetrics[1].scope.name)               --> akkar
 ```
 
 ## metrics.Registry
@@ -262,15 +280,40 @@ print((scrape.raw:match "\nqueue_depth (%S+)"))            --> 3
 
 O corpo do scrape é `scrape.raw`, não `scrape.body`: o endpoint responde com uma string bruta em vez de uma table. O content type está no objeto de resposta e o cliente de teste em processo não o expõe em `headers`.
 
+### registry:snapshot(now)
+
+O registro como uma lista de objetos `Metric` do OTLP, lido agora: a mesma leitura de `render()`, pools incluídos, no formato que [akkar.otlp](otlp.md) envia. A memória é definida no registro antes, como um scrape a define, então um push e um scrape mostram as mesmas séries.
+
+`now` é o segundo do relógio de parede para `timeUnixNano` e por padrão é `akkar.time.now()`; passe um para fixá-lo em um teste.
+
+**Retorna** `{ time = now, metrics = { ... } }`.
+
+```lua
+local metrics = require "akkar.metrics"
+
+local registry = metrics.new()
+registry:counter("orders_total", 1, { { "kind", "card" } })
+registry:counter("orders_total", 1, { { "kind", "card" } })
+
+local orders
+for _, metric in ipairs(registry:snapshot(1755000000).metrics) do
+  if metric.name == "orders_total" then orders = metric end
+end
+print(orders.sum.isMonotonic)                       --> true
+print(orders.sum.aggregationTemporality)            --> 2
+print(orders.sum.dataPoints[1].asInt)               --> 2
+print(orders.sum.dataPoints[1].attributes[1].key)   --> kind
+```
+
 ## O que é exportado
 
-`metrics.new`, `metrics.Registry` e `metrics.DEFAULT_BUCKETS`, e os métodos acima. Não há contador em nível de módulo nem registro global: um registro é um valor que você mantém.
+`metrics.new`, `metrics.otlp`, `metrics.Registry` e `metrics.DEFAULT_BUCKETS`, e os métodos acima. Não há contador em nível de módulo nem registro global: um registro é um valor que você mantém.
 
 ## O que não está aqui
 
 - **Summaries e quantis.** Eles não podem ser agregados entre processos, e a resposta deste runtime para mais CPU é mais processos.
 - **Um espaço de rótulos ilimitado.** `registry:counter` recebe rótulos com nomes seus, e para em 64 combinações por nome de contador. `registry:pool` para em 64 nomes de pool da mesma forma. Veja acima o motivo.
-- **Push.** Nada é enviado a lugar nenhum. Algo faz scrape do endpoint.
+- **Push, daqui.** Este módulo não envia nada; algo faz scrape do endpoint. [akkar.otlp](otlp.md) envia `registry:snapshot()` a um collector em um intervalo, e essa é a mesma leitura de um scrape.
 - **Amostragem.** Nada lê um pool em um timer. `registry:pool` lê dentro de `render()`, então um processo sem scrape não paga nada e um scrape nunca lê um número que algum amostrador pegou em outro momento.
 - **Agregação entre processos.** Cada processo tem seu próprio registro e seu próprio uptime. Somá-los é trabalho do scraper.
 
@@ -278,4 +321,5 @@ O corpo do scrape é `scrape.raw`, não `scrape.body`: o endpoint responde com u
 
 - [akkar](akkar.md) para `app:use`, `req.route` e `app:test{}`
 - [akkar.trace](trace.md) para spans por requisição, que respondem "por que essa foi lenta" onde um histograma responde "quantas foram"
+- [akkar.otlp](otlp.md) para o mesmo registro enviado a um collector OpenTelemetry
 - o código-fonte do módulo, `akkar/metrics.lua`, para entender por que o padrão de rota é o rótulo e o caminho não é

@@ -95,12 +95,45 @@ local function with_redis(body)
   return result
 end
 
+--- The Postgres half. The store keeps its leases in a column rather than in a
+--- list, so `expired` orders by `claimed_at` and breaks a tie on `id` -- and
+--- what that ordering has to produce is the same oldest-first answer the
+--- other two give. A column is not obviously FIFO the way a list is, which is
+--- exactly why it belongs in this file: `UPDATE ... RETURNING` makes no
+--- promise about the order of its rows, so the order is the outer `select`'s
+--- and nothing else establishes that it is right.
+local function with_postgres(body)
+  local support = require "spec.support.jobs_postgres"
+  local postgres = require "akkar.jobs.postgres"
+  local conn  = support.shared()
+  local key   = "spec:reap:postgres"
+  local store = postgres.store(conn)
+  support.clean(conn, key)
+  for _, encoded in ipairs(JOBS) do store:enqueue(key, encoded) end
+  -- The server's clock, not this process's, for the reason the docstring
+  -- above gives: the claim times were written by Postgres, so the instant
+  -- they are compared against has to come from Postgres too.
+  local server = conn:one "select extract(epoch from clock_timestamp()) as at"
+  local ok, res = pcall(body, store, key, tonumber(server.at) + 10000)
+  pcall(support.clean, conn, key)
+  if not ok then error(res, 0) end
+  return res
+end
+
 local stores = { { name = "akkar.jobs.memory", drive = with_memory } }
 if reachable() then
   stores[#stores + 1] = { name = "akkar.jobs.redis", drive = with_redis }
 else
   describe("akkar.jobs.redis (reap order)", function()
     pending "Redis is not reachable on 127.0.0.1:6379; skipping the server half"
+  end)
+end
+
+if require("spec.support.jobs_postgres").reachable "pgmoon" then
+  stores[#stores + 1] = { name = "akkar.jobs.postgres", drive = with_postgres }
+else
+  describe("akkar.jobs.postgres (reap order)", function()
+    pending "Postgres is not reachable on 127.0.0.1:55432; skipping the server half"
   end)
 end
 

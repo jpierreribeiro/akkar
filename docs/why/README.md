@@ -1,6 +1,6 @@
 # Why akkar is like this
 
-Seven arguments. Each one takes a decision that shows up in the API, says what it
+Eight arguments. Each one takes a decision that shows up in the API, says what it
 makes impossible, says what it costs, and points at the measurement or the
 retraction behind it.
 
@@ -18,6 +18,7 @@ when a page makes you ask "why on earth is it like that".
 | [what-the-runtime-is-for.md](what-the-runtime-is-for.md) | What does `akkar build` buy, and why is speed not on the list? |
 | [what-akkar-does-not-do.md](what-akkar-does-not-do.md) | What is deliberately excluded, and what should you use instead? |
 | [slower-than-openresty.md](slower-than-openresty.md) | Why is akkar slower than OpenResty, where does the time go, and what can be done? |
+| [production-scorecard.md](production-scorecard.md) | Every critique of Lua as a production language, one at a time: which ones the runtime neutralizes, which are real risks, and where in the tree each answer lives. |
 
 ## How to read a number on these pages
 

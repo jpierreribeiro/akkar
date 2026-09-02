@@ -16,6 +16,7 @@ local metrics = require "akkar.metrics"
 
 - [metrics.DEFAULT_BUCKETS](#metricsdefault_buckets)
 - [metrics.new(options)](#metricsnewoptions)
+- [metrics.otlp(snapshots, resource)](#metricsotlpsnapshots-resource)
 - [metrics.Registry](#metricsregistry)
 - [Registry](#registry)
   - [registry:counter(name, delta, labels)](#registrycountername-delta-labels)
@@ -26,6 +27,7 @@ local metrics = require "akkar.metrics"
   - [registry:pool(name, pool)](#registrypoolname-pool)
   - [registry:render()](#registryrender)
   - [registry:serve(app, path, sources)](#registryserveapp-path-sources)
+  - [registry:snapshot(now)](#registrysnapshotnow)
 - [What is exported](#what-is-exported)
 - [Not here](#not-here)
 
@@ -58,6 +60,25 @@ registry:observe("GET", "/users/:id", 200, 0.012)
 registry:observe("GET", "/users/:id", 404, 0.003)
 
 io.write(registry:render())
+```
+
+## metrics.otlp(snapshots, resource)
+
+Builds the OTLP/HTTP JSON `ExportMetricsServiceRequest` for a list of
+snapshots from `registry:snapshot`, one `ResourceMetrics` per snapshot.
+`resource` is a table of resource attributes. This is the `encode`
+[akkar.otlp](otlp.md) gives its metrics exporter.
+
+**Returns** a table.
+
+```lua
+local metrics = require "akkar.metrics"
+
+local registry = metrics.new()
+local body = metrics.otlp({ registry:snapshot(1755000000) },
+                          { ["service.name"] = "tasks" })
+print(body.resourceMetrics[1].resource.attributes[1].value.stringValue)  --> tasks
+print(body.resourceMetrics[1].scopeMetrics[1].scope.name)               --> akkar
 ```
 
 ## metrics.Registry
@@ -332,10 +353,39 @@ The scrape body is `scrape.raw`, not `scrape.body`: the endpoint answers with
 a raw string rather than a table. The content type is on the response object
 and the in-process test client does not surface it in `headers`.
 
+### registry:snapshot(now)
+
+The registry as a list of OTLP `Metric` objects, read now: the same read as
+`render()`, pools included, in the shape [akkar.otlp](otlp.md) pushes. Memory
+is set on the registry first, as a scrape sets it, so a push and a scrape show
+the same series.
+
+`now` is the wall-clock second for `timeUnixNano` and defaults to
+`akkar.time.now()`; pass one to pin it in a test.
+
+**Returns** `{ time = now, metrics = { ... } }`.
+
+```lua
+local metrics = require "akkar.metrics"
+
+local registry = metrics.new()
+registry:counter("orders_total", 1, { { "kind", "card" } })
+registry:counter("orders_total", 1, { { "kind", "card" } })
+
+local orders
+for _, metric in ipairs(registry:snapshot(1755000000).metrics) do
+  if metric.name == "orders_total" then orders = metric end
+end
+print(orders.sum.isMonotonic)                       --> true
+print(orders.sum.aggregationTemporality)            --> 2
+print(orders.sum.dataPoints[1].asInt)               --> 2
+print(orders.sum.dataPoints[1].attributes[1].key)   --> kind
+```
+
 ## What is exported
 
-`metrics.new`, `metrics.Registry` and `metrics.DEFAULT_BUCKETS`, and the
-methods above. There is no module-level counter and no global registry: a
+`metrics.new`, `metrics.otlp`, `metrics.Registry` and `metrics.DEFAULT_BUCKETS`,
+and the methods above. There is no module-level counter and no global registry: a
 registry is a value you hold.
 
 ## Not here
@@ -345,7 +395,9 @@ registry is a value you hold.
 - **An unbounded label space.** `registry:counter` takes labels of your own
   naming, and stops at 64 combinations per counter name. `registry:pool` stops
   at 64 pool names the same way. See them above for why.
-- **Pushing.** Nothing is sent anywhere. Something scrapes the endpoint.
+- **Pushing, from here.** This module sends nothing; something scrapes the
+  endpoint. [akkar.otlp](otlp.md) pushes `registry:snapshot()` to a
+  collector on an interval, and that is the same read as a scrape.
 - **Sampling.** Nothing reads a pool on a timer. `registry:pool` reads inside
   `render()`, so an unscraped process pays nothing and a scrape never reads a
   number some sampler took at a different moment.
@@ -357,5 +409,7 @@ registry is a value you hold.
 - [akkar](akkar.md) for `app:use`, `req.route` and `app:test{}`
 - [akkar.trace](trace.md) for per-request spans, which answer "why was this
   one slow" where a histogram answers "how many were"
+- [akkar.otlp](otlp.md) for the same registry pushed to an OpenTelemetry
+  collector
 - the module source, `akkar/metrics.lua`, for why the route pattern is the
   label and the path is not

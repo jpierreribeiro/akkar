@@ -10,7 +10,7 @@ A semântica de uma fila de jobs sem nenhum armazenamento embutido: o que é um 
 local jobs = require "akkar.jobs"
 ```
 
-Dois stores acompanham o akkar. [`akkar.jobs.memory`](#akkarjobsmemory) mantém os jobs numa tabela Lua, [`akkar.jobs.redis`](#akkarjobsredis) mantém os jobs no Redis.
+Três stores acompanham o akkar. [`akkar.jobs.memory`](#akkarjobsmemory) mantém os jobs numa tabela Lua, [`akkar.jobs.redis`](#akkarjobsredis) mantém os jobs no Redis, e `akkar.jobs.postgres` mantém os jobs numa única tabela do Postgres -- reivindicando com `select ... for update skip locked`, de modo que um job enfileirado dentro da transação que o produziu existe se e somente se aquela escrita existir.
 
 ## Índice
 
@@ -66,7 +66,7 @@ Estes são opcionais, e cada um oferece uma funcionalidade nomeada. Pedir a func
 | `store:peek(key, limit)` | `queue:dead_letters` |
 | `store:trim(key, keep)` | a lista de dead letters se manter abaixo de `max_dead` |
 
-Os dois stores que acompanham o akkar implementam todos eles.
+Os três stores que acompanham o akkar implementam todos eles, e as mesmas specs de contrato rodam sobre cada um: `spec/jobs_spec.lua`, `spec/jobs_delivery_spec.lua` e `spec/jobs_expired_order_spec.lua` fazem uma passada por store, em vez de um conjunto de asserções por store -- asserções iguais em três arquivos divergem com o tempo, e uma passada compartilhada não tem como divergir.
 
 **Os últimos quatro vêm como um conjunto.** `jobs.new` só ativa a entrega ao menos uma vez quando os quatro estão presentes, porque um store que arrenda um job sem conseguir dizer quais arrendamentos expiraram fica com esse job para sempre, o que é uma falha pior do que nunca arrendá-lo. Um store com três dos quatro tem entrega no máximo uma vez e diz isso explicitamente; veja [`jobs.new`](#jobsnewstore-name-options).
 
@@ -80,7 +80,7 @@ deixado de fora, o store responde com seu próprio relógio, que no caso do
 Redis é o `TIME` do servidor e é o único relógio que todo worker de uma frota
 compartilha.
 
-A ordem do mais antigo para o mais novo faz parte do contrato, e agora os dois
+A ordem do mais antigo para o mais novo faz parte do contrato, e agora os três
 stores a respeitam. O store Redis não respeitava: `RPOPLPUSH` insere no início
 da lista de processamento, então a janela de `LRANGE` voltava do mais novo para
 o mais antigo. Uma recuperação em massa — durante um deploy, um encerramento por

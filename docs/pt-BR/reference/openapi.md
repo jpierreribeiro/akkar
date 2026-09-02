@@ -186,11 +186,18 @@ assert(schema.required[1] == "name")
 assert(schema.required[2] == "role")         -- `age` é opcional
 ```
 
-Uma coisa que esse mapeamento ainda não faz. Uma regra que este módulo não
-reconhece vira um esquema vazio `{}` em vez de um erro, enquanto uma rota que
-a declara lança `unknown schema type` na linha em que é declarada, então, na
-prática, uma regra inválida falha o boot bem antes de este módulo sequer
-vê-la.
+Uma regra que este módulo não consegue expandir é um erro, nunca um
+fallback. Ela costumava virar um esquema vazio `{}` para uma grafia curta
+desconhecida e `type: string` para uma tabela sem `kind`, então um array
+escrito como tabela aninhada nua — `response = { users = { { id = "string" } }
+}` — era documentado como string, e um cliente gerado a partir do documento o
+tipava como uma, contra um servidor que envia uma lista. Uma rota recusa essa
+tabela onde é declarada agora, nomeando a rota, o caminho e a grafia que
+funciona, então uma rota declarada nunca carrega uma. Uma tabela de rota
+montada à mão e passada a `document` levanta erro aqui em vez disso —
+`akkar.openapi: GET /x: response.users is a table with no schema kind and
+cannot be documented` — porque um padrão silencioso é exatamente a mentira
+sobre a qual o cliente gerado foi construído.
 
 `match` é copiado para `pattern` sem alteração, e o `match` do akkar é um
 padrão Lua, enquanto o `pattern` do OpenAPI é uma expressão regular ECMA-262,

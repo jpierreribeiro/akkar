@@ -101,6 +101,8 @@ capability drops every batch.
 | `interval` | number | `5` | seconds that make an export due by time |
 | `timeout` | number | `2` | seconds one export may take |
 | `sampler` | function | none | called with the request; a falsy answer means no span |
+| `encode` | function | `trace.otlp` | turns a batch and the resource into the request body. [akkar.otlp](otlp.md) passes `metrics.otlp` and `log.otlp` here, which is how one exporter carries three signals. |
+| `name` | string | `"akkar.trace"` | what the reasons this exporter returns call it |
 
 **Returns** an exporter.
 
@@ -435,8 +437,9 @@ nanoseconds. `startTimeUnixNano` does not: it goes through the integer path.
 - **Database or cache spans.** Only the server span exists, from
   `exporter:middleware()`.
 - **Retry of a failed export.** By design. The batch is dropped and counted.
-- **Metrics or logs over OTLP.** Spans only. Metrics are
-  [akkar.metrics](metrics.md), a Prometheus scrape.
+- **Metrics or logs over OTLP.** This exporter carries spans. The same
+  exporter with a different `encode` carries the other two, and
+  [akkar.otlp](otlp.md) builds all three from one setting.
 - **Protobuf.** The payload is OTLP/HTTP JSON, generated here.
 - **Head sampling by ratio.** `sampler` is a function you write. There is no
   `ratio = 0.1`.
@@ -446,5 +449,7 @@ nanoseconds. `startTimeUnixNano` does not: it goes through the integer path.
 - [akkar](akkar.md) for `req.trace`, the validated inbound `traceparent`, and
   for `app:use`
 - [akkar.metrics](metrics.md) for the aggregate view of the same requests
+- [akkar.otlp](otlp.md) for metrics and logs to the same collector, through
+  this exporter
 - the module source, `akkar/trace.lua`, for why a request is never blocked on
   an export

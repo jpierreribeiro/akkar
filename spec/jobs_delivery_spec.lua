@@ -60,6 +60,17 @@ local function redis_reachable()
   return alive
 end
 
+-- The Postgres half. No controller around it, and that difference is real
+-- rather than an oversight: the Redis adapter yields while it waits, so its
+-- half has to run inside one, and the Postgres store's waits are a
+-- `cqueues.poll` that blocks perfectly well standalone. Every property below
+-- passes `timeout = 0` anyway, so nothing here waits at all.
+local pg_support = require "spec.support.jobs_postgres"
+
+local function over_postgres(extra, fn)
+  fn(pg_support.queue("spec:delivery", options(extra)))
+end
+
 --- Runs `fn` against a Redis-backed queue inside a cqueues controller, since
 --- the Redis adapter yields while it waits, and leaves no keys behind.
 local function over_redis(extra, fn)
@@ -313,6 +324,14 @@ else
   end)
 end
 
+if pg_support.reachable "pgmoon" then
+  delivers_at_least_once("postgres", over_postgres)
+else
+  describe("at-least-once delivery over postgres", function()
+    pending "Postgres is not reachable on 127.0.0.1:55432; skipping"
+  end)
+end
+
 -- ==================================================== the two stores agree
 
 --- Drives one queue through the whole delivery lifecycle and writes down
@@ -347,22 +366,37 @@ local function trace(q)
   return out
 end
 
+-- Memory is the reference the others are read against, because it is the one
+-- that never skips. Each server-backed store is compared to it by name, so a
+-- divergence says WHICH store diverged rather than that two traces differ.
+local others = {}
 if redis_reachable() then
+  others[#others + 1] = { name = "the Redis store", run = over_redis }
+else
   describe("the memory store and the Redis store", function()
-    it("answer the same lifecycle identically", function()
-      local from_memory, from_redis
-      over_memory({}, function(q) from_memory = trace(q) end)
-      over_redis({}, function(q) from_redis = trace(q) end)
+    pending "Redis is not reachable on 127.0.0.1:6379; skipping"
+  end)
+end
+if pg_support.reachable "pgmoon" then
+  others[#others + 1] = { name = "the Postgres store", run = over_postgres }
+else
+  describe("the memory store and the Postgres store", function()
+    pending "Postgres is not reachable on 127.0.0.1:55432; skipping"
+  end)
+end
 
-      assert.same(from_memory, from_redis)
+for _, other in ipairs(others) do
+  describe("the memory store and " .. other.name, function()
+    it("answer the same lifecycle identically", function()
+      local from_memory, from_other
+      over_memory({}, function(q) from_memory = trace(q) end)
+      other.run({}, function(q) from_other = trace(q) end)
+
+      assert.same(from_memory, from_other)
       -- And the trace is worth comparing only if it actually observed the
       -- crash: a pair of empty traces would match too.
       assert.is_truthy(#from_memory > 8)
     end)
-  end)
-else
-  describe("the memory store and the Redis store", function()
-    pending "Redis is not reachable on 127.0.0.1:6379; skipping"
   end)
 end
 
