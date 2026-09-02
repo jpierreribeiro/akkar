@@ -45,9 +45,19 @@ local function over_memory(extra, fn)
 end
 
 local function redis_reachable()
+  -- PING, not merely connect: `cqueues.socket.connect` builds the socket
+  -- lazily, so `pcall(redis.connect{...})` returns true with nothing
+  -- listening. The connect-only form is decorative -- the same defect fixed
+  -- in `jobs_redis_spec` and the two guards on `ci-green`, and the one CI's
+  -- no-services job caught. And it is worse than a false skip here: a
+  -- connect that FAILS is what fires the cqueues fd-cancel path, so a whole
+  -- spec file connecting to a dead port at load time is the arm64 segfault's
+  -- own trigger.
   local ok, conn = pcall(redis.connect { pool_size = 0 })
-  if ok then conn:close() end
-  return ok
+  if not ok then return false end
+  local alive = pcall(function() return conn:ping() end)
+  conn:close()
+  return alive
 end
 
 --- Runs `fn` against a Redis-backed queue inside a cqueues controller, since
