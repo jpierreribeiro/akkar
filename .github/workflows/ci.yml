@@ -316,62 +316,81 @@ jobs:
       - name: Install gdb
         run: sudo apt-get update -qq && sudo apt-get install -y -qq gdb
 
-      - name: PROBE the guards in isolation (markers only)
-        if: always()
-        run: PROBE=all $LUA_BIN armprobe.lua ; echo "exit=$?"
-
-      - name: PROBE under gdb (backtrace)
+      - name: Core dumps into the workspace
         if: always()
         run: |
-          ulimit -c unlimited
-          gdb --batch -ex run -ex bt -ex "info registers" \
-              --args $LUA_BIN armprobe.lua 2>&1 | tail -80
-          echo "gdb step done"
-
-      - name: Locate the real busted entry point
-        if: always()
-        run: |
-          # /usr/local/bin/busted is a luarocks SHELL wrapper, so feeding it to
-          # `lua` fails at line 3 with "unexpected symbol near '-'". The Lua
-          # script itself lives under the rock tree; find it and remember it.
-          BUSTED_LUA=$(ls /usr/local/lib/luarocks/rocks-5.4/busted/*/bin/busted 2>/dev/null | head -1)
-          echo "wrapper : $(command -v busted)"
-          echo "lua bin : $BUSTED_LUA"
-          head -5 "$BUSTED_LUA"
+          sudo sysctl -w kernel.core_pattern="$PWD/core.%p" || true
+          cat /proc/sys/kernel/core_pattern
+          BUSTED_LUA=$(ls /usr/local/lib/luarocks/rocks-5.4/busted/*/bin/busted | head -1)
           echo "BUSTED_LUA=$BUSTED_LUA" >> $GITHUB_ENV
+          echo "lua bin: $BUSTED_LUA"
 
-      - name: Baseline -- the suite, no gdb, just the exit code
-        if: always()
-        run: |
-          busted --output=plainTerminal; echo "BASELINE suite exit=$?"
-
-      - name: The WHOLE suite under gdb (backtrace)
-        if: always()
-        run: |
-          ulimit -c unlimited
-          gdb --batch \
-              -ex "set confirm off" \
-              -ex "set pagination off" \
-              -ex run \
-              -ex "echo \n==== BT ====\n" -ex bt \
-              -ex "echo \n==== INFO THREADS ====\n" -ex "info threads" \
-              -ex "echo \n==== REGISTERS ====\n" -ex "info registers" \
-              -ex "echo \n==== BT FULL ====\n" -ex "bt full" \
-              --args $LUA_BIN "$BUSTED_LUA" --output=plainTerminal 2>&1 | tail -200
-          echo "gdb whole-suite step done"
-
-      - name: The three spec files under gdb (backtrace)
+      # THE CRASH IS NOT DETERMINISTIC. Two arm runs of a tree that differs from
+      # a clean one by two MARKDOWN FILES segfaulted; four others ran the whole
+      # suite. Both crashes stopped after exactly nine tests, so the SITE is
+      # fixed even though the firing is not. So: run the nine-test window over
+      # and over at FULL SPEED -- gdb's ptrace overhead would perturb the very
+      # timing this depends on -- and pull the backtrace out of a core file.
+      - name: HUNT -- the nine-test window, repeatedly, at full speed
         if: always()
         run: |
           ulimit -c unlimited
-          gdb --batch -ex "set confirm off" -ex "set pagination off" -ex run \
-              -ex "echo \n==== BT ====\n" -ex bt \
-              -ex "echo \n==== BT FULL ====\n" -ex "bt full" \
-              --args $LUA_BIN "$BUSTED_LUA" --output=plainTerminal \
-              spec/000_strict_first_spec.lua \
-              spec/abandoned_defence_spec.lua \
-              spec/abandoned_spec.lua 2>&1 | tail -120
-          echo "gdb spec step done"
+          THREE="spec/000_strict_first_spec.lua spec/abandoned_defence_spec.lua spec/abandoned_spec.lua"
+          crashes=0; runs=0
+          deadline=$(( $(date +%s) + 780 ))
+          while [ $(date +%s) -lt $deadline ]; do
+            runs=$((runs+1))
+            $LUA_BIN "$BUSTED_LUA" --output=plainTerminal $THREE >/dev/null 2>&1
+            rc=$?
+            if [ $rc -ge 128 ]; then
+              crashes=$((crashes+1))
+              echo ""
+              echo "=== CRASH on run $runs, rc=$rc ==="
+              core=$(ls -t core.* 2>/dev/null | head -1)
+              if [ -n "$core" ]; then
+                gdb --batch -ex "set pagination off" \
+                    -ex "echo \n==== BT ====\n" -ex bt \
+                    -ex "echo \n==== BT FULL ====\n" -ex "bt full" \
+                    -ex "echo \n==== REGISTERS ====\n" -ex "info registers" \
+                    "$LUA_BIN" "$core" 2>&1 | tail -120
+                rm -f "$core"
+              else
+                echo "no core file found in $PWD"; ls -la core.* 2>&1 | head
+              fi
+              [ $crashes -ge 3 ] && break
+            fi
+          done
+          echo ""
+          echo "HUNT RESULT: $crashes crashes in $runs runs of the nine-test window"
+
+      - name: HUNT -- the WHOLE suite, repeatedly, at full speed
+        if: always()
+        run: |
+          ulimit -c unlimited
+          crashes=0; runs=0
+          deadline=$(( $(date +%s) + 1500 ))
+          while [ $(date +%s) -lt $deadline ]; do
+            runs=$((runs+1))
+            $LUA_BIN "$BUSTED_LUA" --output=plainTerminal >/dev/null 2>&1
+            rc=$?
+            echo "suite run $runs -> rc=$rc"
+            if [ $rc -ge 128 ]; then
+              crashes=$((crashes+1))
+              core=$(ls -t core.* 2>/dev/null | head -1)
+              if [ -n "$core" ]; then
+                gdb --batch -ex "set pagination off" \
+                    -ex "echo \n==== BT ====\n" -ex bt \
+                    -ex "echo \n==== BT FULL ====\n" -ex "bt full" \
+                    -ex "echo \n==== REGISTERS ====\n" -ex "info registers" \
+                    "$LUA_BIN" "$core" 2>&1 | tail -120
+                rm -f "$core"
+              else
+                echo "no core file found"
+              fi
+              [ $crashes -ge 2 ] && break
+            fi
+          done
+          echo "HUNT RESULT: $crashes crashes in $runs full-suite runs"
 
       - name: The suite, with no database and no Redis
         if: always()
