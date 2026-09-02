@@ -3753,12 +3753,41 @@ function App:run(config)
           local rh = headers.new()
           rh:append(":status", "400")
           rh:append("content-type", "application/json")
+          -- `Connection: close`, AND IT IS NOT DECORATIVE.
+          --
+          -- The framing of this message is exactly what akkar failed to
+          -- establish, so it does not know where the request ended -- which
+          -- means it does not know where the NEXT one begins. Whatever is
+          -- still in the socket is unattributable bytes, and the only safe
+          -- thing to do with them is to stop reading. Answering 400 and then
+          -- carrying on with keep-alive is what turns a rejected message into
+          -- a smuggled one: the rejection is delivered, and the attacker's
+          -- trailing bytes are then parsed as a fresh request that no front
+          -- end ever saw.
+          --
+          -- RFC 9112 9.6: a server "MUST send a 'close' connection option in
+          -- its final response" when it intends to close, so that the peer --
+          -- here a CDN, which is the half that matters -- retires the
+          -- connection instead of returning it to a pool and pipelining
+          -- somebody else's request onto it.
+          --
+          -- `shutdown` below already closed the socket in the cases measured
+          -- on this tree, so this header states an intent that was being
+          -- carried out silently. Stating it is what an intermediary can
+          -- act on; a FIN it has to race against is not.
+          rh:append("connection", "close")
           local body = cjson.encode { error = "malformed request" }
           rh:append("content-length", tostring(#body))
           stream:write_headers(rh, false)
           stream:write_chunk(body, true)
         end)
+        -- The connection, not just the stream. `stream:shutdown` ends the
+        -- message; it is `connection:shutdown` that guarantees nothing more
+        -- is read off this socket, which is the property the paragraph above
+        -- depends on. Both are pcall'd: this path is already handling one
+        -- failure and must not raise a second.
         pcall(stream.shutdown, stream)
+        pcall(function() stream.connection:shutdown() end)
         return
       end
 

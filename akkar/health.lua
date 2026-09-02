@@ -83,8 +83,9 @@ down with it -- a readiness endpoint that 500s tells the orchestrator nothing
 about which dependency is unhappy.
 ]]
 
-local cqueues = require "cqueues"
-local time    = require "akkar.time"
+local cqueues   = require "cqueues"
+local time      = require "akkar.time"
+local execution = require "akkar.execution"
 
 local M = {}
 
@@ -135,6 +136,55 @@ local function with_timeout(fn, seconds)
     return ok, reason, false
   end
 
+  if cqueues.running() then
+    -- INSIDE THE SERVER'S CONTROLLER, and this path no longer creates one of
+    -- its own.  It used to allocate a fresh `cqueues.new()` per probe purely to
+    -- arbitrate the timeout, and on timeout it DROPPED that controller with the
+    -- probe still running inside -- an abandoned pollset holding the failed
+    -- probe's socket.  A `connect` failing anywhere then made cqueues walk
+    -- EVERY controller's fd-tree (`cstack_cancelfd`), and one of those
+    -- abandoned trees was unclean -> SIGSEGV in `fileno_cmp`.  The no-services
+    -- CI job is the one that crashes because its probes against absent
+    -- Postgres/Redis time out continuously, and timeout was the one path that
+    -- abandoned a controller.  `docs/substrate/SEGFAULT.md` has the account.
+    --
+    -- The fix is exactly what F2 did for the request path in `execution.lua`:
+    -- run the probe as a worker on the controller we are ALREADY inside, with
+    -- the deadline carried as a bare number in `cqueues.poll`.
+    -- `execution.with_deadline` is that machinery.  A probe the deadline
+    -- abandons is no longer inert-inside-a-dropped-controller; it wakes on the
+    -- shared loop, finishes and rejoins the worker pool, leaving NOTHING on the
+    -- cstack for `cstack_cancelfd` to walk.
+    --
+    -- `call` never raises -- it `pcall`s `fn` and turns a raise into a failed
+    -- check -- so `with_deadline` sees only COMPLETION or TIMEOUT, never ERROR.
+    -- The two-value (ok, reason) answer rides back in a table because
+    -- `with_deadline` carries a single result value.
+    --
+    -- Publishing the timeout as the execution budget (which `with_deadline`
+    -- does, keyed on the worker coroutine) is a bonus this path did not have
+    -- before: an akkar-adapter check -- `db.ping`, `redis` -- now reads
+    -- `execution.remaining()` and cuts itself off at the adapter boundary as
+    -- well, so only a raw, adapterless, never-returning check can outlive the
+    -- timeout, and even then it merely parks on the shared loop rather than
+    -- leaving a controller to be walked.
+    local outcome, result = execution.with_deadline(seconds, function()
+      local ok, reason = call(fn)
+      return { ok = ok, reason = reason }
+    end)
+    if outcome == "TIMEOUT" then
+      return false, ("timed out after %gs"):format(seconds), true
+    end
+    return result.ok, result.reason, false
+  end
+
+  -- OUTSIDE ANY CONTROLLER -- a CLI, a test, a boot-time check.  There is no
+  -- ambient loop to run a worker on, so a private controller stepped to a
+  -- decision is the only tool available.  Unlike the in-server branch this one
+  -- is safe: the controller is on no parent's cstack and nothing polls it from
+  -- another controller, so when it is dropped it is ordinary local garbage, not
+  -- an abandoned pollset linked into a live loop.  Low frequency, and it blocks
+  -- nobody -- see the header.
   local cq = cqueues.new()
   local done, ok, reason = false, nil, nil
   cq:wrap(function()
@@ -143,39 +193,23 @@ local function with_timeout(fn, seconds)
   end)
 
   -- Step before polling: `wrap` only queues the coroutine, so a check that
-  -- never yields has not run yet and polling first would wait on a descriptor
-  -- for work that is already ready.  Copied from `with_deadline`, which found
-  -- this the same way.
+  -- never yields has not run yet and stepping is what first runs it.
   cq:step(0)
 
   local deadline = cqueues.monotime() + seconds
   while not done do
     local remaining = deadline - cqueues.monotime()
     if remaining <= 0 then break end
-    if cqueues.running() then
-      -- Inside the server's controller: yield to it, never `loop`, or this
-      -- probe blocks every request in the process while it waits.
-      cqueues.poll(cq, remaining)
-      cq:step(0)
-    else
-      -- Outside any controller -- a CLI, a test, a boot-time check.  There is
-      -- nothing to yield to, so blocking here is the only thing available and
-      -- costs nobody anything.
-      cq:step(remaining)
-    end
+    -- No ambient controller to yield to, so blocking on `step` is the only
+    -- thing available and costs nobody anything.
+    cq:step(remaining)
   end
 
   if not done then
-    -- The controller is dropped, never reused: the check is still running
-    -- inside it, and handing that to the next probe is the same class of bug
-    -- as a pooled connection with a transaction still open.
-    --
-    -- It holds two file descriptors until the collector runs (init.lua
-    -- measured exactly 2.00 per controller).  That is affordable only because
-    -- of the cache below: a timing-out check costs one controller per cache
-    -- period, not one per probe.  With `cache = 0` and a probe every second,
-    -- it is one every second, which is a real cost and is stated rather than
-    -- discovered.
+    -- The controller is dropped with the check still inside it.  It holds its
+    -- descriptors until the collector runs, affordable because this is the
+    -- CLI/boot branch and the readiness cache means a timing-out check costs
+    -- one controller per cache period, not one per probe.
     return false, ("timed out after %gs"):format(seconds), true
   end
   return ok, reason, false

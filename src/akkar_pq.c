@@ -335,8 +335,76 @@ static int pq_flush(lua_State *L) {
   return 1;
 }
 
+/* Pulls this connection's descriptor out of the cqueues pollset, if a cqueues
+ * that is polling it exists. Best effort: any failure is swallowed, because
+ * the only thing a failure can mean here is "nobody was polling it", and that
+ * is the case where there is nothing to pull.
+ *
+ * This is the ONE place the C half touches the scheduler, and it is doing the
+ * opposite of waiting: it is removing a descriptor from the set the scheduler
+ * waits on. The "C never waits" line in the header still holds.
+ *
+ * `package.loaded.cqueues` is consulted rather than `require`, so a process
+ * that loaded `pq_native` without cqueues -- `spec/pq_spec.lua` drives the
+ * native module with no controller at all -- neither forces cqueues to load
+ * nor pays for a lookup that cannot matter: with no cqueues there is no
+ * pollset, so there is nothing stale to leave behind. */
+static void drop_from_pollset(lua_State *L, akkar_conn *c) {
+  int fd = PQsocket(c->conn);
+  if (fd < 0) return;                 /* already closed; too late to matter */
+
+  if (!lua_checkstack(L, 4)) return;
+
+  lua_getfield(L, LUA_REGISTRYINDEX, "_LOADED");   /* +1: package.loaded */
+  if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
+  lua_getfield(L, -1, "cqueues");                  /* +1: cqueues module */
+  if (!lua_istable(L, -1)) { lua_pop(L, 2); return; }
+  lua_getfield(L, -1, "cancel");                   /* +1: cqueues.cancel */
+  if (!lua_isfunction(L, -1)) { lua_pop(L, 3); return; }
+
+  lua_pushinteger(L, fd);                          /* +1: the descriptor */
+  /* `cqueues.cancel` raises when it is called outside a running controller,
+   * which is a legitimate state -- a query run outside `cq:loop`. pcall turns
+   * that into the no-op it should be. */
+  if (lua_pcall(L, 1, 0, 0) != LUA_OK)
+    lua_pop(L, 1);                                 /* discard the error */
+  lua_pop(L, 2);                                   /* cqueues module, _LOADED */
+}
+
+/* Reads whatever libpq has waiting.
+ *
+ * CANCEL BEFORE CONSUME, and the order is the whole fix.
+ *
+ * When the backend goes away -- `pg_terminate_backend`, a failover, a restart
+ * -- libpq reads its final ErrorResponse and the EOF that follows it in a
+ * SINGLE `PQconsumeInput`, and closes the socket from under us as it does:
+ * `PQsocket` answers -1 the instant this returns. cqueues is still holding
+ * that descriptor in its pollset with POLLIN armed from the poll that woke us.
+ * Once the number is closed behind cqueues' back the kernel drops it from the
+ * epoll set, so cqueues' next attempt to change its disposition -- an
+ * EPOLL_CTL_MOD or _DEL on that number, which the next socket to inherit it
+ * provokes -- returns ENOENT: `unable to update event disposition: No such
+ * file or directory`. That is raised inside the scheduler, where no request's
+ * pcall can reach it, so one dead backend takes down every request in the
+ * process.
+ *
+ * `cqueues.cancel` AFTER the close cannot undo it: its own EPOLL_CTL_DEL hits
+ * the same already-closed number, gets the same ENOENT, and returns before it
+ * clears the armed state -- which is the state that does the damage. Four
+ * Lua-side variants were tried against exactly this and `akkar/pq.lua` records
+ * that none worked.
+ *
+ * The EOF arrives glued to the ErrorResponse, so a peek before the read sees
+ * bytes and reports the connection healthy on the very call that closes it --
+ * there is no way to single out the fatal consume in advance. So the
+ * descriptor is pulled from the pollset before EVERY consume: the cancel
+ * clears the armed state to 0 while the fd is still open and still in the set,
+ * and the next poll re-arms it on the healthy path. On the death path libpq
+ * then closes an fd whose cqueues state is already 0, so nothing stale is left
+ * for the descriptor's next owner, and the loop survives. */
 static int pq_consume(lua_State *L) {
   akkar_conn *c = check_conn(L, 1);
+  drop_from_pollset(L, c);
   if (!PQconsumeInput(c->conn)) {
     lua_pushnil(L);
     lua_pushstring(L, PQerrorMessage(c->conn));

@@ -133,6 +133,42 @@ describe("the keyspace belongs to the server", function()
           .headers["idempotent-replay"])
     end)
   end)
+
+  -- The same failure the fingerprint unit test pins, driven through the real
+  -- middleware and a real Redis: a key reused across two requests that differ
+  -- ONLY in their query string must not replay the first request's response.
+  -- It is a promise about WHICH request this is, and the query is half of that.
+  it("does not replay one request's response for another with a different query",
+     function()
+    in_controller(function()
+      local runs = {}
+      local app = akkar.new()
+      app:use(akkar.idempotency { prefix = prefix(), namespace = idempotency.GLOBAL })
+      app:post("/transfers", function(req)
+        local to = req.query and req.query.to or "?"
+        runs[#runs + 1] = to
+        return akkar.created { paid = to }
+      end)
+      local client = app:test { cache = redis.connect { pool_size = 2 } }
+      local key = { ["idempotency-key"] = "reused-across-queries" }
+
+      local first = client:post("/transfers?to=alice",
+        { body = { amount = 100 }, headers = key })
+      assert.equal(201, first.status)
+      assert.equal("alice", first.body.paid)
+
+      -- Same key, same body, DIFFERENT query. Reusing a key for a different
+      -- request is a client error, and the module's answer for that is 422 --
+      -- never a 200 replaying the other request's stored body.
+      local second = client:post("/transfers?to=bob",
+        { body = { amount = 100 }, headers = key })
+
+      assert.is_nil(second.headers["idempotent-replay"],
+        "bob's request was answered with alice's stored response")
+      assert.equal(422, second.status,
+        "a key reused for a different query was not caught as a mismatch")
+    end)
+  end)
 end)
 
 describe("the in-flight claim", function()
@@ -267,5 +303,44 @@ describe("the fingerprint", function()
       method = "POST", path = "/charges", body = { [2] = "ninety", note = "n" },
     }
     assert.not_equal(first, second)
+  end)
+
+  -- `req.path` excludes the query string -- `akkar/init.lua` splits the target
+  -- on `?` and hands the query to `req.query`. The fingerprint was built from
+  -- method, path and body only, so `POST /transfers?to=alice` and
+  -- `POST /transfers?to=bob` with the same body were the SAME request as far
+  -- as this module could tell. A client that reuses a key while changing only
+  -- the query -- `?to=`, `?dry_run=`, `?account=` -- got the FIRST request's
+  -- stored response replayed and its handler never ran: the exact silent wrong
+  -- answer the 512-byte truncation once produced, arriving through the half of
+  -- the request the fingerprint forgot to read.
+  it("does not lose the query string, which names which request this is",
+     function()
+    local alice = idempotency.fingerprint_of {
+      method = "POST", path = "/transfers",
+      query = { to = "alice" }, body = { amount = 100 },
+    }
+    local bob = idempotency.fingerprint_of {
+      method = "POST", path = "/transfers",
+      query = { to = "bob" }, body = { amount = 100 },
+    }
+    assert.not_equal(alice, bob,
+      "two requests differing only in query string share one fingerprint")
+  end)
+
+  -- Order does not make two spellings of one request. A query is a set of
+  -- parameters, not a sequence, so `?a=1&b=2` and `?b=2&a=1` are the same
+  -- request and must fingerprint the same -- otherwise an honest retry whose
+  -- client reordered the parameters would be refused with a 422.
+  it("does not depend on query parameter order", function()
+    local one = idempotency.fingerprint_of {
+      method = "POST", path = "/search",
+      query = { a = "1", b = "2" }, body = {},
+    }
+    local two = idempotency.fingerprint_of {
+      method = "POST", path = "/search",
+      query = { b = "2", a = "1" }, body = {},
+    }
+    assert.equal(one, two)
   end)
 end)

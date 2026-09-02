@@ -99,8 +99,12 @@ describe("links in the Brazilian Portuguese documentation", function()
 
     it("resolve from " .. source, function()
       local text = read(source)
-      for destination in text:gmatch "!?%[[^%]]-%]%(([^%)]+)%)" do
-        destination = destination:match "^%s*<?([^%s>]+)>?" or destination
+      -- BOUND TO A LOCAL, NOT REASSIGNED. Lua 5.5 makes a generic-for control
+      -- variable const, so trimming in place is `attempt to assign to const
+      -- variable 'destination'` -- a whole spec file red under 5.5 and green
+      -- under 5.4, which is the one difference the 5.5 job exists to catch.
+      for raw in text:gmatch "!?%[[^%]]-%]%(([^%)]+)%)" do
+        local destination = raw:match "^%s*<?([^%s>]+)>?" or raw
         if not destination:match "^%a[%w+.-]*:"
            and not destination:match "^//" then
           local path, anchor = destination:match "^([^#]*)#?(.*)$"

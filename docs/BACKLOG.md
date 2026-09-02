@@ -728,7 +728,8 @@ luaossl; a client needs sockets, TLS and a pool, and cqueues, luaossl and
 
 Wrapping lua-http's client is the fast path and means **inheriting lua-http**
 — the library this project found a denial of service in, whose last commit is
-September 2024 and which `akkar/substrate.lua` now carries a repair for.
+September 2024 and which `akkar/vendor/http/h1_stream.lua` now carries a
+repair for.
 
 The answer is probably the same one the driver just demonstrated: the value is
 in the **adapter** — deadline, pool, retry, metrics, and the client sitting

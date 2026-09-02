@@ -156,10 +156,11 @@ end)
 -- for a day before anyone noticed.
 --
 -- `app:test()` never calls `app:run`, so it never touches lua-http, the socket
--- or `akkar/substrate.lua`. The substrate repair wraps `h1_stream:shutdown`,
--- and in HTTP/1.1 keep-alive a stream IS a request, so it was allocating a
--- closure, an instance-table slot and a `table.pack` result on every request
--- -- entirely invisible to a ceiling measured through `app:test`.
+-- or the drain repair inside it. That repair was then a monkey-patch wrapping
+-- `h1_stream:shutdown`, and in HTTP/1.1 keep-alive a stream IS a request, so
+-- it was allocating a closure, an instance-table slot and a `table.pack`
+-- result on every request -- entirely invisible to a ceiling measured through
+-- `app:test`.
 --
 -- It surfaced only because a benchmark on another machine noticed akkar had
 -- lost 6.7% against its own published number while Gin reproduced to within
@@ -234,6 +235,11 @@ describe("allocation per request, through a real socket", function()
     --   repair_substrate = false          14,710   14,708 bytes/request
     --   repair_substrate = true, today    14,708   14,708      the repair is free
     --   repair_substrate = true, 0ff3c80  15,220   15,220      +511 per request
+    --
+    -- Those labels are historical: `repair_substrate` was the flag gating the
+    -- monkey-patch, and both it and `akkar/substrate.lua` are gone -- the
+    -- repair is unconditional in `akkar/vendor/http/h1_stream.lua` now. The
+    -- numbers still stand; they are what set this ceiling.
     --
     -- Two samples of six hundred requests each, and the four figures that
     -- should agree agree to within two bytes. That is a small enough noise

@@ -321,7 +321,37 @@ function connection_methods:read_body_chunk(timeout)
 	if chunk_header == nil then
 		return nil, err, errno
 	end
-	local chunk_size, chunk_ext = chunk_header:match("^(%x+) *(.-)\r\n")
+	-- AKKAR: a chunk extension must be introduced by `;`, and the line must
+	-- end where the pattern says it ends.
+	--
+	-- Upstream's `^(%x+) *(.-)\r\n` accepted ARBITRARY TRAILING TEXT after the
+	-- size, with no `;` required -- `0 junk\r\n` parsed happily as size 0 with
+	-- extension "junk". That is CVE-2026-24880 (Tomcat) exactly, and it is a
+	-- desync primitive for the same reason as every other item here: a front
+	-- end that rejects `0 junk` and a back end that accepts it disagree about
+	-- where the body ends, and akkar is the back end.
+	--
+	-- RFC 9112 7.1.1: `chunk-ext = *( BWS ";" BWS chunk-ext-name
+	-- [ BWS "=" BWS chunk-ext-val ] )`. The extension is OPTIONAL, but when
+	-- there is one it starts with a semicolon. Anything else on that line is
+	-- not an extension, it is a framing error.
+	--
+	-- `%-` is anchored at both ends: `(.-)\r\n` alone is non-greedy and will
+	-- happily stop at the FIRST CRLF anywhere later in the buffer, so the
+	-- trailing `$`-equivalent matters. `xread("*L")` hands over exactly one
+	-- line, so anchoring to its end is what "the rest of this line" means.
+	-- Matched in two steps so that `chunk_ext` keeps the shape its callers
+	-- already expect -- the extension text WITHOUT the introducing `;`, and
+	-- `""` when there is none.
+	local chunk_size, chunk_rest = chunk_header:match("^(%x+)[ \t]*([^\r\n]*)\r\n$")
+	local chunk_ext = ""
+	if chunk_size ~= nil and chunk_rest ~= "" then
+		chunk_ext = chunk_rest:match("^;(.*)$")
+		if chunk_ext == nil then
+			-- Trailing bytes that are not an extension: refuse, do not ignore.
+			chunk_size, chunk_ext = nil, ""
+		end
+	end
 	if chunk_size == nil then
 		self.socket:seterror("r", ce.EILSEQ)
 		local unget_ok1, unget_errno1 = self.socket:unget(chunk_header)
@@ -420,8 +450,40 @@ function connection_methods:write_header(k, v, timeout)
 	--
 	-- The checks themselves are unchanged and they are not decorative: they
 	-- are what stops a header value from injecting CRLF into the response.
-	assert(type(k) == "string" and k:find("^[^:\r\n]+$"), "field name invalid")
-	assert(type(v) == "string" and v:byte(-1) ~= 10 and not v:find("\n[^ ]"), "field value invalid")
+	-- AKKAR: the value check now covers BARE CR, NUL and a leading space,
+	-- none of which it covered before despite the comment above claiming it
+	-- stopped CRLF injection.
+	--
+	-- What it actually tested was `v:byte(-1) ~= 10` and `not v:find("\n[^ ]")`
+	-- -- both about LINE FEED. A lone `\r` passed straight through and was
+	-- written verbatim into the response, and that is enough on its own: many
+	-- intermediaries, and a CDN in front of this server especially, treat a
+	-- bare CR as a line terminator when splitting a header block. So a value
+	-- of `"/x\rContent-Length: 0\r\n\r\nHTTP/1.1 200 OK"` is a response split
+	-- at the front end even though this server considers it one header. It
+	-- needs an application that reflects input into a header to reach -- a
+	-- redirect that echoes a `?next=` parameter into `Location` is the
+	-- ordinary case, not an exotic one.
+	--
+	-- NUL is rejected for the same reason one level down: it truncates in the
+	-- C string handling of whatever parses this next.
+	--
+	-- A LEADING space or tab is rejected because such a value is
+	-- indistinguishable from an obs-fold continuation of the PREVIOUS header,
+	-- so it lets a value be smuggled onto a different field name entirely.
+	--
+	-- `\n` in any position now goes too, rather than only when unfolded.
+	-- Writing obs-fold was already forbidden -- RFC 9112 5.2: "A sender MUST
+	-- NOT generate a message that includes line folding" -- so nothing
+	-- legitimate loses, and the `\n[^ ]` carve-out was the hole that made the
+	-- rest of the check conditional.
+	--
+	-- Still allocation-free: a character-class `find` returns indices, and
+	-- `byte` returns a number, so this stays numbers-only per header per
+	-- response, which is what `spec/allocation_spec.lua` pins.
+	assert(type(k) == "string" and k:find("^[^%z:\r\n]+$"), "field name invalid")
+	assert(type(v) == "string" and not v:find("[%z\r\n]")
+	       and v:byte(1) ~= 32 and v:byte(1) ~= 9, "field value invalid")
 	local ok, err, errno = self.socket:xwrite(k..": "..v.."\r\n", "f", timeout)
 	if not ok then
 		return nil, err, errno

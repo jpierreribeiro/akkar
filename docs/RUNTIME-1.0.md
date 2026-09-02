@@ -230,7 +230,7 @@ original are marked.
 4. **Then the HTTP fast path**, if the spike does not supply the win. It is
    46% of `/ping` and it is also the least defended dependency in the stack:
    no release since September 2024, two denial-of-service repairs already
-   carried in `akkar/substrate.lua`.
+   carried in `akkar/vendor/http/h1_stream.lua`.
 5. **Lua 5.5 when `luaossl` moves.** Verified: `cqueues` at master builds and
    runs an event loop under 5.5; `luaossl` has no 5.5 target at all. One
    upstream bump, no fork, no heroics.

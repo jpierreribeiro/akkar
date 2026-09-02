@@ -15,7 +15,8 @@ argued: `spec/db_spec.lua` runs one contract against two Postgres drivers, so
 swapping a transport costs one file. That matters more here than it did for
 the database, because the transport underneath this one is lua-http -- the
 library this project found a denial of service in, whose last commit is
-September 2024, and which `akkar/substrate.lua` already carries a repair for.
+September 2024, and which `akkar/vendor/http/h1_stream.lua` already carries a
+repair for.
 
 So the value is in the ADAPTER: a deadline, a response ceiling, a retry policy
 that knows what is safe to repeat, trace propagation, and metrics. The
@@ -131,6 +132,7 @@ local time         = require "akkar.time"
 -- For the execution's remaining budget. `akkar.execution` requires only
 -- cqueues and akkar.time, so this adds no cycle.
 local execution    = require "akkar.execution"
+local describe     = require("akkar.errno").describe
 
 local M = {}
 
@@ -274,7 +276,15 @@ function Client:pool_for(key, host, port, tls)
     }, timeout)
     -- `Pool:get` expects `open` to raise, and treats the raise as a slot that
     -- must be given back -- so returning nil here would wedge the pool.
-    if not conn then error(tostring(err or "could not connect"), 0) end
+    --
+    -- NAMED, NOT NUMBERED. `http_client.connect` hands back cqueues' raw errno
+    -- on a socket failure, and `tostring` on that produced a reason of `32` --
+    -- the whole message, in the log line and in the 502 the caller sees.
+    -- `spec/dns_failure_spec.lua` caught it: a lookup that fails somewhere with
+    -- no resolver reports a number nobody can act on. `akkar.errno.describe`
+    -- passes an already-worded message through untouched, so this only ever
+    -- adds a name where there was none.
+    if not conn then error(tostring(describe(err) or "could not connect"), 0) end
     return setmetatable({ conn = conn, key = key }, Connection)
   end, self.pool_size, function(resource)
     return self.reuse and not resource.broken and resource:alive()

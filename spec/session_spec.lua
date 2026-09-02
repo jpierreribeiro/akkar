@@ -136,6 +136,34 @@ describe("akkar.session", function()
       "the pre-rotation cookie still works")
   end)
 
+  it("forgets EVERY pre-rotation id, not just the most recent", function()
+    -- `regenerate` promises to forget the old id, and that promise is the whole
+    -- of the fixation defence: the id an attacker planted before the login must
+    -- stop working after it. But the session remembered only the single
+    -- immediately-preceding id, so a SECOND rotation overwrote the memory of
+    -- the first -- and the first is the id loaded from the cookie, the one the
+    -- attacker controls. Two rotations in one request (log in, then rotate
+    -- again on a privilege change -- both listed in this module's docstring as
+    -- reasons to regenerate) left the planted id alive in the store.
+    local c = cache.new()
+    local m = manager()
+
+    -- The attacker's planted, validly-signed id, with data already in the store.
+    local s = m:open(c, nil)
+    s:set("user_id", 7)
+    local planted = m.name .. "=" .. cookie_value(s:commit())
+    local planted_id = s.id
+
+    local live = m:open(c, planted)
+    live:regenerate()          -- login rotation
+    live:regenerate()          -- second rotation, e.g. a privilege change
+    live:commit()
+
+    assert.is_nil(m:open(c, planted):get "user_id",
+      "the planted pre-rotation cookie still works after a second rotation")
+    assert.are_not.equal(planted_id, live.id)
+  end)
+
   it("does not rewrite the cookie when nothing changed", function()
     -- Rewriting on every response resets the expiry on every poll, and a
     -- session that never expires while a tab is open outlives a stolen laptop.

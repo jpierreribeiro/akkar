@@ -36,6 +36,22 @@ app:get("/users", function() return { users = {} } end)
 app:post("/users", { body = { name = "string" } },
          function(req) return akkar.created { name = req.body.name } end)
 
+-- THE SMUGGLING MARKER. A route that only a request the client never framed
+-- can reach, so a desync leaves a fingerprint in the byte stream instead of
+-- having to be inferred from a status code.
+--
+-- POST, and only POST, ON PURPOSE. `spec/framing_spec.lua`'s original corpus
+-- smuggles a *GET* /admin and asserts that a 404 -- proof the trailing bytes
+-- were routed -- never comes back. Registering a GET handler here would make
+-- that case answer 200 and quietly retire the suite's oldest smuggling
+-- assertion. GET /admin therefore stays unrouted and still 404s; the POST is
+-- new ground.
+app:post("/admin", function() return { admin = "SMUGGLED" } end)
+-- A 204, for the response-framing assertions. RFC 9110 8.6 forbids a
+-- Content-Length here, and akkar synthesised one, so the route exists to put
+-- the actual bytes of a bodyless response in front of a test.
+app:get("/nothing", function() return akkar.response(204) end)
+
 app:handle_signals()
 app:run { port = %d, check_capabilities = false, timeout = 1,
           %s
@@ -74,9 +90,8 @@ end
 --- port would make the spec fail on its second run for a reason that has
 --- nothing to do with what it tests.
 --- `extra` is pasted into the server's `app:run{}` call, so a spec can start
---- a server configured differently -- `repair_substrate = false`, say, which
---- is how `spec/substrate_repair_spec.lua` shows that the repair is what
---- keeps the server alive rather than something else in the stack.
+--- a server configured differently -- a smaller `body_limit`, say -- without
+--- needing a second support module per configuration.
 --- `prelude` is Lua that runs BEFORE `require "akkar"`, which is the only
 --- place a `package.preload` override can be installed and still be seen.
 --- `spec/substrate_repair_spec.lua` uses it to swap one vendored module for
@@ -203,6 +218,160 @@ function M.send(port, bytes, timeout)
   cq:loop(timeout or 2)
 
   return outcome or "timeout"
+end
+
+--- Sends bytes and returns EVERY byte the server writes back before it closes,
+--- as one string, plus the outcome word `M.send` would have returned.
+---
+--- ## Why `M.send` cannot be used to test request smuggling
+---
+--- `M.send` reads ONE status line with `conn:read "*L"` and closes. A desync
+--- IS a second response on the same connection -- the smuggled request's
+--- answer, arriving after the first -- so a harness that stops reading at the
+--- first status line cannot observe one BY CONSTRUCTION. Every smuggling
+--- assertion written against `M.send` was therefore unfalsifiable: it saw the
+--- first response, which is well-formed even when the connection has been
+--- desynchronised behind it.
+---
+--- This reads until the peer closes or the budget runs out, so a caller can
+--- count occurrences of "HTTP/1.1 " and look for a marker that only a
+--- smuggled request could have produced.
+---
+--- Reading is a LOOP over bounded chunks rather than a single `read "*a"`.
+--- `*a` returns nothing at all until EOF, so against a server that answers and
+--- then holds the connection open -- which is precisely the bug being hunted,
+--- since a framing error is supposed to close -- `*a` yields the empty string
+--- on timeout and the test reads it as "no response". The loop keeps what
+--- arrived before the budget expired, which is the evidence.
+---
+--- Returns `body, outcome, closed` where `closed` says the server actually
+--- ended the connection rather than the budget doing it. That distinction is
+--- itself an assertion target: RFC 9112 6.3 requires a close after a framing
+--- error, so a test can demand it.
+function M.send_raw(port, bytes, timeout)
+  local parts, outcome, closed = {}, nil, false
+  local cq = cqueues.new()
+  cq:wrap(function()
+    local conn = socket.connect("127.0.0.1", port)
+    if not conn then outcome = "closed" return end
+    conn:setmode("bn", "bn")
+    conn:onerror(function(_, _, why) return why end)
+
+    if not conn:write(bytes) then
+      conn:close()
+      outcome = "closed"
+      return
+    end
+    conn:flush()
+
+    -- A negative count is cqueues' "up to this many bytes", so a response
+    -- shorter than the buffer does not block waiting for the rest of it.
+    while true do
+      local chunk = conn:read(-4096)
+      if chunk == nil or chunk == "" then
+        closed = chunk == nil
+        break
+      end
+      parts[#parts + 1] = chunk
+    end
+    conn:close()
+    outcome = #parts > 0 and "answered" or "closed"
+  end)
+  cq:loop(timeout or 2)
+
+  return table.concat(parts), outcome or "timeout", closed
+end
+
+--- Splits a byte stream `M.send_raw` returned into the responses it contains.
+--- Returns a sequence of `{ status = 400, headers = {...}, body = "..." }`,
+--- newest last, and a reason if the stream ended mid-message.
+---
+--- ## Why this PARSES rather than counting "HTTP/1.1 "
+---
+--- Two failure modes, in opposite directions, and a `string.find` count has
+--- both:
+---
+---   * FALSE NEGATIVE, which is the one that matters. akkar frames its
+---     responses with `Content-Length`, so the smuggled request's answer
+---     begins on the byte immediately after the first response's body -- e.g.
+---     `...{"error":"malformed request"}HTTP/1.1 200 OK`. There is no CRLF in
+---     front of it, so any boundary rule based on a preceding delimiter
+---     misses exactly the desync the test exists to catch, and the test goes
+---     green on a vulnerable server.
+---   * FALSE POSITIVE. A bare count also counts the token inside a response
+---     BODY, and akkar echoes request detail into its 400 body -- so an input
+---     carrying "HTTP/1.1 200" could manufacture a second "response" and fail
+---     a server that never desynchronised.
+---
+--- Walking the framing is the only thing that answers both: a response ends
+--- where its own `Content-Length` or chunk terminator says it ends, and
+--- whatever begins there is a genuinely separate message.
+function M.parse_responses(stream)
+  local out, at = {}, 1
+
+  while at <= #stream do
+    local line_end = stream:find("\r\n", at, true)
+    if not line_end then
+      return out, "no status line at byte " .. at
+    end
+    local status = tonumber(stream:sub(at, line_end - 1):match "^HTTP/1%.[01] (%d%d%d)")
+    if not status then
+      return out, "not a status line at byte " .. at .. ": " ..
+                  stream:sub(at, math.min(line_end - 1, at + 60))
+    end
+    at = line_end + 2
+
+    local hdrs = {}
+    while true do
+      local eol = stream:find("\r\n", at, true)
+      if not eol then return out, "headers never ended" end
+      if eol == at then at = at + 2 break end -- the blank line
+      local k, v = stream:sub(at, eol - 1):match "^([^:]+):%s*(.-)%s*$"
+      if k then hdrs[k:lower()] = v end
+      at = eol + 2
+    end
+
+    local body
+    if hdrs["transfer-encoding"] and hdrs["transfer-encoding"]:find "chunked" then
+      local buf = {}
+      while true do
+        local eol = stream:find("\r\n", at, true)
+        if not eol then return out, "chunked body truncated" end
+        local size = tonumber(stream:sub(at, eol - 1):match "^(%x+)", 16)
+        if not size then return out, "bad chunk size" end
+        at = eol + 2
+        if size == 0 then
+          -- trailers, then the terminating blank line
+          while true do
+            local te = stream:find("\r\n", at, true)
+            if not te then return out, "trailers never ended" end
+            local was = at
+            at = te + 2
+            if te == was then break end
+          end
+          break
+        end
+        buf[#buf + 1] = stream:sub(at, at + size - 1)
+        at = at + size + 2 -- the chunk's own CRLF
+      end
+      body = table.concat(buf)
+    else
+      local len = tonumber(hdrs["content-length"] or "0")
+      if not len then return out, "unusable content-length" end
+      body = stream:sub(at, at + len - 1)
+      at = at + len
+    end
+
+    out[#out + 1] = { status = status, headers = hdrs, body = body }
+  end
+
+  return out
+end
+
+--- How many complete responses came back on one connection. More than one is
+--- a desync: the server answered a request the client never framed.
+function M.count_responses(stream)
+  return #(M.parse_responses(stream))
 end
 
 return M

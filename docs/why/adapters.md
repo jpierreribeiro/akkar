@@ -153,8 +153,9 @@ documents a request with `Content-Length: banana` that leaves lua-http alive,
 listening, spinning, and answering nobody, for ever. Every port based liveness
 check calls that server healthy. The page originally ended "it is not akkar's
 to fix"; that has been corrected, because it was true of *reporting* the bug
-and false of *surviving* it. `akkar/substrate.lua` carries the repair and
-`spec/substrate_repair_spec.lua` proves it by starting a server without it and
+and false of *surviving* it. `akkar/vendor/http/h1_stream.lua` carries the
+repair and `spec/substrate_repair_spec.lua` proves it by starting a server
+with the upstream module swapped back in and
 requiring that one to die.
 
 You can only repair a dependency you have wrapped.

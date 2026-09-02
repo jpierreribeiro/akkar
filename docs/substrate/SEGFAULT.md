@@ -1,5 +1,14 @@
 # The suite segfaults, intermittently, inside cqueues
 
+> **Resolved 2 September 2026 by a core dump — see "RESOLVED" below.** A failing
+> `connect` makes cqueues cancel that fd across *every* controller in the state
+> (`cstack_cancelfd`), and one of them has an unclean descriptor tree: a
+> controller `akkar/health.lua` abandoned, probe socket still inside, when a
+> probe timed out. Not the freelist or the controller pool this page spends most
+> of its length on — both of those are already gone (`962ceaa`, and F2 in
+> `fb61b07`). Everything before the resolution is the investigation as it
+> happened, kept as record; read the resolution first.
+
 Found on 17 August 2026 while running the suite for an unrelated change. Not
 caused by that change — the timestamps rule it out, and they are the first
 thing recorded here because "did I break this" is the only question that
@@ -168,6 +177,112 @@ lines that touch nothing relevant.
 CI, where before it needed half an hour of local runs to catch four. A
 platform that fails every time is a better laboratory than one that fails
 sometimes.
+
+## RESOLVED, 2 September 2026: the core dump, and it is neither hypothesis on this page
+
+The arm64 job "reproducible on demand" turned out to be a better laboratory than
+half an hour of local runs: it produced a symbolised core dump, saved beside
+this file as `segfault-backtrace-2026-09-02.txt`. It settles the diagnosis and
+retracts the two standing hypotheses, the freelist one below included.
+
+**Finding the trigger first.** Four sessions could not reproduce this crash, and
+the reason was the harness, not the bug: `busted` in CI writes to a pipe, and
+redirecting stdout to a file changes the heap layout enough to hide it. **48
+arm64 runs to a file, 0 crashes; 6 runs to the pipe, 6 crashes.** So the bug is
+real, load- and layout-sensitive exactly as this page always said, and the pipe
+is what makes it fire every time.
+
+**Frame 0 is the tell.** The crash is `fileno_cmp` — the comparator this whole
+page is about — called with `b=0xffda00014807`, a heap pointer sitting in the
+`fd` slot of a red-black-tree node. A live `struct fileno` holds a small integer
+there. A node whose memory is no longer a `struct fileno` holds whatever now
+occupies that word. The tree walk is comparing against freed memory.
+
+**Frames 3 through 11 are the mechanism, and it is not the pool.**
+
+```
+#0  fileno_cmp                          cqueues.c:1195
+#3  cqueue_cancelfd (fd=-1)
+#4  cstack_cancelfd                     cqueues.c:2780   LIST_FOREACH over CS->cqueues
+#5  cqs_cancelfd
+#7  so_closesocket                      errno 65535
+#10 so_connect
+#11 lso_connect2
+```
+
+Read bottom-up: a socket `connect` FAILS, `so_closesocket` tears the fd down,
+and `cqs_cancelfd` asks cqueues to cancel it. `cstack_cancelfd` then does the
+thing that matters — it walks **every controller in the whole Lua state**
+(`LIST_FOREACH(cqueue, &CS->cqueues, le)`), calling `cqueue_cancelfd` on each so
+no pollset is left holding a stale reference to that fd. One of those
+controllers has a corrupt fileno tree, and its root faults the next failing
+connect anywhere in the process.
+
+So the corrupting condition is a controller the cstack still walks whose
+descriptor tree is not clean — and the akkar-specific source of that is a
+controller **abandoned with work still inside it**. Two earlier suspects are
+already gone and are NOT it: `962ceaa` retired the controller pool (the update
+above eliminated reuse), and `fb61b07` (F2) removed the per-request deadline
+controller outright — `akkar/execution.lua` now carries the deadline as a bare
+number in `cqueues.poll` on the controller it is already inside, so a request no
+longer creates a controller at all. That correction matters: an earlier draft of
+this section blamed execution.lua, and the code had already moved.
+
+What is left is `akkar/health.lua`. It takes a fresh `cqueues.new()` per probe
+(line 138) and, on timeout, **drops it without reuse while the probe coroutine
+is still parked inside it** (line 169) — the socket of the failed probe is still
+registered in that controller's pollset when it is abandoned. Those controllers
+sit on the cstack until they are collected, and `cstack_cancelfd` walks every
+one of them on each failing connect.
+
+**Why the no-services job specifically, and it fits health.lua exactly.** That
+job refuses every Postgres and Redis connection, so its health probes against
+absent services *time out* — which is the one path that abandons a controller —
+and they do so continuously through the run. `integration`, which has both
+services, has its probes answered, abandons nothing, and almost never crashes.
+The crash was never about what the suite computes; it is about a job whose
+health checks cannot connect, piling up abandoned pollsets for the next failing
+connect to walk.
+
+**The freelist hypothesis below is retracted, and it was mechanically
+impossible.** It required `fileno_del` to return a node to cqueues' object pool
+while the tree still linked it. `fileno_del` has exactly one call site, inside
+`cqueue_destroy` — the node is freed only as its whole controller is torn down,
+so there is no live tree left to walk it from. The real fault is a *different*
+controller's tree, reached through the cstack, not a recycled node in the same
+one.
+
+**The fix is akkar's own, and F2 was half of it — the other half is
+health.lua.** F2 already did to the request path what needs doing here: it stops
+creating a controller and carries the deadline as a number, running the handler
+as a worker on the controller it is already inside (`akkar/execution.lua`'s
+`run_on_worker`). `health.lua` still allocates a fresh `cqueues.new()` per probe
+purely to arbitrate the timeout, and on timeout DROPS it with the probe still
+inside (line 168) — that is the abandoned pollset. The in-server branch today
+only *polls* that nested controller from the ambient one (line 156); the fix is
+to not create it at all — wrap the probe coroutine onto the ambient controller
+the way `run_on_worker` does, so an abandoned probe wakes and finishes on the
+shared loop rather than leaving a controller on the cstack. Until that lands,
+the crash's remaining fuel is health probes that cannot connect.
+
+It is not a mechanical port, and that is why it is written up rather than done
+in passing: the nested controller also ISOLATES a hung probe from the server's
+hot controller, and a check function is arbitrary — not every one is bounded by
+an adapter deadline the way `db.ping` is. Moving probes onto the ambient
+controller trades that isolation against this multiplicity, which is a judgment
+to make deliberately. And the fix cannot be proven locally: the crash reproduces
+only on arm64 under a pipe, so the confirmation that it is gone is the arm64 CI
+job going green, not a local red-to-green.
+
+The cqueues pin is already upstream master's tip, so there is no released fix to
+pull. The endorsed upstream fix (cqueues issue #42) deletes the
+cancel-across-all-controllers walk entirely — it would remove the crash site
+rather than starve it, and is the durable fix if abandoning a controller ever
+becomes unavoidable again.
+
+Everything below is left as written — the hypotheses, the pool experiment, the
+price of turning recycling off — because the record of what was tried and what
+it cost is the point of this file. It is history now, not the diagnosis.
 
 ## The experiment, and its result
 

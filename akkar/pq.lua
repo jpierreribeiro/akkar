@@ -244,6 +244,32 @@ end
 ---
 --- `cqueues.cancel` removes it from the pollset and wakes anything waiting on
 --- it, which is exactly the contract needed here.
+---
+--- AND IT DOES NOT COVER THE CASE THIS PARAGRAPH DESCRIBES BEST, which is
+--- measured rather than suspected and is why this note exists.
+---
+--- When the BACKEND goes away -- `pg_terminate_backend`, a failover, a
+--- restart -- libpq tears the connection down inside `PQconsumeInput`, which
+--- means it closes the descriptor before this function is ever reached, and
+--- `PQsocket` then answers -1:
+---
+---     fd while healthy:      5
+---     fd after backend died: -1
+---
+--- so the guard below skips itself. Remembering the number and cancelling the
+--- remembered one does not help either, and neither does cancelling after
+--- every poll, a collection, or a yield: cqueues keeps per-descriptor state
+--- that `cqueues.cancel` does not clear once the descriptor has been closed
+--- behind its back. The next connection handed descriptor 5 then kills the
+--- whole controller:
+---
+---     unable to update event disposition: No such file or directory (fd:5)
+---
+--- raised at the scheduler rather than at the caller, so no `pcall` around a
+--- request catches it -- one dead backend takes down every request in the
+--- process. `spec/pg_restart_spec.lua` carries the twelve-line reproduction.
+--- The fix has to be in `src/akkar_pq.c`: the descriptor must leave the
+--- pollset before libpq closes it, which only the C side can see happen.
 function Conn:close()
   if self.closed then return end
   self.closed = true
