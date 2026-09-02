@@ -13,6 +13,7 @@ local trace = require "akkar.trace"
 ## Sumário
 
 - [trace.attributes_of(map)](#traceattributes_ofmap)
+- [trace.Batch](#tracebatch)
 - [trace.DEFAULTS](#tracedefaults)
 - [trace.Exporter](#traceexporter)
 - [trace.KIND](#tracekind)
@@ -49,6 +50,16 @@ Transforma uma tabela de chave para valor na lista de atributos do OTLP, ordenad
 Uma string vira `stringValue`, um booleano vira `boolValue`, um inteiro Lua vira `intValue` (como **string**, que é o que o mapeamento JSON do OTLP exige para um int64), um float vira `doubleValue`. Qualquer outra coisa é convertida para string.
 
 **Retorna** uma lista, ou `nil` para um mapa `nil` ou vazio.
+
+## trace.Batch
+
+A fila, os dois limites e o loop em segundo plano, em uma metatabela própria. `record`, `due`, `tick`, `client`, `deliver`, `flush`, `stats`, `run` e `stop` são definidos aqui; um `Exporter` herda todos eles e acrescenta `start_span`, `middleware` e `encode`.
+
+Está separado porque há mais de uma coisa neste runtime que precisa sair do processo sem ficar em cima do relógio da requisição: o `akkar.errors` é a outra, e todo argumento desta página — nunca inline, descartar em vez de crescer, descartar em vez de repetir, dois limites e não um — é argumento dela também. Escrever uma segunda vez uma troca de fila cuja correção só aparece sob concorrência é como a segunda cópia sai sutilmente errada.
+
+`trace.batch(target, options)` instala esses campos em uma tabela; quem chama põe a própria metatabela por cima. `options.origin` é o nome do módulo, para que `"akkar.trace has no http capability"` nomeie o que está mal configurado.
+
+Uma consequência que vale saber: `sink = function(document, spans)` também funciona em um exporter, e recebe exatamente o documento OTLP que teria ido no POST.
 
 ## trace.DEFAULTS
 
@@ -235,7 +246,7 @@ O span é exposto ao handler como `req.span`. Nada é escrito na resposta: o val
 | `name` | function | `req.method .. " " .. req.route` | nomeia o span, chamada depois que o handler roda, para que `req.route` já exista |
 | `sampler` | function | nenhum | chamada com a requisição; uma resposta falsa significa nenhum span |
 
-O nome do span usa o padrão da rota, não o caminho, então `/tasks/7` e `/tasks/8` são uma única operação. Atributos definidos: `http.request.method`, `url.path`, `http.response.status_code`. O status é `ERROR` para um erro gerado ou um 5xx, e permanece `UNSET` para um 4xx, que é a própria regra do OpenTelemetry para um span de servidor.
+O nome do span usa o padrão da rota, não o caminho, então `/tasks/7` e `/tasks/8` são uma única operação. Atributos definidos: `http.request.method`, `url.path`, `http.response.status_code` e `akkar.request_id`, que é o `req.id` -- o mesmo valor que `req.log` escreve como `request_id` e que a resposta carrega como `x-request-id`. Fica sob o namespace do próprio akkar porque as convenções semânticas não definem atributo de request id, e o único atributo delas em forma de header registra o que o cliente mandou, que o `req.id` não é. O status é `ERROR` para um erro gerado ou um 5xx, e permanece `UNSET` para um 4xx, que é a própria regra do OpenTelemetry para um span de servidor.
 
 **Retorna** uma função middleware.
 
@@ -384,6 +395,33 @@ O início vem de `akkar.time.now()`, que é `os.time` e tem **resolução de um 
 - **Métricas ou logs via OTLP.** Este exportador carrega spans. O mesmo exportador com outro `encode` carrega os outros dois, e [akkar.otlp](otlp.md) constrói os três a partir de uma única opção.
 - **Protobuf.** O payload é JSON OTLP/HTTP, gerado aqui.
 - **Amostragem por cabeça (head sampling) por proporção.** `sampler` é uma função que você escreve. Não existe `ratio = 0.1`.
+
+## Correlação com logs
+
+Um span e uma linha de log da mesma requisição compartilham duas chaves, uma em cada direção. `req.log` carrega `trace_id` e `span_id` assim que o middleware iniciou um span (e os ids do trace de entrada mesmo quando não iniciou); o span de servidor carrega `akkar.request_id`. Qualquer um leva ao outro, e uma linha de log de uma requisição sem trace não carrega chave nenhuma, em vez de uma vazia. Veja [akkar.log](log.md#loggerwithfields).
+
+```lua
+local akkar = require "akkar"
+local trace = require "akkar.trace"
+local log   = require "akkar.log"
+local json  = require "akkar.json"
+
+local lines = {}
+local logger = log.new { format = "json", sink = function(line) lines[#lines + 1] = line end }
+local exporter = trace.new {}
+
+local app = akkar.new()
+app:use(exporter:middleware())
+app:get("/tasks/:id", function(req) req.log:info("looked up") return { id = req.params.id } end)
+
+local res = app:test({ log = logger }):get "/tasks/7"
+local span = exporter.queue[1]
+local line = json.decode(lines[1])
+
+print(line.trace_id == span.trace_id)                              --> true
+print(line.span_id == span.span_id)                                --> true
+print(span.attributes["akkar.request_id"] == res.headers["x-request-id"])   --> true
+```
 
 ## Veja também
 

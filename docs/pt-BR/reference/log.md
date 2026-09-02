@@ -147,9 +147,31 @@ Escreve em `warn`. Mesmo formato de `logger:info`.
 
 Retorna um novo logger que escreve `fields` em toda linha, por cima do que ele já carregava. O logger original permanece inalterado, e level, format e sink são copiados.
 
-É isso que o próprio akkar faz por requisição: `req.log` é o logger configurado com `request_id` vinculado àquela requisição.
+É isso que o próprio akkar faz por requisição: `req.log` é o logger configurado com `request_id` vinculado àquela requisição, `client_request_id` quando quem chamou mandou um `x-request-id`, e `trace_id` e `span_id` quando a requisição carrega um trace: um `traceparent` de entrada, ou um span iniciado pelo middleware do [akkar.trace](trace.md), o que for o span dentro do qual a linha é escrita. Uma requisição sem trace **não** ganha chave `trace_id` nenhuma, em vez de uma vazia. Esses dois nomes são os campos que o modelo de dados de logs do OpenTelemetry coloca num registro de log para correlação, então um coletor que os indexa junta a linha ao seu span sem precisar ser ensinado.
 
 **Retorna** um logger.
+
+```lua
+local akkar = require "akkar"
+local log   = require "akkar.log"
+local json  = require "akkar.json"
+
+local lines = {}
+local logger = log.new { format = "json", sink = function(line) lines[#lines + 1] = line end }
+
+local app = akkar.new()
+app:get("/", function(req) req.log:info("handler ran") return { ok = true } end)
+local client = app:test { log = logger }
+
+client:get("/", { headers = {
+  traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+} })
+print(json.decode(lines[1]).trace_id)   --> 4bf92f3577b34da6a3ce929d0e0e4736
+print(json.decode(lines[1]).span_id)    --> 00f067aa0ba902b7
+
+client:get "/"
+print(json.decode(lines[2]).trace_id)   --> nil: sem trace, sem chave
+```
 
 ```lua
 local log = require "akkar.log"

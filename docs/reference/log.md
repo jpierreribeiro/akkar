@@ -176,9 +176,38 @@ already carried. The original logger is unchanged, and level, format and sink
 are copied.
 
 This is what akkar itself does per request: `req.log` is the configured logger
-with `request_id` bound to that request.
+with `request_id` bound to that request, `client_request_id` when the caller
+sent an `x-request-id`, and `trace_id` and `span_id` when the request carries
+a trace: an inbound `traceparent`, or a span started by
+[akkar.trace](trace.md)'s middleware, whichever is the span the line is
+written inside. A request with no trace gets **no** `trace_id` key, rather
+than an empty one. Those two names are the fields the OpenTelemetry log data
+model puts on a log record for correlation, so a collector that indexes them
+joins a line to its span without being told how.
 
 **Returns** a logger.
+
+```lua
+local akkar = require "akkar"
+local log   = require "akkar.log"
+local json  = require "akkar.json"
+
+local lines = {}
+local logger = log.new { format = "json", sink = function(line) lines[#lines + 1] = line end }
+
+local app = akkar.new()
+app:get("/", function(req) req.log:info("handler ran") return { ok = true } end)
+local client = app:test { log = logger }
+
+client:get("/", { headers = {
+  traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+} })
+print(json.decode(lines[1]).trace_id)   --> 4bf92f3577b34da6a3ce929d0e0e4736
+print(json.decode(lines[1]).span_id)    --> 00f067aa0ba902b7
+
+client:get "/"
+print(json.decode(lines[2]).trace_id)   --> nil: no trace, no key
+```
 
 ```lua
 local log = require "akkar.log"

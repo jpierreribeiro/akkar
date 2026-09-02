@@ -180,6 +180,33 @@ function M.acquire(carrier, record, key)
     -- upstream's logs without ever being trusted for identity.
     local bound = { request_id = carrier.id }
     bound.client_request_id = carrier.client_request_id
+    -- AND THE TRACE, WHEN THERE IS ONE. Until this line a log line and a
+    -- span shared no key: the span carried the trace id and the log line the
+    -- request id, and nothing joined them. The OpenTelemetry log data model
+    -- puts `TraceId` and `SpanId` ON the log record for exactly this --
+    -- "can be set for logs that are part of request processing and have an
+    -- assigned trace ID" -- so a collector that speaks it, and a person
+    -- grepping, get the join for free.
+    --
+    -- The active span wins, because its id is the span this line is emitted
+    -- within. With no span of our own the inbound `traceparent` is still a
+    -- trace, and its span id is the caller's -- which is what OpenTelemetry
+    -- calls the current span when nothing local has started one. `trace` is
+    -- HTTP's field and `span` is the exporter's; this module reads them as
+    -- fields on the carrier, the way it already reads `client_request_id`,
+    -- and still never learns what a header is.
+    --
+    -- NOTHING IS ADDED WHEN THERE IS NO TRACE. Assigning nil to a table key
+    -- allocates nothing, `rawget` allocates nothing, and a request with no
+    -- header leaves `carrier.trace` unset -- so a line from an untraced
+    -- request has no `trace_id` key rather than an empty one, and the
+    -- allocation ceiling reads the same as before.
+    local span = rawget(carrier, "span")
+    local context = span or carrier.trace
+    if context then
+      bound.trace_id = context.trace_id
+      bound.span_id  = context.span_id
+    end
     value = (provided or default_log):with(bound)
   elseif provided == nil then
     value = M.guard("req." .. key,

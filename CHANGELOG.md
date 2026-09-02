@@ -64,6 +64,13 @@ one commit with a spec that failed before it and passes after.
 
 ### Added
 
+- **`akkar.errors`** — the other end of `app:on_error`, which has documented
+  `sentry:capture(err, ...)` since early on against nothing. Captures the
+  request id, trace id, span id, route PATTERN, method, status and a sanitised
+  message; delivers to a function or to any URL that reads JSON, on the
+  background loop `akkar.trace` already had. Not the Sentry envelope protocol.
+  The 500 is unchanged: the hook declines, so the client still gets the bare
+  `{"error": "internal server error"}`.
 - `job.uid`, stable across every retry and redelivery — the key a handler dedups
   on, without which "your handler will sometimes run twice" is unusable advice.
 - `max_lifetime` and `idle_timeout` on the connection pool, so a socket the
