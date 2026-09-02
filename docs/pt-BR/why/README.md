@@ -2,7 +2,7 @@
 
 > **Português (Brasil)** | [Original em inglês](../../why/README.md)
 
-Sete argumentos. Cada um trata de uma decisão que aparece na API, diz o que ela torna impossível, diz quanto ela custa e aponta para a medição ou a retratação por trás dela.
+Oito argumentos. Cada um trata de uma decisão que aparece na API, diz o que ela torna impossível, diz quanto ela custa e aponta para a medição ou a retratação por trás dela.
 
 Estas páginas são para um leitor curioso ou cético, e ser cético é a postura correta. Elas **não** são o lugar para aprender akkar: se você quer construir algo, comece em `docs/pt-BR/guide/00-quickstart.md` e volte para cá quando uma página fizer você perguntar "por que raios isso é assim".
 
@@ -15,6 +15,7 @@ Estas páginas são para um leitor curioso ou cético, e ser cético é a postur
 | [what-the-runtime-is-for.md](what-the-runtime-is-for.md) | O que o `akkar build` oferece, e por que velocidade não está na lista? |
 | [what-akkar-does-not-do.md](what-akkar-does-not-do.md) | O que é deliberadamente excluído, e o que você deveria usar no lugar? |
 | [slower-than-openresty.md](slower-than-openresty.md) | Por que o akkar é mais lento que o OpenResty, para onde vai o tempo e o que pode ser feito? |
+| [production-scorecard.md](production-scorecard.md) | Cada crítica a Lua como linguagem de produção, uma de cada vez: quais o runtime neutraliza, quais são riscos reais, e onde na árvore vive cada resposta. |
 
 ## Como ler um número nestas páginas
 
