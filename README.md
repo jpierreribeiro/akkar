@@ -367,6 +367,7 @@ a global by another name.
 | | |
 |---|---|
 | [`akkar.http`](docs/reference/http.md) | a client with a pool, retries and a body ceiling |
+| [`akkar.breaker`](docs/reference/breaker.md) | a circuit breaker, so a dead dependency stops being dialled |
 | [`akkar.email`](docs/reference/email.md) | SMTP |
 | [`akkar.storage`](docs/reference/storage.md) | S3-compatible object storage, signed |
 

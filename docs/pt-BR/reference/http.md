@@ -64,6 +64,7 @@ Constrói um cliente e devolve uma factory que o entrega. O formato é igual ao 
 | `pool_size` | number | `8` | conexões vivas por `scheme://host:port` |
 | `reuse` | boolean | `true` | `false` fornece uma conexão por requisição pelo mesmo caminho de código |
 | `http_version` | number | nenhum | deixado sem definição para que o lua-http negocie; fixe `1.1` para um peer que anuncia h2 incorretamente |
+| `breaker` | table | nenhum | uma tabela de opções de [breaker](breaker.md) dá um breaker por origem; uma instância de breaker é compartilhada por toda origem |
 
 A chave do pool vem da URI interpretada, então `http://x/a` e `http://x:80/b` compartilham um pool, e `http://x` e `https://x` nunca compartilham.
 
@@ -235,7 +236,7 @@ O que os pools estão fazendo, por origem em vez de como um total único: um ún
 - **Seguir redirecionamentos.** O cliente conduz o stream ele mesmo em vez de passar por `request:go()`, então um `301` ou `302` é devolvido a você como um valor de resposta com um header `location`. Siga-o você mesmo se quiser que ele seja seguido.
 - **Um cookie jar.** Nada é armazenado entre chamadas. `set-cookie` chega como um header (uma lista quando se repete) e cabe a você tratá-lo.
 - **Fazer stream de uma requisição ou de um corpo de resposta.** Ambos são strings. O teto de resposta é `max_body`, e ele recusa em vez de truncar.
-- **Um circuit breaker, ou rate limiting por host.** [limit](limit.md) é a metade de entrada e não tem uma contraparte de saída.
+- **Rate limiting por host.** [limit](limit.md) é a metade de entrada e não tem uma contraparte de saída. Um circuit breaker é o campo `breaker` de `http.connect`; sua página é [breaker](breaker.md).
 - **Verificação de nomes de opção.** Chaves desconhecidas em `config` e nas `options` de uma chamada são ignoradas silenciosamente, diferentemente de `app:run{}`.
 - **`client:acquire`, `client:attempt`, `client:pool_for`.** Estão em `http.Client` e são internos. Suas assinaturas mudam sem aviso.
 
@@ -243,4 +244,5 @@ O que os pools estão fazendo, por origem em vez de como um total único: um ún
 
 - [akkar](akkar.md) para como uma capacidade é configurada e como `req.http` chega a um handler
 - [pool](pool.md), cujo `pool:stats()` é o que aparece em `origins`
+- [breaker](breaker.md), cujo `b:stats()` é o que aparece em `breakers`
 - o código-fonte do módulo, `akkar/http.lua`, para os dois defeitos encontrados durante a construção do pool (uma leitura de corpo sem timeout, e um segundo fixo por corpo acima de 1 KiB) e para o quanto o pooling vale a pena, conforme medido

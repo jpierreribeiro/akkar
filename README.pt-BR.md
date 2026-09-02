@@ -314,6 +314,7 @@ Trinta e seis módulos e oito comandos, cada linha apontando para sua página de
 | | |
 |---|---|
 | [`akkar.http`](docs/pt-BR/reference/http.md) | um client com pool, retries e um teto de tamanho de body |
+| [`akkar.breaker`](docs/pt-BR/reference/breaker.md) | um circuit breaker, para uma dependência morta parar de ser discada |
 | [`akkar.email`](docs/pt-BR/reference/email.md) | SMTP |
 | [`akkar.storage`](docs/pt-BR/reference/storage.md) | armazenamento de objetos compatível com S3, assinado |
 

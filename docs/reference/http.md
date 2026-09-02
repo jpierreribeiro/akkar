@@ -78,6 +78,7 @@ client, so the pools are shared.
 | `pool_size` | number | `8` | live connections per `scheme://host:port` |
 | `reuse` | boolean | `true` | `false` gives a connection per request through the same code path |
 | `http_version` | number | none | left unset so lua-http negotiates; pin `1.1` for a peer that mis-advertises h2 |
+| `breaker` | table | none | a table of [breaker](breaker.md) options gives one breaker per origin; a breaker instance is shared by every origin |
 
 The pool key comes from the parsed uri, so `http://x/a` and `http://x:80/b`
 share a pool and `http://x` and `https://x` never do.
@@ -289,8 +290,9 @@ reused one failed.
   header (a list when it repeats) and is yours to handle.
 - **Streaming a request or a response body.** Both are strings. The response
   ceiling is `max_body` and it refuses rather than truncates.
-- **A circuit breaker, or per-host rate limiting.** [limit](limit.md) is the
-  inbound half and has no outbound counterpart.
+- **Per-host rate limiting.** [limit](limit.md) is the inbound half and has no
+  outbound counterpart. A circuit breaker is the `breaker` field of
+  `http.connect`, and its page is [breaker](breaker.md).
 - **Option-name checking.** Unknown keys in `config` and in a call's `options`
   are ignored silently, unlike `app:run{}`.
 - **`client:acquire`, `client:attempt`, `client:pool_for`.** They are on
@@ -301,6 +303,7 @@ reused one failed.
 - [akkar](akkar.md) for how a capability is configured and how `req.http`
   reaches a handler
 - [pool](pool.md), whose `pool:stats()` is what appears under `origins`
+- [breaker](breaker.md), whose `b:stats()` is what appears under `breakers`
 - the module source, `akkar/http.lua`, for the two defects found while building
   the pool (a body read with no timeout, and a fixed second per body over 1 KiB)
   and for what pooling is measured to be worth
