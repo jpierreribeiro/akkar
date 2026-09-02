@@ -282,14 +282,39 @@ local function crypto()
   return crypto_module
 end
 
+--- THE QUERY STRING IS HALF OF "WHICH REQUEST THIS IS".
+---
+--- `req.path` does not carry the query: `akkar/init.lua` splits the target on
+--- `?` and hands the query to `req.query`. So a fingerprint built from method,
+--- path and body alone read `POST /transfers?to=alice` and
+--- `POST /transfers?to=bob` as the SAME request, and a client that reused a key
+--- while changing only the query -- `?to=`, `?dry_run=`, `?account=` -- was
+--- handed the FIRST request's stored response with `idempotent-replay: true`
+--- and its handler never ran. That is the same silent wrong answer the
+--- 512-byte truncation once produced, reappearing through the half of the
+--- request this function forgot to read: not a 422 saying the key was reused,
+--- but a 200 answering a question the caller did not ask.
+---
+--- The query is canonicalised, so it is a SET of parameters and not a
+--- sequence: `?a=1&b=2` and `?b=2&a=1` are one request and fingerprint the
+--- same, which keeps an honest retry whose client reordered its parameters
+--- from being refused. It is length-prefixed ahead of the body so the boundary
+--- between the two caller-chosen strings cannot be slid to forge a collision,
+--- the same reason the record key length-prefixes its namespace.
 local function fingerprint_of(req)
   local body = ""
   if req.body ~= nil then
     local ok, encoded = pcall(canonical, req.body)
     body = ok and encoded or tostring(req.body)
   end
-  return req.method .. " " .. req.path .. " " .. #body .. ":" ..
-         crypto().to_hex(crypto().sha256(body))
+  local query = ""
+  if req.query ~= nil then
+    local ok, encoded = pcall(canonical, req.query)
+    query = ok and encoded or tostring(req.query)
+  end
+  local material = #query .. ":" .. query .. #body .. ":" .. body
+  return req.method .. " " .. req.path .. " " .. #material .. ":" ..
+         crypto().to_hex(crypto().sha256(material))
 end
 
 M.canonical = canonical
