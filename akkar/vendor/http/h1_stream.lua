@@ -489,6 +489,30 @@ function stream_methods:read_headers(timeout)
 			self.body_read_type = "close"
 		end
 	elseif headers:has("transfer-encoding") then
+		-- AKKAR: BOTH Transfer-Encoding AND Content-Length is a desync, so
+		-- refuse the message rather than picking a winner.
+		--
+		-- Upstream let this `elseif` do the deciding: Transfer-Encoding is
+		-- tested first, so it silently won and `content-length` stayed in the
+		-- header set for the application to read. That is the classic
+		-- CL.TE request smuggling primitive. akkar is deployed behind a CDN,
+		-- which makes it the BACK-END half of a desync pair -- and the pair
+		-- only has to *disagree*. A front end that honours Content-Length and
+		-- a back end that honours Transfer-Encoding will disagree about where
+		-- this message ends, and the bytes past that point become a request
+		-- the front end never saw and never authorised.
+		--
+		-- RFC 9112 6.3.3: "If a message is received with both a
+		-- Transfer-Encoding and a Content-Length header field, the
+		-- Transfer-Encoding overrides the Content-Length. Such a message
+		-- might indicate an attempt to perform request smuggling [...] The
+		-- recipient MUST either [...] or respond with 400 (Bad Request) and
+		-- then close the connection." A back end takes the second option:
+		-- stripping and continuing is only safe for a recipient that is the
+		-- final one, and akkar cannot know that it is.
+		if headers:has("content-length") then
+			return nil, "content-length with transfer-encoding"
+		end
 		no_body = false
 		local transfer_encoding = Transfer_Encoding:match(headers:get_comma_separated("transfer-encoding"))
 		local n = #transfer_encoding
@@ -512,7 +536,95 @@ function stream_methods:read_headers(timeout)
 			return nil, "unknown transfer-encoding"
 		end
 	elseif headers:has("content-length") then
-		local cl = tonumber(headers:get("content-length"), 10)
+		-- AKKAR: `tonumber(v, 10)` IS NOT A CONTENT-LENGTH PARSER, and every
+		-- way it is wrong here ends in the same place -- the recipient
+		-- believing the body ends somewhere the sender does not.
+		--
+		-- Three separate defects, all verified in lua5.4:
+		--
+		--   * OVERFLOW SILENTLY WRAPS TO ZERO.
+		--     `tonumber("18446744073709551616", 10)` is `0`, not `nil`: with
+		--     an explicit base, Lua accumulates into a wrapping integer
+		--     instead of falling back to a float. `cl == 0` then set
+		--     `no_body = true`, so the "body" was left in the socket and
+		--     parsed as THE NEXT REQUEST. That is a complete smuggling
+		--     primitive out of one header value.
+		--   * SIGNS AND EXOTIC SPACE ARE ACCEPTED. `tonumber` skips leading
+		--     whitespace -- which for Lua includes `\v` and `\f`, neither of
+		--     them HTTP OWS -- and accepts a leading `+` or `-`. So `"+0"`,
+		--     `"-0"`, `"\v0"` and `"\f0"` are all `0`. A front end that
+		--     rejects those and a back end that accepts them are a desync
+		--     pair by construction.
+		--   * DUPLICATES: FIRST ONE SILENTLY WON. `headers:get` returns ALL
+		--     values for a repeated name, and Lua truncates a multi-value
+		--     call in an argument list to its first value -- so
+		--     `tonumber(headers:get("content-length"), 10)` read the FIRST
+		--     header and threw the rest away, without anything noticing they
+		--     existed. Meanwhile akkar's own `normalize_headers` joins them,
+		--     so the application saw `"0, 40"` while the framing used `0`.
+		--
+		-- The parse below is therefore explicit about the whole grammar.
+		-- RFC 9112 6.3.5: an invalid Content-Length is an unrecoverable
+		-- framing error; 6.3.4: multiple Content-Length fields with differing
+		-- values must be rejected. Content-Length is `1*DIGIT` (RFC 9112 8.6)
+		-- -- no sign, no space, no exponent, no hex.
+		local cl do
+			-- TWO VALUES CAPTURED, and the second one is a probe rather than
+			-- a value to parse.
+			--
+			-- `headers:get` returns every occurrence as multiple returns, and
+			-- its single-occurrence path returns the stored string WITHOUT
+			-- building a sequence -- which is a deliberate allocation
+			-- optimisation in `headers.lua`, worth a table on every request
+			-- that carries a body. Going straight to `get_as_sequence` here
+			-- would quietly undo it for exactly those requests, and
+			-- `spec/allocation_spec.lua` would not have caught it: it
+			-- measures a GET, which has no Content-Length at all.
+			--
+			-- So: the common case reads one value and allocates nothing, and
+			-- `second ~= nil` is enough to DETECT duplication without being
+			-- enough to adjudicate it. Only then is the full sequence built,
+			-- which is the attacker's path and may pay for itself.
+			local first, second = headers:get("content-length")
+			local values, count = nil, 1
+			if second ~= nil then
+				values = headers:get_as_sequence("content-length")
+				count = values.n
+			end
+			local seen
+			for i = 1, count do
+				local v = values and values[i] or first
+				-- OWS is SP and HTAB and nothing else (RFC 9110 5.6.3). Not
+				-- `%s`, which would match the `\v` and `\f` this is here to
+				-- reject.
+				local digits = type(v) == "string" and v:match("^[ \t]*(%d+)[ \t]*$")
+				if digits == nil then
+					return nil, "invalid content-length"
+				end
+				-- Leading zeros are legal `1*DIGIT`, so strip them before
+				-- measuring the magnitude -- otherwise a padded but perfectly
+				-- ordinary length gets refused.
+				digits = digits:match("^0*(%d+)$") or digits
+				-- A cap, so the value cannot reach the wrapping `tonumber`
+				-- that started all this. 10^15 is a petabyte: far above any
+				-- real body and far below `math.maxinteger`, so the number
+				-- below is exact.
+				if #digits > 15 then
+					return nil, "content-length too large"
+				end
+				local n = tonumber(digits, 10)
+				if n == nil then
+					return nil, "invalid content-length"
+				end
+				-- Repeated but identical values are a proxy artefact and may
+				-- be collapsed; differing ones are a desync attempt.
+				if seen ~= nil and seen ~= n then
+					return nil, "conflicting content-length"
+				end
+				seen = n
+			end
+			cl = seen
+		end
 		if cl == nil then
 			return nil, "invalid content-length"
 		end
@@ -734,7 +846,34 @@ function stream_methods:write_headers(headers, end_stream, timeout)
 		end
 		if end_stream then
 			-- Make sure 'end_stream' is respected
-			if self.type == "server" and (self.req_method == "HEAD" or status_code == "304") then
+			-- AKKAR: 204 joins HEAD and 304 here, because the guard above
+			-- cannot reach the Content-Length this branch is about to INVENT.
+			--
+			-- Thirty lines up there is an `error("Content-Length not allowed
+			-- in response with 204 status code")`, and it looks like it
+			-- covers this. It does not: it is inside `if cl then`, so it only
+			-- fires when the APPLICATION set a Content-Length. A handler that
+			-- simply returns 204 leaves `cl` nil, sails past it, and reaches
+			-- the `else` below -- which synthesises `cl = "0"` for any server
+			-- response, whatever its status, and writes it to the wire. So
+			-- the one status the file explicitly refuses to put a
+			-- Content-Length on was the one getting a synthesised one.
+			--
+			-- RFC 9110 8.6: "A server MUST NOT send a Content-Length header
+			-- field in any response with a status code of 1xx
+			-- (Informational) or 204 (No Content)." RFC 9112 6.3: a 204 "is
+			-- always terminated by the first empty line after the header
+			-- fields, regardless of the header fields present", so a
+			-- Content-Length on it is not merely redundant -- it is framing
+			-- that contradicts the framing the status already fixed, which is
+			-- the same disagreement every smuggling defect in this file is
+			-- made of.
+			--
+			-- 1xx never arrives here (it is handled in its own branch above
+			-- and returns), and 304 was already listed.
+			if self.type == "server" and (self.req_method == "HEAD"
+			                              or status_code == "304"
+			                              or status_code == "204") then
 				self.body_write_type = "missing"
 			elseif transfer_encoding_header then
 				if transfer_encoding_header[#transfer_encoding_header][1] == "chunked" then

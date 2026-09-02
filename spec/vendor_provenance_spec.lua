@@ -100,6 +100,36 @@ local PATCHES = {
     needle = "pcall(self.step, self, 0)",
     why = "Content-Length: -5 raised out of shutdown, which handle_stream does not protect" },
 
+  -- ------------------------------------------- request smuggling, HTTP/1.1
+  -- akkar sits behind a CDN, so it is the BACK-END half of a desync pair and
+  -- these are reachable. Each is proved by a deliberate break in
+  -- `spec/framing_spec.lua`'s "framing (desync)" block: revert one row here
+  -- and two of its assertions go red on the byte stream, not on a status code.
+  { file = "h1_stream.lua", commit = "uncommitted",
+    needle = "content-length with transfer-encoding",
+    why = "CL.TE: transfer-encoding silently won and content-length stayed in the header set" },
+  { file = "h1_stream.lua", commit = "uncommitted",
+    needle = "if #digits > 15 then",
+    why = "tonumber('18446744073709551616', 10) wraps to 0, so the body became the next request" },
+  { file = "h1_stream.lua", commit = "uncommitted",
+    -- The comment rather than the pattern: the pattern is `^[ \t]*(%d+)[ \t]*$`
+    -- and a needle carrying those escapes is one that silently stops matching.
+    needle = "OWS is SP and HTAB and nothing else",
+    why = "tonumber accepts '+0', '-0', and skips \\v and \\f, none of which are HTTP OWS" },
+  { file = "h1_stream.lua", commit = "uncommitted",
+    needle = "conflicting content-length",
+    why = "headers:get returned both values and Lua truncated the call to the first" },
+  { file = "h1_connection.lua", commit = "uncommitted",
+    -- Chosen over `not v:find("[%z\\r\\n]")` for the escape reason above.
+    needle = "and v:byte(1) ~= 32 and v:byte(1) ~= 9",
+    why = "the CRLF-injection check tested only LF; a bare CR went into the response verbatim" },
+  { file = "h1_connection.lua", commit = "uncommitted",
+    needle = 'chunk_ext = chunk_rest:match("^;(.*)$")',
+    why = "CVE-2026-24880: '^(%x+) *(.-)' took arbitrary trailing text as a chunk extension" },
+  { file = "h1_stream.lua", commit = "uncommitted",
+    needle = 'or status_code == "204") then',
+    why = "the file's own 204 guard sits inside `if cl then`, so the synthesised content-length: 0 sailed past it" },
+
   -- ------------------------------------------------------- upstream, post-v0.4
   { file = "h1_stream.lua", commit = "ddab283 (upstream)",
     needle = "BACKPORT of upstream ddab283",

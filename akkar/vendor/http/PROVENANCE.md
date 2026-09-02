@@ -79,9 +79,9 @@ them in between.
 | `client.lua` | patched | +6 / −0 | 1 |
 | `connection_common.lua` | unmodified | | |
 | `cookie.lua` | unmodified | | |
-| `h1_connection.lua` | patched | +56 / −5 | 3 |
+| `h1_connection.lua` | patched | +65 / −3 | 5 |
 | `h1_reason_phrases.lua` | unmodified | | |
-| `h1_stream.lua` | patched | +144 / −24 | 10 |
+| `h1_stream.lua` | patched | +141 / −2 | 13 |
 | `h2_connection.lua` | patched | +80 / −2 | 6 |
 | `h2_error.lua` | unmodified | | |
 | `h2_stream.lua` | patched | +116 / −2 | 6 |
@@ -189,6 +189,82 @@ eight idle steps and out. (2) `Content-Length: -5` reaches `read_next_chunk` as
 `error("invalid length")`, and `handle_stream` calls `shutdown` with no pcall
 — one malformed header ended the process. Guards: `if idle > 8 then`, and the
 protected `step` call above it.
+
+**`h1_stream.lua` — four request-smuggling primitives in the body framing.**
+Uncommitted. akkar is deployed behind a CDN, which makes it the **back-end**
+half of a desync pair, and a pair only has to *disagree* about where a message
+ends for the bytes past that point to become a request the front end never saw.
+All four were in `get_headers`, and all four are refused now rather than
+guessed at.
+
+1. **CL.TE.** `elseif headers:has("transfer-encoding")` let Transfer-Encoding
+   win by ordering alone and left `content-length` in the header set for the
+   application to read. RFC 9112 §3.3.3 permits stripping *or* refusing; a
+   back end cannot know it is the final recipient, so this refuses.
+2. **Content-Length overflows to zero.** `tonumber("18446744073709551616", 10)`
+   is `0`, not `nil` — with an explicit base Lua accumulates into a wrapping
+   integer instead of falling back to a float. `cl == 0` then set
+   `no_body = true` and the body was parsed as the next request. Verified in
+   lua5.4. Now capped at 10^15 before any conversion.
+3. **Signs and exotic whitespace.** `tonumber` accepts a leading `+`/`-` and
+   skips Lua's idea of whitespace, which includes `\v` and `\f` — neither is
+   HTTP OWS. `"+0"`, `"-0"`, `"\v0"`, `"\f0"` were all `0`. Content-Length is
+   `1*DIGIT` (RFC 9112 §8.6), so the grammar is now matched literally.
+4. **Duplicate Content-Length, first silently wins.** `headers:get` returns
+   *all* values and Lua truncates a multi-value call in an argument list to
+   its first — so the framing used the first header while akkar's own
+   `normalize_headers` joined them and showed the application `"0, 40"`.
+   RFC 9112 §6.3.4: differing values must be rejected; identical ones may be
+   collapsed, and are.
+
+Guards: `content-length with transfer-encoding`, `if #digits > 15 then`,
+`OWS is SP and HTAB and nothing else`, `conflicting content-length`. Each is
+proved load-bearing by a deliberate revert in `spec/framing_spec.lua`'s
+"framing (desync)" block, which asserts on the **byte stream** — one response
+per connection and no `/admin` marker — because a desync *is* a second
+response and a harness that reads one status line cannot fail on it.
+
+**`h1_connection.lua` — response splitting, and an unvalidated chunk extension.**
+Uncommitted. Two defects, opposite directions, same disagreement.
+
+*Bare CR into a response header.* `write_header`'s comment claimed its asserts
+were "what stops a header value from injecting CRLF into the response". They
+tested `v:byte(-1) ~= 10` and `not v:find("\n[^ ]")` — both about **line
+feed**. A lone `\r`, a NUL, and a leading space all passed, and a bare CR is
+enough on its own: a CDN that treats it as a line terminator sees a header
+block this server never wrote. Reaching it needs an application that reflects
+input into a header, which a redirect echoing `?next=` into `Location` does as
+a matter of course. Now `not v:find("[%z\r\n]")` plus a leading-SP/HTAB check,
+and still allocation-free — `find` on a character class returns indices, which
+is what `spec/allocation_spec.lua` pins. Writing obs-fold was already
+forbidden by RFC 9112 §5.2, so the `\n[^ ]` carve-out cost nothing to close.
+
+*Chunk extension with no semicolon.* `chunk_header:match("^(%x+) *(.-)\r\n")`
+accepted arbitrary trailing text, so `0 junk\r\n` parsed as size 0 with
+extension `junk`. This is CVE-2026-24880 (Tomcat) exactly. RFC 9112 §7.1.1
+requires a `;` to introduce an extension; the match is now anchored to the end
+of the line and the semicolon is required. `chunk_ext` keeps its old shape —
+the extension without the introducing `;` — because callers already expect it.
+
+Guards: `and v:byte(1) ~= 32 and v:byte(1) ~= 9`,
+`chunk_ext = chunk_rest:match("^;(.*)$")`.
+
+**`h1_stream.lua` — a 204 no longer carries `content-length: 0`.**
+Uncommitted. RFC 9110 §8.6 forbids Content-Length on 1xx and 204, and this file
+already contains `error("Content-Length not allowed in response with 204 status
+code")` — which is why the defect survived: the guard is inside `if cl then`,
+so it only fires when the *application* set the header. A handler that simply
+returns 204 leaves `cl` nil, passes the guard, and reaches the branch that
+**synthesises** `cl = "0"` for any server response regardless of status. So the
+one status the file explicitly refuses to put a Content-Length on was the one
+reliably getting a synthesised one. 204 now joins HEAD and 304 in the
+`body_write_type = "missing"` condition, which is the branch that runs before
+the synthesis. RFC 9112 §6.3: a 204 "is always terminated by the first empty
+line after the header fields, regardless of the header fields present" — so the
+header was not merely redundant, it was framing contradicting the framing the
+status had already fixed. Guard: `or status_code == "204") then`. Proved by
+`spec/framing_spec.lua`'s "framing (responses)" block, which is the first spec
+in the suite to assert anything about a response Content-Length at all.
 
 ### Backports — fixes upstream made after v0.4 and never released
 
