@@ -38,6 +38,10 @@ so a spec running beside it against the same database is untouched.
 ]]
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
+-- The C driver's `pq_native.so` lives beside `akkar/pq.lua`; the pgmoon cases
+-- do not need it, so this only matters for the `pq` case at the foot of the
+-- file, which guards on whether the require below succeeded.
+package.cpath = "./?.so;" .. package.cpath
 
 local cqueues = require "cqueues"
 local db      = require "akkar.db"
@@ -262,50 +266,105 @@ end)
 -- `driver = "pq"` gets the `broken` flag right on its own -- libpq reports
 -- `terminating connection due to administrator command` as a result error and
 -- `akkar/db.lua` believes it, so the corpse above cannot happen there. What it
--- gets wrong is louder: a killed backend leaves its descriptor registered in
--- the cqueues controller, and the next connection handed the same descriptor
--- number KILLS THE WHOLE EVENT LOOP -- every request in the process, not one.
+-- got wrong was louder: a killed backend left its descriptor registered in the
+-- cqueues controller, and the next connection handed that same descriptor
+-- number KILLED THE WHOLE EVENT LOOP -- every request in the process, not one.
 --
 --     unable to update event disposition: No such file or directory (fd:5)
 --
 -- raised at the scheduler rather than at the caller, so no `pcall` around a
--- request catches it and `cq:loop` returns false.
+-- request caught it and `cq:loop` returned false.
 --
--- Reproduced in twelve lines, no pool involved:
---
---     local cq = cqueues.new()
---     cq:wrap(function()
---       local c = assert(pq.connect(cfg))
---       c:query "select 1"
---       kill_that_backend()
---       c:query "select 1"          -- fails; libpq closes the descriptor
---       c:close()
---       pq.connect(cfg)             -- gets the same descriptor number
---     end)
---     print(cq:loop(30))            --> false  unable to update event ...
---
--- `akkar/pq.lua` names this hazard and defends against it in `Conn:close`, and
--- the defence is defeated in exactly the case it was written for: libpq closes
--- the socket inside `PQconsumeInput`, so by the time `close` runs `PQsocket`
--- already answers -1 and the cancel is skipped. Measured:
+-- WHY THE OLD DEFENCE MISSED IT. `akkar/pq.lua`'s `Conn:close` cancels the
+-- descriptor before `PQfinish` -- but libpq closes the socket itself, INSIDE
+-- `PQconsumeInput`, the instant it reads the dying backend's final message and
+-- the EOF glued behind it. By the time `close` runs, `PQsocket` already
+-- answers -1, so the fd guard skips the cancel:
 --
 --     fd while healthy:      5
 --     fd after backend died: -1
 --
--- Four Lua-side repairs were tried and none of them works -- remembering the
--- descriptor and cancelling the remembered one, cancelling again after close,
--- cancelling after every poll, and dropping the connection with two
--- collections and a yield so the controller can reap it. cqueues keeps
--- per-descriptor state that `cqueues.cancel` does not clear once the
--- descriptor was closed behind its back; the last variant only changes the
--- message to `Bad file descriptor`. The descriptor has to leave the pollset
--- BEFORE libpq closes it, and only `src/akkar_pq.c` is in a position to see
--- that moment.
+-- and `cqueues.cancel` after the close cannot repair it -- the number is gone,
+-- its own EPOLL_CTL_DEL gets the same ENOENT, and it returns before clearing
+-- the armed state that does the damage. Four Lua-side repairs were tried
+-- against exactly this and none worked; only the C side sees the descriptor
+-- while it is still open.
 --
--- Left pending rather than red: this suite has no fix available to it, and a
--- permanently failing case teaches the next reader to ignore the file.
+-- THE FIX, in `src/akkar_pq.c`: `consume` pulls the descriptor out of the
+-- pollset before every `PQconsumeInput`. The closing EOF cannot be told apart
+-- from data in advance, so the cancel is unconditional -- it clears the armed
+-- state while the fd is still open, the healthy path re-arms it on the next
+-- poll, and the death path then closes an fd whose cqueues state is already 0,
+-- leaving nothing stale for the descriptor's next owner. This case is the
+-- proof: against the pre-fix `.so` it takes the loop down (`cq:loop` returns
+-- false with the disposition error); against the fixed one the reused
+-- descriptor serves a query and the loop stays up.
+local has_native = pcall(require, "akkar.pq_native")
+if not has_native then
+  describe("a killed backend on the pq driver", function()
+    pending("akkar/pq_native.so is not built; skipping the C-driver case")
+  end)
+else
+local pq = require "akkar.pq"
+
+local PQCFG = { host = PG.host, port = PG.port, database = PG.database,
+                user = PG.user, password = PG.password }
+
+local function pq_connect()
+  local c, err = pq.connect(PQCFG)
+  assert(c, err)
+  return c
+end
+
 describe("a killed backend on the pq driver", function()
-  pending("takes the cqueues controller down with it -- see the note above " ..
-          "this describe; the repair belongs in src/akkar_pq.c")
+  it("leaves the pollset before libpq closes the fd, so the next connection " ..
+     "to inherit that descriptor number does not take the loop down",
+  function()
+    local q_failed, first_err, reused, recovered
+
+    -- The whole scenario runs inside ONE controller, because the bug is a
+    -- property of the controller's pollset, not of any one connection.
+    local alive, why = in_controller(function()
+      local a = pq_connect()
+      -- The descriptor cqueues is about to be left holding.
+      local healthy_fd = a.handle:pollfd()
+      local pid = a:query("select pg_backend_pid() as p")[1].p
+
+      -- Kill it from a second connection, exactly this backend and no other,
+      -- then give the reset a moment to arrive.
+      local killer = pq_connect()
+      killer:query("select pg_terminate_backend($1::int)", { pid })
+      killer:close()
+      cqueues.sleep(0.2)
+
+      -- The query during which libpq reads the FATAL message and the EOF and
+      -- closes the socket. It must fail, and it is the close inside it that
+      -- the fix has to get in front of.
+      local ok, err = a:query("select 1 as x")
+      q_failed = (ok == nil)
+      first_err = err and err.message
+      a:close()
+
+      -- The next connection is handed the just-freed descriptor number. On
+      -- the pre-fix driver, polling it is what raises at the scheduler.
+      local c = pq_connect()
+      reused = (c.handle:pollfd() == healthy_fd)
+      local row = c:query("select 42 as answer")
+      recovered = row and row[1] and row[1].answer
+      c:close()
+    end)
+
+    assert.is_true(alive,
+      ("the controller died after a backend was killed: %s"):format(tostring(why)))
+    assert.is_true(q_failed,
+      ("the query against a killed backend did not fail; message was %s")
+      :format(tostring(first_err)))
+    assert.is_true(reused,
+      "the recovery connection did not inherit the dead descriptor's number, " ..
+      "so this run never exercised the hazard -- the assertion above is empty")
+    assert.equal(42, recovered,
+      "the connection on the reused descriptor could not run a query")
+  end)
 end)
+end
 end
