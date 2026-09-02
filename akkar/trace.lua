@@ -199,6 +199,8 @@ local function any_value(value)
   return { stringValue = tostring(value) }
 end
 
+M.any_value = any_value
+
 --- A key/value map as OTLP's list of attributes, in a stable order.
 ---
 --- Sorted, for the same reason `akkar.etag` sorts before hashing: `pairs()`
@@ -330,6 +332,14 @@ Exporter.__index = Exporter
 --- The reason is the one `akkar/http.lua` gives at length: every I/O path here
 --- goes through an adapter akkar owns, which is what makes a fake possible.
 --- `spec/trace_spec.lua` passes a table with a `post` method and nothing else.
+---
+--- THE QUEUE DOES NOT KNOW WHAT IT HOLDS. `encode` turns a batch into the
+--- request body and defaults to `M.otlp`, the span encoder; `akkar/otlp.lua`
+--- hands the same exporter a log encoder and a metrics encoder, so the three
+--- signals share one bounded queue, one flush and one set of counters rather
+--- than three copies of them with three ways to drift. `name` is what the
+--- reason strings call the exporter, for the same reason: "akkar.trace has no
+--- http capability" is a lie about a logs exporter.
 function M.new(options)
   options = options or {}
 
@@ -337,6 +347,8 @@ function M.new(options)
   for key, value in pairs(options.resource or {}) do resource[key] = value end
 
   return setmetatable({
+    name      = options.name or "akkar.trace",
+    encode    = options.encode or M.otlp,
     http      = options.http,
     endpoint  = options.endpoint or DEFAULTS.endpoint,
     headers   = options.headers,
@@ -458,13 +470,13 @@ function Exporter:flush()
     -- misconfiguration, and a misconfiguration in the tracing system must not
     -- take down the service it is tracing.
     self.counts.dropped = self.counts.dropped + #batch
-    return nil, "akkar.trace has no http capability"
+    return nil, self.name .. " has no http capability"
   end
 
   self.counts.batches = self.counts.batches + 1
 
   local ok, res, why = pcall(client.post, client, self.endpoint, {
-    body    = M.otlp(batch, self.resource),
+    body    = self.encode(batch, self.resource),
     headers = self.headers,
     timeout = self.timeout,
   })
@@ -512,23 +524,34 @@ end
 --- burst that fills `max_batch` in the first second of a five-second interval
 --- should not wait out the other four.
 function Exporter:run(controller)
+  return M.loop(self, controller, math.min(self.interval / 4, 1))
+end
+
+--- The loop itself: `subject:tick()` every `nap` seconds until
+--- `subject.stopped`, on a cqueues controller.
+---
+--- Lifted out of `Exporter:run` so that `akkar/otlp.lua` can run three
+--- exporters from ONE coroutine instead of three copies of these lines. The
+--- subject needs a `tick` and a `name`, and nothing else.
+function M.loop(subject, controller, nap)
   local cqueues = require "cqueues"
   controller = controller or cqueues.running()
   if not controller then
-    error("akkar.trace: run() needs a cqueues controller; call it from " ..
-          "inside the loop akkar runs on, or pass one", 2)
+    error((subject.name or "akkar.trace") .. ": run() needs a cqueues " ..
+          "controller; call it from inside the loop akkar runs on, or pass " ..
+          "one", 3)
   end
 
-  self.stopped = false
+  subject.stopped = false
   controller:wrap(function()
-    while not self.stopped do
-      time.sleep(math.min(self.interval / 4, 1))
+    while not subject.stopped do
+      time.sleep(nap)
       -- pcall so that one bad tick cannot end the loop. `flush` already
       -- swallows transport failures; this covers the rest.
-      pcall(function() self:tick() end)
+      pcall(function() subject:tick() end)
     end
   end)
-  return self
+  return subject
 end
 
 --- Stops the loop, after one last export.

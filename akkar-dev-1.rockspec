@@ -152,6 +152,7 @@ build = {
     ["akkar.session"] = "akkar/session.lua",
     ["akkar.time"] = "akkar/time.lua",
     ["akkar.trace"] = "akkar/trace.lua",
+    ["akkar.otlp"] = "akkar/otlp.lua",
     ["akkar.vm"] = "akkar/vm.lua",
     ["akkar.watch"] = "akkar/watch.lua",
     ["akkar.doctor"] = "akkar/doctor.lua",
