@@ -80,7 +80,23 @@ jobs:
         # combinations worth paying for, not every pairing of two lists.
         # macos-14 is Apple Silicon, so it covers macOS and a second arm64.
         include:
-          - { os: ubuntu-24.04-arm, lua: "5.4" }
+          # DIAG4. Six identical arm64 runners, differing only in what they
+          # are instrumented with. The crash fires on roughly one run in
+          # three, so one job is not an experiment -- four plain jobs looping
+          # the suite is thirty-odd attempts inside one wall-clock window.
+          - { os: ubuntu-24.04-arm, lua: "5.4", probe: hunt-a }
+          - { os: ubuntu-24.04-arm, lua: "5.4", probe: hunt-b }
+          - { os: ubuntu-24.04-arm, lua: "5.4", probe: hunt-c }
+          - { os: ubuntu-24.04-arm, lua: "5.4", probe: hunt-d }
+          # And two that change cqueues rather than watch it. Both build a
+          # cqueues whose object freelist is gone: `pool_put` calls `free`
+          # and `pool_get` calls `malloc`, so a fileno node released back to
+          # the queue is released to the ALLOCATOR. That is the one reason
+          # AddressSanitizer came back clean before -- a node reused from
+          # cqueues' own freelist is not a heap use-after-free and ASan
+          # cannot see it. With the freelist gone it is one, exactly.
+          - { os: ubuntu-24.04-arm, lua: "5.4", probe: nopool }
+          - { os: ubuntu-24.04-arm, lua: "5.4", probe: nopool-asan }
     steps:
       - uses: actions/checkout@v4
 
@@ -172,7 +188,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/cqueues-build
-          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua${{ matrix.lua }}-${{ matrix.os }}
+          key: cqueues-${{ env.CQUEUES_COMMIT }}-lua${{ matrix.lua }}-${{ matrix.os }}-${{ matrix.probe }}
 
       # OpenSSL has to be pointed at on macOS and does not on Linux, and the
       # difference is not a preference: Homebrew's `openssl@3` is keg-only, so
@@ -190,8 +206,40 @@ jobs:
           cd ~/cqueues-build
           git checkout "$CQUEUES_COMMIT"
 
+          # DIAG4: delete the object freelist on the two probe builds. Nothing
+          # else changes -- same commit, same flags, same everything -- so a
+          # difference in behaviour between these and the four plain jobs is
+          # attributable to recycling and to nothing else.
+          case "${{ matrix.probe }}" in
+            nopool|nopool-asan)
+              python3 - <<'PY'
+          import re
+          p = "src/cqueues.c"
+          s = open(p).read()
+          s, n1 = re.subn(
+              r"static void pool_put\(struct pool \*P, void \*p\) \{.*?\} /\* pool_put\(\) \*/",
+              "static void pool_put(struct pool *P, void *p) {\n"
+              "        (void)P;\n"
+              "        free(p);\n"
+              "} /* pool_put() */", s, flags=re.S)
+          s, n2 = re.subn(
+              r"static void \*pool_get\(struct pool \*P, int \*_error\) \{.*?\} /\* pool_get\(\) \*/",
+              "static void *pool_get(struct pool *P, int *_error) {\n"
+              "        return make(P->size, _error);\n"
+              "} /* pool_get() */", s, flags=re.S)
+          assert n1 == 1 and n2 == 1, (n1, n2)
+          open(p, "w").write(s)
+          print("freelist neutered: pool_put -> free, pool_get -> malloc")
+          PY
+              ;;
+          esac
+
           CPP="-I$LUA_INC"
           LDF=""
+          if [ "${{ matrix.probe }}" = "nopool-asan" ]; then
+            CPP="$CPP -fsanitize=address -fno-omit-frame-pointer -g3"
+            LDF="$LDF -fsanitize=address"
+          fi
           if [ -n "${OPENSSL_DIR:-}" ]; then
             CPP="$CPP -I$OPENSSL_DIR/include"
             LDF="-L$OPENSSL_DIR/lib"
@@ -325,34 +373,77 @@ jobs:
           echo "BUSTED_LUA=$BUSTED_LUA" >> $GITHUB_ENV
           echo "lua bin: $BUSTED_LUA"
 
-      # THE CRASH IS NOT DETERMINISTIC. Two arm runs of a tree that differs from
-      # a clean one by two MARKDOWN FILES segfaulted; four others ran the whole
-      # suite. Both crashes stopped after exactly nine tests, so the SITE is
-      # fixed even though the firing is not. So: run the nine-test window over
-      # and over at FULL SPEED -- gdb's ptrace overhead would perturb the very
-      # timing this depends on -- and pull the backtrace out of a core file.
-      - name: HUNT -- the nine-test window, repeatedly, at full speed
+      # DIAG4, and it corrects two mistakes in DIAG3 rather than repeating it.
+      #
+      # DIAG3 asked the wrong question and then could not ask it. Its
+      # nine-test window ran 318 times with ZERO crashes -- which is a real
+      # finding, not a null one: busted LOADS EVERY SPEC FILE BEFORE IT RUNS
+      # THE FIRST TEST, so restricting the run to three files removes the
+      # load-time work of the other sixty. The crash lands after nine tests
+      # because that is where the whole suite's load phase ends, not because
+      # those nine tests cause it. The window is not the reproducer; the
+      # suite is.
+      #
+      # And DIAG3's whole-suite loop never ran a second iteration. The step
+      # is `bash -e`, the suite exits 1 on a runner with no Postgres and no
+      # Redis, and `set -e` killed the loop on the first pass. `set +e` here,
+      # explicitly, is the whole repair.
+      - name: HUNT -- loop the WHOLE suite at full speed
         if: always()
         run: |
+          set +e
           ulimit -c unlimited
-          THREE="spec/000_strict_first_spec.lua spec/abandoned_defence_spec.lua spec/abandoned_spec.lua"
+
+          # `busted`, the luarocks wrapper -- the EXACT invocation the red CI
+          # step uses. DIAG2 and DIAG3 called `lua5.4 <rock>/bin/busted`
+          # instead, which resolves its own paths; a memory bug is allowed to
+          # care about that and we are not in a position to argue with it.
+          case "${{ matrix.probe }}" in
+            nopool)
+              # glibc paints freed memory with 0xa5. With the freelist gone,
+              # a fileno node used after release is 0xa5a5a5a5a5a5a5a5 and
+              # faults AT THE MISUSE instead of somewhere downstream.
+              export MALLOC_PERTURB_=165
+              echo "MALLOC_PERTURB_=165, freelist neutered"
+              ;;
+            nopool-asan)
+              export LD_PRELOAD="$(gcc -print-file-name=libasan.so)"
+              export ASAN_OPTIONS="detect_leaks=0:abort_on_error=0:print_stacktrace=1:verify_asan_link_order=0"
+              echo "LD_PRELOAD=$LD_PRELOAD, freelist neutered"
+              ;;
+          esac
+
           crashes=0; runs=0
-          deadline=$(( $(date +%s) + 780 ))
+          deadline=$(( $(date +%s) + 1800 ))
           while [ $(date +%s) -lt $deadline ]; do
             runs=$((runs+1))
-            $LUA_BIN "$BUSTED_LUA" --output=plainTerminal $THREE >/dev/null 2>&1
+            busted --output=plainTerminal >run.out 2>&1
             rc=$?
+            echo "run $runs -> rc=$rc  ($(date -u +%H:%M:%S))"
+
+            if grep -q "AddressSanitizer" run.out; then
+              echo "=== ASAN REPORT on run $runs ==="
+              sed -n '/AddressSanitizer/,$p' run.out | head -200
+              crashes=$((crashes+1))
+              break
+            fi
+
             if [ $rc -ge 128 ]; then
               crashes=$((crashes+1))
-              echo ""
               echo "=== CRASH on run $runs, rc=$rc ==="
+              tail -20 run.out
               core=$(ls -t core.* 2>/dev/null | head -1)
               if [ -n "$core" ]; then
                 gdb --batch -ex "set pagination off" \
-                    -ex "echo \n==== BT ====\n" -ex bt \
-                    -ex "echo \n==== BT FULL ====\n" -ex "bt full" \
+                    -ex "echo \n==== BT ====\n"        -ex "bt" \
+                    -ex "echo \n==== BT FULL ====\n"   -ex "bt full" \
+                    -ex "echo \n==== FRAME 0 ====\n"   -ex "frame 0" -ex "info args" -ex "info locals" \
+                    -ex "echo \n==== FRAME 1 ====\n"   -ex "frame 1" -ex "info args" -ex "info locals" \
+                    -ex "echo \n==== FRAME 2 ====\n"   -ex "frame 2" -ex "info args" -ex "info locals" \
                     -ex "echo \n==== REGISTERS ====\n" -ex "info registers" \
-                    "$LUA_BIN" "$core" 2>&1 | tail -120
+                    -ex "echo \n==== FAULTING INSN ====\n" -ex "x/8i \$pc" \
+                    -ex "echo \n==== MAPS ====\n"      -ex "info sharedlibrary" \
+                    "$(command -v lua5.4)" "$core" 2>&1 | tail -250
                 rm -f "$core"
               else
                 echo "no core file found in $PWD"; ls -la core.* 2>&1 | head
@@ -361,36 +452,8 @@ jobs:
             fi
           done
           echo ""
-          echo "HUNT RESULT: $crashes crashes in $runs runs of the nine-test window"
+          echo "HUNT RESULT (${{ matrix.probe }}): $crashes crashes in $runs full-suite runs"
 
-      - name: HUNT -- the WHOLE suite, repeatedly, at full speed
-        if: always()
-        run: |
-          ulimit -c unlimited
-          crashes=0; runs=0
-          deadline=$(( $(date +%s) + 1500 ))
-          while [ $(date +%s) -lt $deadline ]; do
-            runs=$((runs+1))
-            $LUA_BIN "$BUSTED_LUA" --output=plainTerminal >/dev/null 2>&1
-            rc=$?
-            echo "suite run $runs -> rc=$rc"
-            if [ $rc -ge 128 ]; then
-              crashes=$((crashes+1))
-              core=$(ls -t core.* 2>/dev/null | head -1)
-              if [ -n "$core" ]; then
-                gdb --batch -ex "set pagination off" \
-                    -ex "echo \n==== BT ====\n" -ex bt \
-                    -ex "echo \n==== BT FULL ====\n" -ex "bt full" \
-                    -ex "echo \n==== REGISTERS ====\n" -ex "info registers" \
-                    "$LUA_BIN" "$core" 2>&1 | tail -120
-                rm -f "$core"
-              else
-                echo "no core file found"
-              fi
-              [ $crashes -ge 2 ] && break
-            fi
-          done
-          echo "HUNT RESULT: $crashes crashes in $runs full-suite runs"
 
       - name: The suite, with no database and no Redis
         if: always()
