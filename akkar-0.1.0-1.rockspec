@@ -124,13 +124,11 @@ build = {
     ["akkar.watch"] = "akkar/watch.lua",
     ["akkar.doctor"] = "akkar/doctor.lua",
     ["akkar.limit"] = "akkar/limit.lua",
-    ["akkar.breaker"] = "akkar/breaker.lua",
     ["akkar.idempotency"] = "akkar/idempotency.lua",
     ["akkar.email"] = "akkar/email.lua",
     ["akkar.etag"] = "akkar/etag.lua",
     ["akkar.strict"] = "akkar/strict.lua",
     ["akkar.work"] = "akkar/work.lua",
-    ["akkar.workflow"] = "akkar/workflow.lua",
     ["akkar.openapi"] = "akkar/openapi.lua",
   },
 
