@@ -1,9 +1,10 @@
 # One header stops lua-http accepting, for ever
 
 > **Status: REPAIRED, and two claims below were wrong.** Reproduced against
-> lua-http 0.4 with a 25-line server containing no akkar. `akkar.substrate`
-> now repairs it, and `spec/substrate_repair_spec.lua` proves the repair by
-> starting a server without it and requiring that one to die.
+> lua-http 0.4 with a 25-line server containing no akkar. The repair lives in
+> the drain loop of `akkar/vendor/http/h1_stream.lua`, and
+> `spec/substrate_repair_spec.lua` proves it by swapping akkar's copy of that
+> module for the upstream rock's and requiring that server to die.
 >
 > This page originally ended "it is not akkar's to fix". That was true of
 > REPORTING it -- lua-http's last commit is September 2024 -- and false of
@@ -95,11 +96,77 @@ already demonstrates: it catches the raise too, and still wedges.
 
 What is actually wrong is that `step` reports progress where progress is
 impossible, and the drain loop trusts it as its only stopping condition. So
-`akkar.substrate` makes the drain REQUIRE progress: during `shutdown`, and
-only during `shutdown`, `step` must show that `stats_recv` moved or the drain
-is treated as finished. Breaking out early is safe by construction — the
-drain is best-effort, and `shutdown` closes the socket immediately afterwards
-when the stream did not reach a closed state.
+akkar makes the drain REQUIRE progress: `step` must show that `stats_recv`
+moved or the drain is treated as finished. Breaking out early is safe by
+construction — the drain is best-effort, lua-http's own comment calls it
+"read any remaining available response and get out of the way", and
+`shutdown` closes the socket immediately afterwards when the stream did not
+reach a closed state. Ending it early means the connection is not reused,
+which for a request whose framing cannot be parsed is the correct outcome
+anyway.
+
+**Eight idle steps is the limit.** One would do, since the wedge produces
+fruitless steps without limit, but a healthy stream can legitimately answer
+"nothing available right now" once or twice against a slow peer, and being
+generous costs a few microseconds on a path that is already tearing a
+connection down.
+
+## The second failure mode, and why swallowing the raise is defensible
+
+`Content-Length: -5` is not the spin — it is the raise described in the
+correction above, and it needed a repair of its own. Shutting a connection
+down is cleanup, and cleanup that raises has nothing useful to say. The
+narrower argument: `handle_stream` in `http/server.lua` calls
+`stream:shutdown()` with no pcall around it, so lua-http *already* treats
+`shutdown` as a method that does not throw. Where it throws anyway, catching
+it is honouring the contract lua-http's own caller assumes. The rescue path
+then performs the same teardown `shutdown` does on its own unhappy path —
+socket shutdown, state set to closed — so a connection is never left open by
+it.
+
+## Where the repair lives, and where it used to live
+
+<a id="history"></a>
+
+It is eight lines inside the drain loop of
+`akkar/vendor/http/h1_stream.lua`. It was not always there, and the move is
+worth recording because it is most of why lua-http was vendored at all.
+
+**Before: `akkar/substrate.lua`, a runtime monkey-patch.** It reached into
+`http.h1_stream.methods` and replaced `shutdown`, which installed a guarded
+`step` on the stream instance with `rawset` for the duration of one call and
+removed it afterwards under `pcall`. About 110 lines: instance overrides,
+`rawset` juggling, defensive shape checks that refused to patch an
+`h1_stream` it did not recognise, and a `repair_substrate` config flag to
+turn the whole thing off. It was applied from `App:run` rather than at
+require time, on the principle that importing a module should not mutate a
+third-party library as a side effect.
+
+**Why it moved.** Sixty lines of that machinery became eight lines in the
+loop, and — the part that mattered — a patch keyed on the shape of somebody
+else's table can silently stop applying when that shape changes. In the
+source it cannot. The shape check that made the monkey-patch safe was also
+the thing that would have quietly disabled the repair on an upstream bump.
+
+**What the monkey-patch cost, measured.** The guard was originally a closure
+built inside `shutdown`, which meant a closure, a hash insert and a
+`table.pack` table allocated on **every stream** — and in HTTP/1.1 keep-alive
+a stream is a request. On the study machine that cost **4.1% of `/ping`
+throughput**: 19,383 req/s against 20,208. Hoisting the guard to a single
+shared function and moving its two counters onto the stream recovered it.
+`spec/allocation_spec.lua` records the same repair at +511 bytes per request
+before that fix and free after it. This is the record of why a guard on a
+per-request path is written the way it is, and it is the reason the vendored
+version keeps its state in two locals rather than a closure.
+
+**The retirement.** Once the repair was in the vendored source,
+`akkar.substrate` patched a module akkar no longer loads, and its `apply()`
+was reduced to returning `{ h1_shutdown_spin = { applied = false } }`. It was
+kept as a no-op for a while on the grounds that its header was the only
+written account of the wedge. That account is now this page, so the module,
+its reference page and the `repair_substrate` flag were removed — the flag in
+particular, because a documented option that gates a call returning a
+constant tells a reader they have opted out of something when they have not.
 
 ## Where it starts
 
@@ -117,8 +184,8 @@ machinery and above anything a handler can reach.
 
 **With the repair, none of the below applies any more**; it is kept because it
 is exactly what a deployment looks like when a substrate defect is carried
-rather than fixed, and because anyone running with `repair_substrate = false`
-is choosing this list.
+rather than fixed, and because anyone running lua-http directly rather than
+through akkar's vendored copy is living with this list.
 
 - **Behind a reverse proxy that validates framing** — nginx, HAProxy, any
   managed load balancer — the malformed request never arrives, and this cannot
