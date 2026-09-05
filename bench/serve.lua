@@ -40,20 +40,23 @@ app:get("/users/:id", {
   return user or akkar.not_found "user not found"
 end)
 
-local factory = db.connect {
-  port = 55432, database = "akkar", user = "postgres", password = "akkar",
+local factory = os.getenv("BENCH_NO_DB") ~= "1" and db.connect {
+  host = os.getenv("PGHOST") or "127.0.0.1",
+  port = tonumber(os.getenv("PGPORT")) or 55432,
+  database = os.getenv("PGDATABASE") or "akkar", user = os.getenv("PGUSER") or "postgres",
+  password = os.getenv("PGPASSWORD") or "akkar",
   pool_size = pool,
 }
 
 registry:serve(app, "/metrics", {
-  akkar_db_pool_idle = function() return factory.pool.stats and factory.pool:stats().idle or 0 end,
-  akkar_db_pool_live = function() return factory.pool.stats and factory.pool:stats().live or 0 end,
+  akkar_db_pool_idle = function() return factory and factory.pool.stats and factory.pool:stats().idle or 0 end,
+  akkar_db_pool_live = function() return factory and factory.pool.stats and factory.pool:stats().live or 0 end,
 })
 
 app:handle_signals()
 app:run {
   port = port,
   reuseport = true,      -- several of these share the port; see bench/run.sh
-  db = factory,
+  db = factory or nil,
   log = akkar.log.new { level = "warn" },   -- warnings only; info would be noise
 }

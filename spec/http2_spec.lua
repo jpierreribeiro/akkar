@@ -336,6 +336,22 @@ describe("HTTP/2", function()
     assert.equal(h2_stream.methods.max_header_lines, decoded:len())
   end)
 
+  it("bounds decompressed header bytes, including indexed repetitions", function()
+    local hpack = require "akkar.vendor.http.hpack"
+    local encoder = hpack.new(8192)
+    encoder:add_header_indexed("x-large", string.rep("v", 1024))
+    local block = encoder:render_data() .. string.rep(string.char(0x80 + 62), 8)
+
+    local got, err = hpack.new(8192):decode_headers(block, nil, nil, 100, 4096)
+    assert.is_nil(got, "an expanded HPACK list crossed the byte ceiling")
+    assert.is_truthy(tostring(err):find("4096 bytes", 1, true), tostring(err))
+
+    local within = hpack.new(8192)
+    within:add_header_indexed("x-small", string.rep("v", 64))
+    assert.is_truthy(hpack.new(8192):decode_headers(
+      within:render_data(), nil, nil, 100, 4096))
+  end)
+
   it("joins duplicate header values in linear time", function()
     -- The other half of the same attack. `normalize_headers` accumulated
     -- repeats of one name with `existing .. ", " .. clean`, which rebuilds the

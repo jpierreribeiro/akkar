@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+akkar_prefix=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+export PATH="$akkar_prefix/bin:$PATH"
+# No ;; fallback: a global rock must not mask an incomplete distribution.
+export LUA_PATH="$akkar_prefix/share/lua/5.4/?.lua;$akkar_prefix/share/lua/5.4/?/init.lua;./?.lua;./?/init.lua"
+export LUA_CPATH="$akkar_prefix/lib/lua/5.4/?.so"
+export AKKAR_SUBSTRATE_MANIFEST="$akkar_prefix/substrate.env"
+exec "$@"

@@ -44,6 +44,22 @@ local random    = require "akkar.random"
 
 local M = {}
 
+-- A callable normally means "acquire a value for this execution". One
+-- built-in adapter keeps a process-lifetime value behind that shape only so
+-- its configuration reads like the pooled adapters. That value must keep its
+-- public identity (`http.Client`), and its `release` is deliberately a no-op.
+-- Keep that exception explicit rather than trying to guess whether an
+-- arbitrary release method is harmless.
+local shared_providers = setmetatable({}, { __mode = "k" })
+
+--- Marks a callable provider as returning a process-lifetime shared value.
+--- Internal adapter seam. Applications can get the same semantics, without
+--- depending on this module, by passing the shared value directly.
+function M.shared(provider)
+  shared_providers[provider] = true
+  return provider
+end
+
 -- ============================================================== capabilities
 
 -- A capability is infrastructure the framework knows how to inject, guard and
@@ -154,6 +170,69 @@ end
 --- silently, and only when no `log` capability was passed.
 local default_log
 
+-- A per-execution resource may already have been returned to its pool when an
+-- abandoned handler wakes. The resource itself therefore cannot be poisoned:
+-- another request may legitimately own it now. Instead the handler receives a
+-- lease whose dispatch checks the execution record before touching the real
+-- object. Weak keys make both associations disappear with the lease; no final
+-- cleanup pass or reference from a long-lived registry is needed.
+local lease_resources = setmetatable({}, { __mode = "k" })
+local lease_records   = setmetatable({}, { __mode = "k" })
+local method_wrappers = setmetatable({}, { __mode = "v" })
+
+local function live_resource(lease, level)
+  local record = lease_records[lease]
+  if not record or record.over then
+    error("capability used after its execution ended", level or 2)
+  end
+  return lease_resources[lease]
+end
+
+local function method_wrapper(key)
+  local wrapper = method_wrappers[key]
+  if wrapper then return wrapper end
+
+  -- One shared closure per live METHOD NAME, not per acquisition. Colon calls
+  -- pass the lease as their first value, so the wrapper can find the right
+  -- resource without capturing it. Weak values prevent dynamic adapter keys
+  -- from turning this cache into process-lifetime growth.
+  wrapper = function(lease, ...)
+    local resource = live_resource(lease, 2)
+    local method = resource[key]
+    if type(method) ~= "function" then
+      error("capability method '" .. tostring(key) .. "' is no longer callable", 2)
+    end
+    return method(resource, ...)
+  end
+  method_wrappers[key] = wrapper
+  return wrapper
+end
+
+local LEASE_MT = {
+  __index = function(lease, key)
+    local value = live_resource(lease, 2)[key]
+    if type(value) == "function" then return method_wrapper(key) end
+    return value
+  end,
+  __newindex = function(lease, key, value)
+    live_resource(lease, 2)[key] = value
+  end,
+  __len = function(lease)
+    return #live_resource(lease, 2)
+  end,
+  __tostring = function(lease)
+    return tostring(live_resource(lease, 2))
+  end,
+  __metatable = "akkar capability lease",
+}
+
+local function leased(resource, record)
+  local lease = setmetatable({}, LEASE_MT)
+  lease_resources[lease] = resource
+  lease_records[lease] = record
+  return lease
+end
+
 --- Sets the logger an execution falls back to. Called from `App:run`.
 function M.default_log(logger)
   default_log = logger
@@ -216,7 +295,14 @@ function M.acquire(carrier, record, key)
       or (getmetatable(provided) or {}).__call then
     value = provided()
     if type(value) == "table" and type(value.release) == "function" then
-      if record.over then
+      local resource = value
+      local shared = shared_providers[provided]
+      if not shared then value = leased(resource, record) end
+      if shared then
+        -- Process lifetime: no lease and no per-execution release list. This
+        -- is reserved for framework adapters whose release is a no-op and
+        -- whose own operations still obey the execution budget.
+      elseif record.over then
         -- ACQUIRED AFTER THE EXECUTION WAS ALREADY OVER, and until this
         -- branch existed that was a leaked resource every time.
         --
@@ -239,14 +325,14 @@ function M.acquire(carrier, record, key)
         -- abandoned; `akkar/db.lua` and `redis.lua` already refuse a query
         -- once the budget has gone negative, so what it holds is a resource
         -- it cannot use.
-        pcall(value.release, value)
+        pcall(resource.release, resource)
       else
         -- LAZILY, and that is the whole reason this is a field rather than a
         -- constructor argument. An execution that acquires nothing releasable
         -- -- which is every `/ping` -- never allocates this table.
         local list = record.released
         if not list then list = {} record.released = list end
-        list[#list + 1] = value
+        list[#list + 1] = resource
       end
     end
   else

@@ -54,6 +54,14 @@ describe("app:run{} checks what a setting IS, not only that it exists", function
     refused({ body_limit = -1 }, "body_limit must be a positive whole number")
   end)
 
+  it("refuses invalid header and JSON shape limits", function()
+    refused({ header_limit = 0 }, "header_limit must be a positive whole number")
+    refused({ header_count_limit = 1.5 },
+            "header_count_limit must be a positive whole number")
+    refused({ json_depth_limit = 0 },
+            "json_depth_limit must be a positive whole nesting depth")
+  end)
+
   it("refuses a body limit that is not whole", function()
     refused({ body_limit = 1.5 }, "body_limit must be a positive whole number")
   end)
@@ -89,6 +97,10 @@ describe("app:run{} checks what a setting IS, not only that it exists", function
     refused({ read_timeout = 0 }, "read_timeout must be a positive number")
   end)
 
+  it("refuses a write_timeout of zero, which would never write anything", function()
+    refused({ write_timeout = 0 }, "write_timeout must be a positive number")
+  end)
+
   it("says what was passed as well as what was wanted", function()
     local _, err = pcall(running_with { timeout = "30" })
     assert.is_truthy(tostring(err):find('got string "30"', 1, true), tostring(err))
@@ -99,8 +111,11 @@ describe("app:run{} checks what a setting IS, not only that it exists", function
     -- function `app:run{}` calls, exported so the doctor can use it too.
     assert.has_no.errors(function()
       akkar.check_settings({
-        host = "0.0.0.0", port = 0, body_limit = 1, timeout = 0.5,
-        read_timeout = 15, shutdown_grace = 0, max_concurrent = 1,
+        host = "0.0.0.0", port = 0, body_limit = 1,
+        header_limit = 1024, header_count_limit = 20, json_depth_limit = 8,
+        timeout = 0.5,
+        read_timeout = 15, write_timeout = 15,
+        shutdown_grace = 0, max_concurrent = 1,
         reuseport = true, strict = false, tls = false, h2c = true,
         trusted_proxies = { "10.0.0.0/8", "127.0.0.1" },
       }, "app:run{}")

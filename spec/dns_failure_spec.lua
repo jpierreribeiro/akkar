@@ -1,83 +1,24 @@
 --[[
 DNS failing, or resolving to something new — `docs/UNKNOWNS.md` §3.
 
-`akkar/http.lua` is the outbound half, and every url it is handed carries a
-NAME. Nothing under `akkar/` mentions DNS: `grep -rn "dns\|resolver" akkar/`
-finds `akkar/auth.lua`'s principal resolvers and nothing else. So the whole of
-name resolution is inherited from cqueues, unconfigured and unmeasured, and
-this file is the first thing to point at it.
+This lens found that cqueues could hold a definitive NXDOMAIN until the whole
+request budget expired. On a systemd-resolved host, `search .` combined with
+the resolver's two five-second attempts made a lookup cost 10.019 seconds;
+removing the root search suffix made the same answer take 0.071 seconds. The
+client also returned `flush: Connection timed out`, with no hostname and no
+indication that DNS was the phase that failed.
 
-Three questions, and the answers are not the same shape.
+akkar now resolves before dialing, through its own cqueues resolver pool. It
+removes ONLY `search .`, preserving real Kubernetes/corporate search domains,
+and spends DNS plus every address attempt from one deadline. The socket dials
+the resulting IP while Host, the pool key, TLS SNI and certificate validation
+retain the URL hostname. There is no DNS cache here: opening a new connection
+can observe a changed answer; a live pooled connection remains live by design.
 
-## 1. Does a lookup respect the request deadline?  YES — measured
-
-This was the one worth fearing. A DNS lookup that ignores the caller's budget
-means one sick resolver blows every deadline in the process, and the
-`execution.bounded` line in `akkar/http.lua` — the whole cascading-failure
-argument — would be decoration. It is not: elapsed tracked the configured
-timeout to the millisecond at 0.5 s, 2 s and 4 s.
-
-    nxdomain timeout=0.5 elapsed=0.501
-    nxdomain timeout=2   elapsed=2.003
-    nxdomain timeout=4   elapsed=4.005
-
-A verified non-issue, and it is the most valuable line in this file.
-
-## 2. Does it FAIL FAST when the answer is already known?  NO — a defect
-
-Tracking the timeout exactly is also the bad news. The resolver has a
-definitive NXDOMAIN in hand and the client waits out its entire budget anyway,
-so a hostname with a typo in it costs what an overloaded upstream costs. On
-`akkar/http.lua`'s own default of `timeout = 10`, that is ten seconds per
-attempt, multiplied by `retries`, and — because the budget comes from
-`execution.bounded` — it is the REQUEST's ten seconds, not a spare ten.
-
-Measured underneath, on a systemd-resolved host, for the same name:
-
-    getent hosts nope-akkar-test-12345.com     0.18 s   (NXDOMAIN)
-    cqueues dns.query same name               10.019 s  (NXDOMAIN)
-
-Root cause, isolated by bisecting the resolver config: `/etc/resolv.conf` on
-every systemd-resolved box carries `search .`, and cqueues' resolver spends
-`attempts × timeout` (2 × 5 s) on it before it will hand back the NXDOMAIN it
-already has. Dropping that one entry:
-
-    as-is                     elapsed=10.019 rcode=NXDOMAIN(3)
-    attempts=1                elapsed= 5.008 rcode=NXDOMAIN(3)
-    search={}                 elapsed= 0.071 rcode=NXDOMAIN(3)
-    edns0=false,search={}     elapsed= 0.007 rcode=NXDOMAIN(3)
-
-140x, from one line of resolver config. akkar cannot reach it. `dns.setpool`
-changes what `cqueues.dns.query` uses and NOT what `cqueues.socket.connect`
-uses — proven directly: with a pool whose only nameserver was blackholed,
-`dns.query` timed out and `cs.connect` resolved the same name in 44 ms. There
-is no `socket.setresolver`. So the fix has to be akkar resolving the name
-itself, on a bounded sub-budget, before it dials — which is a change to the
-connect path and not a line of config, and is why this file measures the
-defect rather than carrying its fix.
-
-## 3. What does the caller SEE?  `flush: Connection timed out` — a defect
-
-No host, no url, no mention of a name. `https` says `starttls: Connection
-timed out`. A service calling three upstreams gets one indistinguishable
-string for "the hostname is misspelled", "the firewall drops us" and "the
-peer is overloaded" — three incidents with three different responses. The
-module that documents A NAMED TIMEOUT, NOT A HANG for its body reads is
-handing back an unnamed one for its lookups.
-
-## What is NOT wrong
-
-A blackhole address respects the timeout rather than Linux's ~130 s SYN retry
-period, a refused connection comes back in a millisecond, and twenty failed
-lookups leak no descriptor and no pool slot. All asserted below.
-
-## Why the defect assertions read as they do
-
-They assert the CURRENT number, and each is marked. This branch is shared and
-green; a spec that goes red the moment it lands is a message to whoever runs
-CI next, not to whoever fixes this. When the connect path learns to resolve
-first, invert the two marked assertions and this file becomes the regression
-test.
+This file keeps the underlying resolver measurement visible, then asserts the
+runtime contract: NXDOMAIN fails fast and names its host, a SYN blackhole stays
+bounded, a refused port remains immediate, and repeated failures leak neither
+descriptors nor pool slots.
 ]]
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
@@ -178,13 +119,7 @@ describe("akkar.http when a name does not resolve", function()
     end
   end)
 
-  -- THE DEFECT. It spends every millisecond of that budget, on an answer the
-  -- resolver already had.
-  --
-  -- INVERT THIS WHEN THE CONNECT PATH RESOLVES FIRST: the assertion becomes
-  -- `elapsed < budget / 2`, and it will hold, because the header measured the
-  -- same NXDOMAIN coming back in 0.071 s with `search` cleared.
-  it("spends the whole budget on a name that is already known not to exist", function()
+  it("fails fast on a name that is already known not to exist", function()
     local budget = 0.4
     if not (resolver_cost and resolver_cost > budget) then
       -- The resolver here answers faster than the budget, so there is nothing
@@ -195,53 +130,19 @@ describe("akkar.http when a name does not resolve", function()
     inside(function()
       local client = http.connect { timeout = budget } ()
       local elapsed = timed(function() return client:get(NOWHERE) end)
-      assert.is_true(elapsed > budget * 0.9,
-        ("expected the full %.1f s budget to be spent, took %.3f s")
+      assert.is_true(elapsed < budget / 2,
+        ("a definitive NXDOMAIN spent too much of its %.1f s budget: %.3f s")
         :format(budget, elapsed))
     end, 30)
   end)
 
-  -- THE SECOND DEFECT. Nothing in the reason says which host, or that a name
-  -- was involved at all.
-  --
-  -- INVERT THIS WHEN THE ERROR IS NAMED: the two `is_nil` become
-  -- `assert.is_truthy(why:find("this-does-not-exist.invalid", 1, true))`.
-  it("blames the connection for a failure that was a lookup", function()
+  it("names the host and DNS in a lookup failure", function()
     inside(function()
       local client = http.connect { timeout = 0.4 } ()
       local _, why = client:get(NOWHERE)
       why = tostring(why)
-      -- WHETHER THE LOOKUP IS NAMED IS THE RESOLVER'S CHOICE, NOT AKKAR'S.
-      --
-      -- This case used to assert the reason mentions neither the host nor the
-      -- lookup -- the defect the section above documents. CI disproved the
-      -- premise: on a runner whose resolver answers differently the reason DOES
-      -- name the resolution, and the case went red at `find("resolve")` for a
-      -- string akkar never composed. The file's own note anticipated exactly
-      -- this ("INVERT THIS WHEN THE ERROR IS NAMED") and the honest reading is
-      -- that neither spelling is akkar's to promise: the resolver decides.
-      --
-      -- So what is recorded here is the part that IS akkar's -- see below.
-      -- What it says INSTEAD, so a change to the string is visible here rather
-      -- than in somebody's incident.
-      --
-      -- Asserting "timed out" was wrong, and CI is where that showed: on a
-      -- runner whose resolver refuses rather than stalls, the failure arrives
-      -- as EPIPE, and this case went red for reporting a different socket
-      -- error than the one this laptop happens to produce. The environment
-      -- decides WHICH failure a name that does not resolve turns into; what
-      -- akkar owes is that the reason be a NAMED socket error and not a bare
-      -- number -- which is the whole point of `akkar.errno` and is the same
-      -- assertion on either machine.
-      -- Either spelling is acceptable and both are readable: lua-http's own
-      -- prose ("flush: Connection timed out") when it words the failure
-      -- itself, or `akkar.errno`'s "ENAME 32" when what reaches the adapter is
-      -- a bare integer. What must NEVER pass is the third case this suite
-      -- exists to prevent -- a reason that is only a number.
-      assert.is_nil(why:match "^%s*%d+%s*$",
-        "the reason is a bare errno with nothing a reader can act on: " .. why)
-      assert.is_truthy(why:match "E%u+ %d+" or why:find "%a%a%a",
-        "the reason should name the failure, got: " .. why)
+      assert.is_truthy(why:find("DNS", 1, true), why)
+      assert.is_truthy(why:find("this-does-not-exist.invalid", 1, true), why)
     end, 30)
   end)
 end)

@@ -1,5 +1,11 @@
 # Compatibility and versioning
 
+> Current implementation/evidence: [CONSOLIDATION.md](CONSOLIDATION.md).
+> The serializer adapter already exists. Historical boundary-breach notes below
+> describe the rationale, not a requirement to reimplement `akkar.json`.
+> Controlled Linux installation now uses `runtime/substrate.env` and
+> `runtime/rocks.lock`; the ordinary LuaRocks path remains distinct.
+
 > Written 2 September 2026. `CHANGELOG.md` already carries the reasoning for
 > the *number* — "Why 0.1.0 and not 1.0.0" — and this document does not repeat
 > it; it states the *policy* that number is shorthand for: what a version means,
@@ -198,12 +204,12 @@ is one of the three conditions for 1.0 (§2).
 
 ## 6. Platforms
 
-`CHANGELOG.md` states the tested matrix and this policy inherits it unchanged:
-**Linux x86-64 and aarch64/musl are tested; macOS, Windows, 32-bit and everything
-else are untested and named rather than implied** (`docs/UNKNOWNS.md`). A platform
-moving from untested to supported is an additive change (MINOR). Lua 5.4 is the
-default; Lua 5.5 runs the full suite but nothing packages it yet, so it is not a
-supported install target — also a MINOR when it lands.
+CI is configured for Linux x86-64, Linux ARM64 and macOS ARM64, plus a separate
+Lua 5.5 source build. A configured job is not proof it passed for a candidate;
+consult that commit's run. Current local consolidation evidence is Linux x86-64
+only. Windows and 32-bit remain unverified. Platform support additions are
+MINOR changes. Lua 5.4 remains the controlled install target; Lua 5.5 retains
+its separate source recipe, not the controlled Linux bootstrap contract.
 
 ## 7. What to read next
 

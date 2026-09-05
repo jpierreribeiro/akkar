@@ -1,5 +1,9 @@
 # Akkar Runtime 1.0 — what goes in Lua, what earns C, what ships together
 
+> Historical proposal and measurements, not the active implementation checklist.
+> See [CONSOLIDATION.md](CONSOLIDATION.md) for current work and evidence. Existing
+> CLI/build/JSON facilities must not be reimplemented from this proposal.
+
 Written after a reframing proposal: stop aiming at *"the fastest Lua framework
 because it uses a special VM"* and aim at **a small, predictable, safe backend
 runtime whose application language is Lua**.

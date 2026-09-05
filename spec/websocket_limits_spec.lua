@@ -43,6 +43,8 @@ local akkar     = require "akkar"
 local cqueues   = require "cqueues"
 local socket    = require "cqueues.socket"
 local websocket = require "http.websocket"
+local ws_vendor = require "akkar.vendor.http.websocket"
+local errno     = require "cqueues.errno"
 
 local LIMIT = 64 * 1024
 
@@ -223,6 +225,45 @@ describe("how many sockets there may be", function()
 end)
 
 describe("a WebSocket message", function()
+  it("keeps the size ceiling when a partial frame read resumes", function()
+    -- `read_frame` retries after the fixed header arrives before the extended
+    -- length. The recursive call used to drop `max_payload`; a peer that split
+    -- those bytes across packets therefore bypassed the pre-allocation check.
+    local first = string.char(0x81, 0x7f) -- FIN+text, 64-bit payload length
+    local extended = string.pack(">I8", LIMIT * 16)
+    local reads, fills, attempted_payload = 0, 0, false
+    local fake = {}
+    function fake:xread()
+      reads = reads + 1
+      if reads <= 2 then return first end
+      return extended
+    end
+    function fake:fill(n)
+      fills = fills + 1
+      if fills == 1 then return nil, "timed out", errno.ETIMEDOUT end
+      if fills == 2 then return true end
+      attempted_payload = n >= LIMIT * 16
+      return nil, "payload fill attempted", errno.ENOMEM
+    end
+    function fake:unget() return true end
+
+    -- The fake socket only needs poll to report that the missing extended
+    -- length arrived. Restore the module function even if the probe raises.
+    local original_poll = cqueues.poll
+    cqueues.poll = function() return fake end
+    local ok, frame_value, why, code = pcall(
+      ws_vendor.read_frame, fake, cqueues.monotime() + 1, LIMIT)
+    cqueues.poll = original_poll
+    assert.is_true(ok, tostring(frame_value))
+
+    assert.is_nil(frame_value)
+    assert.equal(errno.EFBIG, code,
+      "the resumed read lost max_payload instead of refusing the declaration")
+    assert.is_false(attempted_payload,
+      "the socket tried to buffer the oversized payload before refusing it")
+    assert.is_truthy(tostring(why):find("too big", 1, true), tostring(why))
+  end)
+
   it("arrives whole when it is inside the limit", function()
     -- THE RAW CLIENT IS FOR HOSTILE FRAMES, AND THIS CASE IS NOT ONE. Every
     -- other case here hand-builds frames because it sends shapes a library

@@ -1,5 +1,10 @@
 # Plan
 
+> Historical design record. The active technical consolidation and execution
+> evidence live in [CONSOLIDATION.md](CONSOLIDATION.md). In particular JSON
+> adapters, CLI/scaffolding and migrations already exist; historical exclusions
+> and “not implemented” statements below are not the current delivery checklist.
+
 ## 1. Objective
 
 An **application runtime for backend services in Lua**, with safe and

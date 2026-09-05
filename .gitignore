@@ -23,3 +23,11 @@ luacov.report.out
 
 # rascunho de agentes; nada aqui é entregável
 .scratch/
+
+# Python/MLOps example local state
+examples/mlops/.venv/
+examples/mlops/.pytest_cache/
+examples/mlops/**/__pycache__/
+examples/mlops/**/*.pyc
+examples/mlops/.env
+examples/mlops/client-keys*.json

@@ -57,20 +57,30 @@ Constrói um cliente e devolve uma factory que o entrega. O formato é igual ao 
 | campo | tipo | padrão | significado |
 |---|---|---|---|
 | `headers` | table | nenhum | headers acrescentados a cada requisição, antes dos headers por chamada |
-| `timeout` | number | `10` | segundos para uma tentativa, cobrindo conexão, headers e corpo |
-| `max_body` | number | `8388608` | teto de resposta em bytes |
-| `retries` | number | `0` | tentativas **além** da primeira |
-| `retry_backoff` | number | `0.1` | segundos antes da primeira retentativa, dobrando a cada vez |
-| `pool_size` | number | `8` | conexões vivas por `scheme://host:port` |
+| `timeout` | número finito não negativo | `10` | segundos para uma tentativa, cobrindo conexão, headers e corpo |
+| `max_body` | inteiro não negativo | `8388608` | teto de resposta em bytes |
+| `retries` | inteiro não negativo | `0` | tentativas **além** da primeira |
+| `retry_backoff` | número finito não negativo | `0.1` | segundos antes da primeira retentativa, dobrando a cada vez |
+| `pool_size` | inteiro positivo | `8` | conexões vivas por `scheme://host:port` |
 | `reuse` | boolean | `true` | `false` fornece uma conexão por requisição pelo mesmo caminho de código |
-| `http_version` | number | nenhum | deixado sem definição para que o lua-http negocie; fixe `1.1` para um peer que anuncia h2 incorretamente |
+| `http_version` | número finito | nenhum | deixado sem definição para que o lua-http negocie; fixe `1.1` para um peer que anuncia h2 incorretamente |
 | `breaker` | table | nenhum | uma tabela de opções de [breaker](breaker.md) dá um breaker por origem; uma instância de breaker é compartilhada por toda origem |
 
 A chave do pool vem da URI interpretada, então `http://x/a` e `http://x:80/b` compartilham um pool, e `http://x` e `https://x` nunca compartilham.
 
+Hostnames são resolvidos em uma fase identificada antes da abertura do socket.
+O DNS e todas as tentativas de endereço compartilham o único deadline da
+requisição. Uma falha de resolução informa o host, e o resolver ignora apenas
+uma entrada raiz `search .`, preservando search domains reais. O socket disca o
+endereço resolvido, mas o hostname da URL continua sendo a autoridade, chave do
+pool, nome SNI do TLS e nome usado para validar o certificado. Conexões novas
+resolvem novamente; conexões vivas no pool não.
+
 **Retorna** uma `function() -> client`.
 
-**Lança** nada. Uma chave desconhecida em `config` é ignorada silenciosamente.
+**Lança** em caso de chave desconhecida ou valor inválido em `config`, antes de
+construir o cliente. O erro informa a chave e sugere o nome válido mais próximo
+quando há um; por exemplo, `timout` sugere `timeout`.
 
 ```lua
 local http = require "akkar.http"
@@ -109,12 +119,16 @@ A table `options` aceita por toda chamada.
 |---|---|---|---|
 | `headers` | table | nenhum | headers por chamada; os nomes são convertidos para minúsculas, os valores passam por `tostring`, e esses headers sobrepõem os headers do cliente |
 | `body` | string ou table | nenhum | uma table é codificada como JSON e define `content-type: application/json` |
-| `timeout` | number | do cliente | segundos para uma tentativa |
-| `max_body` | number | do cliente | teto de resposta para esta chamada |
-| `retries` | number | do cliente | tentativas além da primeira |
-| `retry_backoff` | number | do cliente | segundos antes da primeira retentativa |
+| `timeout` | número finito não negativo | do cliente | segundos para uma tentativa |
+| `max_body` | inteiro não negativo | do cliente | teto de resposta para esta chamada |
+| `retries` | inteiro não negativo | do cliente | tentativas além da primeira |
+| `retry_backoff` | número finito não negativo | do cliente | segundos antes da primeira retentativa |
 | `retry_unsafe` | boolean | `false` | permite repetir um `POST` ou `PATCH` |
 | `traceparent` | string | nenhum | enviado como o header `traceparent` |
+
+Chaves desconhecidas e valores inválidos são recusados antes de qualquer I/O
+de rede. O erro informa a chave e sugere a opção válida mais próxima quando há
+uma.
 
 `content-length` é definido a partir do corpo, e nenhum `expect: 100-continue` é gerado. Esse header é o que `request:set_body` no lua-http acrescenta acima de 1024 bytes, e isso custou, em medição, 1,005 s e um `408` em um corpo de dois mil bytes contra o próprio servidor do akkar.
 
@@ -177,7 +191,8 @@ Retentativas, na ordem em que se aplicam:
 
 **Retorna** um valor de resposta, ou `nil, reason`. Os motivos são strings e incluem `"timed out reading the response body"`, `"response exceeded max_body of N bytes"`, `"the pooled connection was closed"`, `"the pool for KEY kept returning connections the peer had closed"`, e o que quer que o lua-http tenha reportado para uma falha de connect, write ou leitura de header. Uma resposta acima de `max_body` é **recusada, não truncada**: um corpo truncado é indistinguível de um completo no ponto de chamada.
 
-**Lança** nada em caso de falha de rede. Ela retorna `nil` e um motivo.
+**Lança** em caso de opção desconhecida ou valor inválido, antes de tentar I/O
+de rede. Uma falha de rede não lança; ela retorna `nil` e um motivo.
 
 ```lua
 local akkar = require "akkar"
@@ -237,7 +252,10 @@ O que os pools estão fazendo, por origem em vez de como um total único: um ún
 - **Um cookie jar.** Nada é armazenado entre chamadas. `set-cookie` chega como um header (uma lista quando se repete) e cabe a você tratá-lo.
 - **Fazer stream de uma requisição ou de um corpo de resposta.** Ambos são strings. O teto de resposta é `max_body`, e ele recusa em vez de truncar.
 - **Rate limiting por host.** [limit](limit.md) é a metade de entrada e não tem uma contraparte de saída. Um circuit breaker é o campo `breaker` de `http.connect`; sua página é [breaker](breaker.md).
-- **Verificação de nomes de opção.** Chaves desconhecidas em `config` e nas `options` de uma chamada são ignoradas silenciosamente, diferentemente de `app:run{}`.
+- **Happy Eyeballs.** Endereços A são tentados primeiro; AAAA é consultado
+  quando não há registros A. Um endereço IPv4 que não aceita pacotes pode,
+  portanto, consumir o deadline restante em vez de disputar com um endereço
+  IPv6.
 - **`client:acquire`, `client:attempt`, `client:pool_for`.** Estão em `http.Client` e são internos. Suas assinaturas mudam sem aviso.
 
 ## Veja também

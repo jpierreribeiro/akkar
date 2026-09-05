@@ -1,0 +1,35 @@
+[project]
+name = "akkar-ml-service"
+version = "0.1.0"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "boto3==1.43.88",
+  "celery[redis]==5.6.3",
+  "fastapi==0.141.1",
+  "mlflow==3.16.0",
+  "pandas==3.0.5",
+  "prometheus-client==0.26.0",
+  "psycopg[binary]==3.3.5",
+  "pydantic==2.13.5",
+  "pydantic-settings==2.15.0",
+  # Celery 5.6 constrains its Redis transport to redis-py < 6.5.
+  "redis==6.4.0",
+  "scikit-learn==1.9.0",
+  "uvicorn==0.52.4",
+]
+
+[dependency-groups]
+dev = [
+  "httpx==0.28.1",
+  # Starlette 1.x prefers httpx2; plain httpx is only its deprecated fallback.
+  "httpx2==2.12.0",
+  "pytest==9.1.1",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]

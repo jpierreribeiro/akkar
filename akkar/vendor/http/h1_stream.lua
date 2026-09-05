@@ -53,6 +53,7 @@ end
 local stream_methods = {
 	use_zlib = has_zlib;
 	max_header_lines = 100;
+	max_header_bytes = 32*1024;
 }
 for k,v in pairs(stream_common.methods) do
 	stream_methods[k] = v
@@ -408,6 +409,7 @@ function stream_methods:read_headers(timeout)
 			-- reason phase intentionally does not exist in HTTP2; discard for consistency
 		end
 		self.headers_in_progress = headers
+		self.header_bytes_in_progress = 0
 	else
 		if not is_trailers and self.type == "client" then
 			status_code = headers:get(":status")
@@ -419,7 +421,7 @@ function stream_methods:read_headers(timeout)
 		if headers:len() >= self.max_header_lines then
 			return nil, ce.strerror(ce.E2BIG), ce.E2BIG
 		end
-		local k, v, errno = self.connection:read_header(0)
+		local k, v, errno, wire_bytes = self.connection:read_header(0)
 		if k == nil then
 			if v ~= nil then
 				if errno == ce.ETIMEDOUT then
@@ -436,6 +438,11 @@ function stream_methods:read_headers(timeout)
 		if k == "host" and not is_trailers then
 			k = ":authority"
 		end
+		local header_bytes = self.header_bytes_in_progress + (wire_bytes or (#k + #v))
+		if header_bytes > self.max_header_bytes then
+			return nil, ce.strerror(ce.E2BIG), ce.E2BIG
+		end
+		self.header_bytes_in_progress = header_bytes
 		headers:append(k, v)
 	end
 
@@ -453,6 +460,7 @@ function stream_methods:read_headers(timeout)
 			return nil, err, errno
 		end
 		self.headers_in_progress = nil
+		self.header_bytes_in_progress = nil
 		self.has_main_headers = status_code == nil or status_code:sub(1,1) ~= "1" or status_code == "101"
 	end
 

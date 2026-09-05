@@ -181,10 +181,11 @@ describe("the rockspec", function()
     -- The pinned commit lives in three places and all three must agree.
     -- `spec/substrate_spec.lua` guards the rockspec-to-CI half; this is the
     -- half that would otherwise build 5.5 against a cqueues nobody chose.
-    local pinned = workflow:match "CQUEUES_COMMIT:%s*(%x+)"
-    assert.is_truthy(pinned, "CI has no CQUEUES_COMMIT")
-    assert.is_truthy(recipe:find(pinned, 1, true),
-      "the 5.5 recipe pins a different cqueues than CI does")
+    local manifest = read("runtime/substrate.env")
+    assert.is_truthy(manifest:match("CQUEUES_COMMIT=(%x+)"))
+    assert.is_truthy(workflow:find("runtime/substrate.env", 1, true))
+    assert.is_truthy(recipe:find('source "$REPO/runtime/substrate.env"', 1, true),
+      "the 5.5 recipe must load the shared substrate manifest")
   end)
 
   it("keeps the CLI runnable by whatever Lua is installed", function()

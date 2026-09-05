@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="${1:-}"
+OUT="${2:-.}"
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "usage: bin/prepare-release X.Y.Z [output-directory]" >&2
+  exit 2
+fi
+
+mkdir -p "$OUT"
+cp runtime/substrate.env "$OUT/substrate.env"
+cp runtime/rocks.lock "$OUT/rocks.lock"
+MAIN="$OUT/akkar-$VERSION-1.rockspec"
+PQ="$OUT/akkar-pq-$VERSION-1.rockspec"
+
+sed \
+  -e "s/version = \"dev-1\"/version = \"$VERSION-1\"/" \
+  -e "/url = \"git+https:\/\/github.com\/jpierreribeiro\/akkar.git\",/a\\  tag = \"v$VERSION\"," \
+  akkar-dev-1.rockspec > "$MAIN"
+
+NEXT_MINOR=$(( ${VERSION%%.*} == 0 ? $(cut -d. -f2 <<<"$VERSION") + 1 : ${VERSION%%.*} + 1 ))
+if [ "${VERSION%%.*}" -eq 0 ]; then
+  UPPER="0.$NEXT_MINOR.0"
+else
+  UPPER="$NEXT_MINOR.0.0"
+fi
+
+sed \
+  -e "s/version = \"0\.1\.0-1\"/version = \"$VERSION-1\"/" \
+  -e "s/tag = \"v0\.1\.0\"/tag = \"v$VERSION\"/" \
+  -e "s/akkar >= 0\.1\.0, < 0\.2\.0/akkar >= $VERSION, < $UPPER/" \
+  akkar-pq-0.1.0-1.rockspec > "$PQ"
+
+luarocks lint "$MAIN"
+luarocks lint "$PQ"
+echo "$MAIN"
+echo "$PQ"

@@ -64,6 +64,17 @@ local PID do
   f:close()
 end
 
+-- `ss -p` may report a PID from the host namespace while this process and
+-- its test runner live in a container PID namespace. Let the child identify
+-- itself in the namespace its parent can signal instead of rediscovering it
+-- through the network stack.
+local pid_file = os.getenv "AKKAR_PID_FILE"
+if pid_file then
+  local f = assert(io.open(pid_file, "w"))
+  f:write(PID, "\n")
+  f:close()
+end
+
 local function fd_count()
   local p = io.popen("ls /proc/" .. PID .. "/fd 2>/dev/null | wc -l")
   local n = tonumber(p:read "l") or 0
@@ -72,6 +83,9 @@ local function fd_count()
 end
 
 local cqueues = require "cqueues"
+-- Regression fixture: publishing a PID does not imply server.listen ran yet.
+local boot_delay = tonumber(os.getenv "AKKAR_BOOT_DELAY") or 0
+if boot_delay > 0 then cqueues.sleep(boot_delay) end
 
 local app = akkar.new()
 app:get("/ping", function() return { pong = true } end)

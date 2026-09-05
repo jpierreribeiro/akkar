@@ -1,106 +1,25 @@
 --[[
 The disk filling while logs are being written — `docs/UNKNOWNS.md` §3.
 
-`akkar/log.lua` is 175 lines and the whole of its output is one of them:
+This lens originally found two defects. `io.stderr:write` reports ENOSPC as
+`nil, reason, errno`, but the default sink discarded those returns. A custom
+sink that raised did get noticed, but could turn a request into a 500 and stop
+`App:stop` on its first diagnostic line, leaving the process permanently in
+`STOP_ACCEPTING`.
 
-    self.sink(line .. "\n")                                   -- log.lua:138
+The sink boundary is now guarded. A returned failure or a raise increments a
+counter shared by the root logger and every request-bound logger; it cannot
+escape into the request or shutdown. On the first later successful write the
+logger emits `log sink recovered` with the dropped count and clears it.
+`spec/log_delivery_spec.lua` proves those rules without a platform device;
+this file proves them against the kernel's real `/dev/full` and through a real
+shutdown listener.
 
-with the default sink two lines further down:
-
-    sink = options.sink or function(line) io.stderr:write(line) end
-
-Nothing reads what `write` returned, and nothing guards what the sink did. So
-this file asks the two questions that follow from those two lines, and they
-have opposite answers.
-
-## ENOSPC is induced with `/dev/full`, and it needs no privileges
-
-Every write to `/dev/full` returns `ENOSPC`. No mount, no `sudo`, no loopback
-image, and it is the same errno a real full filesystem produces:
-
-    f:write("hello\n")  ->  nil  "No space left on device"  28
-
-## 1. The default sink loses the line, silently and completely — a defect
-
-`io.stderr:write` does not raise; it returns `nil, err, errno`, and
-`log.lua:138` discards all three. On a full disk akkar keeps answering
-requests at 200 with every log line going nowhere, and there is no counter, no
-flag, no fallback and no line on any other stream saying so. The logger's
-fields after the loss are `bound, format, level, sink` — exactly what they
-were before.
-
-The module's own comment two dozen lines up says
-
-    -- ... because a log line that quietly loses a field is worse than an
-    -- ugly one.
-
-and the module quietly loses the whole line. This is the incident where the
-logs matter most — §8 of `docs/UNKNOWNS.md` is "observability during an
-incident" — and it is the incident where there are none.
-
-Buffering makes it worse and akkar does not set any: `io.stderr` is unbuffered
-by C convention, so the default sink at least *could* have noticed. A file
-sink — `sink = function(l) f:write(l) end` over an opened log file — is FULLY
-buffered, because it is not a tty. Measured below: the write returns the file
-handle, success, and `ENOSPC` surfaces at a `flush` that `akkar/log.lua`
-never calls and that the caller cannot associate with any line.
-
-## 2. A sink that REPORTS the failure wedges the shutdown — a defect
-
-Checking the write is the only way to notice a full disk, so it is what
-anybody who reads §3 of `UNKNOWNS.md` would write:
-
-    sink = function(line) assert(file:write(line)) end
-
-Inside a handler that is contained: `akkar/init.lua` xpcalls the chain, so the
-raise becomes a 500 and the server carries on. Asserted below, and a verified
-non-issue.
-
-`App:stop` is not contained. Its first statement is
-
-    internal:info("shutdown: no longer accepting connections")     -- 2924
-
-and it is the ONLY statement in that function that is not wrapped: `pcall`
-guards `server:pause()`, every websocket close, every closer, and
-`server:close()`. So the log line raises, and the shutdown never happens —
-measured:
-
-    state before app:stop  RUNNING
-    app:stop raised        ENOSPC: no space left on device
-    state after            STOP_ACCEPTING
-    app:stop again         STOP_ACCEPTING   (did nothing)
-    state final            STOP_ACCEPTING
-
-The listener was never paused, the drain never ran, `self.closers` never ran
-so the database and Redis pools were never closed, and the server socket was
-never closed. And it is PERMANENT: `App:stop` opens with
-`if self.state ~= "RUNNING" then return self.state end`, so calling it again
-— even after the disk is emptied — returns immediately. One log line on a
-full disk turns a graceful shutdown into a server that is neither serving nor
-stopping.
-
-`App:handle_signals` is the same shape and is the path a container actually
-takes:
-
-    listener:wait()
-    internal:info("signal received")     -- unguarded, raises here
-    app:stop()                           -- never reached
-
-so on a full disk SIGTERM does not drain; it kills the coroutine before
-`App:stop` is even called.
-
-## What a fix looks like
-
-`log.lua:138` guarding the sink and counting what it dropped — the process
-notices, the request path is unchanged, and `App:stop` cannot be taken down by
-its own logging. The count is the part that matters: "dropped 41 200 lines"
-on the first line that gets through is the difference between an outage that
-explains itself and one that does not.
-
-Not carried here: this branch is shared and green, and `log.lua` swallowing a
-sink's error is a contract change other files assert against. The assertions
-below therefore state the CURRENT behaviour, each one marked, so that when the
-guard lands they invert into the regression test.
+One limit remains and is stated rather than hidden: a user-supplied BUFFERED
+file sink can report success and encounter ENOSPC only on a later `flush`.
+An opaque callback gives akkar no handle to flush, so a file sink must itself
+flush and return or raise its failure. The default stderr sink is unbuffered
+and preserves all three return values.
 ]]
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
@@ -143,12 +62,10 @@ describe("akkar.log on a full disk", function()
     assert.is_truthy(tostring(why):lower():find("no space", 1, true))
   end)
 
-  -- THE DEFECT. `log.lua:138` discards the return, so the line is gone and
-  -- nothing anywhere records that it was.
-  --
-  -- INVERT THIS WHEN THE SINK IS GUARDED: `logger.dropped` becomes 1.
-  it("loses the line without raising and without counting it", function()
-    local logger = log.new { sink = function(line) FULL:write(line) end }
+  it("counts a line refused with ENOSPC without raising", function()
+    local logger = log.new {
+      sink = function(line) return FULL:write(line) end,
+    }
 
     local ok, err = pcall(function()
       logger:info("charged", { account_id = 7, amount = 10 })
@@ -156,7 +73,11 @@ describe("akkar.log on a full disk", function()
     assert.is_true(ok, "the write failing raised: " .. tostring(err))
     assert.is_nil(err)
 
-    -- Nothing on the logger changed, so nothing downstream can tell.
+    assert.equal(1, logger:stats().dropped)
+    assert.is_truthy(logger:stats().last_error:lower():find("no space", 1, true))
+
+    -- Delivery state lives beside the shared sink rather than making every
+    -- request-bound logger larger.
     local fields = {}
     for key in pairs(logger) do fields[#fields + 1] = key end
     table.sort(fields)
@@ -185,10 +106,10 @@ describe("akkar.log on a full disk", function()
     buffered:close()
   end)
 
-  it("keeps answering requests at 200 while every line goes nowhere", function()
-    -- The shape of the outage: nothing is broken, nothing is slow, and there
-    -- is no record of any of it.
-    local logger = log.new { sink = function(line) FULL:write(line) end }
+  it("keeps answering requests and exposes how many lines were lost", function()
+    local logger = log.new {
+      sink = function(line) return FULL:write(line) end,
+    }
     local app = akkar.new()
     app:get("/charge", function(req)
       req.log:info("charged", { amount = 10 })
@@ -198,6 +119,7 @@ describe("akkar.log on a full disk", function()
     local res = app:test { log = logger } :get "/charge"
     assert.equal(200, res.status)
     assert.is_true(res.body.ok)
+    assert.equal(1, logger:stats().dropped)
   end)
 end)
 
@@ -206,7 +128,7 @@ describe("a log sink that reports ENOSPC instead of swallowing it", function()
   -- it is the sink this section is about. What akkar does with a sink that
   -- raises is the same question whatever made it raise.
 
-  it("is contained inside a handler: the request 500s, the server lives",
+  it("is contained inside a handler without changing the response",
      function()
     local logger = log.new { sink = function(line) assert(FULL:write(line)) end }
     local app = akkar.new()
@@ -216,7 +138,8 @@ describe("a log sink that reports ENOSPC instead of swallowing it", function()
     end)
 
     local res = app:test { log = logger } :get "/charge"
-    assert.equal(500, res.status)
+    assert.equal(200, res.status)
+    assert.equal(1, logger:stats().dropped)
 
     -- And the next request still works, which is what "contained" has to
     -- mean. Verified non-issue.
@@ -224,11 +147,7 @@ describe("a log sink that reports ENOSPC instead of swallowing it", function()
     assert.equal(200, again.status)
   end)
 
-  -- THE DEFECT. `App:stop` pcalls everything except the line that talks.
-  --
-  -- INVERT THIS WHEN `log.lua:138` IS GUARDED: `stopped` becomes true and
-  -- `state_after` becomes "STOPPED".
-  it("takes the whole shutdown down from App:stop's first statement", function()
+  it("cannot take shutdown down from App:stop's own log lines", function()
     local armed = false
     -- Disarmed it writes to stderr, so replacing akkar's `internal` voice for
     -- the rest of this process does not silence anything.
@@ -268,18 +187,13 @@ describe("a log sink that reports ENOSPC instead of swallowing it", function()
 
     assert.equal("RUNNING", seen.state_before)
 
-    -- The shutdown raised, out of its own first line.
-    assert.is_false(seen.stopped)
-    assert.is_truthy(tostring(seen.raised):find("ENOSPC", 1, true))
+    assert.is_true(seen.stopped, tostring(seen.raised))
+    assert.equal("STOPPED", seen.raised)
+    assert.equal("STOPPED", seen.state_after)
 
-    -- It got no further than setting the state. The listener was never
-    -- paused, nothing was drained, and `self.closers` -- the database and
-    -- Redis pools -- were never closed.
-    assert.equal("STOP_ACCEPTING", seen.state_after)
-
-    -- AND IT IS PERMANENT. `App:stop` returns early on any state that is not
-    -- RUNNING, so the retry after the disk was emptied did nothing at all.
-    assert.equal("STOP_ACCEPTING", seen.second)
-    assert.equal("STOP_ACCEPTING", seen.state_final)
+    -- A repeated stop stays idempotent after the disk is writable again.
+    assert.equal("STOPPED", seen.second)
+    assert.equal("STOPPED", seen.state_final)
+    assert.is_true(logger:stats().dropped > 0)
   end)
 end)

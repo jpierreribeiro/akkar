@@ -26,6 +26,7 @@ local log = require "akkar.log"
   - [logger:error(message, fields)](#loggererrormessage-fields)
   - [logger:info(message, fields)](#loggerinfomessage-fields)
   - [logger:log(level, message, fields)](#loggerloglevel-message-fields)
+  - [logger:stats()](#loggerstats)
   - [logger:warn(message, fields)](#loggerwarnmessage-fields)
   - [logger:with(fields)](#loggerwithfields)
 - [Not here](#not-here)
@@ -56,8 +57,8 @@ Builds a logger. All fields are optional.
 |---|---|---|---|
 | `level` | string | `"info"` | one of `debug`, `info`, `warn`, `error`. Lines below it are not written and not formatted. |
 | `format` | string | `"text"` | `"json"` writes one JSON object per line. Any other value writes text. |
-| `sink` | function | writes to stderr | called with one string per line, newline included. |
-| `exporter` | table | none | anything with a `record(entry)` method, given every entry after the sink has written it; in practice the logs exporter from [akkar.otlp](otlp.md), and `pipeline:logger` sets it for you. Carried into every logger `:with` derives. |
+| `sink` | function | writes to stderr | called with one string per line, newline included. Preserve `nil, reason, errno` from file writes or raise on failure so the logger can count a dropped line. |
+| `exporter` | table | none | anything with a `record(entry)` method, given every entry independently of whether the sink accepted it; in practice the logs exporter from [akkar.otlp](otlp.md), and `pipeline:logger` sets it for you. Carried into every logger `:with` derives. |
 
 **Returns** a logger.
 
@@ -69,7 +70,7 @@ not `"json"` produces text output.
 ```lua
 local log = require "akkar.log"
 
-local logger = log.new { level = "info", sink = function(line) io.write(line) end }
+local logger = log.new { level = "info", sink = function(line) return io.write(line) end }
 
 logger:info("server started", { port = 3000 })
 logger:debug("not printed, below the level")
@@ -144,10 +145,15 @@ the epoch, from `akkar.time`) alongside the fields.
 
 **Returns** nothing.
 
+A sink failure never escapes this method. A raise, `false`, or
+`nil, reason, errno` increments `logger:stats().dropped`; the exporter still
+receives the entry. On the first later successful write, the logger writes a
+`warn` line named `log sink recovered` with the dropped count and clears it.
+
 ```lua
 local log = require "akkar.log"
 
-local logger = log.new { format = "json", sink = function(line) io.write(line) end }
+local logger = log.new { format = "json", sink = function(line) return io.write(line) end }
 logger:info("payment taken", { account_id = 7, amount = 12.5 })
 ```
 
@@ -165,6 +171,14 @@ The method the four named ones call. `level` is a level name.
 name. Unlike `log.new`, this path does not check the name first, so prefer the
 named methods.
 
+### logger:stats()
+
+Returns `{ dropped = n, last_error = string-or-nil }`. `dropped` is the number
+of lines the sink has refused since its last recovery notice. The state is
+shared with every logger produced by `:with`, so inspecting the configured
+root logger includes failures from request-bound loggers. The returned table
+is a copy.
+
 ### logger:warn(message, fields)
 
 Writes at `warn`. Same shape as `logger:info`.
@@ -172,8 +186,8 @@ Writes at `warn`. Same shape as `logger:info`.
 ### logger:with(fields)
 
 Returns a new logger that writes `fields` on every line, on top of whatever it
-already carried. The original logger is unchanged, and level, format and sink
-are copied.
+already carried. The original logger is unchanged; level, format and sink are
+copied, and sink delivery statistics are shared.
 
 This is what akkar itself does per request: `req.log` is the configured logger
 with `request_id` bound to that request, `client_request_id` when the caller
@@ -212,7 +226,7 @@ print(json.decode(lines[2]).trace_id)   --> nil: no trace, no key
 ```lua
 local log = require "akkar.log"
 
-local logger = log.new { sink = function(line) io.write(line) end }
+local logger = log.new { sink = function(line) return io.write(line) end }
 local bound = logger:with { request_id = "1a2b3c" }
 
 bound:warn("slow query", { took_ms = 120 })
@@ -227,7 +241,10 @@ ERROR query failed request_id=1a2b3c table_name=tasks
 ## Not here
 
 - **Log file rotation.** The sink is a function, so writing to a file, to a
-  socket or to a rotating handle is the caller's to arrange.
+  socket or to a rotating handle is the caller's to arrange. A buffered file
+  may report success and encounter ENOSPC only on `flush`; an opaque callback
+  cannot be flushed by akkar, so such a sink must flush and report that error
+  itself.
 - **A global logger.** There is no module-level `log.info`. A logger is a
   value, and the one akkar hands a handler is `req.log`.
 - **Redaction.** A field is written as it is given. A value wrapped by

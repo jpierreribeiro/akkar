@@ -115,15 +115,17 @@ describe("the concurrency ceiling", function()
   --- servers other specs left behind, the interpreter's own files -- so a
   --- descriptor count taken inside it measures the suite. The number that
   --- means something is the delta in a process that is doing nothing else.
-  local function with_server(seconds_to_hold, body)
+  local function with_server(seconds_to_hold, body, boot_delay)
     local port = 8100 + math.random(0, 900)
     if portable.port_in_use(port) then port = port + 173 end
     local log = os.tmpname()
+    local pidfile = log .. ".pid"
     -- `env`, not a bare `VAR=value` prefix: `portable.timeout` wraps this in
     -- `timeout N ...`, and `timeout` execs its argument rather than handing
     -- it to a shell, so it would go looking for a program named `AKKAR_PORT=8137`.
-    local command = ("env AKKAR_PORT=%d AKKAR_HOLD=%d %s %s")
-      :format(port, seconds_to_hold, portable.lua, "spec/support/idle_server.lua")
+    local command = ("env AKKAR_PORT=%d AKKAR_HOLD=%d AKKAR_PID_FILE=%q AKKAR_BOOT_DELAY=%s %s %s")
+      :format(port, seconds_to_hold, pidfile, tostring(boot_delay or 0), portable.lua,
+              "spec/support/idle_server.lua")
     os.execute(portable.detached(portable.timeout(90, command), log))
 
     -- Wait by asking the port. `sleep 0.1` is not portable and `sleep 1` in a
@@ -132,15 +134,30 @@ describe("the concurrency ceiling", function()
     for _ = 1, 400 do
       local ok, c = pcall(socket.connect, "127.0.0.1", port)
       if ok and c then
+        -- cqueues.connect is lazy: construction alone does not prove a
+        -- listener exists. Force actual I/O before declaring the fixture ready.
+        local ready, status = pcall(function()
+          c:setmode("bn", "bn")
+          c:settimeout(0.2)
+          c:write("GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+          assert(c:flush())
+          return c:read("*l")
+        end)
         pcall(function() c:close() end)
-        if portable.pid_on_port(port) then up = true break end
+        local f = io.open(pidfile, "r")
+        if f then
+          f:close()
+          if ready and status and status:match("^HTTP/1%.[01] 200") then up = true break end
+        end
       end
+      cqueues.sleep(0.01)
     end
     if not up then
       local f = io.open(log, "r")
       local why = f and f:read "a" or "(no log)"
       if f then f:close() end
       os.remove(log)
+      os.remove(pidfile)
       -- RAISED, not returned as nil. A nil here becomes `pending`, and a
       -- pending is what a platform that cannot answer deserves -- not a
       -- fixture that failed to boot for a reason printed in a file nobody
@@ -148,10 +165,15 @@ describe("the concurrency ceiling", function()
       error("the fixture server did not start on port " .. port .. ": " .. why, 0)
     end
 
-    local pid = portable.pid_on_port(port)
+    local f = assert(io.open(pidfile, "r"))
+    local pid = assert(tonumber(f:read "a"), "fixture wrote an invalid PID")
+    f:close()
+    assert(pid ~= portable.pid,
+      "refusing to stop the test runner while cleaning up the fixture server")
     local ok, result = pcall(body, port)
     os.execute(("kill %d 2>/dev/null"):format(pid))
     os.remove(log)
+    os.remove(pidfile)
     if not ok then error(result, 0) end
     return result
   end
@@ -223,6 +245,14 @@ describe("the concurrency ceiling", function()
       return (peak - idle) / flight
     end)
   end
+
+  it("waits for actual HTTP readiness after the PID file exists", function()
+    with_server(1, function(port)
+      local c = connect(port)
+      assert.is_truthy(ask(c, "/ping"):find("pong", 1, true))
+      c:close()
+    end, 0.2)
+  end)
 
   it("queues rather than collapsing when the ceiling is reached", function()
     -- Slow is a state a server can be in. Out of descriptors is not.

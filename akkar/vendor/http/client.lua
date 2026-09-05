@@ -107,7 +107,10 @@ local function connect(options, timeout)
 	end
 	local s, err, errno = ca.fileresult(cs.connect {
 		family = options.family;
-		host = options.host;
+		-- akkar may resolve explicitly so DNS has its own named, bounded phase.
+		-- Keep `options.host` for SNI and certificate verification in
+		-- `negotiate`; `address` changes only what the socket dials.
+		host = options.address or options.host;
 		port = options.port;
 		path = options.path;
 		bind = bind;

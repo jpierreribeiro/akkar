@@ -838,10 +838,24 @@ end
 --- decoded to 16,001 fields carrying 64 MB of value. Under the 400 KB cap
 --- the same shape reaches ~400,000 fields.
 local MAX_HEADER_LIST_ENTRIES = 100 -- `h1_stream`'s `max_header_lines`
-function methods:decode_headers(payload, header_list, pos, max_entries)
+local MAX_HEADER_LIST_BYTES = 32*1024
+function methods:decode_headers(payload, header_list, pos, max_entries, max_bytes)
 	header_list = header_list or new_headers()
 	pos = pos or 1
 	max_entries = max_entries or MAX_HEADER_LIST_ENTRIES
+	max_bytes = max_bytes or MAX_HEADER_LIST_BYTES
+	local header_bytes = 0
+	for name, value in header_list:each() do
+		header_bytes = header_bytes + #name + #value
+	end
+	local function within_limit(name, value)
+		header_bytes = header_bytes + #name + #value
+		if header_bytes > max_bytes then
+			return nil, h2_errors.PROTOCOL_ERROR:new_traceback(
+				string.format("header list of more than %d bytes", max_bytes)), ce.E2BIG
+		end
+		return true
+	end
 	while pos <= #payload do
 		-- Checked before decoding the next field rather than after appending
 		-- it, so a block of exactly `max_entries` fields is accepted and the
@@ -868,6 +882,8 @@ function methods:decode_headers(payload, header_list, pos, max_entries)
 			if name == nil then
 				return nil, h2_errors.COMPRESSION_ERROR:new_traceback(string.format("index %d not found in table", index))
 			end
+			local fits, err, errno = within_limit(name, value)
+			if not fits then return nil, err, errno end
 			header_list:append(name, value, false)
 		elseif band(first_byte, 0x40) ~= 0 then -- Section 6.2.1
 			local name, value, newpos = decode_header_helper(self, payload, 6, pos)
@@ -878,6 +894,8 @@ function methods:decode_headers(payload, header_list, pos, max_entries)
 				return nil, value
 			end
 			pos = newpos
+			local fits, err, errno = within_limit(name, value)
+			if not fits then return nil, err, errno end
 			self:add_to_dynamic_table(name, value, compound_key(name, value))
 			header_list:append(name, value, false)
 		elseif band(first_byte, 0x20) ~= 0 then -- Section 6.3
@@ -905,6 +923,8 @@ function methods:decode_headers(payload, header_list, pos, max_entries)
 				return nil, value
 			end
 			pos = newpos
+			local fits, err, errno = within_limit(name, value)
+			if not fits then return nil, err, errno end
 			header_list:append(name, value, never_index)
 		end
 	end

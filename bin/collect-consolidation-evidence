@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Read-only with respect to the source tree. Outputs only into a fresh directory.
+set -euo pipefail
+akkar_repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+akkar_evidence=${1:?usage: bash bin/collect-consolidation-evidence /absolute/new-directory}
+case "$akkar_evidence" in /*) ;; *) echo "absolute directory required" >&2; exit 2;; esac
+test ! -e "$akkar_evidence" || { echo "refusing to overwrite evidence" >&2; exit 2; }
+mkdir -p "$akkar_evidence"
+cd "$akkar_repo"
+{
+  date -Is
+  git rev-parse HEAD
+  git status --short
+  uname -a
+  lua -v
+  lua -e 'print("cqueues=" .. tostring(require("cqueues").COMMIT or "unknown")); print("openssl=" .. require("openssl").version())'
+} > "$akkar_evidence/environment.txt"
+git diff --binary | sha256sum > "$akkar_evidence/tracked-diff.sha256"
+# Explicit source paths, never .env, credential files, .venv or agent worktrees.
+git ls-files --cached --others --exclude-standard -z -- akkar spec runtime \
+  bin/bootstrap-runtime bin/runtime-exec bin/prepare-release \
+  bench/soak.sh bench/serve.lua \
+  examples/mlops/ml_service examples/mlops/tests examples/mlops/observability \
+  examples/mlops/gateway.lua examples/mlops/gateway_app.lua \
+  examples/mlops/schema.sql examples/mlops/pyproject.toml examples/mlops/uv.lock \
+  examples/mlops/Dockerfile examples/mlops/docker-compose.yml \
+  examples/mlops/smoke.py examples/mlops/recovery.py .github/workflows \
+  | sort -zu | xargs -0 sha256sum > "$akkar_evidence/sources.sha256"
+echo "$akkar_evidence"

@@ -1,0 +1,178 @@
+x-ml-env: &ml-env
+  ML_INTERNAL_TOKEN: ${ML_INTERNAL_TOKEN:-development-token-change-me-000000000}
+  ML_DATABASE_URL: postgresql://akkar:akkar@postgres:5432/akkar_ml
+  ML_REDIS_URL: redis://redis:6379/0
+  ML_MLFLOW_TRACKING_URI: http://mlflow:5000
+  ML_MODEL_NAME: akkar-reference
+  ML_MODEL_ALIAS: champion
+  ML_S3_ENDPOINT_URL: http://minio:9000
+  ML_S3_ACCESS_KEY: minio
+  ML_S3_SECRET_KEY: ${ML_S3_SECRET_KEY:-development-minio-secret}
+  ML_S3_REGION: us-east-1
+  MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+  AWS_ACCESS_KEY_ID: minio
+  AWS_SECRET_ACCESS_KEY: ${ML_S3_SECRET_KEY:-development-minio-secret}
+  AWS_DEFAULT_REGION: us-east-1
+  GIT_PYTHON_REFRESH: quiet
+  MLFLOW_HTTP_REQUEST_TIMEOUT: "5"
+  MLFLOW_HTTP_REQUEST_MAX_RETRIES: "0"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: akkar
+      POSTGRES_PASSWORD: akkar
+      POSTGRES_DB: akkar_ml
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U akkar -d akkar_ml"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    security_opt: [no-new-privileges:true]
+
+  redis:
+    image: redis:7-alpine
+    command: [redis-server, --appendonly, "yes", --maxmemory, 256mb, --maxmemory-policy, noeviction]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - redis-data:/data
+    security_opt: [no-new-privileges:true]
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: [server, /data, --console-address, ":9001"]
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: ${ML_S3_SECRET_KEY:-development-minio-secret}
+    healthcheck:
+      test: [CMD, curl, -f, http://localhost:9000/minio/health/live]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - minio-data:/data
+    security_opt: [no-new-privileges:true]
+
+  create-buckets:
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        mc alias set local http://minio:9000 minio "$${ML_S3_SECRET_KEY}"
+        mc mb --ignore-existing local/mlflow
+        mc mb --ignore-existing local/ml-batch
+        mc version enable local/ml-batch
+    environment:
+      ML_S3_SECRET_KEY: ${ML_S3_SECRET_KEY:-development-minio-secret}
+
+  mlflow:
+    build: .
+    entrypoint: [/app/.venv/bin/mlflow]
+    command:
+      - server
+      - --host=0.0.0.0
+      - --port=5000
+      - --allowed-hosts=mlflow:5000,localhost:5000,127.0.0.1:5000
+      - --backend-store-uri=postgresql+psycopg://akkar:akkar@postgres:5432/akkar_ml
+      - --artifacts-destination=s3://mlflow
+      - --serve-artifacts
+    environment: *ml-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      create-buckets:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, /app/.venv/bin/python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 40
+    security_opt: [no-new-privileges:true]
+
+  bootstrap-model:
+    build: .
+    entrypoint: [/app/.venv/bin/python]
+    command: [bootstrap.py]
+    environment:
+      <<: *ml-env
+      ML_REQUIRE_MODEL_DIGEST: "false"
+    depends_on:
+      mlflow:
+        condition: service_healthy
+
+  api:
+    build: .
+    environment: *ml-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      bootstrap-model:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, /app/.venv/bin/python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready', timeout=10)"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+    ports: ["127.0.0.1:8000:8000"]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+
+  worker:
+    build: .
+    entrypoint: [/app/.venv/bin/celery]
+    command: [-A, ml_service.tasks:celery, worker, --loglevel=INFO, --concurrency=2]
+    environment: *ml-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      bootstrap-model:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs: [/tmp]
+    stop_grace_period: 30s
+    security_opt: [no-new-privileges:true]
+
+  migrate:
+    build: .
+    entrypoint: [/app/.venv/bin/python, -c, "from ml_service.db import migrate; migrate()"]
+    environment: *ml-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  dispatcher:
+    build: .
+    entrypoint: [/app/.venv/bin/python, -m, ml_service.dispatcher]
+    environment: *ml-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:

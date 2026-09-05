@@ -3,6 +3,32 @@
 A plan for the performance work that remains, written after a pass that cut
 allocation per request by 21.6% and bought 16.0% of throughput.
 
+> **Implementation status — 3 September 2026.** This is now the historical
+> decision record for the performance programme, not a list of patches still
+> waiting to land. The request-path work it selected is implemented:
+>
+> | item | shipped result | executable proof |
+> |---|---|---|
+> | A2, akkar coroutine | handlers run on a controller-local worker pool; the coroutine cost fell from 2,368 to about 115 bytes/request | `spec/worker_pool_spec.lua`, `spec/allocation_spec.lua` |
+> | A2, lua-http coroutine | HTTP/1.1 streams run inline; HTTP/2 keeps its per-stream coroutine | `spec/http2_spec.lua`, `spec/framing_spec.lua`, `spec/allocation_spec.lua` |
+> | B1/F2 | a deadline is a number on the existing controller; an in-flight request costs one descriptor instead of three | `spec/concurrency_spec.lua`, `spec/abandoned_defence_spec.lua` |
+> | D3 | the resource pool is FIFO and refuses barging; measured database-route p99 fell from 5.42 s to 17 ms while throughput rose | `spec/pool_fairness_spec.lua` |
+> | D4 | production-shaped headers became the default benchmark fixture and exposed the header parser's backtracking; the long-line case is 4.7x faster | `spec/vendor_header_parse_spec.lua`, `bench/study/request-shapes.lua` |
+> | C1 surface | `app:run { gc = ... }` exposes the measured collector modes without making an obsolete measurement the default | `spec/gc_spec.lua`, `bench/study/gc-cost.sh` |
+>
+> Together the two coroutine changes took the real-socket allocation figure
+> from 14,610 to **5,376 bytes/request**. The later H1 fast-path spike was
+> measured at only 1.2x and refused; LuaJIT measured 1.62x against a 2x rule
+> written in advance and was refused as the default substrate. Pre-growing a
+> per-request coroutine became irrelevant once that coroutine became a reused
+> worker. Stream-object recycling and a custom allocator remain deliberately
+> unshipped: neither has evidence that clears the risk and complexity bar.
+>
+> The sections below are kept in chronological form because their failed
+> hypotheses and blockers explain the resulting design. Current consolidated
+> measurements live in `bench/study/COST-OF-A-REQUEST.md`; the fast-path verdict
+> lives in `bench/study/H1-FAST-PATH.md` on `spike/h1-fastpath`.
+
 Every item below is judged by what it is worth **within this stack**: pure
 Lua 5.4/5.5 on cqueues. `bench/study/COST-OF-A-REQUEST.md` decomposes the gap
 to OpenResty and shows that 78% of it is nginx being C, which is why nothing
@@ -181,8 +207,8 @@ out of it that nothing in the previous plan anticipated:
 
 1. **Two coroutines are 55% of a request.** Not parsing, not writing, not
    header objects — the per-request coroutines themselves.
-2. **A coroutine's cost is set by its CALLER'S STACK DEPTH**, not by the
-   coroutine. The object is ~1.2 KB; the rest is stack reallocation as it
+2. **A coroutine's cost is set by its own stack depth**, not by its caller's.
+   The object is ~1.2 KB; the rest is stack reallocation as the coroutine
    descends. 40 frames cost 13,416 bytes, 200 frames cost 54,376.
 3. **All request parsing is 152 bytes.** The thing everyone assumed was the
    target is 1.3% of a request.
@@ -311,21 +337,19 @@ the abandoned handler touched a capability that had been released
 So the hazard is not theoretical and the gate is not decorative. Whoever
 attempts B1 or A2 will see this fail on the first run, which is the point.
 
-**One of the five is deliberately uncomfortable.** It asserts what is TRUE
-rather than what ought to be: after `release`, the object a handler captured
-in a local **still works**. There is no poisoning and none is cheap — the
-object may BE the pooled connection, so poisoning it would break whoever
-borrows it next. A real defence needs a per-execution handle or a generation
-check, and neither exists.
+**That deliberately uncomfortable case is now inverted and green.** A
+factory-returned releasable capability is represented by a per-execution lease.
+The release list still owns the real resource, so returning it to a pool does
+not mutate or poison it; the handler's lease reads the execution record and
+refuses every field or method after it ends. Direct process-lifetime adapter
+tables retain their exact identity, and shared built-ins state that lifetime
+explicitly.
 
-**So the shape of the remaining work is now precise**, which it was not this
-morning:
-
-1. Give a released capability a way to refuse — a per-execution handle, or a
-   generation counter the pooled object checks. This is the actual blocker,
-   and it is a design problem rather than an optimisation.
-2. Then B1 and A2 are unblocked, and the test that guards them gets rewritten
-   to assert the new guarantee instead of the old accident.
+The lease costs only on the path that acquires a releasable resource. `/ping`
+still allocates none of this machinery. A local CPU microbenchmark prices its
+method dispatch at about 1 microsecond, below one percent of the measured local
+database round trip; the allocation gate and integration suites remain green.
+B1 and A2 no longer depend on the old inert-controller accident.
 
 ### A3 — pre-grow the coroutine's stack  ·  new, and it has a precedent with numbers
 
@@ -476,14 +500,12 @@ assertion: lua-http issue #32 is the same defect, diagnosed by its maintainer,
 with `/proc/PID/fd` showing `anon_inode:[eventpoll]` and `anon_inode:[eventfd]`
 held by a nested controller the collector had not reached.
 
-**One blocker remains, and it is the one akkar's own comment named**: an
-abandoned handler moved to the shared controller keeps running, wakes after
-the 503 has gone out, and touches a connection already returned to the pool —
-trading a descriptor leak for a data bug. That is a real design problem and it
-is now the ONLY thing between this plan and its largest win. `execution.release`
-is already idempotent and `db.lua` already marks a connection broken on a
-passed budget, so the pieces exist; what does not exist is a test that proves a
-late handler cannot touch a recycled connection.
+**That blocker is closed.** An abandoned handler moved to the shared controller
+can wake, but a factory-returned releasable capability is now an
+execution-scoped lease. `execution.release` returns the real object exactly
+once and marks the lease dead before the handler can touch a recycled
+connection. `spec/abandoned_defence_spec.lua` proves both a captured local and
+a fresh carrier read refuse after release.
 
 **Not `timeout.c`.** Two reasons, both checked. cqueues does not embed it and
 does not need it — `src/cqueues.c` includes `lib/llrb.h` and no `timeout.h`,

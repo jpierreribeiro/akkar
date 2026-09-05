@@ -8,11 +8,10 @@
 
 ## The state in one line
 
-Everything a release needs exists and is validated **except one thing the
-maintainer must decide and one action only the maintainer can take.** The
-rockspecs are correct, lint clean, and install from a clean tree; the source they
-must point at is a git tag that does not exist yet. The decision is the version
-number; the action is tagging and uploading.
+The development and historical rockspecs are correct and lint clean. Release
+rockspecs are generated from the exact tagged tree by `bin/prepare-release`, so
+they cannot drift while waiting in the repository. The remaining decisions are
+the version number, the immutable tag, and the maintainer-only uploads.
 
 ## The decisive blocker, since corrected — and what it leaves behind
 
@@ -70,17 +69,16 @@ the changelog, not about breaking installed users.
 
 | option | what it is | cost |
 |---|---|---|
-| **A — cut `0.2.0` at HEAD** *(recommended)* | Leave the immutable `v0.1.0` tag as the historical "intended but never shipped" marker. Tag current `main` as `v0.2.0`; publish the prepared `akkar-0.2.0-1` / `akkar-pq-0.2.0-1` rockspecs. Fold `CHANGELOG.md`'s "Unreleased" section — which is a list of changes that **break code that works today** — into the `0.2.0` notes. | The published number is not `0.1.0`. Harmless: nobody installed `0.1.0`. |
+| **A — cut `0.2.0` at HEAD** *(recommended)* | Leave the immutable `v0.1.0` tag as the historical "intended but never shipped" marker. Tag current `main` as `v0.2.0`; generate and publish the `akkar-0.2.0-1` / `akkar-pq-0.2.0-1` rockspecs. Fold `CHANGELOG.md`'s "Unreleased" section — which is a list of changes that **break code that works today** — into the `0.2.0` notes. | The published number is not `0.1.0`. Harmless: nobody installed `0.1.0`. |
 | **B — keep the number `0.1.0`** | Move the published `v0.1.0` tag from `d83fc61` to the release commit, so the existing `akkar-0.1.0-1.rockspec` becomes correct. | **Rewrites a public git tag.** Acceptable only because no rock consumed it, but it violates tag immutability and will confuse anyone who fetched it. |
 
 **Recommendation: A.** Immutability of a published tag is the stronger norm, and
 `CHANGELOG.md`'s own "Unreleased" block is a set of breaking changes — under
 `docs/COMPATIBILITY.md` a `0.x` MINOR is exactly where those belong, so `0.2.0` is
-also the *honest* number, not merely the convenient one. The prepared rockspecs in
-this branch (`akkar-0.2.0-1.rockspec`, `akkar-pq-0.2.0-1.rockspec`) implement A and
-are validated below. If the maintainer prefers B, delete those two files and move
-the tag instead; the readiness evidence transfers unchanged, since the tree is
-identical.
+also the *honest* number, not merely the convenient one. `bin/prepare-release
+0.2.0 dist` implements A and lints both generated files. If the maintainer
+prefers B, pass that version to the generator instead; the readiness evidence
+transfers unchanged, since the tree is identical.
 
 Either way, **the rule is: `source.tag` must point at a commit whose tree
 contains exactly the modules the rockspec lists.** That is the whole of what went
@@ -140,8 +138,8 @@ luarocks make --tree <clean prefix> --deps-mode none akkar-0.2.0-1.rockspec
     → "akkar 0.2.0-1 is now installed". Same result.
 ```
 
-The `dev` and `0.1.0` rockspecs carry **byte-identical module lists and
-dependency blocks** (verified by diff), so the `luarocks make` above proves the
+The `dev` and generated `0.2.0` rockspecs carry **byte-identical module lists
+and dependency blocks**, so the `luarocks make` above proves the
 release module set installs cleanly from the working tree. `--deps-mode none` was
 used so the build stays offline; the "missing dependencies" it then lists are the
 declared bounds, not build failures. What is **not** yet provable locally is a
@@ -155,22 +153,24 @@ this preparation stops short of every one of them.
 
 1. **Decide the version** (§"The one decision"). Assume `0.2.0` below.
 2. Move `CHANGELOG.md`'s `## Unreleased` block under `## 0.2.0 — <date>`.
-3. Confirm the rockspecs: `akkar-0.2.0-1.rockspec` and `akkar-pq-0.2.0-1.rockspec`
-   are present, lint clean, and their `source.tag` is `v0.2.0`. (Done in this
-   branch.)
-4. `luarocks lint akkar-0.2.0-1.rockspec && luarocks lint akkar-pq-0.2.0-1.rockspec`
+3. Generate and lint the rockspecs with `bin/prepare-release 0.2.0 dist`.
+4. Review `dist/akkar-0.2.0-1.rockspec` and
+   `dist/akkar-pq-0.2.0-1.rockspec`; both must pin `v0.2.0`.
 5. **[maintainer]** Tag and push the release commit:
    `git tag -a v0.2.0 -m "akkar 0.2.0" && git push origin v0.2.0`
-6. Prove the published tarball builds, in a clean prefix, now that the tag exists:
-   `luarocks build --tree /tmp/akkar-verify akkar-0.2.0-1.rockspec`
+6. Run the protected `release` GitHub workflow with input `v0.2.0`. It requires
+   successful CI and emits the GitHub/GHCR release, SPDX SBOMs, checksums and
+   provenance attestations.
+7. Prove the published tarball builds, in a clean prefix, now that the tag exists:
+   `luarocks build --tree /tmp/akkar-verify dist/akkar-0.2.0-1.rockspec`
    (this fetches `v0.2.0` and resolves real dependencies).
-7. **[maintainer]** Upload, main rock first:
-   `luarocks upload akkar-0.2.0-1.rockspec --api-key=<key>`
-8. **[maintainer]** Then the driver, which depends on the rock now published:
-   `luarocks upload akkar-pq-0.2.0-1.rockspec --api-key=<key>`
+8. **[maintainer]** Upload, main rock first:
+   `luarocks upload dist/akkar-0.2.0-1.rockspec --api-key=<key>`
+9. **[maintainer]** Then the driver, which depends on the rock now published:
+   `luarocks upload dist/akkar-pq-0.2.0-1.rockspec --api-key=<key>`
 
 `luarocks upload` needs a luarocks.org account and API key — a maintainer
-credential. Steps 5, 7 and 8 are the only ones that change anything outside this
+credential. Steps 5, 6, 8 and 9 are the only ones that change anything outside this
 repository, and none of them has been run.
 
 ## Checklist

@@ -122,6 +122,7 @@ local stream_methods = {
 	-- Enforced inside `hpack:decode_headers`, not on its result: after it
 	-- returns, every field has already been allocated.
 	max_header_lines = 100;
+	max_header_bytes = 32*1024;
 }
 for k, v in pairs(stream_common.methods) do
 	stream_methods[k] = v
@@ -535,7 +536,7 @@ local function process_end_headers(stream, end_stream, pad_len, pos, promised_st
 	-- The field-count bound travels INTO the decoder, because the decoder is
 	-- where the fields are allocated. See `max_header_lines` above.
 	local headers, newpos, errno = stream.connection.decoding_context:decode_headers(
-		payload, nil, pos, stream.max_header_lines)
+		payload, nil, pos, stream.max_header_lines, stream.max_header_bytes)
 	if not headers then
 		return nil, newpos, errno
 	end

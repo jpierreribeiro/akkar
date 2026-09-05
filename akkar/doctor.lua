@@ -172,6 +172,7 @@ end
 
 function M.check_environment(report)
   report = report or new_report()
+  require("akkar.internal.substrate").check(report, os.getenv("AKKAR_SUBSTRATE_MANIFEST"))
 
   -- The Lua version.
   --
