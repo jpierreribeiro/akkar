@@ -101,6 +101,9 @@ test = {
 build = {
   type = "builtin",
   modules = {
+    ["akkar.internal.substrate"] = "akkar/internal/substrate.lua",
+    ["akkar.internal.http_input"] = "akkar/internal/http_input.lua",
+    ["akkar.internal.configuration"] = "akkar/internal/configuration.lua",
     ["akkar"]    = "akkar/init.lua",
     ["akkar.auth"] = "akkar/auth.lua",
     -- Bitwise operations and integer division, spelled as functions so the

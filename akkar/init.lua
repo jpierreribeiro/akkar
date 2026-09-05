@@ -76,27 +76,8 @@ local akkar = {}
 -- A valid string is returned UNCHANGED and allocates nothing, which is what
 -- keeps this off the allocation ceiling. Only bytes that are already broken
 -- pay for the repair.
-local function safe_text(value)
-  if type(value) ~= "string" then return value end
-  if utf8.len(value) then return value end
-
-  -- U+FFFD per invalid byte, which is what every other decoder does and what
-  -- makes the result inspectable rather than merely legal.
-  local out, i, n = {}, 1, #value
-  while i <= n do
-    local ok = utf8.len(value, i, i)
-    if ok then
-      local _, stop = utf8.offset(value, 2, i), nil
-      stop = (_ or (n + 1)) - 1
-      out[#out + 1] = value:sub(i, stop)
-      i = stop + 1
-    else
-      out[#out + 1] = "\239\191\189"      -- U+FFFD
-      i = i + 1
-    end
-  end
-  return table.concat(out)
-end
+local http_input = require "akkar.internal.http_input"
+local safe_text = http_input.safe_text
 
 akkar.safe_text = safe_text
 
@@ -196,6 +177,9 @@ end
 -- a deadline exist whether or not anyone remembered to ask for them.
 akkar.defaults = {
   body_limit     = 1024 * 1024,   -- 1 MB
+  header_limit   = 32 * 1024,     -- aggregate h1 wire / h2 decoded bytes
+  header_count_limit = 100,       -- fields, including repeated names
+  json_depth_limit = 64,          -- nested arrays/objects in a request body
   timeout        = 30,            -- seconds of wall clock per request
   shutdown_grace = 10,            -- seconds to drain before saying so
 
@@ -204,6 +188,7 @@ akkar.defaults = {
   -- `timeout`, which bounds the HANDLER: this bounds the stranger who has not
   -- asked for anything yet.
   read_timeout   = 30,            -- seconds to send a request
+  write_timeout  = 30,            -- seconds to accept one response write
 
   -- INSTRUCTIONS A HANDLER MAY RUN WITHOUT RETURNING. `nil` is no ceiling,
   -- which is what every akkar before this had and what a service that trusts
@@ -265,63 +250,10 @@ execution.default_log(internal)
 -- Everything else app:run{} accepts.  Listed so that a typo is an error rather
 -- than silence: `app:run { timout = 5 }` used to be ignored, leaving a server
 -- running with a 30 s deadline the author believed was 5 s.
-local SETTINGS = {
-  host = true, port = true, tls = true, ctx = true,
-  body_limit = true, timeout = true, shutdown_grace = true,
-  check_capabilities = true, reuseport = true, strict = true,
-  max_concurrent = true, trusted_proxies = true, read_timeout = true,
-  socket_buffer = true, gc = true,
-  cpu_limit = true, h2c = true, websocket_idle_timeout = true,
-  websocket_max_message = true, websocket_max_connections = true,
-  h2_max_concurrent_streams = true,
-}
-
--- Route options, checked for the same reason: `app:post("/x", { bdy = ... })`
--- silently declaring no schema at all is worse than an error, because the
--- route then accepts anything while looking validated.
-local ROUTE_OPTIONS = {
-  params = true, query = true, body = true, response = true, before = true,
-  -- `response` describes the success body whatever its status. `responses`
-  -- names one schema per status, for the route that answers 201 with a shape
-  -- its 200 does not have -- enforced AND documented from the same table.
-  responses = true,
-  -- Documentation the schemas cannot carry, because it is not validation:
-  -- a summary, a security requirement, a header the client must send.
-  openapi = true,
-}
-
-local function nearest(word, candidates)
-  -- Levenshtein, small enough to be worth it: a suggestion turns "unknown
-  -- option" into a one-second fix.
-  local best, best_distance = nil, math.huge
-  for candidate in pairs(candidates) do
-    local previous = {}
-    for j = 0, #candidate do previous[j] = j end
-    for i = 1, #word do
-      local current = { [0] = i }
-      for j = 1, #candidate do
-        local cost = word:sub(i, i) == candidate:sub(j, j) and 0 or 1
-        current[j] = math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
-      end
-      previous = current
-    end
-    if previous[#candidate] < best_distance then
-      best, best_distance = candidate, previous[#candidate]
-    end
-  end
-  if best_distance <= math.max(2, bitwise.idiv(#word, 3)) then return best end
-end
-
-local function check_config(config, allowed, what)
-  for key in pairs(config) do
-    if not allowed[key] then
-      local suggestion = nearest(key, allowed)
-      error(string.format("unknown %s option '%s'%s", what, key,
-                          suggestion and ("; did you mean '" .. suggestion .. "'?")
-                                      or ""), 3)
-    end
-  end
-end
+local configuration = require "akkar.internal.configuration"
+local SETTINGS = configuration.settings
+local ROUTE_OPTIONS = configuration.route_options
+local check_config = configuration.check_names
 
 -- Acquires each configured capability once, checks it answers its contract,
 -- and lets it go again.
@@ -1001,9 +933,7 @@ local with_deadline = execution.with_deadline
 local guard = execution.guard
 
 
-local function unescape(s)
-  return (s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
-end
+local unescape = http_input.unescape
 
 -- ==================================================================== router
 local App = {}
@@ -2173,425 +2103,23 @@ end
 
 -- `/users/` and `/users` are the same resource.  Answering 404 to one of them
 -- is a distinction no client asked for.  The root stays "/".
-local function normalize_path(path)
-  if path == "" then return "/" end
-  if #path > 1 and path:sub(-1) == "/" then
-    path = path:gsub("/+$", "")
-    if path == "" then return "/" end
-  end
-  return path
-end
-
--- Headers reach a handler as a plain table with lowercase keys, whether the
--- request came off a socket or from the in-process test client.  Before this,
--- a handler had to write
---   req.headers.authorization or (req.headers.get and req.headers:get "...")
--- which is the framework leaking lua-http into user code.
--- A request id, taken from the client when it sends one so a trace survives
--- across services, generated otherwise.  Not a UUID: this only has to be
--- unique enough to correlate lines within a window, and pulling in a UUID
--- library for that would be a dependency bought with nothing.
--- The generating half moved to `akkar/execution.lua`: every execution has an
--- identity, and only HTTP has an opinion about honouring a caller's header.
--- That split is deliberate -- `execution.id()` cannot be handed a header,
--- because trusting one is a transport decision and belongs here.
---- One header out of whatever shape the transport handed us.
----
---- `request_id` and nothing else needs a header BEFORE `req` exists, and it
---- needs exactly one. Normalising all of them to answer that was most of what
---- made a browser-shaped request expensive: 12% of its CPU spent copying
---- headers, on the overwhelming majority of requests that never read one.
----
---- Two shapes, because `app:test` passes a plain table and the server passes a
---- lua-http headers object, and `normalize_headers` has always handled both.
-local function one_header(source, name)
-  if not source then return nil end
-  if type(source.get) == "function" then return source:get(name) end
-  for key, value in pairs(source) do
-    if key:lower() == name then return value end
-  end
-  return nil
-end
-
--- `req.id` is akkar's own, always.
---
--- It used to be whatever arrived in `x-request-id`, length-checked and nothing
--- else, and three things read it. `akkar.limit.concurrent` uses it as the ZSET
--- member for a slot, so every caller sending one constant header collapsed onto
--- a single member and the ceiling stopped counting -- measured at peak 46
--- against a limit of 2. `akkar.log` writes it into a logfmt line, which
--- separates fields with spaces, so one header wrote four fields into the
--- operator's log with three of them invented. And it is echoed back on the
--- response.
---
--- So it is unique by construction now, and made of characters no log format can
--- be steered with. What the caller sent survives as `req.client_request_id`,
--- validated, and named so that trusting it is a decision an application makes
--- rather than one it inherits. Correlation that has to be trusted across
--- services is what `traceparent` is for, and that one is parsed rather than
--- echoed.
-local function request_id(_headers)
-  return execution.id()
-end
-
--- Length is capped at a UUID with room to spare, and anything outside the set
--- is DROPPED rather than stripped or truncated: an id sanitised into a
--- different id correlates to the wrong request, which is worse than not
--- correlating at all.
-local CLIENT_REQUEST_ID_MAX = 128
-
-local function client_request_id(headers)
-  local given = headers and headers["x-request-id"]
-  if type(given) ~= "string" then return nil end
-  if #given == 0 or #given > CLIENT_REQUEST_ID_MAX then return nil end
-  if given:match "^[%w%._:%-]+$" then return given end
-  return nil
-end
-akkar.client_request_id = client_request_id
-
---- The same rule, against raw transport headers rather than a normalised copy.
----
---- Kept separate rather than folded into `request_id`, because `request_id` is
---- exported and `spec/` calls it with a plain normalised table.
-local function request_id_from(_source)
-  return execution.id()
-end
-
--- W3C Trace Context, which is the same idea as `x-request-id` with a format
--- everything else already speaks:
---
---     traceparent: 00-<32 hex trace id>-<16 hex span id>-<2 hex flags>
---
--- akkar accepts one, exposes it, and passes it on. It does NOT create spans
--- or export them: that is an OpenTelemetry dependency and an adapter, and it
--- belongs behind the same boundary as everything else here.
---
--- Validated rather than trusted. A malformed header is dropped instead of
--- propagated, because forwarding a broken trace id corrupts somebody else's
--- trace as well as this one, and it arrives from the network.
-local function trace_context(headers)
-  local given = headers and headers["traceparent"]
-  if type(given) ~= "string" then return nil end
-
-  local version, trace_id, span_id, flags =
-    given:match "^(%x%x)%-(%x+)%-(%x+)%-(%x%x)$"
-  if not version then return nil end
-  if #trace_id ~= 32 or #span_id ~= 16 then return nil end
-  -- All-zero ids are explicitly invalid in the specification.
-  if trace_id:match "^0+$" or span_id:match "^0+$" then return nil end
-  -- Version ff is forbidden; a version akkar does not know is still
-  -- forwarded, which is what the specification asks for.
-  if version == "ff" then return nil end
-
-  return {
-    traceparent = given,
-    trace_id = trace_id,
-    span_id = span_id,
-    sampled = bitwise.band(tonumber(flags, 16), 0x01) == 1,
-    tracestate = headers["tracestate"],
-  }
-end
-akkar.trace_context = trace_context
-
---- Turns whatever carried the headers into a plain lowercase table.
----
---- DUPLICATE VALUES ARE COLLECTED AND JOINED ONCE. The line this replaced was
---- `out[name] = existing and (existing .. ", " .. clean) or clean`, which
---- builds a NEW string of the whole accumulation on every repeat of a name --
---- the textbook quadratic string build, and quadratic in a number an
---- unauthenticated peer chooses.
----
---- Measured on this box, with 4,000-byte values arriving over h2:
----
----     1,000 duplicates      2.5 s
----     4,000 duplicates     32.2 s
----     8,000 duplicates    111.4 s
----    16,000 duplicates    364.0 s      from a 20,008-byte header block
----
---- None of it yields, so it is the whole process, not one request. `req.headers`
---- is lazy, but `req.ip` reads it and `akkar/limit.lua` reads `req.ip` in the
---- default rate-limit key, so the ordinary path arrives here.
----
---- The h2 header-count cap in `hpack` is what stops that block being decoded at
---- all, and is the fix that matters for the attack. This is the other half: a
---- bound and a quadratic together are a bound on how bad the bound may be
---- wrong, and 100 duplicates should not cost what 100 duplicates cost here.
----
---- The single-value case -- every header appearing once, which is every real
---- request -- still writes straight into `out` and allocates no table.
-local function normalize_headers(source)
-  local out = {}
-  if not source then return out end
-  if type(source.get) == "function" then          -- a lua-http headers object
-    local repeated                                -- name -> {value, ...}, lazily
-    for name, value in source:each() do
-      if name:sub(1, 1) ~= ":" then               -- drop :method, :path, ...
-        -- Header values are bytes as far as HTTP is concerned, and akkar puts
-        -- them in JSON responses. See `safe_text`.
-        local clean = safe_text(value)
-        local existing = out[name]
-        if existing == nil then
-          out[name] = clean
-        else
-          repeated = repeated or {}
-          local parts = repeated[name]
-          if parts == nil then
-            parts = { existing, clean }
-            repeated[name] = parts
-          else
-            parts[#parts + 1] = clean
-          end
-        end
-      end
-    end
-    if repeated then
-      for name, parts in pairs(repeated) do
-        out[name] = table.concat(parts, ", ")
-      end
-    end
-  else
-    for name, value in pairs(source) do out[name:lower()] = safe_text(value) end
-  end
-  return out
-end
--- Exported for the same reason `safe_text`, `client_ip`, `parse_query` and
--- `trace_context` are: it is reachable from a request only through a live
--- server, and its cost is the thing under test. `spec/http2_spec.lua` measures
--- it directly.
-akkar.normalize_headers = normalize_headers
-
--- ============================================================== client address
---
--- Who the caller IS, which is a different question from what the caller SAYS.
---
--- `akkar.limit` shipped keying its buckets on `X-Forwarded-For`, falling back
--- to `X-Real-IP`, with nothing else available -- because nothing else WAS
--- available: the peer address was never plumbed to `req`. Both of those are
--- client-supplied strings. Any caller could send a fresh one per request and
--- mint a fresh rate-limit bucket each time, which defeats the limiter with a
--- single header.
---
--- So `req.ip` is the address of the socket, always. `X-Forwarded-For` is
--- believed only when the connection came FROM a proxy the application named,
--- and then only as far back as the trusted hops go: walking the list from the
--- right, the first address that is not itself a trusted proxy is the client,
--- and everything to its left is whatever that client chose to send.
-local function ipv4_to_int(address)
-  local a, b, c, d = address:match "^(%d+)%.(%d+)%.(%d+)%.(%d+)$"
-  if not a then return nil end
-  a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
-  if a > 255 or b > 255 or c > 255 or d > 255 then return nil end
-  return a * 16777216 + b * 65536 + c * 256 + d
-end
-
---- Is `address` inside `cidr`? IPv4 only, and it says so rather than
---- pretending: an IPv6 peer simply never matches, which fails CLOSED --
---- forwarded headers are ignored rather than believed.
-local function in_cidr(address, cidr)
-  local base, bits = cidr:match "^([%d%.]+)/(%d+)$"
-  if not base then base, bits = cidr, "32" end
-  bits = tonumber(bits)
-  local a, b = ipv4_to_int(address), ipv4_to_int(base)
-  if not a or not b or not bits or bits < 0 or bits > 32 then return false end
-  if bits == 0 then return true end
-  local mask = bitwise.band(bitwise.lshift(0xFFFFFFFF, 32 - bits), 0xFFFFFFFF)
-  return bitwise.band(a, mask) == bitwise.band(b, mask)
-end
-akkar.in_cidr = in_cidr
-
--- ======================================= what a setting must actually BE
---
--- `check_config` checks the NAME of every option and stops there, and half a
--- check turns out to be worth about half as much:
---
---     app:run { timeout = os.getenv "REQUEST_TIMEOUT" }
---
--- The name is spelled right, so it boots, and every request afterwards is a
--- 500 -- the deadline compares a string to a number and raises -- while the
--- only thing in the log is `error_kind=string`.  Four more passed the same
--- way, each one a server that starts and then does not work:
---
---     body_limit = -1            rejects every body, including empty ones
---     port = "not-a-port"        reaches server.listen as a string
---     max_concurrent = 0         accepts no connection at all
---     trusted_proxies = "10/8"   a string where a list belongs, so the walk
---                                over it finds nothing and no proxy is
---                                trusted -- while the config says one is
---
--- The whole argument for the name check applies unchanged: a mistake found at
--- boot costs a second, and found in production costs an incident.  So the
--- values are checked against what the code that reads them actually needs,
--- and the message says what was passed rather than only what was wanted.
---
--- Each rule returns the expectation when the value is wrong, and nothing when
--- it is fine.  A setting with no rule here is one whose value the framework
--- genuinely cannot judge -- `ctx` is an OpenSSL object, `db` is checked
--- against its contract instead, and `cpu_limit` answers for itself in
--- `App:run` because "false, or a positive count" is not a shape any of these
--- rules describes.
---
--- THERE IS DELIBERATELY NO `http_version` RULE, and no such setting: this
--- runtime serves h2 over ALPN whenever a TLS client asks for it, and
--- cleartext h2 behind `h2c = true`.  A version switch defaulting to 1.1 would
--- turn a shipped feature off, so the flag says whether the server will answer
--- h2 WITHOUT TLS and nothing says which version it may speak.
-local function valid_cidr(cidr)
-  local base, bits = cidr:match "^([%d%.]+)/(%d+)$"
-  if not base then base, bits = cidr, "32" end
-  bits = tonumber(bits)
-  return ipv4_to_int(base) ~= nil and bits ~= nil and bits >= 0 and bits <= 32
-end
-
-local function seconds(allow_zero)
-  local wanted = allow_zero and "a number of seconds, zero or more"
-                             or "a positive number of seconds"
-  return function(value)
-    if type(value) ~= "number" or value ~= value then return wanted end
-    if value < 0 or (not allow_zero and value == 0) then return wanted end
-  end
-end
-
-local function flag(value)
-  if type(value) ~= "boolean" then return "true or false" end
-end
-
-local SETTING_RULES = {
-  host = function(value)
-    if type(value) ~= "string" or value == "" then return "a non-empty string" end
-  end,
-  port = function(value)
-    if math.type(value) ~= "integer" or value < 0 or value > 65535 then
-      return "an integer from 0 to 65535 (0 asks the kernel for a free port)"
-    end
-  end,
-  body_limit = function(value)
-    if math.type(value) ~= "integer" or value < 1 then
-      return "a positive whole number of bytes"
-    end
-  end,
-  -- `false` and `0` both mean "no deadline" to `with_deadline`, and an
-  -- application that means it should be able to say so.
-  timeout = function(value)
-    if value == false then return nil end
-    if type(value) ~= "number" or value ~= value or value < 0 then
-      return "a number of seconds, or false for no deadline"
-    end
-  end,
-  read_timeout   = seconds(false),
-  shutdown_grace = seconds(true),
-  max_concurrent = function(value)
-    if math.type(value) ~= "integer" or value < 1 then
-      return "an integer of at least 1 (it is a ceiling on connections)"
-    end
-  end,
-  reuseport          = flag,
-  strict             = flag,
-  check_capabilities = flag,
-  -- Cleartext h2, which costs a preface sniff on every connection including
-  -- the h1 ones -- so it is a decision, and a decision made with a string is
-  -- not one.
-  h2c                = flag,
-  -- Not `flag`: this tree answers `tls = { certificate = ..., key = ... }`
-  -- itself, so a table is the ordinary way to serve HTTPS.  What is inside it
-  -- is checked where the context is built, which is where the failure can say
-  -- which PEM did not parse.
-  tls = function(value)
-    if type(value) ~= "boolean" and type(value) ~= "table" then
-      return "true, false, or { certificate = ..., key = ... }"
-    end
-  end,
-  log = function(value)
-    if type(value) ~= "table" then return "a logger, from akkar.log.new{}" end
-  end,
-  peer = function(value)
-    if type(value) ~= "string" then return "an address, as a string" end
-  end,
-  trusted_proxies = function(value)
-    local list = [[a LIST of CIDR strings, e.g. { "10.0.0.0/8" }]]
-    if type(value) ~= "table" then return list end
-    if next(value) ~= nil and value[1] == nil then return list end
-    for _, cidr in ipairs(value) do
-      if type(cidr) ~= "string" then return list end
-      -- A CIDR that does not parse matches nothing, so the proxy list looks
-      -- configured and trusts no hop -- failing closed, silently, which is
-      -- the failure mode this whole section exists to make loud.
-      if not valid_cidr(cidr) then
-        return "a list of IPv4 CIDRs; '" .. cidr .. "' is not one"
-      end
-    end
-  end,
-}
-
-local function describe_value(value)
-  if type(value) == "string" then return string.format("string %q", value) end
-  return type(value) .. " " .. tostring(value)
-end
-
---- Raises on the first setting whose VALUE the runtime cannot use.
---- Exported so a caller that must not bind a port -- `akkar.doctor`, a
---- deployment preflight -- can report the same finding without booting.
-local function check_setting_values(config, what)
-  for key, value in pairs(config) do
-    local rule = SETTING_RULES[key]
-    if rule and value ~= nil then
-      local expected = rule(value)
-      if expected then
-        error(string.format("%s: %s must be %s; got %s",
-                            what, key, expected, describe_value(value)), 3)
-      end
-    end
-  end
-end
+local normalize_path = http_input.normalize_path
+local one_header = http_input.one_header
+local request_id = http_input.request_id
+local client_request_id = http_input.client_request_id
+local request_id_from = http_input.request_id_from
+local trace_context = http_input.trace_context
+local normalize_headers = http_input.normalize_headers
+local in_cidr = http_input.in_cidr
+local client_ip = http_input.client_ip
+local parse_query = http_input.parse_query
+local check_setting_values = configuration.check_values
 akkar.check_settings = check_setting_values
-
-local function is_trusted(address, trusted)
-  if not address or not trusted then return false end
-  for _, cidr in ipairs(trusted) do
-    if in_cidr(address, cidr) then return true end
-  end
-  return false
-end
-
---- The client address, given the socket's peer and the forwarded header.
----
---- Exported because it is worth testing directly: the walk is the whole
---- security property, and it is easy to get backwards. Taking the LEFTMOST
---- entry -- which is what most implementations do -- is exactly the spoofable
---- version, since the leftmost entry is whatever the client typed.
-local function client_ip(peer, forwarded, trusted)
-  if not peer then return nil end
-  if not forwarded or not is_trusted(peer, trusted) then return peer end
-
-  local hops = {}
-  for hop in tostring(forwarded):gmatch "[^,]+" do
-    -- `text.trim`, not `^%s*(.-)%s*$`: this trims a hop out of a header
-    -- THE CLIENT SENT, and the pattern's cost tracked the string's
-    -- length rather than the whitespace. Ten kilobytes in one
-    -- `X-Forwarded-For` cost 515 us against 83 us for a whole request.
-    hops[#hops + 1] = text.trim(hop)
-  end
-
-  for i = #hops, 1, -1 do
-    if not is_trusted(hops[i], trusted) then return hops[i] end
-  end
-  -- Every hop is a trusted proxy: the peer is the best answer there is.
-  return peer
-end
+akkar.client_request_id = client_request_id
+akkar.trace_context = trace_context
+akkar.normalize_headers = normalize_headers
+akkar.in_cidr = in_cidr
 akkar.client_ip = client_ip
-
-local function parse_query(qs)
-  local out = {}
-  if not qs or qs == "" then return out end
-  for pair in qs:gmatch "[^&]+" do
-    local k, val = pair:match "^([^=]*)=?(.*)$"
-    if k and k ~= "" then
-      -- Percent-decoding turns %C3%28 into bytes that are not text, and a
-      -- query value reaches a validation error message and a response.
-      out[safe_text(unescape(k))] = safe_text(unescape((val:gsub("+", " "))))
-    end
-  end
-  return out
-end
 akkar.parse_query = parse_query
 
 -- Rate and concurrency limiting, as middleware rather than core: a limit
@@ -2933,11 +2461,41 @@ end
 -- would blame the client for the wrong thing.
 --
 -- Returns (true, value) or (false, { status, message }).
-local function decode_body(raw, content_type)
+local function json_within_depth(raw, limit)
+  local depth, in_string, escaped = 0, false, false
+  for i = 1, #raw do
+    local byte = raw:byte(i)
+    if in_string then
+      if escaped then
+        escaped = false
+      elseif byte == 0x5c then -- backslash
+        escaped = true
+      elseif byte == 0x22 then -- quote
+        in_string = false
+      end
+    elseif byte == 0x22 then
+      in_string = true
+    elseif byte == 0x7b or byte == 0x5b then -- { or [
+      depth = depth + 1
+      if depth > limit then return false end
+    elseif byte == 0x7d or byte == 0x5d then -- } or ]
+      depth = depth - 1
+    end
+  end
+  return true
+end
+
+local function decode_body(raw, content_type, json_depth_limit)
   local kind = (content_type or "application/json"):match "^[^;]*"
   kind = kind:gsub("%s", ""):lower()
 
   if kind == "" or kind == "application/json" or kind:match "%+json$" then
+    if not json_within_depth(raw, json_depth_limit) then
+      return false, {
+        status = 400,
+        message = "JSON body exceeds nesting depth of " .. json_depth_limit,
+      }
+    end
     local ok, value = pcall(cjson.decode, raw)
     if not ok then return false, { status = 400, message = "invalid JSON body" } end
     return true, strip_nulls_in(raw, value)
@@ -3459,6 +3017,16 @@ function App:run(config)
   end
 
   local read_timeout = config.read_timeout or akkar.defaults.read_timeout
+  local header_limit = config.header_limit or akkar.defaults.header_limit
+  local header_count_limit = config.header_count_limit
+                           or akkar.defaults.header_count_limit
+  local json_depth_limit = config.json_depth_limit
+                         or akkar.defaults.json_depth_limit
+  -- Distinct from the handler deadline: the handler may have completed, and
+  -- an h2 peer can then advertise a zero flow-control window and never update
+  -- it. Every write gets a bound so that peer cannot retain `in_flight`, a
+  -- deferred capability release, and shutdown for ever.
+  local write_timeout = config.write_timeout or akkar.defaults.write_timeout
 
   -- PUBLISHED ON THE APP, not merely handed to lua-http. `akkar.limit.shed`
   -- sheds low-priority work at a fraction of this number and reads it from
@@ -3655,8 +3223,8 @@ function App:run(config)
       rh:append("content-length", tostring(#payload))
       rh:append("retry-after", "1")
       if close_it then rh:append("connection", "close") end
-      stream:write_headers(rh, false)
-      stream:write_chunk(payload, true)
+      stream:write_headers(rh, false, write_timeout)
+      stream:write_chunk(payload, true, write_timeout)
     end)
     if close_it then pcall(function() stream:shutdown() end) end
   end
@@ -3747,6 +3315,11 @@ function App:run(config)
     reuseport = config.reuseport,
     max_concurrent = max_concurrent,
     onstream = function(_, stream)
+      -- These live on the stream because both vendored protocol parsers read
+      -- them while decoding. In particular, HTTP/2 enforces the byte ceiling
+      -- on the decompressed HPACK list, not merely on the compressed frames.
+      stream.max_header_bytes = header_limit
+      stream.max_header_lines = header_count_limit
       -- A connection that has not finished its header block is not a request
       -- yet, and counting it as one is what makes a drain unable to end. One
       -- half-open socket -- a port scanner, a slowloris, a phone that left the
@@ -3823,8 +3396,8 @@ function App:run(config)
           rh:append("connection", "close")
           local body = cjson.encode { error = "malformed request" }
           rh:append("content-length", tostring(#body))
-          stream:write_headers(rh, false)
-          stream:write_chunk(body, true)
+          stream:write_headers(rh, false, write_timeout)
+          stream:write_chunk(body, true, write_timeout)
         end)
         -- The connection, not just the stream. `stream:shutdown` ends the
         -- message; it is `connection:shutdown` that guarantees nothing more
@@ -3893,7 +3466,8 @@ function App:run(config)
           short = response(413, { error = "request body exceeds " ..
                                           body_limit .. " bytes" })
         elseif raw and #raw > 0 then
-          local decoded, value = decode_body(raw, h:get "content-type")
+          local decoded, value = decode_body(raw, h:get "content-type",
+                                             json_depth_limit)
           if decoded then body = value
           else short = response(value.status or 400, { error = value.message }) end
         end
@@ -3945,9 +3519,10 @@ function App:run(config)
             rh:append(":status", "503")
             rh:append("content-type", "application/json")
             rh:append("retry-after", "5")
-            stream:write_headers(rh, false)
+            stream:write_headers(rh, false, write_timeout)
             stream:write_chunk(
-              '{"error":"too many websocket connections"}', true)
+              '{"error":"too many websocket connections"}', true,
+              write_timeout)
             -- NOT decremented here. This `return` leaves the pcall'd function,
             -- not `onstream`, so the decrement at the end of the stream still
             -- runs: doing it twice drove `in_flight` negative and `App:stop`
@@ -4002,14 +3577,14 @@ function App:run(config)
           -- never run -- running it to throw the bytes away would perform the
           -- side effects of a body nobody asked for.
           rh:append("content-type", res.content_type or "application/json")
-          stream:write_headers(rh, is_head)
+          stream:write_headers(rh, is_head, write_timeout)
 
           if not is_head then
             local wrote = false
             local produced, failure = xpcall(res.stream, trap, function(chunk)
               if chunk == nil or chunk == "" then return end
               wrote = true
-              assert(stream:write_chunk(tostring(chunk), false))
+              assert(stream:write_chunk(tostring(chunk), false, write_timeout))
             end)
             -- The log is the ONLY record a failed stream leaves -- the status
             -- went out with the first byte, so this can never become a 500 --
@@ -4018,7 +3593,7 @@ function App:run(config)
             local where_from = (not produced) and raised_at or nil
 
             if produced then
-              stream:write_chunk("", true)          -- the terminating chunk
+              stream:write_chunk("", true, write_timeout) -- terminating chunk
             else
               -- The status went out with the first byte, so this cannot
               -- become a 500.  Dropping the connection without the terminating
@@ -4044,8 +3619,8 @@ function App:run(config)
           -- HEAD carries the headers a GET would, including content-length, and
           -- no body.  That is the point of HEAD.
           local send_body = payload ~= nil and not is_head
-          stream:write_headers(rh, not send_body)
-          if send_body then stream:write_chunk(payload, true) end
+          stream:write_headers(rh, not send_body, write_timeout)
+          if send_body then stream:write_chunk(payload, true, write_timeout) end
         end
       end, trap)
       -- Taken before `pending_release` runs: that is a pcall, and a release

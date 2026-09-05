@@ -284,7 +284,10 @@ function connection_methods:read_header(timeout)
 		end
 		return nil, onerror(self.socket, "read_header", ce.EILSEQ)
 	end
-	return key, val
+	-- Return the wire size as a fourth value. Callers that predate the bound
+	-- ignore it; akkar's stream uses it so leading/trailing OWS cannot vanish
+	-- before the aggregate request-header ceiling is charged.
+	return key, val, nil, #line
 end
 
 function connection_methods:read_headers_done(timeout)

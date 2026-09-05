@@ -914,7 +914,12 @@ As configurações aplicadas a menos que `app:run{}` as sobrescreva, então
 | campo | valor |
 |---|---|
 | `body_limit` | `1048576` (1 MB) |
+| `header_limit` | `32768` (32 KiB) |
+| `header_count_limit` | `100` campos |
+| `json_depth_limit` | `64` níveis |
 | `timeout` | `30` segundos |
+| `read_timeout` | `30` segundos |
+| `write_timeout` | `30` segundos |
 | `shutdown_grace` | `10` segundos |
 
 ### app:run(config)
@@ -928,7 +933,12 @@ Vincula um socket e atende. Esta chamada não retorna até o servidor parar.
 | `tls` | tabela | nenhum | `{ certificate = ..., key = ..., protocol = ... }`, cada um uma string PEM ou um caminho |
 | `ctx` | userdata | nenhum | um contexto luaossl, a via de escape além de `tls` |
 | `body_limit` | número | `1048576` | bytes, acima dos quais a resposta é 413 |
+| `header_limit` | inteiro positivo | `32768` | bytes agregados no fio em HTTP/1 ou de nomes/valores decodificados em HTTP/2; acima disso a requisição é recusada |
+| `header_count_limit` | inteiro positivo | `100` | campos de header, incluindo nomes repetidos |
+| `json_depth_limit` | inteiro positivo | `64` | arrays/objetos JSON aninhados, verificados antes da decodificação |
 | `timeout` | número | `30` | segundos de relógio de parede por requisição, acima dos quais a resposta é 503. **`0` desliga o deadline** |
+| `read_timeout` | número positivo | `30` | segundos totais para o peer terminar headers/corpo; enviar aos poucos não reinicia o prazo |
+| `write_timeout` | número positivo | `30` | segundos permitidos para uma escrita da resposta, incluindo espera por flow control HTTP/2 |
 | `shutdown_grace` | número | `10` | segundos para drenar ao parar |
 | `check_capabilities` | booleano | `true` | adquire cada capability uma vez no boot e verifica seu contrato |
 | `reuseport` | booleano | nenhum | permite que vários processos compartilhem a porta |
@@ -937,9 +947,14 @@ Vincula um socket e atende. Esta chamada não retorna até o servidor parar.
 | `trusted_proxies` | lista de strings | nenhum | CIDRs cujo `x-forwarded-for` é confiável |
 | `db`, `cache`, `log`, `clock`, `http` | tabela ou função | nenhum | capabilities. Uma função é chamada uma vez por requisição que a lê |
 
-Uma capability fornecida como função é chamada por requisição, e se o que ela
-retorna tem um método `release`, o framework o chama em todo caminho de
-saída.
+Uma capability fornecida como função é chamada por requisição. Se o que ela
+retorna tem um método `release`, o framework entrega ao handler uma lease
+vinculada à execução e chama `release` no recurso real em todo caminho de
+saída. A lease recusa campos e métodos depois que a execução termina, então um
+handler que estourou o deadline não pode usar um objeto que talvez já tenha
+voltado ao pool. Uma capability fornecida diretamente como tabela pertence ao
+processo: ela não é embrulhada, sua identidade e metatable não mudam e o akkar
+não a libera a cada requisição.
 
 **Retorna** nada. Ela não retorna.
 

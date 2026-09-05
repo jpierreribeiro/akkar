@@ -232,7 +232,7 @@ local function read_frame(sock, deadline, max_payload)
 				local timeout = deadline and deadline-monotime()
 				if cqueues.poll(sock, timeout) ~= timeout then
 					-- retry
-					return read_frame(sock, deadline)
+					return read_frame(sock, deadline, max_payload)
 				end
 			elseif err == nil then
 				sock:seterror("r", ce.EILSEQ)
@@ -285,7 +285,7 @@ local function read_frame(sock, deadline, max_payload)
 				local timeout = deadline and deadline-monotime()
 				if cqueues.poll(sock, timeout) ~= timeout then
 					-- retry
-					return read_frame(sock, deadline)
+					return read_frame(sock, deadline, max_payload)
 				end
 			elseif err == nil then
 				sock:seterror("r", ce.EILSEQ)
@@ -520,8 +520,16 @@ function websocket_methods:receive(timeout)
 				if not ok and err2 ~= ce.EPIPE then
 					return close_helper(self, 1002, "Pong failed", deadline)
 				end
+				-- `receive(timeout)` is the runtime's IDLE bound, not a budget
+				-- for application messages only. A ping is proof that the peer is
+				-- alive even though it is consumed here and never returned to the
+				-- caller, so start the inactivity interval again. Data fragments
+				-- deliberately keep the original deadline: otherwise a peer could
+				-- trickle one unfinished message for ever.
+				deadline = timeout and (monotime()+timeout)
 			elseif frame.opcode == 0xA then -- luacheck: ignore 542
 				-- Received unexpected pong frame
+				deadline = timeout and (monotime()+timeout)
 			else
 				return close_helper(self, 1002, "Reserved opcode", deadline)
 			end

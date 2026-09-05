@@ -29,6 +29,24 @@ instruments applied so far were chosen by whoever happened to be working.
 So the honest answer to "what else is missing" is: **the classes no lens has
 been pointed at.** Here they are, as far as they can be enumerated.
 
+### Local-first queue — 3 September 2026
+
+The AWS throughput recertification is deferred until a controlled machine is
+available. It does not block work on the runtime. The next lenses are ordered
+by impact and by whether their answer can be made deterministic on one local
+machine:
+
+1. **Long-lived WebSockets and h2/pool coupling.** The deterministic protocol
+   state machines are now covered. What remains is a local socket soak for
+   descriptor/registry memory over hours, plus a multiplexed burst that holds
+   a real database pool at saturation. This needs no public traffic generator.
+2. **Shape limits.** Route scale is closed. Header count/bytes, JSON depth and
+   result-set size need explicit ceilings and tests that count allocations or
+   VM instructions rather than depending on wall-clock noise.
+3. **Dependency and platform movement.** Build the pinned matrix in containers,
+   starting with musl, then deliberately bump one dependency at a time. Treat a
+   compatibility diff as the result; throughput is not the gate here.
+
 ---
 
 ## 1. Platform — MOSTLY CLOSED. See `docs/PLATFORMS.md`
@@ -74,29 +92,40 @@ row at hour six passes that soak perfectly.
 Nothing in the run compared a response body against an expectation after the
 first minute.
 
-## 3. Infrastructure failure injection
+## 3. Infrastructure failure injection — MOSTLY MEASURED
 
-`akkar/db/memory.lua` can now `:hang()` and `:drop()`, which covers a query
-misbehaving. Nothing covers the layer below:
-
-- the database restarted underneath a live pool
-- a Redis failover, or a replica promoted mid-request
-- DNS failing, or resolving to something new
-- the disk filling while logs are being written
-- ~~**the clock jumping**~~ — **CLOSED.** Measured, and it was worse than
-  feared: one worker's clock stepping forward reaped the whole fleet's live
-  claims. The Redis store now reads the server's clock, so the caller's is
-  never consulted. Deadlines were always immune, being monotonic.
+- **Postgres restart:** covered by `spec/pg_restart_spec.lua`; dead connections
+  are discarded rather than returned to the idle pool forever.
+- **Redis failover/frozen primary:** covered by `spec/redis_failover_spec.lua`
+  after matching the memory adapter's injected faults to real Redis responses.
+- **DNS:** covered by `spec/dns_failure_spec.lua`. Resolution is a named phase
+  sharing one deadline with connection attempts; definitive NXDOMAIN fails
+  fast, errors name the host, and repeated failures leak no descriptor or slot.
+- **Disk full while logging:** covered by `spec/log_enospc_spec.lua` and
+  `spec/log_delivery_spec.lua`. Sink failures are contained and counted, and
+  cannot wedge shutdown. A user-supplied buffered file sink still has to flush
+  and report its own delayed write error.
+- **Clock jump:** closed. One worker's clock stepping forward reaped the whole
+  fleet's live claims. The Redis store now reads the server's clock, while
+  deadlines use a monotonic clock.
+- **Capability reuse after a deadline:** closed by
+  `spec/abandoned_defence_spec.lua`. Callable providers that return a
+  releasable resource hand the execution a lease. The real object is released
+  exactly once; captured references refuse afterwards without mutating an
+  object that may already be back in a pool. Direct process-lifetime tables
+  retain their identity and are not wrapped.
 
 ## 4. Resource exhaustion at the ceiling
 
-What akkar does *approaching* a limit is measured. What it does *at* one is
-not: file descriptors exhausted, memory limit reached in a container, the pool
-saturated for minutes rather than seconds, a connection count above what
-Postgres will accept.
+Descriptor exhaustion at `accept()` is measured by
+`spec/accept_exhaustion_spec.lua`. It found and fixed tight loops for `ENFILE`,
+`ENOBUFS` and `ENOMEM`; the derived concurrency ceiling prevents ordinary
+per-process `EMFILE` on supported platforms.
 
-The saturation study went to 4× capacity and stopped, and it stopped because
-that was the interesting part of the curve, not because the rest was checked.
+Still open: a real container memory limit, a pool saturated for minutes rather
+than seconds, and a connection count above what Postgres accepts. The traffic
+saturation study went to 4× capacity; those remaining cases need fault/state
+harnesses, not an AWS throughput number.
 
 ## 5. Encoding — CLOSED for encoding, still open for locale and time zone
 
@@ -113,10 +142,11 @@ akkar has database timestamps crossing a JSON boundary.
 
 ## 6. Scale of shape rather than scale of traffic
 
-Ten thousand routes. A thousand headers. A JSON body nested five hundred deep.
-A single header a megabyte long. A result set of a million rows. Each of these
-is a different failure from "lots of requests", and the router, the validator
-and the encoder have only ever seen small shapes.
+Ten thousand routes is closed by `spec/router_scale_spec.lua`: it found linear
+404 matching and quadratic registration, then replaced both with deterministic
+allocation/instruction assertions. A thousand headers, a JSON body nested five
+hundred deep, a single header a megabyte long and a result set of a million rows
+remain. Each is a different failure from "lots of requests".
 
 ## 7. Dependency movement
 
@@ -133,10 +163,11 @@ are not, and nothing exercises a version bump.
 
 ## 8. Observability during an incident
 
-akkar has structured logs, metrics and trace propagation. Nobody has taken an
-induced failure and asked whether those three are enough to diagnose it. A
-metric that exists and does not answer the question is a metric nobody will
-miss until the night they need it.
+The first incident lens now exists: a full log sink is contained, counted and
+announced on recovery by `logger:stats()` and `spec/log_delivery_spec.lua`.
+That closes one especially destructive blind spot, not this section. Nobody
+has yet induced a whole dependency or saturation incident and asked whether
+logs, metrics and traces together identify its cause quickly enough.
 
 ## 8b. The two protocols that arrived in two days
 
@@ -147,27 +178,27 @@ points here calling it the honest list of what is not known; a list that does
 not know about two whole subsystems was not that.
 
 What IS known about them, so the unknowns below are the actual remainder:
-h2spec 2.6.0 passes 146 of 146 with nothing skipped; 22 hostile HTTP/2 frame
-shapes and 15 hostile WebSocket ones leave the server answering; one connection
-is bounded to 100 concurrent streams and a socket message to `body_limit`.
+h2spec 2.6.0 passes 146 of 146 with nothing skipped; hostile frame suites leave
+the server answering; one connection is bounded to 100 concurrent streams and
+a socket message to `body_limit`. CONTINUATION and Rapid Reset floods are
+rate/shape bounded. HTTP/2 window overflow, negative window transitions and a
+peer that advertises zero then never sends `WINDOW_UPDATE` are deterministic
+tests; the last one found the unbounded response-write path and produced
+`write_timeout`. A partial WebSocket frame cannot shed `max_message`, and
+protocol ping/pong now renews the idle interval without letting data fragments
+extend one unfinished message forever.
 
 **What is not known:**
 
-- **The h2 and WebSocket framing layers are upstream lua-http 0.4's**, and
-  nobody here has read them line by line. Two defects have been found in them
-  by accident, both by measurement rather than by review: a frame header read
-  that raised on a short read, and a message size nobody bounded. A reviewer
-  looking on purpose would probably find more.
+- **The h2 and WebSocket framing layers began as upstream lua-http 0.4's** and
+  still have not had a complete line-by-line review. Targeted review has found
+  bounds missing from CONTINUATION/RST_STREAM, response flow control and a
+  resumed WebSocket frame read. More state combinations probably remain.
 
 - **Nothing has held sockets open for a long time.** The longest WebSocket
-  measurement here is seconds. What a thousand sockets look like after six
-  hours, whether the idle timeout interacts with a peer that pings just often
-  enough, and whether the registry stays consistent across a reload, are all
-  unmeasured.
-
-- **h2 under a hostile flow-control peer.** WINDOW_UPDATE games, a peer that
-  advertises a window and never reads, and the CONTINUATION flood that has its
-  own CVE class in other servers, are not covered by the 22 shapes.
+  measurement here is seconds. Ping/idle semantics are now explicit, but what
+  a thousand sockets look like after six hours and whether the registry stays
+  consistent across reload remain unmeasured.
 
 - **The interaction between h2 multiplexing and the pool.** 100 concurrent
   streams on one connection can ask for 100 database connections, and the

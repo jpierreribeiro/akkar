@@ -2,7 +2,11 @@
 
 > [English](README.md) | **Português (Brasil)**
 
-**A backend runtime para Lua que inicializa em 29 milissegundos, fala HTTP/2 sem nginx na frente e não deixa você escrever os bugs que te tiram da cama às três da manhã.**
+**Um runtime backend para Lua com HTTP/2 nativo, recursos com escopo e limites de execução por requisição.**
+
+Consolidação atual e evidências: [registro de execução](docs/pt-BR/CONSOLIDATION.md).
+Os números de desempenho abaixo são medições históricas, não garantias para
+o checkout atual ou toda plataforma. O runtime continua candidato a produção.
 
 Uma corrotina por requisição. Uma thread por processo. Uma aplicação inteira, com Postgres, Redis, jobs em background, sessões e métricas, responde à primeira requisição em dezenas de milissegundos em vez de segundos.
 
@@ -23,9 +27,9 @@ return app
 |---|---:|
 | boot até a primeira resposta | **68 ms**, ou 29 ms antes do HTTP/2 |
 | memória por conexão ociosa | 9.2 KB |
-| testes, Lua 5.4 e Lua 5.5 | **1,852** |
+| evidência local atual de testes | [registro de consolidação](docs/pt-BR/CONSOLIDATION.md) |
 | conformidade HTTP/2, h2spec 2.6.0 | **146 de 146** |
-| plataformas testadas a cada commit | Linux x86_64, Linux arm64, macOS |
+| plataformas configuradas no CI; verificar cada execução | Linux x86_64, Linux arm64, macOS |
 
 Todo número nesta página saiu de uma máquina. Onde falta algum, a página diz isso.
 
@@ -213,11 +217,11 @@ Os dois últimos são recusados por ALOCAÇÃO, não por uma razão de throughpu
 
 O akkar roda os serviços do seu próprio autor. Ele é jovem, e estas são as três coisas que vale saber antes de colocá-lo na frente dos seus clientes:
 
-**A API vai mudar.** Ainda não existe uma política de compatibilidade. Fixe a versão no rockspec.
+**A API segue a [política de compatibilidade](docs/COMPATIBILITY.md).** Continua em 0.x; fixe a release ou commit exato que você validou.
 
 **Nenhuma revisão de segurança independente aconteceu.** Os limites, os fuzzers e a suíte de conformidade são reais, mas todos internos.
 
-**Ele ainda não está no luarocks.org**, então instalar significa apontar o LuaRocks para a URL do rockspec acima. Isso é um passo de release, não um obstáculo.
+**Um rockspec histórico não instala as funcionalidades novas deste checkout.** Para o candidato Linux atual, use a [instalação controlada](docs/pt-BR/CONTROLLED-INSTALL.md). A publicação segue [RELEASE.md](RELEASE.md); validação local não é publicação.
 
 O que já está consolidado: o substrato, a ergonomia e o formato de produção. Limites de corpo, deadlines, pooling, encerramento gracioso, logs estruturados, métricas, tracing, OpenAPI, migrations, jobs, sessões, um adapter em memória para cada capability, declarações Teal e um modo estrito que transforma uma global acidental em erro.
 
@@ -563,9 +567,13 @@ um GET comum para uma rota comum, nunca chega a ser aceito. Medido.
 ```lua
 app:run {
   port = 8080,
+  write_timeout             = 30,    -- um peer não pode travar uma resposta para sempre
   websocket_max_connections = 500,   -- recusado acima disso com 503 + retry-after
   websocket_idle_timeout    = 300,   -- um socket quieto é fechado e esquecido
   body_limit                = 1024 * 1024,   -- também limita uma MENSAGEM de socket
+  header_limit              = 32 * 1024,     -- bytes no fio h1 / decodificados h2
+  header_count_limit        = 100,           -- campos repetidos também contam
+  json_depth_limit          = 64,            -- arrays e objetos
 }
 ```
 
@@ -574,6 +582,12 @@ na soma dos seus fragmentos, e a recusa é com o close code 1009. Antes desse
 limite existir, uma única mensagem de 64 MB custou **192 MB de memória residente** numa
 aplicação que tinha configurado `body_limit = 1 MB`. O `akkar doctor` avisa quando uma
 aplicação serve sockets e não configurou um teto para eles.
+
+Frames de protocolo ping/pong contam como atividade WebSocket, enquanto os
+fragmentos de uma única mensagem de dados incompleta não reiniciam o prazo de
+ociosidade. No HTTP/2, `write_timeout` também limita esperas de flow control;
+assim, um peer que anuncia janela zero não retém indefinidamente o slot de uma
+requisição já concluída.
 
 **Vários processos, uma porta.** Uma VM Lua é um núcleo, então capacidade
 é uma questão de processos. O `SO_REUSEPORT` permite que eles compartilhem uma porta sem
@@ -667,6 +681,8 @@ PORT=8099 lua5.4 examples/crud.lua
 |---|---|
 | [`docs/DEPLOY.md`](docs/DEPLOY.md) | Railway, Docker, e o que quebra em um container scratch |
 | [`docs/RUNTIME.md`](docs/RUNTIME.md) | `akkar build`, e o que ainda precisa ser feito à mão |
+| [`docs/pt-BR/PRODUCTION-READINESS.md`](docs/pt-BR/PRODUCTION-READINESS.md) | gate bloqueante de produção e evidências a guardar |
+| [`examples/mlops/`](examples/mlops/) | inferência Python online/batch atrás de um gateway akkar |
 | [`docs/pt-BR/reference/cli.md`](docs/pt-BR/reference/cli.md) | os oito comandos |
 
 **O que é medido, e o que não é**
@@ -698,6 +714,8 @@ só entra em cena quando você discorda do padrão.
 | Padrão | Valor | Como sobrescrever |
 |---|---|---|
 | Limite do corpo da requisição | 1 MB | `app:run { body_limit = 5 * 1024 * 1024 }` |
+| Limite dos headers | 32 KiB / 100 campos | `app:run { header_limit = 65536, header_count_limit = 200 }` |
+| Profundidade do JSON | 64 | `app:run { json_depth_limit = 32 }` |
 | Prazo da requisição | 30 s | `app:run { timeout = 5 }` |
 | Tamanho do pool de conexões | 10 | `db.connect { pool_size = 25 }` |
 | Tempo de tolerância no desligamento | 10 s | `app:run { shutdown_grace = 30 }` |

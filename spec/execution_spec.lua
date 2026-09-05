@@ -96,6 +96,63 @@ describe("capabilities", function()
 end)
 
 describe("release", function()
+  it("keeps a factory capability usable until release", function()
+    local used = 0
+    local carrier, record = new_execution {
+      db = function()
+        return {
+          one = function(_, n) used = used + n; return used end,
+          release = function() end,
+        }
+      end,
+    }
+    assert.equal(3, carrier.db:one(3))
+    assert.equal(3, used)
+    execution.release(record)
+  end)
+
+  it("revokes methods and fields without poisoning the released resource", function()
+    local resource = {
+      state = "ready",
+      one = function(self) return self.state end,
+      release = function(self) self.released = (self.released or 0) + 1 end,
+    }
+    local carrier, record = new_execution {
+      db = function() return resource end,
+    }
+    local held = carrier.db
+    assert.equal("ready", held.state)
+    execution.release(record)
+
+    local method_ok, method_err = pcall(function() return held:one() end)
+    local field_ok, field_err = pcall(function() return held.state end)
+    assert.is_false(method_ok)
+    assert.is_false(field_ok)
+    assert.is_truthy(tostring(method_err):find("execution ended", 1, true))
+    assert.is_truthy(tostring(field_err):find("execution ended", 1, true))
+    assert.equal(1, resource.released)
+    assert.equal("ready", resource:one(),
+      "revoking one lease poisoned the resource another request may hold")
+  end)
+
+  it("returns an already-dead lease when acquisition finishes too late", function()
+    local released = 0
+    local resource = {
+      one = function() return 1 end,
+      release = function() released = released + 1 end,
+    }
+    local carrier, record = new_execution {
+      db = function() return resource end,
+    }
+    record.over = true
+    local held = carrier.db
+
+    assert.equal(1, released, "a late-acquired resource was not returned")
+    assert.is_nil(record.released, "a late resource was registered after cleanup")
+    local ok = pcall(function() return held:one() end)
+    assert.is_false(ok, "late acquisition returned a usable released resource")
+  end)
+
   it("frees what was acquired", function()
     local freed = 0
     local carrier, record = new_execution {
@@ -132,6 +189,24 @@ describe("release", function()
     local carrier, record = new_execution { clock = function() return { now = 1 } end }
     local _ = carrier.clock
     assert.is_nil(record.released)
+  end)
+
+  it("preserves the identity of an explicitly shared provider", function()
+    local released = 0
+    local marker = {}
+    local resource = setmetatable({
+      one = function() return 1 end,
+      release = function() released = released + 1 end,
+    }, marker)
+    local provider = execution.shared(function() return resource end)
+    local carrier, record = new_execution { db = provider }
+
+    assert.is_true(rawequal(resource, carrier.db))
+    assert.equal(marker, getmetatable(carrier.db))
+    assert.is_nil(record.released,
+      "a process-lifetime value was registered for per-execution release")
+    execution.release(record)
+    assert.equal(0, released)
   end)
 
   it("survives a resource whose release raises", function()

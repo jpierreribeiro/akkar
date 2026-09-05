@@ -22,6 +22,22 @@ local LEVELS = { debug = 10, info = 20, warn = 30, error = 40 }
 local Logger = {}
 Logger.__index = Logger
 
+-- A logger and every `:with` derived from it share one unique sink function.
+-- Keeping delivery state beside that function avoids adding a fifth field to
+-- every request-bound logger (measured elsewhere in this file as 128 bytes).
+local DELIVERY_OF = setmetatable({}, { __mode = "k" })
+
+local function delivery_of(logger)
+  local delivery = DELIVERY_OF[logger.sink]
+  if not delivery then
+    -- `sink` is a public field and old code may replace it after construction.
+    -- Stay safe on that path too; log.new still gives every root a unique key.
+    delivery = { dropped = 0 }
+    DELIVERY_OF[logger.sink] = delivery
+  end
+  return delivery
+end
+
 -- Values that survive a JSON round-trip.  Anything else is stringified rather
 -- than silently dropped, because a log line that quietly loses a field is
 -- worse than an ugly one.
@@ -143,6 +159,29 @@ local function format_text(entry)
   return table.concat(parts, " ")
 end
 
+--- Calls a sink without giving it control of the request or shutdown path.
+---
+--- A conventional callback returns nothing on success. File-like sinks may
+--- instead return `nil, reason, errno`, and a stricter sink may raise. Both
+--- failure shapes mean the line was dropped; neither is allowed to escape.
+local function write_sink(sink, line)
+  -- Fixed locals deliberately avoid allocating a result table for every log
+  -- line. A sink with no returns is the conventional success shape.
+  local ok, result, reason, errno = pcall(sink, line)
+  if not ok then return false, tostring(result) end
+  if result == false then
+    return false, tostring(reason or "sink returned false")
+  end
+  if result == nil and (reason ~= nil or errno ~= nil) then
+    return false, tostring(reason or errno)
+  end
+  return true
+end
+
+local function formatted(logger, entry)
+  return logger.format == "json" and cjson.encode(entry) or format_text(entry)
+end
+
 function Logger:log(level, message, fields)
   if LEVELS[level] < LEVELS[self.level] then return end
 
@@ -150,8 +189,29 @@ function Logger:log(level, message, fields)
   merge(entry, self.bound)
   merge(entry, fields)
 
-  local line = self.format == "json" and cjson.encode(entry) or format_text(entry)
-  self.sink(line .. "\n")
+  local delivered, why = write_sink(self.sink, formatted(self, entry) .. "\n")
+  local delivery = delivery_of(self)
+  local recovery_export
+  if not delivered then
+    delivery.dropped = delivery.dropped + 1
+    delivery.last_error = why
+  elseif delivery.dropped > 0 then
+    -- The first ordinary line gets through before this notice, proving the
+    -- sink has actually recovered. Only then announce how much evidence was
+    -- lost. If the notice itself fails, keep the count for the next attempt.
+    local recovery = {
+      level = "warn", message = "log sink recovered", time = time.now(),
+      dropped = delivery.dropped, last_error = delivery.last_error,
+    }
+    local recovered, recovery_error =
+      write_sink(self.sink, formatted(self, recovery) .. "\n")
+    if recovered then
+      delivery.dropped, delivery.last_error = 0, nil
+      recovery_export = recovery
+    else
+      delivery.last_error = recovery_error
+    end
+  end
 
   -- THE SECOND OUTPUT IS AN APPEND, and it comes after the sink on purpose.
   --
@@ -162,7 +222,10 @@ function Logger:log(level, message, fields)
   -- the export loop, off the request. stderr is written FIRST so that a line
   -- reaches the operator's terminal even when the exporter is the thing that
   -- is broken.
-  if self.exporter then self.exporter:record(entry) end
+  if self.exporter then
+    self.exporter:record(entry)
+    if recovery_export then self.exporter:record(recovery_export) end
+  end
 end
 
 for level in pairs(LEVELS) do
@@ -187,6 +250,13 @@ function Logger:with(fields)
   return derived
 end
 
+--- Delivery failures observed by this logger and every logger derived from it.
+--- Returns a copy so callers cannot erase an outage by mutating the result.
+function Logger:stats()
+  local delivery = delivery_of(self)
+  return { dropped = delivery.dropped, last_error = delivery.last_error }
+end
+
 local M = {}
 
 --- Builds a logger.
@@ -201,10 +271,18 @@ function M.new(options)
     error("akkar.log: unknown level '" .. tostring(level) ..
           "'; use debug, info, warn or error", 2)
   end
+  local target_sink = options.sink
+                      or function(line) return io.stderr:write(line) end
+  -- Unique per root logger, shared by its derived loggers. Besides carrying
+  -- the side-table identity, this preserves every return value a file sink
+  -- uses to report `nil, reason, errno`.
+  local sink = function(line) return target_sink(line) end
+  DELIVERY_OF[sink] = { dropped = 0 }
+
   local logger = setmetatable({
     level  = level,
     format = options.format or "text",
-    sink   = options.sink or function(line) io.stderr:write(line) end,
+    sink   = sink,
     bound  = {},
   }, Logger)
   if options.exporter then

@@ -13,25 +13,21 @@ already in and uses a bare number in `cqueues.poll` as the deadline. Descriptors
 per in-flight request went 3.00 -> 1.00, and the concurrency ceiling on the
 usual `ulimit -n 1024` went 225 -> 675.
 
-So an abandoned handler DOES wake now, and this file records what replaced
-inertness.
+So an abandoned handler DOES wake now, and this file records the two defences
+that replaced inertness.
 
-**The budget did.** A handler abandoned by its deadline carries a NEGATIVE
-remaining budget: `M.begin` set the deadline inside the handler's own
-coroutine and `M.finish` never ran, because the handler never resumed.
-Measured on a forced resume: `remaining()` reads -0.55 s. Every capability
-that asks how long it has left is therefore told it is over, and refuses.
-`akkar/db.lua` did that already; `akkar/redis.lua` was given it when this file
-found the gap; `log` and `clock` hold nothing poolable.
+**The budget protects built-in I/O.** A handler abandoned by its deadline
+carries a NEGATIVE remaining budget: `M.begin` set the deadline inside the
+handler's own coroutine and `M.finish` never ran, because the handler never
+resumed. Database and Redis consult it before I/O.
 
-That is a stronger position than inertness, because it is a decision the code
-makes rather than an accident of who steps which controller.
-
-**And the gap that remains is named in the last case:** a capability an
-application supplies itself need not consult the budget at all. Nothing stops
-an abandoned handler using one. `spec/abandoned_spec.lua` tells the protocol
-half of this story against real servers, because a fake cannot have the
-problem it is about.
+**A lease protects every per-execution resource.** A custom capability need
+not know akkar's budget. The handler receives a proxy tied to the execution
+record, while release keeps the real object. Once the record is over, the
+proxy refuses fields and methods without poisoning the object that may already
+belong to another request. `spec/abandoned_spec.lua` tells the protocol half
+of this story against real servers, because a fake cannot have the problem it
+is about.
 ]]
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
@@ -141,8 +137,7 @@ end)
 
 describe("what stands between an abandoned handler and a recycled connection", function()
   it("is the BUDGET, for a capability that reads it", function()
-    -- THE DEFENCE, and it turned out to already exist for two of the three
-    -- releasable capabilities.
+    -- One defence, which already existed for the built-in network adapters.
     --
     -- An abandoned handler carries a NEGATIVE remaining budget: `begin` set
     -- the deadline inside the handler's own coroutine and `finish` never ran,
@@ -179,20 +174,11 @@ describe("what stands between an abandoned handler and a recycled connection", f
       "refuses on the budget -- db and redis -- would have served it")
   end)
 
-  it("is ONLY inertness for a capability that ignores the budget", function()
-    -- AND THE GAP THAT REMAINS, stated rather than glossed.
-    --
-    -- `release` calls `resource:release()` and drops the framework's own
-    -- reference. It does not poison the object and it cannot cheaply: the
-    -- object may BE the pooled connection, so poisoning it would break
-    -- whoever borrows it next.
-    --
-    -- So a capability that never asks the budget -- an application's own,
-    -- passed to `app:run { cache = ... }` -- is protected by nothing but the
-    -- fact that its handler is in a controller nobody steps.
-    --
-    -- IF YOU ADD A GENERIC DEFENCE, THIS TEST SHOULD FAIL. Rewrite it to
-    -- assert the new guarantee. That is the test doing its job.
+  it("revokes a captured capability even when it ignores the budget", function()
+    -- The resource itself cannot be poisoned: release may already have put it
+    -- back in a pool for another request. The value held by THIS execution is
+    -- a lease, though, and the lease must stop dispatching as soon as release
+    -- marks its execution over.
     local resource = recorder()
     local record  = { capabilities = { db = function() return resource end } }
     local carrier = setmetatable({ id = "held-1" }, {
@@ -205,18 +191,14 @@ describe("what stands between an abandoned handler and a recycled connection", f
     execution.release(record)
     assert.equal(1, resource.released)
 
-    held:touch "after release"
-    assert.same({ "after release" }, resource.used,
-      "a released capability refused to work -- if that is deliberate, this " ..
-      "test is out of date")
+    local ok, err = pcall(function() held:touch "after release" end)
+    assert.is_false(ok, "a captured capability remained usable after release")
+    assert.is_truthy(tostring(err):find("execution ended", 1, true), tostring(err))
+    assert.same({}, resource.used,
+      "the revoked lease dispatched a call to the recycled resource")
   end)
 
-  it("does not survive release for a handler that reads the carrier again", function()
-    -- The narrower case, and the only one currently defended: a handler that
-    -- reads `req.db` FRESH after release gets a new acquisition rather than
-    -- the released one, because `release` clears the list and `acquire`
-    -- caches on the carrier. It is not a defence against a captured local,
-    -- which is what handlers actually write.
+  it("also revokes a fresh read of the cached carrier value", function()
     local opened = 0
     local record = { capabilities = { db = function()
       opened = opened + 1
@@ -232,11 +214,14 @@ describe("what stands between an abandoned handler and a recycled connection", f
     execution.release(record)
     assert.equal(1, opened, "the capability was opened more than once")
 
-    -- Still cached on the carrier: the same object comes back, released.
+    -- Still cached on the carrier: no second acquisition, but the cached
+    -- lease is dead too.
     local again = carrier.db
     assert.equal(1, opened,
       "reading the carrier after release opened a SECOND capability, which " ..
       "would leak one per abandoned request")
     assert.is_not_nil(again)
+    local ok = pcall(function() again:touch "after release" end)
+    assert.is_false(ok, "the carrier returned a usable released capability")
   end)
 end)

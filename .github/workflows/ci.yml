@@ -14,6 +14,9 @@
 
 name: ci
 
+permissions:
+  contents: read
+
 # ONE RUN PER COMMIT, and this was measured rather than tidied.
 #
 # `push: ["**"]` together with `pull_request:` ran the ENTIRE matrix twice for
@@ -42,13 +45,38 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
-env:
-  # Pinned deliberately. Moving it is a decision with a diff, not a drift:
-  # `spec/substrate_spec.lua` is what says whether a new one still answers
-  # what akkar depends on.
-  CQUEUES_COMMIT: c36614982fe07917b2e1ce5a9e7a0e55b81be262
-
 jobs:
+  controlled-install:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build isolated distribution from the shared manifest
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl git luarocks libssl-dev m4 unzip
+          bash bin/bootstrap-runtime "$RUNNER_TEMP/akkar-controlled"
+      - name: Verify away from the development tree
+        working-directory: /tmp
+        run: |
+          "$RUNNER_TEMP/akkar-controlled/bin/runtime-exec" akkar doctor --no-probe
+          "$RUNNER_TEMP/akkar-controlled/bin/runtime-exec" lua -e '
+            local app = require("akkar").new()
+            app:get("/ping", function() return {ok=true} end)
+            assert(app:test():get("/ping").body.ok)
+          '
+      - name: Exercise contracts with the controlled libraries
+        run: |
+          PREFIX="$RUNNER_TEMP/akkar-controlled"
+          TEST_TOOLS="$RUNNER_TEMP/akkar-test-tools"
+          luarocks --lua-dir="$PREFIX" --lua-version=5.4 --tree="$TEST_TOOLS" install busted 2.3.0-1
+          luarocks --lua-dir="$PREFIX" --lua-version=5.4 --tree="$TEST_TOOLS" install http 0.4-0
+          export LUA_PATH="$PREFIX/share/lua/5.4/?.lua;$PREFIX/share/lua/5.4/?/init.lua;./?.lua;./?/init.lua;$TEST_TOOLS/share/lua/5.4/?.lua;$TEST_TOOLS/share/lua/5.4/?/init.lua"
+          export LUA_CPATH="$PREFIX/lib/lua/5.4/?.so;$TEST_TOOLS/lib/lua/5.4/?.so"
+          source runtime/substrate.env
+          export CQUEUES_COMMIT
+          "$PREFIX/bin/lua" -e 'assert(require("cqueues").COMMIT == os.getenv("CQUEUES_COMMIT"))'
+          ulimit -n 8192
+          "$PREFIX/bin/lua" runtime/test-runner.lua spec/akkar_spec.lua spec/allocation_spec.lua spec/substrate_spec.lua spec/config_validation_spec.lua spec/framing_spec.lua
   # ---------------------------------------------------------------- unit
   # No services. This job proves the suite is green on a machine with no
   # Postgres and no Redis -- which is the state the skip guards exist for and
@@ -84,7 +112,12 @@ jobs:
           - { os: ubuntu-24.04-arm, lua: "5.4" }
           - { os: macos-14,         lua: "5.4" }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Load substrate identity
+        run: |
+          source runtime/substrate.env
+          echo "CQUEUES_COMMIT=$CQUEUES_COMMIT" >> "$GITHUB_ENV"
 
       - name: Install Lua ${{ matrix.lua }} and build dependencies (Linux)
         if: runner.os == 'Linux'
@@ -171,7 +204,7 @@ jobs:
       # confusing link error rather than as a cache problem.
       - name: Cache the cqueues build
         id: cqueues-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/cqueues-build
           key: cqueues-${{ env.CQUEUES_COMMIT }}-lua${{ matrix.lua }}-${{ matrix.os }}
@@ -604,7 +637,12 @@ jobs:
   lua55:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Load substrate identity
+        run: |
+          source runtime/substrate.env
+          echo "CQUEUES_COMMIT=$CQUEUES_COMMIT" >> "$GITHUB_ENV"
 
       - name: Build dependencies
         run: |
@@ -616,7 +654,7 @@ jobs:
       # cache and seconds with one. Keyed on the recipe itself: change the
       # script or the pinned commit and the cache is correctly abandoned.
       - name: Cache the 5.5 stack
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/lua55
           key: lua55-${{ runner.os }}-${{ hashFiles('docs/runtime/lua55-stack.sh') }}-${{ env.CQUEUES_COMMIT }}
@@ -794,7 +832,12 @@ jobs:
           --health-cmd "redis-cli ping" --health-interval 5s
           --health-timeout 5s --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Load substrate identity
+        run: |
+          source runtime/substrate.env
+          echo "CQUEUES_COMMIT=$CQUEUES_COMMIT" >> "$GITHUB_ENV"
 
       - name: Install Lua and build dependencies
         run: |
@@ -805,7 +848,7 @@ jobs:
 
       - name: Cache the cqueues build
         id: cqueues-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/cqueues-build
           key: cqueues-${{ env.CQUEUES_COMMIT }}-lua5.4-ubuntu-24.04
@@ -1003,6 +1046,51 @@ jobs:
 
           exit "$fail"
 
+  # --------------------------------------------------------- Python / MLOps
+  # Python is intentionally a separate process boundary. This job proves the
+  # reference service from its committed lockfile; it does not add Python to
+  # the Lua runtime or to the main rock's dependency graph.
+  mlops:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: consolidation-test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      ML_TEST_DATABASE_URL: postgresql://postgres:consolidation-test@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Load substrate identity
+        run: |
+          source runtime/substrate.env
+          echo "CQUEUES_COMMIT=$CQUEUES_COMMIT" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+
+      - name: Install the locked Python environment
+        working-directory: examples/mlops
+        run: |
+          python -m pip install --disable-pip-version-check uv==0.8.22
+          uv sync --frozen --python 3.13
+
+      - name: Test the API, model gate and batch contracts
+        working-directory: examples/mlops
+        run: |
+          uv run --frozen pytest
+          uv run --frozen python -m compileall -q ml_service bootstrap.py
+
+      - name: Validate the local stack manifest
+        run: docker compose -f examples/mlops/docker-compose.yml config --quiet
+
   # -------------------------------------------------------------- install
   # The job that would have caught `bin/akkar` never being installed: the
   # rockspec has no `install.bin`, so the CLI the README documents as a shell
@@ -1011,7 +1099,12 @@ jobs:
   install:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Load substrate identity
+        run: |
+          source runtime/substrate.env
+          echo "CQUEUES_COMMIT=$CQUEUES_COMMIT" >> "$GITHUB_ENV"
 
       - name: Install Lua and build dependencies
         run: |
@@ -1021,7 +1114,7 @@ jobs:
 
       - name: Cache the cqueues build
         id: cqueues-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/cqueues-build
           key: cqueues-${{ env.CQUEUES_COMMIT }}-lua5.4-ubuntu-24.04

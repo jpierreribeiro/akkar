@@ -23,6 +23,7 @@ local log = require "akkar.log"
   - [logger:error(message, fields)](#loggererrormessage-fields)
   - [logger:info(message, fields)](#loggerinfomessage-fields)
   - [logger:log(level, message, fields)](#loggerloglevel-message-fields)
+  - [logger:stats()](#loggerstats)
   - [logger:warn(message, fields)](#loggerwarnmessage-fields)
   - [logger:with(fields)](#loggerwithfields)
 - [O que não está aqui](#o-que-não-está-aqui)
@@ -50,8 +51,8 @@ Constrói um logger. Todos os campos são opcionais.
 |---|---|---|---|
 | `level` | string | `"info"` | um entre `debug`, `info`, `warn`, `error`. Linhas abaixo dele não são escritas nem formatadas. |
 | `format` | string | `"text"` | `"json"` escreve um objeto JSON por linha. Qualquer outro valor escreve texto. |
-| `sink` | function | escreve em stderr | chamada com uma string por linha, quebra de linha incluída. |
-| `exporter` | table | nenhum | qualquer coisa com um método `record(entry)`, que recebe toda entrada depois que o sink a escreveu; na prática o exportador de logs de [akkar.otlp](otlp.md), e `pipeline:logger` o define por você. Carregado para todo logger que `:with` deriva. |
+| `sink` | function | escreve em stderr | chamada com uma string por linha, quebra de linha incluída. Preserve `nil, reason, errno` de escritas em arquivo ou levante em caso de falha para que o logger possa contar uma linha perdida. |
+| `exporter` | table | nenhum | qualquer coisa com um método `record(entry)`, que recebe toda entrada independentemente de o sink tê-la aceitado; na prática o exportador de logs de [akkar.otlp](otlp.md), e `pipeline:logger` o define por você. Carregado para todo logger que `:with` deriva. |
 
 **Retorna** um logger.
 
@@ -60,7 +61,7 @@ Constrói um logger. Todos os campos são opcionais.
 ```lua
 local log = require "akkar.log"
 
-local logger = log.new { level = "info", sink = function(line) io.write(line) end }
+local logger = log.new { level = "info", sink = function(line) return io.write(line) end }
 
 logger:info("server started", { port = 3000 })
 logger:debug("not printed, below the level")
@@ -120,10 +121,15 @@ No formato texto os campos são ordenados por chave e o timestamp não é impres
 
 **Retorna** nada.
 
+Uma falha do sink nunca escapa deste método. Um raise, `false` ou
+`nil, reason, errno` incrementa `logger:stats().dropped`; o exporter ainda
+recebe a entrada. Na primeira escrita posterior bem-sucedida, o logger escreve
+uma linha `warn` chamada `log sink recovered` com a contagem perdida e a zera.
+
 ```lua
 local log = require "akkar.log"
 
-local logger = log.new { format = "json", sink = function(line) io.write(line) end }
+local logger = log.new { format = "json", sink = function(line) return io.write(line) end }
 logger:info("payment taken", { account_id = 7, amount = 12.5 })
 ```
 
@@ -139,13 +145,21 @@ O método que os quatro nomeados chamam. `level` é um nome de nível.
 
 **Levanta** `attempt to compare nil with number` quando `level` não é um nome conhecido. Diferente de `log.new`, esse caminho não verifica o nome antes, então prefira os métodos nomeados.
 
+### logger:stats()
+
+Retorna `{ dropped = n, last_error = string-ou-nil }`. `dropped` é o número de
+linhas recusadas pelo sink desde o último aviso de recuperação. O estado é
+compartilhado por todo logger produzido por `:with`, então inspecionar o logger
+raiz configurado inclui falhas dos loggers vinculados às requisições. A table
+retornada é uma cópia.
+
 ### logger:warn(message, fields)
 
 Escreve em `warn`. Mesmo formato de `logger:info`.
 
 ### logger:with(fields)
 
-Retorna um novo logger que escreve `fields` em toda linha, por cima do que ele já carregava. O logger original permanece inalterado, e level, format e sink são copiados.
+Retorna um novo logger que escreve `fields` em toda linha, por cima do que ele já carregava. O logger original permanece inalterado; level, format e sink são copiados, e as estatísticas de entrega do sink são compartilhadas.
 
 É isso que o próprio akkar faz por requisição: `req.log` é o logger configurado com `request_id` vinculado àquela requisição, `client_request_id` quando quem chamou mandou um `x-request-id`, e `trace_id` e `span_id` quando a requisição carrega um trace: um `traceparent` de entrada, ou um span iniciado pelo middleware do [akkar.trace](trace.md), o que for o span dentro do qual a linha é escrita. Uma requisição sem trace **não** ganha chave `trace_id` nenhuma, em vez de uma vazia. Esses dois nomes são os campos que o modelo de dados de logs do OpenTelemetry coloca num registro de log para correlação, então um coletor que os indexa junta a linha ao seu span sem precisar ser ensinado.
 
@@ -176,7 +190,7 @@ print(json.decode(lines[2]).trace_id)   --> nil: sem trace, sem chave
 ```lua
 local log = require "akkar.log"
 
-local logger = log.new { sink = function(line) io.write(line) end }
+local logger = log.new { sink = function(line) return io.write(line) end }
 local bound = logger:with { request_id = "1a2b3c" }
 
 bound:warn("slow query", { took_ms = 120 })
@@ -190,7 +204,7 @@ ERROR query failed request_id=1a2b3c table_name=tasks
 
 ## O que não está aqui
 
-- **Rotação de arquivo de log.** O sink é uma function, então escrever em um arquivo, em um socket ou em um handle rotativo fica por conta de quem chama arranjar.
+- **Rotação de arquivo de log.** O sink é uma function, então escrever em um arquivo, em um socket ou em um handle rotativo fica por conta de quem chama arranjar. Um arquivo com buffer pode reportar sucesso e encontrar ENOSPC apenas no `flush`; um callback opaco não pode ser esvaziado pelo akkar, então esse sink precisa fazer flush e reportar o erro por conta própria.
 - **Um logger global.** Não existe um `log.info` no nível do módulo. Um logger é um valor, e o que o akkar entrega a um handler é `req.log`.
 - **Redação.** Um campo é escrito como é dado. Um valor envolvido por `akkar.config.secret` é seguro (ele não guarda nada), mas uma string simples guardando uma senha é escrita por completo.
 - **Amostragem ou limitação de taxa de linhas.** Toda linha acima do nível é escrita.

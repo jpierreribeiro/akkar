@@ -143,12 +143,14 @@ describe("the cost of an idle connection", function()
     if portable.port_in_use(port) then port = port + 137 end
 
     local log = os.tmpname()
+    local pidfile = log .. ".pid"
     -- `env`, not a bare `VAR=value` prefix: `portable.timeout` wraps the
     -- command in `timeout 60 ...`, and `timeout` execs its argument rather
     -- than handing it to a shell -- so it went looking for a program called
     -- `AKKAR_PORT=8876` and reported it missing.
-    local command = ("env AKKAR_PORT=%d AKKAR_BUFSIZ=%s %s %s")
-      :format(port, tostring(buffer), portable.lua, "spec/support/idle_server.lua")
+    local command = ("env AKKAR_PORT=%d AKKAR_BUFSIZ=%s AKKAR_PID_FILE=%q %s %s")
+      :format(port, tostring(buffer), pidfile, portable.lua,
+              "spec/support/idle_server.lua")
     os.execute(portable.detached(portable.timeout(60, command), log))
 
     -- Wait by ASKING THE PORT, not by sleeping. `sleep 0.1` is not portable
@@ -161,15 +163,23 @@ describe("the cost of an idle connection", function()
       if ok and c then
         local reached = pcall(function() c:settimeout(0.05) c:write "" end)
         pcall(function() c:close() end)
-        if reached then pid = portable.pid_on_port(port) end
+        if reached then
+          local f = io.open(pidfile, "r")
+          if f then
+            pid = tonumber(f:read "a")
+            f:close()
+          end
+        end
         if pid then break end
       end
+      cqueues.sleep(0.01)
     end
     if not pid then
       local f = io.open(log, "r")
       local why = f and f:read "a" or "(no log)"
       if f then f:close() end
       os.remove(log)
+      os.remove(pidfile)
       error("the idle server did not start on port " .. port .. ":\n" .. why, 0)
     end
 
@@ -213,8 +223,11 @@ describe("the cost of an idle connection", function()
     end)
 
     for _, c in ipairs(held) do pcall(function() c:close() end) end
+    assert(pid ~= portable.pid,
+      "refusing to stop the test runner while cleaning up the idle server")
     os.execute(("kill %d 2>/dev/null"):format(pid))
     os.remove(log)
+    os.remove(pidfile)
     if not ok then error(why, 0) end
     return cost
   end

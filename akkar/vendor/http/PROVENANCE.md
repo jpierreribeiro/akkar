@@ -95,7 +95,7 @@ them in between.
 | `tls.lua` | unmodified | | |
 | `util.lua` | unmodified | | |
 | `version.lua` | patched | +22 / −3 | 1 |
-| `websocket.lua` | patched | +42 / −2 | 5 |
+| `websocket.lua` | patched | +52 / −4 | 7 |
 | `zlib.lua` | unmodified | | |
 
 `websocket.lua` was not in the first vendoring at all; it arrived whole from
@@ -150,6 +150,15 @@ because a half-decoded block leaves the dynamic table out of step with the
 peer's (RFC 7540 §6.8). Guards: `max_header_lines` on the h2 stream,
 `max_entries` in `hpack:decode_headers`.
 
+**`h1_connection.lua`, `h1_stream.lua`, `h2_stream.lua` and `hpack.lua` — an
+aggregate header list is bounded at 32 KiB by default.** Uncommitted. HTTP/1
+charges the wire line before optional whitespace is trimmed, and preserves the
+running total across partial reads. HTTP/2 charges each decoded name and value
+inside HPACK, including indexed repetitions; the 400 KiB compressed-frame cap
+cannot enforce this because HPACK expands data. Applications can lower the
+ceiling with `header_limit`. Guards: `return key, val, nil, #line`,
+`header_bytes_in_progress`, `max_header_bytes`, `MAX_HEADER_LIST_BYTES`.
+
 **`h2_stream.lua` — RST_STREAM is rate-accounted. CVE-2023-44487.**
 Uncommitted. Rapid Reset: open a stream, cancel it, repeat at line speed. The
 `RST_STREAM` handler's `set_state("closed")` decrements `n_active_streams`
@@ -173,6 +182,20 @@ existed: one 64 MB message cost 192 MB of RSS while the application's
 declared frame length, and the running sum of the fragments, since a thousand
 legal 1 MB fragments are one illegal message. Refused as `EFBIG` and turned
 into an RFC 6455 close code 1009. Guards: `max_payload`, `databuffer_size`.
+
+**`websocket.lua` — a partial frame cannot shed the message bound.**
+Uncommitted. `read_frame(sock, deadline, max_payload)` retries recursively when
+the fixed header arrives before the extended length. Both recursive calls
+dropped `max_payload`, so splitting those bytes across packets turned the
+pre-buffer ceiling off. The bound is now forwarded through every retry;
+`spec/websocket_limits_spec.lua` proves the oversized payload is never offered
+to `fill`.
+
+**`websocket.lua` — ping/pong is activity, not idleness.** Uncommitted.
+`receive(timeout)` consumes control frames internally, so its original absolute
+deadline closed a peer that was actively sending heartbeats. Ping and pong now
+restart the inactivity interval. Data fragments do not: otherwise a peer could
+trickle one unfinished message forever.
 
 **`server.lua` — one connection can no longer kill the server.**
 `0c1d20d`. `handle_socket` was wrapped bare; an error out of it escaped

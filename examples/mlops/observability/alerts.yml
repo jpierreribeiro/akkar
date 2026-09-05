@@ -1,0 +1,22 @@
+groups:
+  - name: akkar-mlops
+    rules:
+      - alert: MLServiceUnavailable
+        expr: up{job="akkar-mlops"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: "MLOps metrics endpoint unavailable; check API and Postgres"}
+      - alert: MLDispatchDelayed
+        expr: ml_outbox_oldest_seconds > 60
+        for: 2m
+        labels: {severity: warning}
+        annotations: {summary: "Outbox is not draining; inspect dispatcher and Redis"}
+      - alert: MLJobsStalled
+        expr: ml_jobs_stalled > 0
+        for: 2m
+        labels: {severity: warning}
+        annotations: {summary: "Jobs are queued too long or have expired leases"}
+      - alert: MLBatchFailures
+        expr: delta(ml_jobs_failed[5m]) > 0
+        labels: {severity: warning}
+        annotations: {summary: "New terminal batch failures; correlate job and attempt logs"}

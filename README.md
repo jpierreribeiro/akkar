@@ -2,9 +2,12 @@
 
 > **English** | [Português (Brasil)](README.pt-BR.md)
 
-**A backend runtime for Lua that boots in 29 milliseconds, speaks HTTP/2 with
-no nginx in front of it, and will not let you write the bugs that page you at
-three in the morning.**
+**A backend runtime for Lua with native HTTP/2, scoped resources and bounded
+request execution.**
+
+Current consolidation and measured evidence: [execution ledger](docs/CONSOLIDATION.md).
+Performance figures below are historical measurements, not guarantees for the
+current checkout or every platform. The runtime remains a production candidate.
 
 One coroutine per request. One thread per process. A whole application, with
 Postgres, Redis, background jobs, sessions and metrics, answers its first
@@ -27,9 +30,9 @@ return app
 |---|---:|
 | boot to first response | **68 ms**, or 29 ms before HTTP/2 |
 | memory per idle connection | 9.2 KB |
-| tests, Lua 5.4 and Lua 5.5 | **1,852** |
+| current local test evidence | [consolidation ledger](docs/CONSOLIDATION.md) |
 | HTTP/2 conformance, h2spec 2.6.0 | **146 of 146** |
-| platforms every commit is tested on | Linux x86_64, Linux arm64, macOS |
+| configured CI platforms; verify each run | Linux x86_64, Linux arm64, macOS |
 
 Every number on this page came off a machine. Where one is missing, the page
 says so.
@@ -170,7 +173,9 @@ it is terminated at the edge in practice.
 
 Every claim above is machine checked, and the checks are the interesting part.
 
-**1,852 tests**, on Lua 5.4 and Lua 5.5, on three platforms, on every commit.
+**Test results are revision-specific.** CI is configured for Lua 5.4 and Lua
+5.5 across its platform matrix; see the consolidation ledger for evidence from
+the current checkout, and CI for each remote run.
 
 **HTTP/2 conformance** through h2spec 2.6.0: **146 of 146, nothing skipped**,
 run after run. `bench/h2spec.sh` fetches the tool and runs it against a live
@@ -258,13 +263,15 @@ neither thing. Corrected 2026-09-02.
 akkar runs its author's services. It is young, and these are the three things
 worth knowing before you put it in front of your own customers:
 
-**The API will change.** There is no compatibility policy yet. Pin the rockspec.
+**The API is versioned under the [compatibility policy](docs/COMPATIBILITY.md).**
+It remains 0.x; pin the exact release or commit you validated.
 
 **No independent security review has happened.** The bounds, the fuzzers and the
 conformance suite are real and they are all internal.
 
-**It is not on luarocks.org yet**, so installing means pointing LuaRocks at the
-rockspec URL above. That is a release step, not an obstacle.
+**A historical rockspec does not install this checkout's new features.** For
+the current Linux candidate, use the [controlled source installation](docs/CONTROLLED-INSTALL.md).
+Release publication follows [RELEASE.md](RELEASE.md); local validation is not publication.
 
 What is settled: the substrate, the ergonomics, and the production shape. Body
 limits, deadlines, pooling, graceful shutdown, structured logs, metrics,
@@ -628,9 +635,13 @@ an ordinary GET to an ordinary route, is never accepted at all. Measured.
 ```lua
 app:run {
   port = 8080,
+  write_timeout             = 30,    -- a peer cannot stall a response forever
   websocket_max_connections = 500,   -- refused past this with 503 + retry-after
   websocket_idle_timeout    = 300,   -- a quiet socket is closed and forgotten
   body_limit                = 1024 * 1024,   -- also bounds a socket MESSAGE
+  header_limit              = 32 * 1024,     -- aggregate h1 wire / h2 decoded
+  header_count_limit        = 100,           -- repeated fields count too
+  json_depth_limit          = 64,            -- arrays and objects
 }
 ```
 
@@ -639,6 +650,11 @@ on the sum of its fragments, and the refusal is close code 1009. Before that
 bound existed, one 64 MB message cost **192 MB of resident memory** against an
 application that had set `body_limit = 1 MB`. `akkar doctor` warns when an
 application serves sockets and has not set a ceiling for them.
+
+Protocol ping/pong frames count as WebSocket activity, while fragments of one
+unfinished data message do not reset the idle deadline. On HTTP/2,
+`write_timeout` also bounds flow-control waits, so a peer advertising a zero
+window cannot retain a finished request slot indefinitely.
 
 **Several processes, one port.** One Lua VM is one core, so capacity is
 processes. `SO_REUSEPORT` lets them share a port with no proxy in front:
@@ -731,6 +747,8 @@ PORT=8099 lua5.4 examples/crud.lua
 |---|---|
 | [`docs/DEPLOY.md`](docs/DEPLOY.md) | Railway, Docker, and what breaks in a scratch container |
 | [`docs/RUNTIME.md`](docs/RUNTIME.md) | `akkar build`, and what it still needs by hand |
+| [`docs/PRODUCTION-READINESS.md`](docs/PRODUCTION-READINESS.md) | the blocking production gate and evidence to retain |
+| [`examples/mlops/`](examples/mlops/) | Python online/batch inference behind an akkar gateway |
 | [`docs/reference/cli.md`](docs/reference/cli.md) | the eight commands |
 
 **What is measured, and what is not**
@@ -763,6 +781,8 @@ appears only when you disagree with the default.
 | Default | Value | Override |
 |---|---|---|
 | Request body limit | 1 MB | `app:run { body_limit = 5 * 1024 * 1024 }` |
+| Request header limit | 32 KiB / 100 fields | `app:run { header_limit = 65536, header_count_limit = 200 }` |
+| JSON nesting depth | 64 | `app:run { json_depth_limit = 32 }` |
 | Request deadline | 30 s | `app:run { timeout = 5 }` |
 | Connection pool size | 10 | `db.connect { pool_size = 25 }` |
 | Shutdown grace | 10 s | `app:run { shutdown_grace = 30 }` |

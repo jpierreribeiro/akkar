@@ -215,6 +215,41 @@ describe("a WebSocket route", function()
     assert.equal("idle timeout", closed_with[1])
   end)
 
+  it("treats protocol pings as activity for the idle timeout", function()
+    -- Browsers and proxies commonly keep a healthy socket alive with ping
+    -- frames rather than application messages. `receive(idle)` consumes those
+    -- frames internally; if it keeps the original deadline, an actively
+    -- pinging peer is still closed as "idle".
+    local answer = with_app(8428,
+      function(app)
+        app:websocket("/heartbeat", {
+          message = function(ws, text) ws:send("ack:" .. text) end,
+        })
+      end,
+      function(port, app)
+        local ws = websocket.new_from_uri(
+          ("ws://127.0.0.1:%d/heartbeat"):format(port))
+        assert(ws:connect(5))
+
+        local pings = 0
+        for i = 1, 5 do
+          local ok = ws:send_ping(tostring(i), 1)
+          if ok then pings = pings + 1 end
+          cqueues.sleep(0.05)
+        end
+        local sent = ws:send("alive", "text", 1)
+        local reply = sent and ws:receive(1) or nil
+        local open_after_pings = app.sockets_open
+        pcall(function() ws:close(1000, nil, 1) end)
+        return { pings = pings, reply = reply, open = open_after_pings }
+      end,
+      { websocket_idle_timeout = 0.12 })
+
+    assert.equal(5, answer.pings, "the idle timer closed an actively pinging peer")
+    assert.equal("ack:alive", answer.reply)
+    assert.equal(1, answer.open, "the socket was unregistered while pings arrived")
+  end)
+
   it("works over TLS on a server that offers HTTP/2", function()
     -- WEBSOCKET IS AN HTTP/1.1 MECHANISM, and akkar now prefers h2 in ALPN.
     -- The RFC 8441 extended CONNECT that would carry a socket over h2 is not

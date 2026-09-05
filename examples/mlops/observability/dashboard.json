@@ -1,0 +1,14 @@
+{
+  "title": "Akkar MLOps recovery",
+  "uid": "akkar-mlops-recovery",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {"from": "now-1h", "to": "now"},
+  "panels": [
+    {"id": 1, "title": "Outbox backlog", "type": "timeseries", "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8}, "targets": [{"expr": "ml_outbox_pending", "refId": "A"}]},
+    {"id": 2, "title": "Oldest intent (seconds)", "type": "timeseries", "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8}, "targets": [{"expr": "ml_outbox_oldest_seconds", "refId": "A"}]},
+    {"id": 3, "title": "Stalled / running / failed", "type": "timeseries", "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8}, "targets": [{"expr": "ml_jobs_stalled", "refId": "A"}, {"expr": "ml_jobs_running", "refId": "B"}, {"expr": "ml_jobs_failed", "refId": "C"}]},
+    {"id": 4, "title": "Retained retry attempts", "type": "timeseries", "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8}, "targets": [{"expr": "ml_job_retries", "refId": "A"}]}
+  ]
+}

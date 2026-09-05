@@ -62,9 +62,8 @@ LOG=$P/build.log
 
 # The cqueues commit akkar pins. Kept in sync with the rockspecs by
 # spec/rockspec_spec.lua, which asserts this file and they agree.
-CQUEUES_COMMIT=c36614982fe07917b2e1ce5a9e7a0e55b81be262
-COMPAT53_TAG=v0.15.1
-LUA_VERSION=5.5.1
+source "$REPO/runtime/substrate.env"
+LUA_VERSION=$LUA55_VERSION
 
 mkdir -p "$SRC" "$LIB" "$SHARE"
 : > "$LOG"

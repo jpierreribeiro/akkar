@@ -143,7 +143,15 @@ local function raw_server(cq, handle)
       server.connections = server.connections + 1
       conn:setmode("bn", "bn")
       conn:onerror(function(_, _, why) return why end)
-      cq:wrap(function() pcall(handle, conn, server) end)
+      -- The peer closing its half does not close ours.  Leaving this socket
+      -- to its finalizer accumulated one accepted descriptor per direct
+      -- request; the benchmark crosses the common 1024 soft limit and then
+      -- turns every later spec into an EMFILE cascade.  Close on both the
+      -- normal and raised paths; handlers that already closed are harmless.
+      cq:wrap(function()
+        pcall(handle, conn, server)
+        pcall(function() conn:close() end)
+      end)
     end
   end)
 

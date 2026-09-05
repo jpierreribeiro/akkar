@@ -71,21 +71,31 @@ client, so the pools are shared.
 | field | type | default | meaning |
 |---|---|---|---|
 | `headers` | table | none | headers added to every request, before per-call ones |
-| `timeout` | number | `10` | seconds for one attempt, covering connect, headers and body |
-| `max_body` | number | `8388608` | response ceiling in bytes |
-| `retries` | number | `0` | attempts **beyond** the first |
-| `retry_backoff` | number | `0.1` | seconds before the first retry, doubling each time |
-| `pool_size` | number | `8` | live connections per `scheme://host:port` |
+| `timeout` | non-negative finite number | `10` | seconds for one attempt, covering connect, headers and body |
+| `max_body` | non-negative integer | `8388608` | response ceiling in bytes |
+| `retries` | non-negative integer | `0` | attempts **beyond** the first |
+| `retry_backoff` | non-negative finite number | `0.1` | seconds before the first retry, doubling each time |
+| `pool_size` | positive integer | `8` | live connections per `scheme://host:port` |
 | `reuse` | boolean | `true` | `false` gives a connection per request through the same code path |
-| `http_version` | number | none | left unset so lua-http negotiates; pin `1.1` for a peer that mis-advertises h2 |
+| `http_version` | finite number | none | left unset so lua-http negotiates; pin `1.1` for a peer that mis-advertises h2 |
 | `breaker` | table | none | a table of [breaker](breaker.md) options gives one breaker per origin; a breaker instance is shared by every origin |
 
 The pool key comes from the parsed uri, so `http://x/a` and `http://x:80/b`
 share a pool and `http://x` and `https://x` never do.
 
+Hostnames are resolved in a named phase before the socket is opened. DNS and
+all address attempts share the request's one deadline. A failed lookup names
+the host, and the resolver ignores only a root `search .` entry while
+preserving real search domains. The socket dials the resolved address, but the
+URL hostname remains the authority, pool key, TLS SNI name and certificate
+validation name. New connections resolve again; live pooled connections do
+not.
+
 **Returns** a `function() -> client`.
 
-**Raises** nothing. An unknown key in `config` is ignored silently.
+**Raises** on an unknown key or an invalid value in `config`, before the client
+is built. The error names the key and suggests the nearest valid name when
+there is one; for example, `timout` suggests `timeout`.
 
 ```lua
 local http = require "akkar.http"
@@ -128,12 +138,15 @@ The `options` table accepted by every call.
 |---|---|---|---|
 | `headers` | table | none | per-call headers; names are lowercased, values are `tostring`ed, and these override the client's `headers` |
 | `body` | string or table | none | a table is JSON-encoded and sets `content-type: application/json` |
-| `timeout` | number | the client's | seconds for one attempt |
-| `max_body` | number | the client's | response ceiling for this call |
-| `retries` | number | the client's | attempts beyond the first |
-| `retry_backoff` | number | the client's | seconds before the first retry |
+| `timeout` | non-negative finite number | the client's | seconds for one attempt |
+| `max_body` | non-negative integer | the client's | response ceiling for this call |
+| `retries` | non-negative integer | the client's | attempts beyond the first |
+| `retry_backoff` | non-negative finite number | the client's | seconds before the first retry |
 | `retry_unsafe` | boolean | `false` | allow retrying a `POST` or `PATCH` |
 | `traceparent` | string | none | sent as the `traceparent` header |
+
+Unknown keys and invalid values are rejected before any network I/O. The error
+names the key and suggests the nearest valid option when there is one.
 
 `content-length` is set from the body and no `expect: 100-continue` is ever
 generated. That header is what `request:set_body` in lua-http appends above
@@ -222,7 +235,8 @@ whatever lua-http reported for a failed connect, write or header read. A
 response over `max_body` is **refused, not truncated**: a truncated body is
 indistinguishable from a complete one at the call site.
 
-**Raises** nothing on a network failure. It returns `nil` and a reason.
+**Raises** on an unknown option or invalid value, before attempting network
+I/O. A network failure does not raise; it returns `nil` and a reason.
 
 ```lua
 local akkar = require "akkar"
@@ -293,8 +307,9 @@ reused one failed.
 - **Per-host rate limiting.** [limit](limit.md) is the inbound half and has no
   outbound counterpart. A circuit breaker is the `breaker` field of
   `http.connect`, and its page is [breaker](breaker.md).
-- **Option-name checking.** Unknown keys in `config` and in a call's `options`
-  are ignored silently, unlike `app:run{}`.
+- **Happy Eyeballs.** A addresses are tried first; AAAA is queried when there
+  are no A records. An IPv4 address that accepts no packets can therefore use
+  the remaining deadline rather than racing an IPv6 address.
 - **`client:acquire`, `client:attempt`, `client:pool_for`.** They are on
   `http.Client` and they are internal. Their signatures change without notice.
 

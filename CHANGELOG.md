@@ -14,6 +14,11 @@ one commit with a spec that failed before it and passes after.
 
 ### Changed — these break code that works today
 
+- **`akkar.http` rejects unknown option names and invalid values.** Both
+  `http.connect{}` and a request's `options` fail before network I/O and
+  suggest the nearest valid name. A typo in `timeout`, `max_body`, or `retries`
+  used to silently remove the bound or retry policy while looking configured;
+  `retries = -1` used to execute no request and return `nil, nil`.
 - **`akkar.idempotency` requires `namespace`.** The idempotency key is a header
   the CLIENT chooses, so one global keyspace let a tenant replay another
   tenant's stored response body. Pass a resolver, or `namespace = false`
@@ -64,6 +69,36 @@ one commit with a spec that failed before it and passes after.
 
 ### Added
 
+- **Bounded request shape beyond the body.** HTTP/1 wire headers and HTTP/2
+  decoded HPACK headers default to 32 KiB and 100 fields; JSON defaults to 64
+  nested arrays/objects. `header_limit`, `header_count_limit`, and
+  `json_depth_limit` are boot-validated overrides, with live protocol tests.
+- **A separate Python/MLOps reference service.** FastAPI serves online
+  inference, Celery/Redis runs idempotent batch work, PostgreSQL holds job
+  state, S3/MinIO holds data, and MLflow resolves immutable versions. Serving
+  verifies the artifact-tree digest and accepts only `sklearn + skops`, not
+  pickle, packaged code, or arbitrary Python. Its 118-package `uv.lock`, tests,
+  Docker stack and akkar gateway have local validation and a configured CI job;
+  the final-commit CI result remains a separate gate.
+- **MLOps tenancy and recovery contracts.** Hashed client credentials define
+  tenant, permissions and allowed models; caller-supplied tenant identity is
+  rejected. Batch acceptance writes an outbox transactionally, pins model and
+  input identity, and uses renewable fenced leases for worker completion.
+  The example now requires versioned input plus SHA-256 and generates output
+  locations itself; see its README for migration and operational limits.
+- **Controlled Linux source installation.** A shared substrate manifest,
+  checked dependency archives, isolated prefix, non-shadowing launcher and
+  doctor drift checks support reproducible installation boundaries. OpenSSL
+  remains host-linked; this is not a hermetic or production-certified build.
+- Private request normalization and configuration modules preserve the public
+  Lua API. Local recovery/restore scripts, observability examples and persisted
+  soak evidence support the remaining operational gates documented in
+  `docs/CONSOLIDATION.md`.
+- Production governance: pinned GitHub Actions, least-privilege workflow
+  permissions, CODEOWNERS, Dependabot, security/contribution policies, an
+  assertive local soak gate, and a manual release workflow producing SBOMs,
+  checksums, attestations, source artifacts, and the locked MLOps image.
+
 - **`akkar.errors`** — the other end of `app:on_error`, which has documented
   `sentry:capture(err, ...)` since early on against nothing. Captures the
   request id, trace id, span id, route PATTERN, method, status and a sanitised
@@ -100,6 +135,31 @@ one commit with a spec that failed before it and passes after.
 
 ### Fixed
 
+- **An HTTP/2 peer could advertise a zero flow-control window and retain a
+  finished request slot forever.** `write_timeout` now bounds every response
+  write (30 seconds by default), including waits for `WINDOW_UPDATE`; overflow
+  and negative-window transitions have deterministic regression coverage.
+- **A WebSocket frame split before its extended length bypassed
+  `websocket_max_message`.** The resumed read had dropped the ceiling and could
+  buffer the declared payload before refusing it. The ceiling now survives
+  every retry. Protocol ping/pong frames also renew the idle interval, while
+  fragments of an unfinished data message deliberately do not.
+- **A handler that woke after its deadline could use a capability already
+  returned to its pool.** Factory-returned releasable capabilities are now
+  execution-scoped leases: release still acts exactly once on the real object,
+  while captured and freshly-read references refuse access after the execution
+  ends. Direct process-lifetime capabilities and explicitly shared built-ins
+  keep their original identity and metatable.
+- **A definitive NXDOMAIN consumed the whole outbound HTTP timeout and returned
+  an error with no hostname.** DNS is now an explicit phase: it removes only
+  the pathological root `search .`, names lookup failures, preserves real
+  search domains and shares one deadline with every connection attempt. The
+  resolved IP never replaces the hostname used for authority, pooling or TLS.
+- **A failed log sink could break requests and permanently wedge shutdown.**
+  Sink raises and returned write errors are now contained and counted by
+  `logger:stats()`, shared across request-bound loggers. The first successful
+  write after recovery reports how many lines were lost. The delivery state
+  lives beside the shared sink, so this adds no field to each request logger.
 - **A tenant scope that was present in the text and absent from the meaning.**
   Conditions were joined with " and " and never parenthesised, so a handler's
   own `or` captured the scope. Reproduced against Postgres reading and deleting

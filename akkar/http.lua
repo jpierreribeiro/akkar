@@ -126,7 +126,11 @@ strength of the loopback number alone, which is the honest floor.
 
 local http_request = require "akkar.vendor.http.request"
 local http_client  = require "akkar.vendor.http.client"
+local http_util    = require "akkar.vendor.http.util"
 local cqueues      = require "cqueues"
+local dns_config   = require "cqueues.dns.config"
+local dns_packet   = require "cqueues.dns.packet"
+local dns_resolvers = require "cqueues.dns.resolvers"
 local Pool         = require "akkar.pool"
 local time         = require "akkar.time"
 -- For the execution's remaining budget. `akkar.execution` requires only
@@ -161,6 +165,108 @@ local DEFAULTS = {
   pool_size     = 8,         -- live connections per scheme://host:port
 }
 
+-- Public option names are closed sets. A typo in `timeout`, `max_body`, or
+-- `retries` does not merely configure the client differently: it silently
+-- removes a resource bound or a failure policy while looking correct. Keep
+-- the names beside the defaults and check them before any network work.
+local CONNECT_OPTIONS = {
+  headers = true, timeout = true, max_body = true, retries = true,
+  retry_backoff = true, pool_size = true, reuse = true,
+  http_version = true, breaker = true,
+}
+
+local REQUEST_OPTIONS = {
+  headers = true, body = true, timeout = true, max_body = true,
+  retries = true, retry_backoff = true, retry_unsafe = true,
+  traceparent = true,
+}
+
+local function finite_number(value)
+  return type(value) == "number" and value == value
+         and value > -math.huge and value < math.huge
+end
+
+local function non_negative_number(value)
+  return finite_number(value) and value >= 0
+end
+
+local function non_negative_integer(value)
+  return non_negative_number(value) and value % 1 == 0
+end
+
+local function positive_integer(value)
+  return non_negative_integer(value) and value > 0
+end
+
+local CONNECT_VALUES = {
+  headers = { "a table", function(value) return type(value) == "table" end },
+  timeout = { "a non-negative finite number", non_negative_number },
+  max_body = { "a non-negative integer", non_negative_integer },
+  retries = { "a non-negative integer", non_negative_integer },
+  retry_backoff = { "a non-negative finite number", non_negative_number },
+  pool_size = { "a positive integer", positive_integer },
+  reuse = { "a boolean", function(value) return type(value) == "boolean" end },
+  http_version = { "a finite number", finite_number },
+  breaker = { "a table", function(value) return type(value) == "table" end },
+}
+
+local REQUEST_VALUES = {
+  headers = CONNECT_VALUES.headers,
+  body = { "a string or table", function(value)
+    return type(value) == "string" or type(value) == "table"
+  end },
+  timeout = CONNECT_VALUES.timeout,
+  max_body = CONNECT_VALUES.max_body,
+  retries = CONNECT_VALUES.retries,
+  retry_backoff = CONNECT_VALUES.retry_backoff,
+  retry_unsafe = { "a boolean", function(value)
+    return type(value) == "boolean"
+  end },
+  traceparent = { "a string", function(value)
+    return type(value) == "string"
+  end },
+}
+
+local function nearest(word, candidates)
+  if type(word) ~= "string" then return nil end
+  local best, best_distance = nil, math.huge
+  for candidate in pairs(candidates) do
+    local previous = {}
+    for j = 0, #candidate do previous[j] = j end
+    for i = 1, #word do
+      local current = { [0] = i }
+      for j = 1, #candidate do
+        local cost = word:sub(i, i) == candidate:sub(j, j) and 0 or 1
+        current[j] = math.min(previous[j] + 1, current[j - 1] + 1,
+                              previous[j - 1] + cost)
+      end
+      previous = current
+    end
+    if previous[#candidate] < best_distance then
+      best, best_distance = candidate, previous[#candidate]
+    end
+  end
+  if best_distance <= math.max(2, math.floor(#word / 3)) then return best end
+end
+
+local function check_options(options, allowed, values, what)
+  if type(options) ~= "table" then
+    error(("%s options must be a table"):format(what), 3)
+  end
+  for key, value in pairs(options) do
+    if not allowed[key] then
+      local suggestion = nearest(key, allowed)
+      error(("unknown %s option '%s'%s"):format(
+        what, tostring(key),
+        suggestion and ("; did you mean '" .. suggestion .. "'?") or ""), 3)
+    end
+    local rule = values[key]
+    if rule and not rule[2](value) then
+      error(("%s option '%s' must be %s"):format(what, key, rule[1]), 3)
+    end
+  end
+end
+
 --- Seconds left before `deadline`, or nil when there is no deadline.
 ---
 --- Every lua-http call below takes a RELATIVE timeout. Handing one an
@@ -170,6 +276,66 @@ local DEFAULTS = {
 local function remaining(deadline)
   if not deadline then return nil end
   return deadline - time.monotime()
+end
+
+-- ======================================================================== DNS
+
+-- Built lazily: an application whose outbound endpoints are IP literals never
+-- needs to read resolver configuration or create a DNS pool.
+local resolver_pool
+
+local function resolver()
+  if resolver_pool then return resolver_pool end
+
+  local config = dns_config.stub()
+  local search = {}
+  for _, suffix in ipairs(config:getsearch()) do
+    -- systemd-resolved commonly writes `search .`. cqueues treats it as a
+    -- suffix to try and waits attempts*timeout before returning a definitive
+    -- NXDOMAIN it already received. Remove ONLY the root marker: Kubernetes
+    -- and corporate search domains keep working for short service names.
+    if suffix ~= "." and suffix ~= "" then search[#search + 1] = suffix end
+  end
+  config:setsearch(search)
+  resolver_pool = dns_resolvers.new(config)
+  return resolver_pool
+end
+
+local function dns_answer(host, kind, timeout)
+  if timeout <= 0 then return nil, "timed out" end
+  local answer, why = resolver():query(host, kind, nil, timeout)
+  if not answer then return nil, tostring(describe(why) or "resolver failure") end
+
+  local flags = answer:flags()
+  local rcode = dns_packet.rcode[flags.rcode] or tostring(flags.rcode)
+  if flags.rcode ~= dns_packet.rcode.NOERROR then return nil, rcode end
+
+  local addresses = {}
+  for record in answer:grep { section = "answer", type = kind } do
+    addresses[#addresses + 1] = record:addr()
+  end
+  return addresses
+end
+
+--- Resolves one host without allowing DNS and connect to each spend the whole
+--- timeout independently. A records are the common path; AAAA is queried when
+--- no A address exists, preserving IPv6-only services without doubling every
+--- connection's DNS traffic.
+local function resolve_host(host, deadline)
+  if http_util.is_ip(host) then return { host } end
+
+  local addresses, why = dns_answer(host, "A", remaining(deadline))
+  if not addresses then
+    return nil, ("DNS lookup for '%s' failed: %s"):format(host, why)
+  end
+  if #addresses > 0 then return addresses end
+
+  addresses, why = dns_answer(host, "AAAA", remaining(deadline))
+  if not addresses then
+    return nil, ("DNS lookup for '%s' failed: %s"):format(host, why)
+  end
+  if #addresses > 0 then return addresses end
+  return nil, ("DNS lookup for '%s' returned no A or AAAA records"):format(host)
 end
 
 --- Reads a body with a hard ceiling, refusing rather than truncating.
@@ -273,9 +439,26 @@ function Client:pool_for(key, host, port, tls)
 
   pool = Pool.new(function()
     local timeout = CONNECT_TIMEOUT[coroutine.running()] or self.timeout
-    local conn, err = http_client.connect({
-      host = host, port = port, tls = tls, version = self.http_version,
-    }, timeout)
+    local deadline = time.monotime() + timeout
+    local addresses, resolution_error = resolve_host(host, deadline)
+    if not addresses then error(resolution_error, 0) end
+
+    local conn, err
+    for _, address in ipairs(addresses) do
+      local left = remaining(deadline)
+      if left <= 0 then
+        err = "connection deadline expired"
+        break
+      end
+      conn, err = http_client.connect({
+        -- `host` remains the URL hostname for SNI and certificate checking;
+        -- `address` is only what the socket dials. The request and pool key
+        -- likewise retain the hostname, so DNS cannot rewrite authority.
+        host = host, address = address, port = port, tls = tls,
+        version = self.http_version,
+      }, left)
+      if conn then break end
+    end
     -- `Pool:get` expects `open` to raise, and treats the raise as a slot that
     -- must be given back -- so returning nil here would wedge the pool.
     --
@@ -286,7 +469,10 @@ function Client:pool_for(key, host, port, tls)
     -- no resolver reports a number nobody can act on. `akkar.errno.describe`
     -- passes an already-worded message through untouched, so this only ever
     -- adds a name where there was none.
-    if not conn then error(tostring(describe(err) or "could not connect"), 0) end
+    if not conn then
+      error(("connection to '%s' failed: %s")
+            :format(host, tostring(describe(err) or "could not connect")), 0)
+    end
     return setmetatable({ conn = conn, key = key }, Connection)
   end, self.pool_size, function(resource)
     return self.reuse and not resource.broken and resource:alive()
@@ -518,7 +704,8 @@ end
 
 --- Makes a request, retrying only what is safe to retry.
 function Client:request(method, url, options)
-  options = options or {}
+  if options == nil then options = {} end
+  check_options(options, REQUEST_OPTIONS, REQUEST_VALUES, "HTTP request")
   method = method:upper()
 
   local allowed = options.retries or self.retries
@@ -605,7 +792,8 @@ end
 
 --- Returns a factory, matching `db.connect` and `redis.connect`.
 function M.connect(config)
-  config = config or {}
+  if config == nil then config = {} end
+  check_options(config, CONNECT_OPTIONS, CONNECT_VALUES, "http.connect")
   local client = setmetatable({
     headers       = config.headers,
     timeout       = config.timeout or DEFAULTS.timeout,
@@ -636,7 +824,7 @@ function M.connect(config)
     stale_reused  = 0,
     retried_stale = 0,
   }, Client)
-  return function() return client end
+  return execution.shared(function() return client end)
 end
 
 M.Client = Client

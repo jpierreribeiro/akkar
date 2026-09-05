@@ -893,7 +893,12 @@ arguments is already production shaped.
 | field | value |
 |---|---|
 | `body_limit` | `1048576` (1 MB) |
+| `header_limit` | `32768` (32 KiB) |
+| `header_count_limit` | `100` fields |
+| `json_depth_limit` | `64` levels |
 | `timeout` | `30` seconds |
+| `read_timeout` | `30` seconds |
+| `write_timeout` | `30` seconds |
 | `shutdown_grace` | `10` seconds |
 
 ### app:run(config)
@@ -907,7 +912,12 @@ Binds a socket and serves. This call does not return until the server stops.
 | `tls` | table | none | `{ certificate = ..., key = ..., protocol = ... }`, each a PEM string or a path |
 | `ctx` | userdata | none | a luaossl context, the escape hatch past `tls` |
 | `body_limit` | number | `1048576` | bytes, above which the answer is 413 |
+| `header_limit` | positive integer | `32768` | aggregate HTTP/1 wire bytes or HTTP/2 decoded name/value bytes, above which the request is refused |
+| `header_count_limit` | positive integer | `100` | header fields, including repeated names |
+| `json_depth_limit` | positive integer | `64` | nested JSON arrays/objects, checked before decoding |
 | `timeout` | number | `30` | seconds of wall clock per request, above which the answer is 503. **`0` turns the deadline off** |
+| `read_timeout` | positive number | `30` | total seconds for the peer to finish request headers/body; trickling does not reset it |
+| `write_timeout` | positive number | `30` | seconds allowed for one response write, including an HTTP/2 flow-control wait |
 | `shutdown_grace` | number | `10` | seconds to drain on stop |
 | `check_capabilities` | boolean | `true` | acquire each capability once at boot and check its contract |
 | `reuseport` | boolean | none | let several processes share the port |
@@ -916,8 +926,13 @@ Binds a socket and serves. This call does not return until the server stops.
 | `trusted_proxies` | list of strings | none | CIDRs whose `x-forwarded-for` is believed |
 | `db`, `cache`, `log`, `clock`, `http` | table or function | none | capabilities. A function is called once per request that reads it |
 
-A capability given as a function is called per request, and if what it returns
-has a `release` method the framework calls it on every exit path.
+A capability given as a function is called per request. If what it returns has
+a `release` method, the framework hands the handler an execution-scoped lease
+and calls the real resource's `release` on every exit path. The lease refuses
+fields and methods after the execution ends, so a timed-out handler cannot use
+an object that may already have returned to a pool. A capability passed as a
+table is process-scoped: it is not wrapped, its identity and metatable stay
+unchanged, and akkar does not release it per request.
 
 **Returns** nothing. It does not return.
 

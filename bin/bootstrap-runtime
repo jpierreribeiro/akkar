@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Controlled Linux Lua 5.4 source installation into a NEW explicit prefix.
+set -euo pipefail
+akkar_repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$akkar_repo/runtime/substrate.env"
+akkar_prefix=${1:?usage: bash bin/bootstrap-runtime /absolute/new-prefix}
+case "$akkar_prefix" in /*) ;; *) echo "prefix must be absolute" >&2; exit 2;; esac
+if [ -e "$akkar_prefix" ]; then
+  echo "prefix already exists; choose a new directory (nothing overwritten)" >&2
+  exit 2
+fi
+test "$(uname -s)" = Linux || { echo "controlled bootstrap currently validates Linux only" >&2; exit 2; }
+for command in curl git make cc luarocks sha256sum; do command -v "$command" >/dev/null; done
+mkdir -p "$akkar_prefix/src"
+cd "$akkar_prefix/src"
+curl --fail --location --retry 2 -o "lua-$LUA_VERSION.tar.gz" "https://www.lua.org/ftp/lua-$LUA_VERSION.tar.gz"
+echo "$LUA_SHA256  lua-$LUA_VERSION.tar.gz" | sha256sum --check -
+tar xf "lua-$LUA_VERSION.tar.gz"
+make -C "lua-$LUA_VERSION" -j2 linux MYCFLAGS=-fPIC
+make -C "lua-$LUA_VERSION" install INSTALL_TOP="$akkar_prefix"
+export PATH="$akkar_prefix/bin:$PATH"
+
+while read -r name version checksum; do
+  [[ -z "$name" || "$name" == \#* ]] && continue
+  luarocks download --source "$name" "$version"
+  archive="$name-$version.src.rock"
+  echo "$checksum  $archive" | sha256sum --check -
+  luarocks --lua-version=5.4 --lua-dir="$akkar_prefix" --tree="$akkar_prefix" \
+    install --deps-mode=none "$archive"
+done < "$akkar_repo/runtime/rocks.lock"
+
+git clone "$CQUEUES_URL" cqueues
+git -C cqueues checkout --detach "$CQUEUES_COMMIT"
+test "$(git -C cqueues rev-parse HEAD)" = "$CQUEUES_COMMIT"
+git -C cqueues submodule update --init --recursive
+make -C cqueues -j2 all5.4 CPPFLAGS="-I$akkar_prefix/include"
+make -C cqueues install5.4 prefix="$akkar_prefix" \
+  lua54path="$akkar_prefix/share/lua/5.4" lua54cpath="$akkar_prefix/lib/lua/5.4"
+
+cd "$akkar_repo"
+luarocks --lua-version=5.4 --lua-dir="$akkar_prefix" --tree="$akkar_prefix" \
+  make --deps-mode=none akkar-dev-1.rockspec
+install -m 755 bin/runtime-exec "$akkar_prefix/bin/runtime-exec"
+install -m 644 runtime/substrate.env "$akkar_prefix/substrate.env"
+install -m 644 runtime/rocks.lock "$akkar_prefix/rocks.lock"
+"$akkar_prefix/bin/runtime-exec" lua -e \
+  'print("OPENSSL_RUNTIME=" .. require("openssl").version())' >> "$akkar_prefix/substrate.env"
+CQUEUES_COMMIT="$CQUEUES_COMMIT" "$akkar_prefix/bin/runtime-exec" lua -e '
+  assert(require("cqueues").COMMIT == os.getenv("CQUEUES_COMMIT"))
+  local app = require("akkar").new()
+  app:get("/", function() return {ok=true} end)
+  assert(app:test():get("/").body.ok)
+'
+echo "Run with: $akkar_prefix/bin/runtime-exec akkar doctor --no-probe"
